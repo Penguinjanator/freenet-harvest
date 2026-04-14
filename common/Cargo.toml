@@ -1,0 +1,13 @@
+[package]
+name = "harvest-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared types for the Harvest decentralized marketplace on Freenet: store/listing/reputation schemas and feedback-token protocol messages."
+
+[dependencies]
+freenet-stdlib = { workspace = true }
+ghostkey-common = { workspace = true }
+serde = { workspace = true }
+ciborium = { workspace = true }
