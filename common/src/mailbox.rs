@@ -6,21 +6,62 @@ use std::collections::HashSet;
 /// 30-day TTL for mailbox messages.
 pub const MESSAGE_TTL_SECS: i64 = 30 * 24 * 3600;
 
-/// Conversation identifier: BLAKE3(sorted(party_a_fingerprint, party_b_fingerprint)).
+/// Message size buckets for padding (bytes). Ciphertexts are padded to the next
+/// bucket boundary to reduce size-based traffic analysis.
+pub const SIZE_BUCKETS: &[usize] = &[1024, 4096, 16384, 65536];
+
+/// Pad data to the next size bucket boundary. Returns the padded data.
+/// The first 4 bytes encode the original length (little-endian u32) so the
+/// receiver can strip padding.
+pub fn pad_to_bucket(data: &[u8]) -> Vec<u8> {
+    let len = data.len();
+    let padded_len = SIZE_BUCKETS
+        .iter()
+        .find(|&&bucket| bucket >= len + 4) // +4 for length prefix
+        .copied()
+        .unwrap_or(len + 4); // if larger than all buckets, no padding
+
+    let mut result = Vec::with_capacity(padded_len);
+    result.extend_from_slice(&(len as u32).to_le_bytes());
+    result.extend_from_slice(data);
+    result.resize(padded_len, 0);
+    result
+}
+
+/// Remove padding from bucket-padded data.
+pub fn unpad_from_bucket(padded: &[u8]) -> Result<Vec<u8>, String> {
+    if padded.len() < 4 {
+        return Err("padded data too short for length prefix".into());
+    }
+    let len = u32::from_le_bytes([padded[0], padded[1], padded[2], padded[3]]) as usize;
+    if len + 4 > padded.len() {
+        return Err(format!(
+            "length prefix {len} exceeds padded data size {}",
+            padded.len() - 4
+        ));
+    }
+    Ok(padded[4..4 + len].to_vec())
+}
+
+/// Opaque conversation identifier chosen by the buyer.
+///
+/// Privacy: this is a random 32-byte value, NOT derived from party identities.
+/// Deriving it from fingerprints would let a passive observer who knows the
+/// seller's fingerprint (public on the store contract) confirm whether a
+/// suspected buyer is communicating with that seller.
+///
+/// The buyer generates a random ConversationId and includes it in their first
+/// (encrypted) message. The seller learns the ConversationId only after
+/// decrypting the message.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct ConversationId(pub [u8; 32]);
 
 impl ConversationId {
-    pub fn new(fingerprint_a: &str, fingerprint_b: &str) -> Self {
-        let mut hasher = blake3::Hasher::new();
-        if fingerprint_a <= fingerprint_b {
-            hasher.update(fingerprint_a.as_bytes());
-            hasher.update(fingerprint_b.as_bytes());
-        } else {
-            hasher.update(fingerprint_b.as_bytes());
-            hasher.update(fingerprint_a.as_bytes());
-        }
-        Self(*hasher.finalize().as_bytes())
+    /// Generate a random conversation ID.
+    pub fn random() -> Self {
+        let mut bytes = [0u8; 32];
+        getrandom::getrandom(&mut bytes).expect("getrandom should not fail");
+        Self(bytes)
     }
 }
 
@@ -28,12 +69,19 @@ impl ConversationId {
 ///
 /// The mailbox is an open-write contract: anyone can submit encrypted messages.
 /// Content is opaque ciphertext; the contract validates structure, not content.
+///
+/// Privacy notes:
+/// - Buyers MUST use a fresh ephemeral key per store to prevent cross-store linkability.
+/// - Ciphertext SHOULD be padded via `pad_to_bucket()` before encryption to reduce
+///   size-based traffic analysis.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct EncryptedMessage {
     pub conversation_id: ConversationId,
-    /// Sender's public key bytes (ephemeral for anonymous buyers, persistent for sellers).
+    /// Sender's public key bytes. Buyers MUST use a fresh ephemeral key per store
+    /// to prevent cross-store linkability.
     pub sender_public_key: Vec<u8>,
     /// Encrypted payload (plaintext format is application-defined).
+    /// SHOULD be padded to a size bucket before encryption.
     pub ciphertext: Vec<u8>,
     /// When the message was created.
     pub timestamp: DateTime<Utc>,
@@ -134,16 +182,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_conversation_id_symmetric() {
-        let id1 = ConversationId::new("alice", "bob");
-        let id2 = ConversationId::new("bob", "alice");
-        assert_eq!(id1, id2);
+    fn test_conversation_id_random_is_unique() {
+        let id1 = ConversationId::random();
+        let id2 = ConversationId::random();
+        assert_ne!(id1, id2);
     }
 
     #[test]
-    fn test_conversation_id_unique() {
-        let id1 = ConversationId::new("alice", "bob");
-        let id2 = ConversationId::new("alice", "carol");
-        assert_ne!(id1, id2);
+    fn test_pad_unpad_roundtrip() {
+        let data = b"hello harvest marketplace";
+        let padded = pad_to_bucket(data);
+        assert_eq!(padded.len(), 1024); // fits in first bucket
+        let unpadded = unpad_from_bucket(&padded).unwrap();
+        assert_eq!(unpadded, data);
+    }
+
+    #[test]
+    fn test_pad_bucket_selection() {
+        // Small message -> 1KB bucket
+        let small = vec![0u8; 100];
+        assert_eq!(pad_to_bucket(&small).len(), 1024);
+
+        // 2KB message -> 4KB bucket
+        let medium = vec![0u8; 2000];
+        assert_eq!(pad_to_bucket(&medium).len(), 4096);
+
+        // 10KB message -> 16KB bucket
+        let large = vec![0u8; 10000];
+        assert_eq!(pad_to_bucket(&large).len(), 16384);
+    }
+
+    #[test]
+    fn test_unpad_rejects_corrupt_data() {
+        assert!(unpad_from_bucket(&[0, 0, 0]).is_err()); // too short
+        assert!(unpad_from_bucket(&[255, 255, 0, 0]).is_err()); // length exceeds data
     }
 }

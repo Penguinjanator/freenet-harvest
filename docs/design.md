@@ -316,6 +316,31 @@ The marketplace application built on top of ghostkeys.
 - **Ghostkey tier granularity:** Current tiers go up to \$100. Will need \$500 and \$1000 for higher-value transactions.
 - **Feedback protocol definition:** JSON schema, Lua validator, or WASM validator for structured feedback content? TBD.
 
+## Privacy and Information Leakage
+
+All Freenet contract state is public. A passive observer who subscribes to Harvest contracts can learn the following:
+
+### What is visible
+
+- **Store contract:** Listings, prices, descriptions, seller ghostkey certificate and donation tier. This is public by design.
+- **Reputation contract:** Number of negative feedback entries (lower bound on failed transactions), feedback categories, comments, timestamps.
+- **Mailbox contract:** Number of messages, message sizes (padded to bucket boundaries: 1KB/4KB/16KB/64KB), timestamps, sender public keys, conversation IDs.
+- **Cross-contract timing correlation:** A burst of mailbox activity followed by a reputation entry can narrow down which conversation led to the feedback, partially undermining blind signature unlinkability.
+
+### Mitigations in place
+
+- **Conversation IDs are random**, not derived from party identities. An observer who knows the seller's fingerprint cannot confirm whether a suspected buyer is communicating with that seller.
+- **Buyers use fresh ephemeral keys per store** to prevent cross-store linkability. A buyer shopping at two different stores cannot be linked by their sender public key.
+- **Ciphertext padding** to fixed size buckets (1KB, 4KB, 16KB, 64KB) reduces size-based message classification.
+- **Feedback tokens are blind-signed (RFC 9474)**: the seller signs tokens they cannot read, so feedback cannot be linked to a specific buyer by the seller or anyone else.
+
+### What cannot be prevented
+
+- **Transaction volume:** The number of reputation entries reveals a lower bound on failed transactions. The total number of mailbox messages reveals approximate buyer traffic.
+- **Temporal patterns:** When a seller is active (listing updates), when buyers are messaging (mailbox activity), and when transactions fail (reputation entries) are all visible.
+- **Network-level analysis:** Which Freenet nodes subscribe to which contracts reveals interest. This is a Freenet platform concern, not Harvest-specific.
+- **Seller identity linkage:** A seller's store, reputation, and mailbox contracts are publicly linked via the seller's ghostkey certificate.
+
 ## Beyond Commerce: Non-Monetary Exchange
 
 Harvest is pitched as a marketplace, but the underlying primitives -- ghostkey identities, encrypted mailboxes, stores with listings, and blind-signed negative feedback -- are payment-agnostic and do not require money to change hands. A listing schema extension adding a `kind` field (`sale`, `gift`, `loan`, `trade`, `request`) would let the same protocol carry gift-economy, mutual-aid, tool-library, and barter exchanges with no change to the trust layer: the payment step is simply skipped, and the mutual negative-feedback ceremony still disciplines both parties against failure modes like no-shows, misrepresentation, or reselling donated goods.

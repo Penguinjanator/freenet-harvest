@@ -19,3 +19,4 @@ bs58 = { workspace = true }
 chrono = { workspace = true }
 rsa = { workspace = true }
 sha2 = { workspace = true }
+getrandom = { workspace = true }
