@@ -46,7 +46,7 @@ getrandom = { version = "0.2", features = ["custom"] }
 dioxus = { version = "=0.7.3", features = ["web"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Window", "Document", "HtmlInputElement", "HtmlElement", "Storage"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlInputElement", "HtmlElement", "Storage", "Location", "WebSocket", "BinaryType", "Blob", "FileReader", "CloseEvent", "ErrorEvent", "MessageEvent"] }
 js-sys = "0.3"
 gloo-timers = { version = "0.3", features = ["futures"] }
 futures = "0.3"

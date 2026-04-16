@@ -94,6 +94,18 @@ pub enum HarvestDelegateResponse {
         transactions: Vec<TransactionRecord>,
     },
 
+    /// A subscribed contract's state changed (new mailbox message, feedback, etc.).
+    ContractUpdate {
+        contract_key: Vec<u8>,
+        update_data: Vec<u8>,
+    },
+
+    /// Full contract state from a GET response.
+    ContractState {
+        contract_key: Vec<u8>,
+        state: Vec<u8>,
+    },
+
     Error {
         message: String,
     },

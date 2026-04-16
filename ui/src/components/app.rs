@@ -3,21 +3,38 @@ use dioxus::prelude::*;
 use super::my_store::MyStore;
 use super::reputation_view::ReputationView;
 use super::store_view::StoreView;
+use crate::gateway::{ConnectionStatus, CONNECTION_STATUS};
 
 /// Top-level navigation route.
 #[derive(Clone, PartialEq)]
 enum Route {
-    /// Browse a store (default landing page).
     Browse,
-    /// Manage your own store.
     MyStore,
-    /// View a seller's reputation.
     Reputation,
 }
 
 #[component]
 pub fn App() -> Element {
     let mut current_route = use_signal(|| Route::Browse);
+    let connection_status = CONNECTION_STATUS.read().clone();
+
+    // Attempt to connect on first render (only in WASM, skipped in no-sync mode)
+    #[cfg(all(target_arch = "wasm32", not(feature = "no-sync")))]
+    {
+        use_effect(|| {
+            wasm_bindgen_futures::spawn_local(async {
+                match crate::gateway::connect().await {
+                    Ok(_rx) => {
+                        dioxus::logger::tracing::info!("Connected to Freenet gateway");
+                        // TODO: spawn response handler loop with rx
+                    }
+                    Err(e) => {
+                        dioxus::logger::tracing::error!("Failed to connect: {}", e);
+                    }
+                }
+            });
+        });
+    }
 
     rsx! {
         div { class: "harvest-app",
@@ -31,7 +48,12 @@ pub fn App() -> Element {
                     "Harvest"
                 }
                 nav {
-                    style: "display: flex; gap: 1rem;",
+                    style: "display: flex; gap: 1rem; align-items: center;",
+                    // Connection status indicator
+                    span {
+                        style: "font-size: 0.75rem; color: {status_color(&connection_status)};",
+                        "{connection_status}"
+                    }
                     button {
                         style: nav_button_style(&current_route(), &Route::Browse),
                         onclick: move |_| current_route.set(Route::Browse),
@@ -57,6 +79,15 @@ pub fn App() -> Element {
                 Route::Reputation => rsx! { ReputationView {} },
             }
         }
+    }
+}
+
+fn status_color(status: &ConnectionStatus) -> &'static str {
+    match status {
+        ConnectionStatus::Connected => "#2d5016",
+        ConnectionStatus::Connecting => "#c4a000",
+        ConnectionStatus::Disconnected => "#888",
+        ConnectionStatus::Error(_) => "#cc0000",
     }
 }
 
