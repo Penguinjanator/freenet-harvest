@@ -1,0 +1,23 @@
+[package]
+name = "mailbox-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Harvest mailbox contract: encrypted buyer-seller messages with TTL-based pruning"
+
+[dependencies]
+harvest-common = { workspace = true }
+freenet-stdlib = { workspace = true }
+ciborium = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+getrandom = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["freenet-main-contract"]
+contract = ["freenet-stdlib/contract"]
+freenet-main-contract = []

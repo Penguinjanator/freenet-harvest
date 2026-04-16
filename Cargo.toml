@@ -1,6 +1,9 @@
 [workspace]
 members = [
     "common",
+    "contracts/reputation-contract",
+    "contracts/store-contract",
+    "contracts/mailbox-contract",
 ]
 resolver = "2"
 
@@ -15,7 +18,7 @@ repository = "https://github.com/freenet/harvest"
 harvest-common = { path = "common" }
 
 # Freenet ecosystem
-freenet-stdlib = "0.6"
+freenet-stdlib = { version = "0.6", features = ["contract"] }
 freenet-scaffold = "0.2.2"
 freenet-scaffold-macro = "0.2.2"
 ghostkey-common = "0.2"
