@@ -148,7 +148,8 @@ impl ReputationStateV1 {
         }
 
         // Sort deterministically by nonce for CRDT convergence
-        self.feedback.sort_by(|a, b| a.token.nonce.cmp(&b.token.nonce));
+        self.feedback
+            .sort_by(|a, b| a.token.nonce.cmp(&b.token.nonce));
 
         Ok(())
     }

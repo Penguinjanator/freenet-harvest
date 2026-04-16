@@ -36,7 +36,5 @@ pub enum FeedbackTokenMsg {
         target_reputation_contract: [u8; 32],
     },
     /// Seller -> Buyer: "Here's my blind signature on your token"
-    Response {
-        blind_signature: Vec<u8>,
-    },
+    Response { blind_signature: Vec<u8> },
 }

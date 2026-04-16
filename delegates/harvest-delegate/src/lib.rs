@@ -28,9 +28,7 @@ impl DelegateInterface for HarvestDelegate {
                 ));
             }
             None => {
-                return Err(DelegateError::Other(
-                    "missing message origin".into(),
-                ));
+                return Err(DelegateError::Other("missing message origin".into()));
             }
             Some(_) => {
                 return Err(DelegateError::Other(
@@ -71,8 +69,8 @@ fn handle_request(
     ctx: &mut DelegateCtx,
     payload: &[u8],
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-    let request: HarvestDelegateRequest =
-        from_cbor(payload).map_err(|e| DelegateError::Other(format!("deserialize request: {e}")))?;
+    let request: HarvestDelegateRequest = from_cbor(payload)
+        .map_err(|e| DelegateError::Other(format!("deserialize request: {e}")))?;
 
     let response = handlers::handle(ctx, request);
 

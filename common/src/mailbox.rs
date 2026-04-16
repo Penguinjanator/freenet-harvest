@@ -70,7 +70,9 @@ impl MailboxStateV1 {
             }
             let age = now.signed_duration_since(msg.timestamp).num_seconds();
             if age > MESSAGE_TTL_SECS {
-                return Err(format!("message older than TTL: {age}s > {MESSAGE_TTL_SECS}s"));
+                return Err(format!(
+                    "message older than TTL: {age}s > {MESSAGE_TTL_SECS}s"
+                ));
             }
         }
         Ok(())

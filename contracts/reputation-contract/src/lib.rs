@@ -54,9 +54,8 @@ impl ContractInterface for Contract {
         for update in data {
             match update {
                 UpdateData::State(new_state) => {
-                    let new_state =
-                        from_reader::<ReputationStateV1, &[u8]>(new_state.as_ref())
-                            .map_err(|e| ContractError::Deser(e.to_string()))?;
+                    let new_state = from_reader::<ReputationStateV1, &[u8]>(new_state.as_ref())
+                        .map_err(|e| ContractError::Deser(e.to_string()))?;
                     // Merge: add any feedback entries we don't have
                     let delta: ReputationDelta = new_state
                         .feedback
@@ -72,8 +71,7 @@ impl ContractInterface for Contract {
                     }
                     // Update certificate if empty
                     if reputation_state.owner_certificate_pem.is_empty() {
-                        reputation_state.owner_certificate_pem =
-                            new_state.owner_certificate_pem;
+                        reputation_state.owner_certificate_pem = new_state.owner_certificate_pem;
                     }
                 }
                 UpdateData::Delta(d) => {

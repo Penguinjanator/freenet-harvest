@@ -5,7 +5,9 @@ use rsa::pss::BlindedSigningKey;
 use rsa::signature::{RandomizedSigner, SignatureEncoding};
 use sha2::Sha256;
 
-use harvest_common::delegate::{HarvestDelegateRequest, HarvestDelegateResponse, TransactionRecord};
+use harvest_common::delegate::{
+    HarvestDelegateRequest, HarvestDelegateResponse, TransactionRecord,
+};
 use harvest_common::{from_cbor, to_cbor};
 
 // Secret key prefixes for delegate storage
@@ -175,9 +177,7 @@ fn handle_blind_sign(
         None => {
             return HarvestDelegateResponse::BlindSignatureResult {
                 request_id,
-                result: Err(format!(
-                    "no RSA keys for ghostkey {ghostkey_fingerprint}"
-                )),
+                result: Err(format!("no RSA keys for ghostkey {ghostkey_fingerprint}")),
             }
         }
     };

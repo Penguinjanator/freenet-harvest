@@ -69,8 +69,12 @@ impl freenet_scaffold::ComposableState for AuthorizedStoreInfoV1 {
         if self.info.version == 0 {
             return Ok(());
         }
-        crate::util::verify_struct(&self.info, &self.signature, &parameters.seller_verifying_key)
-            .map_err(|e| format!("store info signature invalid: {e}"))
+        crate::util::verify_struct(
+            &self.info,
+            &self.signature,
+            &parameters.seller_verifying_key,
+        )
+        .map_err(|e| format!("store info signature invalid: {e}"))
     }
 
     fn summarize(
@@ -186,7 +190,8 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
             }
 
             // Sort deterministically for CRDT convergence
-            self.listings.sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
+            self.listings
+                .sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
         }
         Ok(())
     }

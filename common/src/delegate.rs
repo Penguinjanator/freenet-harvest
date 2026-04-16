@@ -12,14 +12,10 @@ pub type RequestId = u64;
 pub enum HarvestDelegateRequest {
     // === RSA Key Management (for feedback token blind signing) ===
     /// Generate and store an RSA-PSS keypair for a ghostkey identity's reputation.
-    InitReputationKeys {
-        ghostkey_fingerprint: String,
-    },
+    InitReputationKeys { ghostkey_fingerprint: String },
 
     /// Get the RSA public key (PKCS#1 DER) for a reputation identity.
-    GetRsaPublicKey {
-        ghostkey_fingerprint: String,
-    },
+    GetRsaPublicKey { ghostkey_fingerprint: String },
 
     // === Blind Signing (seller signs buyer's feedback token) ===
     /// Blind-sign a buyer's feedback token.

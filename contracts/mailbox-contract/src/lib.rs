@@ -4,9 +4,7 @@ use chrono::Utc;
 use ciborium::{de::from_reader, ser::into_writer};
 use freenet_stdlib::prelude::*;
 
-use harvest_common::mailbox::{
-    MailboxDelta, MailboxParameters, MailboxStateV1, MailboxSummary,
-};
+use harvest_common::mailbox::{MailboxDelta, MailboxParameters, MailboxStateV1, MailboxSummary};
 
 #[allow(dead_code)]
 struct Contract;
@@ -56,9 +54,8 @@ impl ContractInterface for Contract {
         for update in data {
             match update {
                 UpdateData::State(new_state) => {
-                    let new_state =
-                        from_reader::<MailboxStateV1, &[u8]>(new_state.as_ref())
-                            .map_err(|e| ContractError::Deser(e.to_string()))?;
+                    let new_state = from_reader::<MailboxStateV1, &[u8]>(new_state.as_ref())
+                        .map_err(|e| ContractError::Deser(e.to_string()))?;
                     // Merge: add messages we don't have
                     let delta: MailboxDelta = new_state
                         .messages
@@ -71,11 +68,11 @@ impl ContractInterface for Contract {
                         })
                         .collect();
                     if !delta.is_empty() {
-                        mailbox_state
-                            .apply_delta(&Some(delta), now)
-                            .map_err(|e| ContractError::InvalidUpdateWithInfo {
+                        mailbox_state.apply_delta(&Some(delta), now).map_err(|e| {
+                            ContractError::InvalidUpdateWithInfo {
                                 reason: e.to_string(),
-                            })?;
+                            }
+                        })?;
                     }
                 }
                 UpdateData::Delta(d) => {
@@ -84,11 +81,11 @@ impl ContractInterface for Contract {
                     }
                     let delta = from_reader::<MailboxDelta, &[u8]>(d.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
-                    mailbox_state
-                        .apply_delta(&Some(delta), now)
-                        .map_err(|e| ContractError::InvalidUpdateWithInfo {
+                    mailbox_state.apply_delta(&Some(delta), now).map_err(|e| {
+                        ContractError::InvalidUpdateWithInfo {
                             reason: e.to_string(),
-                        })?;
+                        }
+                    })?;
                 }
                 _ => {
                     return Err(ContractError::InvalidUpdate);
