@@ -5,6 +5,7 @@ members = [
     "contracts/store-contract",
     "contracts/mailbox-contract",
     "delegates/harvest-delegate",
+    "ui",
 ]
 resolver = "2"
 

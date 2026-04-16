@@ -1,0 +1,44 @@
+[package]
+name = "harvest-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Harvest decentralized marketplace UI"
+
+[features]
+default = []
+example-data = []
+no-sync = []
+
+[dependencies]
+harvest-common = { workspace = true }
+ghostkey-common = { workspace = true }
+
+# UI Framework
+dioxus = { workspace = true }
+
+# Web
+web-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+js-sys = { workspace = true }
+gloo-timers = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+ciborium = { workspace = true }
+serde_json = { workspace = true }
+
+# Crypto
+ed25519-dalek = { workspace = true }
+blake3 = { workspace = true }
+bs58 = { workspace = true }
+
+# Utilities
+chrono = { workspace = true }
+getrandom = { version = "0.2", features = ["js", "wasm-bindgen", "js-sys"], default-features = false }
+
+# Freenet
+freenet-stdlib = { workspace = true, features = ["net"] }

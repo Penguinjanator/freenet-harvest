@@ -1,0 +1,53 @@
+[config]
+default_to_workspace = false
+
+[env]
+CONTRACT_TARGET = "wasm32-unknown-unknown"
+BUILD_PROFILE = "release"
+# CONTRACT_ID will be set after first publish
+# WEB_CONTAINER_TOOL and KEY_FILE will be configured for publishing
+
+# --- Build tasks ---
+
+[tasks.build-delegate]
+description = "Build the harvest delegate WASM"
+command = "cargo"
+args = ["build", "--release", "--target", "${CONTRACT_TARGET}", "-p", "harvest-delegate"]
+
+[tasks.build-contracts]
+description = "Build all contract WASMs"
+command = "cargo"
+args = ["build", "--release", "--target", "${CONTRACT_TARGET}", "-p", "reputation-contract", "-p", "store-contract", "-p", "mailbox-contract"]
+
+[tasks.build-ui]
+description = "Build the Dioxus UI"
+dependencies = ["build-delegate", "build-contracts"]
+command = "dx"
+args = ["build", "--${BUILD_PROFILE}"]
+cwd = "./ui"
+
+# --- Development tasks ---
+
+[tasks.dev]
+description = "Run UI in development mode with example data"
+command = "dx"
+args = ["serve", "--features", "example-data"]
+cwd = "./ui"
+
+[tasks.dev-no-sync]
+description = "Run UI without Freenet connection"
+command = "dx"
+args = ["serve", "--features", "example-data,no-sync"]
+cwd = "./ui"
+
+# --- Testing ---
+
+[tasks.test]
+description = "Run all tests"
+command = "cargo"
+args = ["test", "--workspace"]
+
+[tasks.clippy]
+description = "Run clippy on all targets"
+command = "cargo"
+args = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
