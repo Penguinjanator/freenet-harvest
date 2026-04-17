@@ -229,20 +229,67 @@ fn initiate_store_creation(_fingerprint: String, _details: StoreDetails) {
             };
             drop(app_state);
 
+            // Try to get the verifying key from the already-loaded ghostkeys
+            let vk_bytes = {
+                let state = APP_STATE.read();
+                state
+                    .ghostkeys
+                    .iter()
+                    .find(|k| k.fingerprint == fingerprint)
+                    .and_then(|k| k.verifying_key_bytes.as_ref())
+                    .and_then(|b| {
+                        if b.len() == 32 {
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(b);
+                            Some(arr)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or([0u8; 32])
+            };
+
             // Store the pending creation details
             APP_STATE.write().pending_store_creation = Some(crate::state::PendingStoreCreation {
                 ghostkey_fingerprint: fingerprint.clone(),
-                // These will be filled in from the ghostkey certificate
-                // For now, use placeholder -- this will be fixed when we
-                // wire up ghostkey delegate communication
-                seller_verifying_key_bytes: [0u8; 32],
+                seller_verifying_key_bytes: vk_bytes,
                 certificate_pem: String::new(),
                 store_name: details.store_name,
                 description: details.description,
                 payment_instructions: details.payment_instructions,
             });
 
-            // Send InitReputationKeys to harvest delegate
+            // Step 1: Request the ghostkey certificate to get the verifying key
+            let app_state = APP_STATE.read();
+            let gk_delegate_key = match &app_state.ghostkey_delegate_key {
+                Some(k) => k.clone(),
+                None => {
+                    dioxus::logger::tracing::error!("Ghostkey delegate not registered");
+                    APP_STATE.write().pending_store_creation = None;
+                    return;
+                }
+            };
+            drop(app_state);
+
+            let cert_request = ghostkey_common::GhostkeyRequest::GetCertificate {
+                fingerprint: fingerprint.clone(),
+            };
+            let cert_payload = match ghostkey_common::to_cbor(&cert_request) {
+                Ok(p) => p,
+                Err(e) => {
+                    dioxus::logger::tracing::error!("Failed to serialize cert request: {}", e);
+                    return;
+                }
+            };
+
+            if let Err(e) =
+                crate::gateway::send_delegate_message(&gk_delegate_key, cert_payload).await
+            {
+                dioxus::logger::tracing::error!("Failed to request certificate: {}", e);
+                return;
+            }
+
+            // Step 2: Send InitReputationKeys to harvest delegate (in parallel)
             let request = harvest_common::HarvestDelegateRequest::InitReputationKeys {
                 ghostkey_fingerprint: fingerprint.clone(),
             };
@@ -260,7 +307,7 @@ fn initiate_store_creation(_fingerprint: String, _details: StoreDetails) {
             }
 
             dioxus::logger::tracing::info!(
-                "Sent InitReputationKeys for {} -- store creation pending",
+                "Sent GetCertificate + InitReputationKeys for {} -- store creation pending",
                 fingerprint
             );
         });

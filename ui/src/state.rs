@@ -260,6 +260,26 @@ impl AppState {
         match response {
             ghostkey_common::GhostkeyResponse::GhostKeyList { keys } => {
                 info!("Received {} ghostkeys", keys.len());
+                // If any ghostkey has verifying_key_bytes and we have a pending
+                // store creation for it, fill in the key
+                for key in &keys {
+                    if let Some(ref vk_bytes) = key.verifying_key_bytes {
+                        if let Some(ref mut pending) = self.pending_store_creation {
+                            if pending.ghostkey_fingerprint == key.fingerprint
+                                && pending.seller_verifying_key_bytes == [0u8; 32]
+                                && vk_bytes.len() == 32
+                            {
+                                let mut arr = [0u8; 32];
+                                arr.copy_from_slice(vk_bytes);
+                                pending.seller_verifying_key_bytes = arr;
+                                info!(
+                                    "Filled verifying key for pending store creation: {}",
+                                    key.fingerprint
+                                );
+                            }
+                        }
+                    }
+                }
                 self.ghostkeys = keys;
             }
 
@@ -288,10 +308,40 @@ impl AppState {
                 }
             }
 
+            ghostkey_common::GhostkeyResponse::Certificate {
+                fingerprint,
+                certificate_pem,
+            } => {
+                info!("Received certificate for {}", fingerprint);
+                // If we have a pending store creation for this fingerprint,
+                // fill in the certificate PEM. The verifying key is extracted
+                // by the store creation code from the certificate at contract
+                // creation time.
+                if let Some(ref mut pending) = self.pending_store_creation {
+                    if pending.ghostkey_fingerprint == fingerprint {
+                        pending.certificate_pem = certificate_pem;
+                        info!("Updated pending store creation with certificate");
+                    }
+                }
+            }
+
+            ghostkey_common::GhostkeyResponse::GhostKeyDetail {
+                fingerprint,
+                certificate_pem,
+                ..
+            } => {
+                info!("Received ghostkey detail for {}", fingerprint);
+                // Also update pending store creation if applicable
+                if let Some(ref mut pending) = self.pending_store_creation {
+                    if pending.ghostkey_fingerprint == fingerprint {
+                        pending.certificate_pem = certificate_pem;
+                    }
+                }
+            }
+
             ghostkey_common::GhostkeyResponse::Error { message } => {
                 self.notifications
                     .push(format!("Ghostkey error: {message}"));
-                // Clear pending listing on error
                 self.pending_listing = None;
             }
 
