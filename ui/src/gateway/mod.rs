@@ -4,6 +4,7 @@
 
 mod connection;
 mod delegate_api;
+pub mod response_handler;
 
 pub use connection::{connect, ConnectionStatus};
 pub use delegate_api::{
@@ -11,11 +12,17 @@ pub use delegate_api::{
 };
 
 use dioxus::prelude::*;
-use freenet_stdlib::client_api::WebApi;
+
+use crate::state::AppState;
 
 /// Global WebSocket connection to the Freenet node.
-pub static WEB_API: GlobalSignal<Option<WebApi>> = GlobalSignal::new(|| None);
+#[cfg(target_arch = "wasm32")]
+pub static WEB_API: GlobalSignal<Option<freenet_stdlib::client_api::WebApi>> =
+    GlobalSignal::new(|| None);
 
 /// Current connection status.
 pub static CONNECTION_STATUS: GlobalSignal<ConnectionStatus> =
     GlobalSignal::new(|| ConnectionStatus::Disconnected);
+
+/// Application state -- updated by the response handler, read by UI components.
+pub static APP_STATE: GlobalSignal<AppState> = GlobalSignal::new(AppState::default);

@@ -18,18 +18,28 @@ pub fn App() -> Element {
     let mut current_route = use_signal(|| Route::Browse);
     let connection_status = CONNECTION_STATUS.read().clone();
 
-    // Attempt to connect on first render (only in WASM, skipped in no-sync mode)
+    // Connect to gateway and spawn response handler loop
     #[cfg(all(target_arch = "wasm32", not(feature = "no-sync")))]
     {
+        use futures::StreamExt;
+
         use_effect(|| {
             wasm_bindgen_futures::spawn_local(async {
                 match crate::gateway::connect().await {
-                    Ok(_rx) => {
-                        dioxus::logger::tracing::info!("Connected to Freenet gateway");
-                        // TODO: spawn response handler loop with rx
+                    Ok(mut rx) => {
+                        dioxus::logger::tracing::info!("Connected -- starting response loop");
+
+                        // Process responses until the connection drops
+                        while let Some(response) = rx.next().await {
+                            crate::gateway::response_handler::handle_response(response);
+                        }
+
+                        dioxus::logger::tracing::warn!("Response loop ended (connection lost)");
+                        *CONNECTION_STATUS.write() = ConnectionStatus::Disconnected;
                     }
                     Err(e) => {
                         dioxus::logger::tracing::error!("Failed to connect: {}", e);
+                        *CONNECTION_STATUS.write() = ConnectionStatus::Error(e);
                     }
                 }
             });
@@ -72,11 +82,33 @@ pub fn App() -> Element {
                 }
             }
 
+            // Notifications
+            {notification_bar()}
+
             // Main content
             match current_route() {
                 Route::Browse => rsx! { StoreView {} },
                 Route::MyStore => rsx! { MyStore {} },
                 Route::Reputation => rsx! { ReputationView {} },
+            }
+        }
+    }
+}
+
+fn notification_bar() -> Element {
+    let app_state = crate::gateway::APP_STATE.read();
+    if app_state.notifications.is_empty() {
+        return rsx! {};
+    }
+
+    rsx! {
+        div {
+            style: "background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 0.5rem 1rem; margin-bottom: 1rem;",
+            for notification in &app_state.notifications {
+                p {
+                    style: "margin: 0.25rem 0; color: #856404;",
+                    "{notification}"
+                }
             }
         }
     }

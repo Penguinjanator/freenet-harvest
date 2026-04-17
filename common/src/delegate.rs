@@ -54,6 +54,19 @@ pub enum HarvestDelegateRequest {
 
     /// Get stored transaction history.
     ListTransactions,
+
+    // === Store Registry ===
+    /// Register a store's contracts with a ghostkey identity so the delegate
+    /// knows which contracts to subscribe to for notifications.
+    RegisterStore {
+        ghostkey_fingerprint: String,
+        store_contract_id: Vec<u8>,
+        reputation_contract_id: Vec<u8>,
+        mailbox_contract_id: Vec<u8>,
+    },
+
+    /// List all stores registered for a ghostkey identity.
+    ListStores { ghostkey_fingerprint: String },
 }
 
 /// Responses from the Harvest delegate to the UI.
@@ -106,9 +119,26 @@ pub enum HarvestDelegateResponse {
         state: Vec<u8>,
     },
 
+    StoreRegistered {
+        ghostkey_fingerprint: String,
+    },
+
+    StoreList {
+        ghostkey_fingerprint: String,
+        stores: Vec<StoreRegistration>,
+    },
+
     Error {
         message: String,
     },
+}
+
+/// A store's contract IDs, registered with the delegate for notifications.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct StoreRegistration {
+    pub store_contract_id: Vec<u8>,
+    pub reputation_contract_id: Vec<u8>,
+    pub mailbox_contract_id: Vec<u8>,
 }
 
 /// A record of a feedback token exchange, stored locally by the delegate.

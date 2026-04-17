@@ -15,7 +15,9 @@ pub mod store;
 pub mod util;
 
 // Re-exports for convenience
-pub use delegate::{HarvestDelegateRequest, HarvestDelegateResponse, TransactionRecord};
+pub use delegate::{
+    HarvestDelegateRequest, HarvestDelegateResponse, StoreRegistration, TransactionRecord,
+};
 pub use feedback::{FeedbackCategory, FeedbackToken, FeedbackTokenMsg};
 pub use listing::{AuthorizedListing, Listing, ListingId, ListingKind, PriceInfo};
 pub use mailbox::{ConversationId, EncryptedMessage, MailboxParameters, MailboxStateV1};

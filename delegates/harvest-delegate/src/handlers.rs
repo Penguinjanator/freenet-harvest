@@ -6,7 +6,7 @@ use rsa::signature::{RandomizedSigner, SignatureEncoding};
 use sha2::Sha256;
 
 use harvest_common::delegate::{
-    HarvestDelegateRequest, HarvestDelegateResponse, TransactionRecord,
+    HarvestDelegateRequest, HarvestDelegateResponse, StoreRegistration, TransactionRecord,
 };
 use harvest_common::{from_cbor, to_cbor};
 
@@ -19,6 +19,9 @@ fn rsa_pk_key(fp: &str) -> Vec<u8> {
 }
 fn tx_key(tx_id: &str) -> Vec<u8> {
     format!("harvest:tx:{tx_id}").into_bytes()
+}
+fn stores_key(fp: &str) -> Vec<u8> {
+    format!("harvest:stores:{fp}").into_bytes()
 }
 const TX_INDEX_KEY: &[u8] = b"harvest:tx_index";
 
@@ -80,6 +83,23 @@ pub fn handle(ctx: &mut DelegateCtx, request: HarvestDelegateRequest) -> Harvest
         } => handle_record_blind_signature(ctx, request_id, &transaction_id, blind_signature),
 
         HarvestDelegateRequest::ListTransactions => handle_list_transactions(ctx),
+
+        HarvestDelegateRequest::RegisterStore {
+            ghostkey_fingerprint,
+            store_contract_id,
+            reputation_contract_id,
+            mailbox_contract_id,
+        } => handle_register_store(
+            ctx,
+            &ghostkey_fingerprint,
+            store_contract_id,
+            reputation_contract_id,
+            mailbox_contract_id,
+        ),
+
+        HarvestDelegateRequest::ListStores {
+            ghostkey_fingerprint,
+        } => handle_list_stores(ctx, &ghostkey_fingerprint),
 
         _ => HarvestDelegateResponse::Error {
             message: "unsupported request variant for this delegate version".into(),
@@ -311,4 +331,55 @@ fn handle_list_transactions(ctx: &DelegateCtx) -> HarvestDelegateResponse {
     }
 
     HarvestDelegateResponse::TransactionList { transactions }
+}
+
+fn load_stores(ctx: &DelegateCtx, ghostkey_fingerprint: &str) -> Vec<StoreRegistration> {
+    ctx.get_secret(&stores_key(ghostkey_fingerprint))
+        .and_then(|bytes| from_cbor(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_stores(ctx: &mut DelegateCtx, ghostkey_fingerprint: &str, stores: &[StoreRegistration]) {
+    if let Ok(bytes) = to_cbor(&stores) {
+        ctx.set_secret(&stores_key(ghostkey_fingerprint), &bytes);
+    }
+}
+
+fn handle_register_store(
+    ctx: &mut DelegateCtx,
+    ghostkey_fingerprint: &str,
+    store_contract_id: Vec<u8>,
+    reputation_contract_id: Vec<u8>,
+    mailbox_contract_id: Vec<u8>,
+) -> HarvestDelegateResponse {
+    let mut stores = load_stores(ctx, ghostkey_fingerprint);
+
+    // Check for duplicate (same store contract)
+    if stores
+        .iter()
+        .any(|s| s.store_contract_id == store_contract_id)
+    {
+        return HarvestDelegateResponse::StoreRegistered {
+            ghostkey_fingerprint: ghostkey_fingerprint.to_string(),
+        };
+    }
+
+    stores.push(StoreRegistration {
+        store_contract_id,
+        reputation_contract_id,
+        mailbox_contract_id,
+    });
+    save_stores(ctx, ghostkey_fingerprint, &stores);
+
+    HarvestDelegateResponse::StoreRegistered {
+        ghostkey_fingerprint: ghostkey_fingerprint.to_string(),
+    }
+}
+
+fn handle_list_stores(ctx: &DelegateCtx, ghostkey_fingerprint: &str) -> HarvestDelegateResponse {
+    let stores = load_stores(ctx, ghostkey_fingerprint);
+    HarvestDelegateResponse::StoreList {
+        ghostkey_fingerprint: ghostkey_fingerprint.to_string(),
+        stores,
+    }
 }
