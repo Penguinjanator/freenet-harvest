@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 
 /// What kind of listing this is.
@@ -65,30 +65,126 @@ pub struct Listing {
     pub created_at: DateTime<Utc>,
 }
 
-/// A listing signed by the seller's ghostkey.
+/// A listing signed by the seller's ghostkey via the ghostkey delegate.
 ///
-/// The signature covers the CBOR-encoded `Listing` bytes. Verification requires
-/// the seller's Ed25519 verifying key (from the store parameters or ghostkey certificate).
+/// The ghostkey delegate wraps the listing bytes in a `ScopedPayload`
+/// (binding the requestor identity) before signing. Verification checks:
+/// 1. Ed25519 signature over scoped_payload bytes
+/// 2. The payload inside the ScopedPayload matches the CBOR of the listing
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AuthorizedListing {
     pub listing: Listing,
-    pub signature: Signature,
+    /// CBOR-serialized ScopedPayload from the ghostkey delegate's SignResult.
+    pub scoped_payload: Vec<u8>,
+    /// Ed25519 signature over the scoped_payload bytes.
+    pub signature: Vec<u8>,
     /// The seller's ghostkey certificate PEM, so any verifier can check the trust chain.
     pub certificate_pem: String,
 }
 
 impl AuthorizedListing {
+    /// Verify this listing's signature against a known verifying key.
     pub fn verify(&self, verifying_key: &VerifyingKey) -> Result<(), String> {
-        crate::util::verify_struct(&self.listing, &self.signature, verifying_key)
-            .map_err(|e| format!("listing signature invalid: {e}"))
+        verify_scoped_signature(
+            &self.scoped_payload,
+            &self.signature,
+            verifying_key,
+            &self.listing,
+        )
     }
+}
+
+/// Verify a ghostkey delegate signature (ScopedPayload format).
+///
+/// 1. Parse the 64-byte Ed25519 signature
+/// 2. Verify the signature over the scoped_payload bytes
+/// 3. Deserialize the ScopedPayload and verify the inner payload matches
+///    the CBOR encoding of the expected data
+pub fn verify_scoped_signature<T: serde::Serialize>(
+    scoped_payload: &[u8],
+    signature_bytes: &[u8],
+    verifying_key: &VerifyingKey,
+    expected_data: &T,
+) -> Result<(), String> {
+    use ed25519_dalek::Verifier;
+
+    // Parse signature
+    let sig_array: [u8; 64] = signature_bytes
+        .try_into()
+        .map_err(|_| format!("signature must be 64 bytes, got {}", signature_bytes.len()))?;
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
+
+    // Verify Ed25519 signature over the scoped_payload bytes
+    verifying_key
+        .verify(scoped_payload, &signature)
+        .map_err(|e| format!("signature verification failed: {e}"))?;
+
+    // Deserialize the ScopedPayload to check the inner payload
+    let scoped: ghostkey_common::ScopedPayload =
+        crate::from_cbor(scoped_payload).map_err(|e| format!("deserialize scoped payload: {e}"))?;
+
+    // Verify the payload matches the CBOR encoding of the expected data
+    let expected_bytes =
+        crate::to_cbor(expected_data).map_err(|e| format!("serialize expected data: {e}"))?;
+
+    if scoped.payload != expected_bytes {
+        return Err("scoped payload content does not match expected data".into());
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::sign_struct;
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    /// Helper to create a signed listing for testing.
+    ///
+    /// Constructs the ScopedPayload manually via CBOR to avoid cross-version
+    /// ContractInstanceId issues (ghostkey-common uses stdlib 0.3.5, we use 0.6).
+    fn make_authorized_listing(signing_key: &SigningKey) -> AuthorizedListing {
+        let ts = DateTime::from_timestamp(1700000000, 0).unwrap();
+        let listing = Listing {
+            id: ListingId::new("abc123", &ts, "Widget"),
+            title: "Widget".into(),
+            description: "A nice widget".into(),
+            kind: ListingKind::Sale,
+            price: Some(PriceInfo {
+                amount: "0.001".into(),
+                currency: "BTC".into(),
+            }),
+            created_at: ts,
+        };
+
+        // Build a ScopedPayload-shaped struct manually to avoid the
+        // cross-stdlib-version ContractInstanceId mismatch.
+        // In production, the ghostkey delegate constructs this.
+        #[derive(serde::Serialize)]
+        struct TestScopedPayload {
+            requestor: TestRequestor,
+            payload: Vec<u8>,
+        }
+        #[derive(serde::Serialize)]
+        enum TestRequestor {
+            WebApp([u8; 32]),
+        }
+
+        let listing_bytes = crate::to_cbor(&listing).unwrap();
+        let scoped = TestScopedPayload {
+            requestor: TestRequestor::WebApp([0u8; 32]),
+            payload: listing_bytes,
+        };
+        let scoped_bytes = crate::to_cbor(&scoped).unwrap();
+        let signature = signing_key.sign(&scoped_bytes);
+
+        AuthorizedListing {
+            listing,
+            scoped_payload: scoped_bytes,
+            signature: signature.to_bytes().to_vec(),
+            certificate_pem: "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----".into(),
+        }
+    }
 
     #[test]
     fn test_listing_id_deterministic() {
@@ -107,30 +203,31 @@ mod tests {
     }
 
     #[test]
-    fn test_authorized_listing_roundtrip() {
+    fn test_authorized_listing_verify() {
         let signing_key = SigningKey::from_bytes(&[42u8; 32]);
         let verifying_key = signing_key.verifying_key();
-        let ts = DateTime::from_timestamp(1700000000, 0).unwrap();
 
-        let listing = Listing {
-            id: ListingId::new("abc123", &ts, "Widget"),
-            title: "Widget".into(),
-            description: "A nice widget".into(),
-            kind: ListingKind::Sale,
-            price: Some(PriceInfo {
-                amount: "0.001".into(),
-                currency: "BTC".into(),
-            }),
-            created_at: ts,
-        };
-
-        let signature = sign_struct(&listing, &signing_key);
-        let authorized = AuthorizedListing {
-            listing,
-            signature,
-            certificate_pem: "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----".into(),
-        };
-
+        let authorized = make_authorized_listing(&signing_key);
         assert!(authorized.verify(&verifying_key).is_ok());
+    }
+
+    #[test]
+    fn test_authorized_listing_wrong_key_fails() {
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let wrong_key = SigningKey::from_bytes(&[99u8; 32]).verifying_key();
+
+        let authorized = make_authorized_listing(&signing_key);
+        assert!(authorized.verify(&wrong_key).is_err());
+    }
+
+    #[test]
+    fn test_authorized_listing_tampered_payload_fails() {
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+
+        let mut authorized = make_authorized_listing(&signing_key);
+        // Tamper with the listing title after signing
+        authorized.listing.title = "Tampered".into();
+        assert!(authorized.verify(&verifying_key).is_err());
     }
 }

@@ -1,8 +1,8 @@
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use freenet_scaffold_macro::composable;
 use serde::{Deserialize, Serialize};
 
-use crate::listing::{AuthorizedListing, ListingId};
+use crate::listing::{verify_scoped_signature, AuthorizedListing, ListingId};
 
 /// Immutable parameters for a store contract, set at creation time.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -30,11 +30,18 @@ pub struct StoreInfoV1 {
     pub payment_instructions: String,
 }
 
-/// Store info signed by the seller's ghostkey.
+/// Store info signed by the seller's ghostkey via the ghostkey delegate.
+///
+/// Uses the ScopedPayload format from the ghostkey delegate's SignResult:
+/// the signature is over the CBOR-encoded ScopedPayload which wraps the
+/// CBOR-encoded StoreInfoV1 as its payload.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AuthorizedStoreInfoV1 {
     pub info: StoreInfoV1,
-    pub signature: Signature,
+    /// CBOR-serialized ScopedPayload from the ghostkey delegate's SignResult.
+    pub scoped_payload: Vec<u8>,
+    /// Ed25519 signature over the scoped_payload bytes.
+    pub signature: Vec<u8>,
 }
 
 impl Default for AuthorizedStoreInfoV1 {
@@ -49,7 +56,8 @@ impl Default for AuthorizedStoreInfoV1 {
                 description: String::new(),
                 payment_instructions: String::new(),
             },
-            signature: Signature::from_bytes(&[0u8; 64]),
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
         }
     }
 }
@@ -69,10 +77,11 @@ impl freenet_scaffold::ComposableState for AuthorizedStoreInfoV1 {
         if self.info.version == 0 {
             return Ok(());
         }
-        crate::util::verify_struct(
-            &self.info,
+        verify_scoped_signature(
+            &self.scoped_payload,
             &self.signature,
             &parameters.seller_verifying_key,
+            &self.info,
         )
         .map_err(|e| format!("store info signature invalid: {e}"))
     }
@@ -108,11 +117,11 @@ impl freenet_scaffold::ComposableState for AuthorizedStoreInfoV1 {
             if new_info.info.version <= self.info.version {
                 return Ok(()); // stale update, ignore
             }
-            // Verify the new info's signature
-            crate::util::verify_struct(
-                &new_info.info,
+            verify_scoped_signature(
+                &new_info.scoped_payload,
                 &new_info.signature,
                 &parameters.seller_verifying_key,
+                &new_info.info,
             )
             .map_err(|e| format!("store info delta signature invalid: {e}"))?;
             *self = new_info.clone();
