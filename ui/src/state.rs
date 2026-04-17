@@ -39,6 +39,11 @@ pub struct AppState {
     /// RSA public keys for our identities (fingerprint -> DER bytes).
     pub rsa_public_keys: HashMap<String, Vec<u8>>,
 
+    /// Store creation pending RSA key response. When InitReputationKeys
+    /// is sent, the store details are stored here. When ReputationKeysInitialized
+    /// arrives, the response handler picks this up and creates the contracts.
+    pub pending_store_creation: Option<PendingStoreCreation>,
+
     /// A listing that's been submitted for signing and is waiting for
     /// the ghostkey delegate's SignResult response.
     pub pending_listing: Option<PendingListing>,
@@ -49,6 +54,17 @@ pub struct AppState {
 
     /// Pending messages/events for the UI to display.
     pub notifications: Vec<String>,
+}
+
+/// Details for a store being created, waiting for RSA key generation.
+#[derive(Clone, Debug)]
+pub struct PendingStoreCreation {
+    pub ghostkey_fingerprint: String,
+    pub seller_verifying_key_bytes: [u8; 32],
+    pub certificate_pem: String,
+    pub store_name: String,
+    pub description: String,
+    pub payment_instructions: String,
 }
 
 /// A listing awaiting signature from the ghostkey delegate.
@@ -172,7 +188,39 @@ impl AppState {
             } => {
                 info!("RSA keys initialized for {}", ghostkey_fingerprint);
                 self.rsa_public_keys
-                    .insert(ghostkey_fingerprint, rsa_public_key_der);
+                    .insert(ghostkey_fingerprint.clone(), rsa_public_key_der.clone());
+
+                // If we have a pending store creation for this fingerprint,
+                // trigger the contract creation flow
+                if let Some(pending) = self.pending_store_creation.take() {
+                    if pending.ghostkey_fingerprint == ghostkey_fingerprint {
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            wasm_bindgen_futures::spawn_local(async move {
+                                if let Err(e) = crate::gateway::store_ops::create_store_contracts(
+                                    pending.ghostkey_fingerprint,
+                                    pending.seller_verifying_key_bytes,
+                                    rsa_public_key_der,
+                                    pending.certificate_pem,
+                                    pending.store_name,
+                                    pending.description,
+                                    pending.payment_instructions,
+                                )
+                                .await
+                                {
+                                    dioxus::logger::tracing::error!("Store creation failed: {}", e);
+                                    crate::gateway::APP_STATE
+                                        .write()
+                                        .notifications
+                                        .push(format!("Store creation failed: {e}"));
+                                }
+                            });
+                        }
+                    } else {
+                        // Wrong fingerprint -- put it back
+                        self.pending_store_creation = Some(pending);
+                    }
+                }
             }
 
             HarvestDelegateResponse::RsaPublicKey {

@@ -76,6 +76,7 @@ fn IdentityCard(
     has_harvest_delegate: bool,
 ) -> Element {
     let mut show_listing_form = use_signal(|| false);
+    let mut show_store_form = use_signal(|| false);
     let fp = identity.fingerprint.clone();
 
     rsx! {
@@ -101,15 +102,22 @@ fn IdentityCard(
                     span { class: "text-warning", "Creating contracts..." }
                 } else {
                     button {
-                        class: "btn btn-sm btn-primary",
+                        class: if show_store_form() { "btn btn-sm btn-outline" } else { "btn btn-sm btn-primary" },
                         disabled: !has_harvest_delegate,
-                        onclick: {
-                            let fp = identity.fingerprint.clone();
-                            move |_| { create_store(fp.clone()); }
-                        },
-                        "Create Store"
+                        onclick: move |_| show_store_form.toggle(),
+                        if show_store_form() { "Cancel" } else { "Create Store" }
                     }
                 }
+            }
+        }
+
+        if show_store_form() {
+            StoreCreationForm {
+                fingerprint: identity.fingerprint.clone(),
+                on_submit: move |details: StoreDetails| {
+                    show_store_form.set(false);
+                    initiate_store_creation(identity.fingerprint.clone(), details);
+                },
             }
         }
 
@@ -125,11 +133,92 @@ fn IdentityCard(
     }
 }
 
-fn create_store(_ghostkey_fingerprint: String) {
+struct StoreDetails {
+    store_name: String,
+    description: String,
+    payment_instructions: String,
+}
+
+#[component]
+fn StoreCreationForm(fingerprint: String, on_submit: EventHandler<StoreDetails>) -> Element {
+    let mut store_name = use_signal(String::new);
+    let mut description = use_signal(String::new);
+    let mut payment_instructions = use_signal(String::new);
+
+    rsx! {
+        div { class: "card",
+            h3 { "Create Your Store" }
+
+            div { class: "form-group",
+                label { class: "form-label", "Store Name" }
+                input {
+                    class: "form-input",
+                    r#type: "text",
+                    placeholder: "e.g. Mountain Valley Crafts",
+                    value: "{store_name}",
+                    oninput: move |e| store_name.set(e.value()),
+                }
+            }
+
+            div { class: "form-group",
+                label { class: "form-label", "Description" }
+                textarea {
+                    class: "form-textarea",
+                    placeholder: "Tell buyers about your store...",
+                    value: "{description}",
+                    oninput: move |e| description.set(e.value()),
+                }
+            }
+
+            div { class: "form-group",
+                label { class: "form-label", "Payment Instructions" }
+                textarea {
+                    class: "form-textarea",
+                    placeholder: "How should buyers pay? e.g. BTC: bc1q..., or contact me to arrange",
+                    value: "{payment_instructions}",
+                    oninput: move |e| payment_instructions.set(e.value()),
+                }
+            }
+
+            button {
+                class: "btn btn-primary",
+                disabled: store_name().trim().is_empty(),
+                onclick: move |_| {
+                    on_submit.call(StoreDetails {
+                        store_name: store_name().trim().to_string(),
+                        description: description().trim().to_string(),
+                        payment_instructions: payment_instructions().trim().to_string(),
+                    });
+                },
+                "Create Store"
+            }
+        }
+    }
+}
+
+/// Initiate the full store creation flow:
+/// 1. Set pending_store_creation with store details
+/// 2. Send InitReputationKeys to harvest delegate
+/// 3. When RSA key arrives, state.rs triggers create_store_contracts
+fn initiate_store_creation(_fingerprint: String, _details: StoreDetails) {
     #[cfg(target_arch = "wasm32")]
     {
-        let ghostkey_fingerprint = _ghostkey_fingerprint;
+        let fingerprint = _fingerprint;
+        let details = _details;
+
         wasm_bindgen_futures::spawn_local(async move {
+            // First, we need the ghostkey's verifying key and certificate.
+            // For now, we'll need the ghostkey delegate to provide these.
+            // The certificate PEM and verifying key bytes come from
+            // GhostkeyResponse::GhostKeyDetail or GhostkeyResponse::Certificate.
+            //
+            // For the initial implementation, we store the pending creation
+            // with placeholder values -- the verifying key will come from
+            // the ghostkey certificate when we have inter-delegate communication.
+            //
+            // TODO: Request GhostKeyDetail from ghostkey delegate to get
+            // certificate_pem and extract verifying key bytes.
+
             let app_state = APP_STATE.read();
             let delegate_key = match &app_state.harvest_delegate_key {
                 Some(k) => k.clone(),
@@ -140,8 +229,22 @@ fn create_store(_ghostkey_fingerprint: String) {
             };
             drop(app_state);
 
+            // Store the pending creation details
+            APP_STATE.write().pending_store_creation = Some(crate::state::PendingStoreCreation {
+                ghostkey_fingerprint: fingerprint.clone(),
+                // These will be filled in from the ghostkey certificate
+                // For now, use placeholder -- this will be fixed when we
+                // wire up ghostkey delegate communication
+                seller_verifying_key_bytes: [0u8; 32],
+                certificate_pem: String::new(),
+                store_name: details.store_name,
+                description: details.description,
+                payment_instructions: details.payment_instructions,
+            });
+
+            // Send InitReputationKeys to harvest delegate
             let request = harvest_common::HarvestDelegateRequest::InitReputationKeys {
-                ghostkey_fingerprint: ghostkey_fingerprint.clone(),
+                ghostkey_fingerprint: fingerprint.clone(),
             };
             let payload = match harvest_common::to_cbor(&request) {
                 Ok(p) => p,
@@ -157,8 +260,8 @@ fn create_store(_ghostkey_fingerprint: String) {
             }
 
             dioxus::logger::tracing::info!(
-                "Sent InitReputationKeys for {} -- waiting for RSA key response",
-                ghostkey_fingerprint
+                "Sent InitReputationKeys for {} -- store creation pending",
+                fingerprint
             );
         });
     }
