@@ -560,3 +560,14 @@ h4 {
   font-size: 0.85rem;
   margin-bottom: var(--space-md);
 }
+
+/* ---- Footer ---- */
+
+.harvest-footer {
+  margin-top: var(--space-2xl);
+  padding-top: var(--space-md);
+  border-top: 1px solid var(--border);
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-weight: 300;
+}

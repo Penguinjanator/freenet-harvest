@@ -125,7 +125,32 @@ pub fn App() -> Element {
                 Route::MyStore => rsx! { MyStore {} },
                 Route::Reputation => rsx! { ReputationView {} },
             }
+
+            // Footer with build timestamp
+            footer { class: "harvest-footer",
+                span { "Built: {format_build_time()}" }
+            }
         }
+    }
+}
+
+const BUILD_TIMESTAMP_ISO: &str = env!("BUILD_TIMESTAMP_ISO");
+
+fn format_build_time() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use js_sys::Date;
+        let date = Date::new(&wasm_bindgen::JsValue::from_str(BUILD_TIMESTAMP_ISO));
+        let year = date.get_full_year();
+        let month = date.get_month() + 1;
+        let day = date.get_date();
+        let hours = date.get_hours();
+        let minutes = date.get_minutes();
+        format!("{year}-{month:02}-{day:02} {hours:02}:{minutes:02}")
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        BUILD_TIMESTAMP_ISO.to_string()
     }
 }
 

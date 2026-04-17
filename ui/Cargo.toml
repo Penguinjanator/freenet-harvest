@@ -44,3 +44,6 @@ getrandom = { version = "0.2", features = ["js", "wasm-bindgen", "js-sys"], defa
 
 # Freenet
 freenet-stdlib = { workspace = true, features = ["net"] }
+
+[build-dependencies]
+chrono = "0.4"
