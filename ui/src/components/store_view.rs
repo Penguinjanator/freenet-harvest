@@ -6,15 +6,19 @@ use crate::gateway::APP_STATE;
 #[component]
 pub fn StoreView() -> Element {
     let app_state = APP_STATE.read();
-    let store_entry = app_state.browsing_stores.values().next();
+    let store_entry = app_state
+        .browsing_stores
+        .iter()
+        .next()
+        .map(|(k, v)| (k.clone(), v.clone()));
 
     rsx! {
         div {
             h2 { "Store" }
 
             match store_entry {
-                Some(store) if store.info.is_some() => {
-                    rsx! { LoadedStore { store: store.clone() } }
+                Some((contract_id, ref store)) if store.info.is_some() => {
+                    rsx! { LoadedStore { store: store.clone(), contract_id: contract_id } }
                 }
                 _ => {
                     rsx! {
@@ -30,8 +34,9 @@ pub fn StoreView() -> Element {
 }
 
 #[component]
-fn LoadedStore(store: crate::state::BrowsingStore) -> Element {
+fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Element {
     let info = store.info.as_ref().unwrap();
+    let mut show_messages = use_signal(|| false);
 
     rsx! {
         div {
@@ -60,6 +65,20 @@ fn LoadedStore(store: crate::state::BrowsingStore) -> Element {
                         "{info.payment_instructions}"
                     }
                 }
+            }
+
+            // Contact seller button
+            div {
+                style: "margin-bottom: 1.5rem;",
+                button {
+                    class: if show_messages() { "btn btn-sm btn-outline" } else { "btn btn-primary" },
+                    onclick: move |_| show_messages.toggle(),
+                    if show_messages() { "Hide Messages" } else { "Contact Seller" }
+                }
+            }
+
+            if show_messages() {
+                super::message_view::MessageView { store_contract_id: contract_id.clone() }
             }
 
             if store.listings.is_empty() {
