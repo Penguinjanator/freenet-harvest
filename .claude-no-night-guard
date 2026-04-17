@@ -1,6 +1,0 @@
-# This file exempts the repo from the late-night merge guard.
-# The guard exists to prevent risky changes to production systems
-# when attention is low. This repo has no users yet, so there's
-# no blast radius for mistakes.
-#
-# REMOVE THIS FILE when Harvest has real users.
