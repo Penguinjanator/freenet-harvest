@@ -3,12 +3,9 @@ use harvest_common::listing::{AuthorizedListing, ListingKind, PriceInfo};
 
 use crate::gateway::APP_STATE;
 
-/// Browse a store's listings.
 #[component]
 pub fn StoreView() -> Element {
     let app_state = APP_STATE.read();
-
-    // Find the first browsing store (for now -- later we'll support URL-based store selection)
     let store_entry = app_state.browsing_stores.values().next();
 
     rsx! {
@@ -21,8 +18,7 @@ pub fn StoreView() -> Element {
                 }
                 _ => {
                     rsx! {
-                        p {
-                            style: "color: #666;",
+                        p { class: "text-muted text-italic",
                             "No store loaded. Share a store link to browse listings."
                         }
                         {example_listings_section()}
@@ -39,50 +35,37 @@ fn LoadedStore(store: crate::state::BrowsingStore) -> Element {
 
     rsx! {
         div {
-            // Store header
-            div {
-                style: "background: #f5f5f0; border-radius: 8px; padding: 1.5rem; margin-bottom: 1rem;",
-                div {
-                    style: "display: flex; justify-content: space-between; align-items: flex-start;",
+            div { class: "store-header",
+                div { class: "store-header-inner",
                     div {
-                        h3 { style: "margin: 0 0 0.5rem 0;", "{info.store_name}" }
-                        p { style: "color: #555; margin: 0;", "{info.description}" }
+                        h3 { class: "store-name", "{info.store_name}" }
+                        p { class: "store-desc", "{info.description}" }
                     }
-                    div {
-                        style: "text-align: right;",
-                        // Reputation summary
+                    div { class: "store-meta",
                         if store.feedback.is_empty() {
-                            span {
-                                style: "color: #2d5016; font-weight: bold;",
-                                "Clean record"
-                            }
+                            span { class: "reputation-clean", "Clean record" }
                         } else {
-                            span {
-                                style: "color: #cc0000; font-weight: bold;",
+                            span { class: "reputation-negative",
                                 "{store.feedback.len()} negative"
                             }
                         }
-                        br {}
-                        span {
-                            style: "font-size: 0.8rem; color: #888;",
+                        p { class: "seller-id",
                             "Seller: {truncate_fingerprint(&info.seller_fingerprint)}"
                         }
                     }
                 }
                 if !info.payment_instructions.is_empty() {
-                    p {
-                        style: "margin: 0.75rem 0 0 0; font-size: 0.85rem; color: #666;",
+                    p { class: "payment-info",
                         strong { "Payment: " }
                         "{info.payment_instructions}"
                     }
                 }
             }
 
-            // Listings
             if store.listings.is_empty() {
-                p { style: "color: #888; font-style: italic;", "No listings yet." }
+                p { class: "text-muted text-italic", "No listings yet." }
             } else {
-                h3 { "{store.listings.len()} listing(s)" }
+                p { class: "section-count", "{store.listings.len()} listing(s)" }
                 for listing in &store.listings {
                     ListingCard { listing: listing.clone() }
                 }
@@ -96,32 +79,22 @@ fn ListingCard(listing: AuthorizedListing) -> Element {
     let l = &listing.listing;
 
     rsx! {
-        div {
-            style: "border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 0.75rem;",
-            div {
-                style: "display: flex; justify-content: space-between; align-items: center;",
-                h4 { style: "margin: 0;", "{l.title}" }
-                span {
-                    style: "background: {kind_color(&l.kind)}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.8rem;",
+        div { class: "listing-card",
+            div { class: "listing-header",
+                h4 { "{l.title}" }
+                span { class: "badge {kind_badge_class(&l.kind)}",
                     "{kind_label(&l.kind)}"
                 }
             }
-            p { style: "color: #555; margin: 0.5rem 0;", "{l.description}" }
-            div {
-                style: "display: flex; justify-content: space-between; align-items: center;",
+            p { class: "listing-desc", "{l.description}" }
+            div { class: "listing-footer",
                 if let Some(ref price) = l.price {
-                    span {
-                        style: "font-weight: bold; color: #2d5016;",
-                        "{price.amount} {price.currency}"
-                    }
+                    span { class: "listing-price", "{price.amount} {price.currency}" }
                 }
                 {
                     let date = l.created_at.format("%Y-%m-%d").to_string();
                     rsx! {
-                        span {
-                            style: "font-size: 0.75rem; color: #999;",
-                            "Listed {date}"
-                        }
+                        span { class: "listing-date", "Listed {date}" }
                     }
                 }
             }
@@ -137,11 +110,11 @@ fn truncate_fingerprint(fp: &str) -> String {
     }
 }
 
-fn kind_color(kind: &ListingKind) -> &'static str {
+fn kind_badge_class(kind: &ListingKind) -> &'static str {
     match kind {
-        ListingKind::Sale => "#2d5016",
-        ListingKind::Gift => "#6b4c9a",
-        ListingKind::Request => "#8b6914",
+        ListingKind::Sale => "badge-sale",
+        ListingKind::Gift => "badge-gift",
+        ListingKind::Request => "badge-request",
     }
 }
 
@@ -187,25 +160,16 @@ fn example_listings_section() -> Element {
 
         rsx! {
             div {
-                style: "margin-top: 1rem;",
                 h3 { "Example Listings" }
                 for (title, desc, kind, price) in examples {
-                    div {
-                        style: "border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 0.75rem;",
-                        div {
-                            style: "display: flex; justify-content: space-between; align-items: center;",
-                            h4 { style: "margin: 0;", "{title}" }
-                            span {
-                                style: "background: {kind_color(&kind)}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.8rem;",
-                                "{kind_label(&kind)}"
-                            }
+                    div { class: "listing-card",
+                        div { class: "listing-header",
+                            h4 { "{title}" }
+                            span { class: "badge {kind_badge_class(&kind)}", "{kind_label(&kind)}" }
                         }
-                        p { style: "color: #555; margin: 0.5rem 0;", "{desc}" }
+                        p { class: "listing-desc", "{desc}" }
                         if let Some(ref p) = price {
-                            p {
-                                style: "font-weight: bold; color: #2d5016;",
-                                "{p.amount} {p.currency}"
-                            }
+                            p { class: "listing-price", "{p.amount} {p.currency}" }
                         }
                     }
                 }

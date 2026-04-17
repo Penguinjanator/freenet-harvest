@@ -36,9 +36,12 @@ echo "Synced all WASMs to ui/public/contracts/"
 [tasks.build-ui]
 description = "Build the Dioxus UI"
 dependencies = ["sync-wasm", "build-contracts"]
-command = "dx"
-args = ["build", "--${BUILD_PROFILE}"]
-cwd = "./ui"
+script = '''
+cd ui && dx build --${BUILD_PROFILE}
+# dx doesn't copy CSS from assets/ to the build output root, so copy manually
+cp ui/assets/harvest.css target/dx/harvest-ui/${BUILD_PROFILE}/web/public/harvest.css
+echo "CSS copied to build output"
+'''
 
 # --- Development tasks ---
 

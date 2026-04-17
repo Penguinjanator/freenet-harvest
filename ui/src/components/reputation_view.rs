@@ -4,12 +4,10 @@ use harvest_common::reputation::FeedbackEntry;
 
 use crate::gateway::APP_STATE;
 
-/// View a seller's reputation (negative feedback history).
 #[component]
 pub fn ReputationView() -> Element {
     let app_state = APP_STATE.read();
 
-    // Collect all feedback from browsed stores
     let all_feedback: Vec<(&FeedbackEntry, Option<&str>)> = app_state
         .browsing_stores
         .values()
@@ -23,26 +21,27 @@ pub fn ReputationView() -> Element {
         div {
             h2 { "Reputation" }
 
-            // Explainer
-            div {
-                style: "background: #f5f5f0; border-radius: 8px; padding: 1rem; margin-bottom: 1rem;",
+            div { class: "info-box",
                 p {
-                    style: "margin: 0; color: #555;",
-                    "Only negative feedback exists. Positive feedback would be meaningless \
-                     since sellers could fake it via blind signatures. A clean record with an \
-                     old, high-tier ghostkey is the best possible reputation."
+                    "Only negative feedback exists. Positive feedback would be meaningless "
+                    "since sellers could fake it via blind signatures. A clean record with an "
+                    "old, high-tier ghostkey is the best possible reputation."
                 }
             }
 
             if all_feedback.is_empty() {
-                p {
-                    style: "color: #666; font-style: italic;",
+                p { class: "text-muted text-italic",
                     "No feedback entries loaded. Browse a store to see its reputation."
                 }
             } else {
-                h3 { "{all_feedback.len()} negative feedback entry/entries" }
+                p { class: "section-count",
+                    "{all_feedback.len()} negative feedback entry/entries"
+                }
                 for (entry, store_name) in &all_feedback {
-                    FeedbackCard { entry: (*entry).clone(), store_name: store_name.map(String::from) }
+                    FeedbackCard {
+                        entry: (*entry).clone(),
+                        store_name: store_name.map(String::from),
+                    }
                 }
             }
         }
@@ -52,32 +51,21 @@ pub fn ReputationView() -> Element {
 #[component]
 fn FeedbackCard(entry: FeedbackEntry, store_name: Option<String>) -> Element {
     rsx! {
-        div {
-            style: "border: 1px solid #e0c0c0; border-left: 4px solid #cc0000; border-radius: 4px; padding: 1rem; margin-bottom: 0.75rem;",
-            div {
-                style: "display: flex; justify-content: space-between; align-items: center;",
-                span {
-                    style: "font-weight: bold; color: #cc0000;",
+        div { class: "feedback-card",
+            div { class: "feedback-header",
+                span { class: "feedback-category",
                     "{category_label(&entry.category)}"
                 }
                 {
                     let ts = entry.submitted_at.format("%Y-%m-%d %H:%M UTC").to_string();
-                    rsx! {
-                        span {
-                            style: "font-size: 0.75rem; color: #999;",
-                            "{ts}"
-                        }
-                    }
+                    rsx! { span { class: "feedback-time", "{ts}" } }
                 }
             }
             if !entry.comment.is_empty() {
-                p { style: "margin: 0.5rem 0 0 0; color: #333;", "{entry.comment}" }
+                p { class: "feedback-comment", "{entry.comment}" }
             }
             if let Some(ref name) = store_name {
-                p {
-                    style: "margin: 0.25rem 0 0 0; font-size: 0.8rem; color: #888;",
-                    "Store: {name}"
-                }
+                p { class: "feedback-store", "Store: {name}" }
             }
         }
     }

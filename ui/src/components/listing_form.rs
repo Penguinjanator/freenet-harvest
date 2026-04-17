@@ -2,7 +2,6 @@ use chrono::Utc;
 use dioxus::prelude::*;
 use harvest_common::listing::{Listing, ListingId, ListingKind, PriceInfo};
 
-/// Form for creating a new listing.
 #[component]
 pub fn ListingForm(seller_fingerprint: String, on_submit: EventHandler<Listing>) -> Element {
     let mut title = use_signal(String::new);
@@ -14,14 +13,13 @@ pub fn ListingForm(seller_fingerprint: String, on_submit: EventHandler<Listing>)
     let fp = seller_fingerprint.clone();
 
     rsx! {
-        div {
-            style: "border: 1px solid #ddd; border-radius: 8px; padding: 1.5rem; margin-top: 1rem;",
+        div { class: "card",
             h3 { "New Listing" }
 
-            div { style: "margin-bottom: 1rem;",
-                label { style: "display: block; font-weight: bold; margin-bottom: 0.25rem;", "Title" }
+            div { class: "form-group",
+                label { class: "form-label", "Title" }
                 input {
-                    style: "width: 100%; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box;",
+                    class: "form-input",
                     r#type: "text",
                     placeholder: "What are you offering?",
                     value: "{title}",
@@ -29,20 +27,20 @@ pub fn ListingForm(seller_fingerprint: String, on_submit: EventHandler<Listing>)
                 }
             }
 
-            div { style: "margin-bottom: 1rem;",
-                label { style: "display: block; font-weight: bold; margin-bottom: 0.25rem;", "Description" }
+            div { class: "form-group",
+                label { class: "form-label", "Description" }
                 textarea {
-                    style: "width: 100%; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; min-height: 80px; box-sizing: border-box;",
+                    class: "form-textarea",
                     placeholder: "Describe your item or service...",
                     value: "{description}",
                     oninput: move |e| description.set(e.value()),
                 }
             }
 
-            div { style: "margin-bottom: 1rem;",
-                label { style: "display: block; font-weight: bold; margin-bottom: 0.25rem;", "Type" }
+            div { class: "form-group",
+                label { class: "form-label", "Type" }
                 select {
-                    style: "padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;",
+                    class: "form-select",
                     value: kind_value(&kind()),
                     onchange: move |e| {
                         kind.set(match e.value().as_str() {
@@ -58,21 +56,21 @@ pub fn ListingForm(seller_fingerprint: String, on_submit: EventHandler<Listing>)
             }
 
             if matches!(kind(), ListingKind::Sale) {
-                div { style: "margin-bottom: 1rem; display: flex; gap: 0.5rem;",
-                    div { style: "flex: 1;",
-                        label { style: "display: block; font-weight: bold; margin-bottom: 0.25rem;", "Price" }
+                div { class: "form-group form-row",
+                    div {
+                        label { class: "form-label", "Price" }
                         input {
-                            style: "width: 100%; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box;",
+                            class: "form-input",
                             r#type: "text",
                             placeholder: "0.001",
                             value: "{price_amount}",
                             oninput: move |e| price_amount.set(e.value()),
                         }
                     }
-                    div { style: "width: 100px;",
-                        label { style: "display: block; font-weight: bold; margin-bottom: 0.25rem;", "Currency" }
+                    div { class: "form-narrow",
+                        label { class: "form-label", "Currency" }
                         input {
-                            style: "width: 100%; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box;",
+                            class: "form-input",
                             r#type: "text",
                             placeholder: "BTC",
                             value: "{price_currency}",
@@ -83,7 +81,7 @@ pub fn ListingForm(seller_fingerprint: String, on_submit: EventHandler<Listing>)
             }
 
             button {
-                style: "background: #2d5016; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 4px; cursor: pointer; font-size: 1rem;",
+                class: "btn btn-primary",
                 disabled: title().trim().is_empty(),
                 onclick: {
                     let fp = fp.clone();
@@ -108,7 +106,6 @@ pub fn ListingForm(seller_fingerprint: String, on_submit: EventHandler<Listing>)
                             created_at: now,
                         };
 
-                        // Clear form
                         title.set(String::new());
                         description.set(String::new());
                         price_amount.set(String::new());

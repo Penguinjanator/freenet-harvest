@@ -4,7 +4,6 @@ use harvest_common::listing::Listing;
 use super::listing_form::ListingForm;
 use crate::gateway::APP_STATE;
 
-/// Manage your own store: create listings, view your reputation.
 #[component]
 pub fn MyStore() -> Element {
     let app_state = APP_STATE.read();
@@ -30,14 +29,9 @@ pub fn MyStore() -> Element {
 #[component]
 fn NoIdentity() -> Element {
     rsx! {
-        div {
-            style: "border: 1px solid #ddd; border-radius: 8px; padding: 1.5rem; text-align: center;",
+        div { class: "card empty-state",
+            p { "No ghostkey identities found." }
             p {
-                style: "font-size: 1.1rem; color: #666;",
-                "No ghostkey identities found."
-            }
-            p {
-                style: "color: #888;",
                 "To create a store, you need a ghostkey identity. Visit the "
                 "Ghostkey Manager to import or create one via a Freenet donation."
             }
@@ -57,8 +51,7 @@ fn IdentityList(
             h3 { "Your Identities" }
 
             if !has_harvest_delegate {
-                p {
-                    style: "color: #c4a000; font-size: 0.85rem; margin-bottom: 1rem;",
+                p { class: "text-warning",
                     "Harvest delegate not yet registered. Store creation will be available once the delegate is loaded."
                 }
             }
@@ -86,66 +79,52 @@ fn IdentityCard(
     let fp = identity.fingerprint.clone();
 
     rsx! {
-        div {
-            style: "border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 0.75rem;",
+        div { class: "identity-card",
             div {
-                style: "display: flex; justify-content: space-between; align-items: center;",
-                div {
-                    strong {
-                        if let Some(ref label) = identity.label {
-                            "{label}"
-                        } else {
-                            "{truncate_fingerprint(&identity.fingerprint)}"
-                        }
-                    }
-                    span {
-                        style: "margin-left: 0.5rem; font-size: 0.8rem; color: #888;",
-                        "({identity.notary_info})"
+                span { class: "identity-name",
+                    if let Some(ref label) = identity.label {
+                        "{label}"
+                    } else {
+                        "{truncate_fingerprint(&identity.fingerprint)}"
                     }
                 }
-                div { style: "display: flex; gap: 0.5rem;",
-                    if has_store {
-                        button {
-                            style: "background: #2d5016; color: white; border: none; padding: 0.4rem 0.8rem; border-radius: 4px; cursor: pointer; font-size: 0.85rem;",
-                            onclick: move |_| show_listing_form.toggle(),
-                            if show_listing_form() { "Cancel" } else { "Add Listing" }
-                        }
-                    } else if has_rsa_key {
-                        span {
-                            style: "color: #c4a000; font-size: 0.85rem;",
-                            "RSA keys ready -- creating contracts..."
-                        }
-                    } else {
-                        button {
-                            style: "background: #2d5016; color: white; border: none; padding: 0.4rem 0.8rem; border-radius: 4px; cursor: pointer; font-size: 0.85rem;",
-                            disabled: !has_harvest_delegate,
-                            onclick: {
-                                let fp = identity.fingerprint.clone();
-                                move |_| {
-                                    create_store(fp.clone());
-                                }
-                            },
-                            "Create Store"
-                        }
+                span { class: "identity-tier", "({identity.notary_info})" }
+            }
+            div {
+                if has_store {
+                    button {
+                        class: if show_listing_form() { "btn btn-sm btn-outline" } else { "btn btn-sm btn-primary" },
+                        onclick: move |_| show_listing_form.toggle(),
+                        if show_listing_form() { "Cancel" } else { "Add Listing" }
+                    }
+                } else if has_rsa_key {
+                    span { class: "text-warning", "Creating contracts..." }
+                } else {
+                    button {
+                        class: "btn btn-sm btn-primary",
+                        disabled: !has_harvest_delegate,
+                        onclick: {
+                            let fp = identity.fingerprint.clone();
+                            move |_| { create_store(fp.clone()); }
+                        },
+                        "Create Store"
                     }
                 }
             }
+        }
 
-            // Show listing form when toggled
-            if show_listing_form() {
-                ListingForm {
-                    seller_fingerprint: fp.clone(),
-                    on_submit: move |listing: Listing| {
-                        show_listing_form.set(false);
-                        sign_and_submit_listing(fp.clone(), listing);
-                    },
-                }
+        if show_listing_form() {
+            ListingForm {
+                seller_fingerprint: fp.clone(),
+                on_submit: move |listing: Listing| {
+                    show_listing_form.set(false);
+                    sign_and_submit_listing(fp.clone(), listing);
+                },
             }
         }
     }
 }
 
-/// Step 1 of store creation: request RSA keys from the harvest delegate.
 fn create_store(_ghostkey_fingerprint: String) {
     #[cfg(target_arch = "wasm32")]
     {
@@ -185,7 +164,6 @@ fn create_store(_ghostkey_fingerprint: String) {
     }
 }
 
-/// Sign a listing via the ghostkey delegate and submit it to the store contract.
 fn sign_and_submit_listing(_fingerprint: String, _listing: Listing) {
     #[cfg(target_arch = "wasm32")]
     {
@@ -193,7 +171,6 @@ fn sign_and_submit_listing(_fingerprint: String, _listing: Listing) {
         let listing = _listing;
 
         wasm_bindgen_futures::spawn_local(async move {
-            // Serialize the listing to CBOR for signing
             let listing_bytes = match harvest_common::to_cbor(&listing) {
                 Ok(b) => b,
                 Err(e) => {
@@ -202,7 +179,6 @@ fn sign_and_submit_listing(_fingerprint: String, _listing: Listing) {
                 }
             };
 
-            // Send SignMessage to the ghostkey delegate
             let app_state = APP_STATE.read();
             let gk_delegate_key = match &app_state.ghostkey_delegate_key {
                 Some(k) => k.clone(),
@@ -210,11 +186,10 @@ fn sign_and_submit_listing(_fingerprint: String, _listing: Listing) {
                     dioxus::logger::tracing::error!(
                         "Ghostkey delegate not registered -- cannot sign listing"
                     );
-                    APP_STATE.write().notifications.push(
-                        "Cannot sign listing: ghostkey delegate not available. \
-                         Make sure the Ghostkey Manager has been opened at least once."
-                            .into(),
-                    );
+                    APP_STATE
+                        .write()
+                        .notifications
+                        .push("Cannot sign listing: ghostkey delegate not available.".into());
                     return;
                 }
             };
@@ -243,10 +218,6 @@ fn sign_and_submit_listing(_fingerprint: String, _listing: Listing) {
                 listing.title
             );
 
-            // The response handler will receive GhostkeyResponse::SignResult
-            // and needs to construct the AuthorizedListing and submit it to
-            // the store contract. This requires storing the pending listing
-            // so the response handler can match it up.
             APP_STATE.write().pending_listing = Some(crate::state::PendingListing {
                 fingerprint,
                 listing,
