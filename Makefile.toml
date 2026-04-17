@@ -20,12 +20,15 @@ command = "cargo"
 args = ["build", "--release", "--target", "${CONTRACT_TARGET}", "-p", "reputation-contract", "-p", "store-contract", "-p", "mailbox-contract"]
 
 [tasks.sync-wasm]
-description = "Copy built delegate WASM to UI public dir for embedding"
-dependencies = ["build-delegate"]
+description = "Copy built WASMs to UI public dir for embedding"
+dependencies = ["build-delegate", "build-contracts"]
 script = '''
 mkdir -p ui/public/contracts
 cp target/${CONTRACT_TARGET}/${BUILD_PROFILE}/harvest_delegate.wasm ui/public/contracts/
-echo "Synced harvest_delegate.wasm to ui/public/contracts/"
+cp target/${CONTRACT_TARGET}/${BUILD_PROFILE}/store_contract.wasm ui/public/contracts/
+cp target/${CONTRACT_TARGET}/${BUILD_PROFILE}/reputation_contract.wasm ui/public/contracts/
+cp target/${CONTRACT_TARGET}/${BUILD_PROFILE}/mailbox_contract.wasm ui/public/contracts/
+echo "Synced all WASMs to ui/public/contracts/"
 '''
 
 [tasks.build-ui]

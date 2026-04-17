@@ -5,6 +5,7 @@
 mod connection;
 mod delegate_api;
 pub mod response_handler;
+pub mod store_ops;
 
 pub use connection::{connect, ConnectionStatus};
 pub use delegate_api::{
