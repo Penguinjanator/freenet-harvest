@@ -38,20 +38,26 @@ pub fn App() -> Element {
                 dioxus::logger::tracing::info!("Connected -- registering delegates");
 
                 // Step 2: Register the harvest delegate
-                // The WASM will be embedded via include_bytes! once we have a built binary.
-                // For now, log that we would register it.
-                // TODO: include_bytes! the harvest delegate WASM and register it
-                dioxus::logger::tracing::info!(
-                    "Harvest delegate registration pending (WASM not yet embedded)"
-                );
+                let harvest_wasm = include_bytes!("../../public/contracts/harvest_delegate.wasm");
+                match crate::gateway::register_delegate(harvest_wasm).await {
+                    Ok(key) => {
+                        dioxus::logger::tracing::info!("Harvest delegate registered: {:?}", key);
+                        crate::gateway::APP_STATE.write().harvest_delegate_key = Some(key);
+                    }
+                    Err(e) => {
+                        dioxus::logger::tracing::error!(
+                            "Failed to register harvest delegate: {}",
+                            e
+                        );
+                    }
+                }
 
-                // Step 3: The ghostkey delegate is registered by the ghostkey UI,
-                // not by Harvest. We communicate with it using its known key.
-                // The key is determined by BLAKE3(BLAKE3(wasm) || params).
-                // For now, we'll discover it via the gateway when we receive responses.
-
-                // Step 4: Request the list of ghostkeys (via ghostkey delegate)
-                // This will be done once we know the ghostkey delegate key.
+                // Step 3: The ghostkey delegate should already be registered
+                // by the ghostkey management UI. We need its key to communicate
+                // with it. The key is determined by BLAKE3(BLAKE3(wasm) || params).
+                // For now, we request the list of ghostkeys once we know the key.
+                // This will be wired up when we have the ghostkey delegate WASM
+                // available or a way to discover the key at runtime.
 
                 // Step 5: Start the response processing loop
                 dioxus::logger::tracing::info!("Starting response loop");

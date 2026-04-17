@@ -19,9 +19,18 @@ description = "Build all contract WASMs"
 command = "cargo"
 args = ["build", "--release", "--target", "${CONTRACT_TARGET}", "-p", "reputation-contract", "-p", "store-contract", "-p", "mailbox-contract"]
 
+[tasks.sync-wasm]
+description = "Copy built delegate WASM to UI public dir for embedding"
+dependencies = ["build-delegate"]
+script = '''
+mkdir -p ui/public/contracts
+cp target/${CONTRACT_TARGET}/${BUILD_PROFILE}/harvest_delegate.wasm ui/public/contracts/
+echo "Synced harvest_delegate.wasm to ui/public/contracts/"
+'''
+
 [tasks.build-ui]
 description = "Build the Dioxus UI"
-dependencies = ["build-delegate", "build-contracts"]
+dependencies = ["sync-wasm", "build-contracts"]
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}"]
 cwd = "./ui"

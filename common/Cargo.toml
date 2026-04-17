@@ -10,7 +10,7 @@ description = "Shared types for the Harvest decentralized marketplace on Freenet
 freenet-stdlib = { workspace = true }
 freenet-scaffold = { workspace = true }
 freenet-scaffold-macro = { workspace = true }
-ghostkey-common = { workspace = true }
+ghostkey-common = { workspace = true, optional = true }
 serde = { workspace = true }
 ciborium = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -20,3 +20,7 @@ chrono = { workspace = true }
 rsa = { workspace = true }
 sha2 = { workspace = true }
 getrandom = { workspace = true }
+
+[features]
+default = ["ghostkey"]
+ghostkey = ["dep:ghostkey-common"]

@@ -12,7 +12,6 @@ freenet-main-delegate = []
 
 [dependencies]
 harvest-common = { workspace = true }
-ghostkey-common = { workspace = true }
 freenet-stdlib = { workspace = true }
 serde = { workspace = true }
 ciborium = { workspace = true }

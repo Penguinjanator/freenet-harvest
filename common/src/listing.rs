@@ -119,19 +119,56 @@ pub fn verify_scoped_signature<T: serde::Serialize>(
         .verify(scoped_payload, &signature)
         .map_err(|e| format!("signature verification failed: {e}"))?;
 
-    // Deserialize the ScopedPayload to check the inner payload
-    let scoped: ghostkey_common::ScopedPayload =
-        crate::from_cbor(scoped_payload).map_err(|e| format!("deserialize scoped payload: {e}"))?;
+    // Verify the inner payload matches the expected data.
+    // The scoped_payload is CBOR-encoded ScopedPayload { requestor, payload }.
+    // We need to extract the payload field and compare it.
+    #[cfg(feature = "ghostkey")]
+    {
+        let scoped: ghostkey_common::ScopedPayload = crate::from_cbor(scoped_payload)
+            .map_err(|e| format!("deserialize scoped payload: {e}"))?;
 
-    // Verify the payload matches the CBOR encoding of the expected data
-    let expected_bytes =
-        crate::to_cbor(expected_data).map_err(|e| format!("serialize expected data: {e}"))?;
+        let expected_bytes =
+            crate::to_cbor(expected_data).map_err(|e| format!("serialize expected data: {e}"))?;
 
-    if scoped.payload != expected_bytes {
-        return Err("scoped payload content does not match expected data".into());
+        if scoped.payload != expected_bytes {
+            return Err("scoped payload content does not match expected data".into());
+        }
+    }
+
+    // Without ghostkey-common, extract the payload from the raw CBOR structure.
+    #[cfg(not(feature = "ghostkey"))]
+    {
+        let value: ciborium::Value = crate::from_cbor(scoped_payload)
+            .map_err(|e| format!("deserialize scoped payload as CBOR: {e}"))?;
+
+        let payload_bytes = extract_payload_from_cbor(&value)
+            .ok_or("could not extract payload from scoped payload")?;
+
+        let expected_bytes =
+            crate::to_cbor(expected_data).map_err(|e| format!("serialize expected data: {e}"))?;
+
+        if payload_bytes != expected_bytes {
+            return Err("scoped payload content does not match expected data".into());
+        }
     }
 
     Ok(())
+}
+
+/// Extract the "payload" field from a CBOR-encoded ScopedPayload.
+/// ScopedPayload is a struct with `requestor` and `payload` fields,
+/// serialized as a CBOR map.
+#[cfg(not(feature = "ghostkey"))]
+fn extract_payload_from_cbor(value: &ciborium::Value) -> Option<Vec<u8>> {
+    let map = value.as_map()?;
+    for (key, val) in map {
+        if let Some(key_str) = key.as_text() {
+            if key_str == "payload" {
+                return val.as_bytes().map(|b| b.to_vec());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
