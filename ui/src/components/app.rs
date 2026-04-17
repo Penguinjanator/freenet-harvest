@@ -87,6 +87,21 @@ pub fn App() -> Element {
         });
     }
 
+    // Update document title based on current view
+    {
+        let app_state = crate::gateway::APP_STATE.read();
+        let store_name = app_state
+            .browsing_stores
+            .values()
+            .find_map(|s| s.info.as_ref())
+            .map(|i| i.store_name.as_str());
+
+        match (&current_route(), store_name) {
+            (Route::Browse, Some(name)) => crate::document_title::set_store_title(name),
+            _ => crate::document_title::set_default_title(),
+        }
+    }
+
     let status_class = match &connection_status {
         ConnectionStatus::Connected => "harvest-status connected",
         ConnectionStatus::Connecting => "harvest-status connecting",

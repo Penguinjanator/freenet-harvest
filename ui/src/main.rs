@@ -3,6 +3,7 @@
 #![allow(dead_code, unused_imports)]
 
 mod components;
+mod document_title;
 mod gateway;
 mod messaging;
 mod state;
