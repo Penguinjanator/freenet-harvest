@@ -14,6 +14,12 @@ use std::collections::HashMap;
 /// The main application state.
 #[derive(Clone, Debug, Default)]
 pub struct AppState {
+    /// The harvest delegate key (set after registration during app startup).
+    pub harvest_delegate_key: Option<freenet_stdlib::prelude::DelegateKey>,
+
+    /// The ghostkey delegate key (set after registration during app startup).
+    pub ghostkey_delegate_key: Option<freenet_stdlib::prelude::DelegateKey>,
+
     /// Stores we're currently browsing, keyed by store contract ID.
     pub browsing_stores: HashMap<Vec<u8>, BrowsingStore>,
 

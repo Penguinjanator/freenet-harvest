@@ -18,30 +18,49 @@ pub fn App() -> Element {
     let mut current_route = use_signal(|| Route::Browse);
     let connection_status = CONNECTION_STATUS.read().clone();
 
-    // Connect to gateway and spawn response handler loop
+    // Connect to gateway, register delegates, and spawn response handler loop
     #[cfg(all(target_arch = "wasm32", not(feature = "no-sync")))]
     {
         use futures::StreamExt;
 
         use_effect(|| {
             wasm_bindgen_futures::spawn_local(async {
-                match crate::gateway::connect().await {
-                    Ok(mut rx) => {
-                        dioxus::logger::tracing::info!("Connected -- starting response loop");
-
-                        // Process responses until the connection drops
-                        while let Some(response) = rx.next().await {
-                            crate::gateway::response_handler::handle_response(response);
-                        }
-
-                        dioxus::logger::tracing::warn!("Response loop ended (connection lost)");
-                        *CONNECTION_STATUS.write() = ConnectionStatus::Disconnected;
-                    }
+                // Step 1: Connect to the Freenet gateway
+                let mut rx = match crate::gateway::connect().await {
+                    Ok(rx) => rx,
                     Err(e) => {
                         dioxus::logger::tracing::error!("Failed to connect: {}", e);
                         *CONNECTION_STATUS.write() = ConnectionStatus::Error(e);
+                        return;
                     }
+                };
+
+                dioxus::logger::tracing::info!("Connected -- registering delegates");
+
+                // Step 2: Register the harvest delegate
+                // The WASM will be embedded via include_bytes! once we have a built binary.
+                // For now, log that we would register it.
+                // TODO: include_bytes! the harvest delegate WASM and register it
+                dioxus::logger::tracing::info!(
+                    "Harvest delegate registration pending (WASM not yet embedded)"
+                );
+
+                // Step 3: The ghostkey delegate is registered by the ghostkey UI,
+                // not by Harvest. We communicate with it using its known key.
+                // The key is determined by BLAKE3(BLAKE3(wasm) || params).
+                // For now, we'll discover it via the gateway when we receive responses.
+
+                // Step 4: Request the list of ghostkeys (via ghostkey delegate)
+                // This will be done once we know the ghostkey delegate key.
+
+                // Step 5: Start the response processing loop
+                dioxus::logger::tracing::info!("Starting response loop");
+                while let Some(response) = rx.next().await {
+                    crate::gateway::response_handler::handle_response(response);
                 }
+
+                dioxus::logger::tracing::warn!("Response loop ended (connection lost)");
+                *CONNECTION_STATUS.write() = ConnectionStatus::Disconnected;
             });
         });
     }
