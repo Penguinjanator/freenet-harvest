@@ -368,9 +368,20 @@ fn sign_and_submit_listing(_fingerprint: String, _listing: Listing) {
                 listing.title
             );
 
+            // Find the store contract ID for this fingerprint
+            let store_contract_id = {
+                let state = APP_STATE.read();
+                state
+                    .my_stores
+                    .get(&fingerprint)
+                    .and_then(|stores| stores.first())
+                    .map(|s| s.store_contract_id.clone())
+            };
+
             APP_STATE.write().pending_listing = Some(crate::state::PendingListing {
                 fingerprint,
                 listing,
+                store_contract_id,
             });
         });
     }

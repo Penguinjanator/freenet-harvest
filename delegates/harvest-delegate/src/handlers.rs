@@ -368,6 +368,7 @@ fn handle_register_store(
         store_contract_id,
         reputation_contract_id,
         mailbox_contract_id,
+        store_contract_key: None,
     });
     save_stores(ctx, ghostkey_fingerprint, &stores);
 

@@ -26,14 +26,14 @@ pub async fn create_store_contracts(
     fn make_contract(
         wasm: &[u8],
         params_bytes: Vec<u8>,
-    ) -> (ContractContainer, ContractInstanceId) {
+    ) -> (ContractContainer, ContractInstanceId, ContractKey) {
         let code = ContractCode::from(wasm.to_vec());
         let params = Parameters::from(params_bytes);
         let wrapped = WrappedContract::new(Arc::new(code), params);
         let key = wrapped.key().clone();
-        let instance_id = ContractInstanceId::from(key);
+        let instance_id = ContractInstanceId::from(key.clone());
         let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(wrapped));
-        (container, instance_id)
+        (container, instance_id, key)
     }
 
     // 1. Reputation contract
@@ -52,7 +52,7 @@ pub async fn create_store_contracts(
         .map_err(|e| format!("serialize reputation state: {e}"))?;
 
     let reputation_wasm = include_bytes!("../../public/contracts/reputation_contract.wasm");
-    let (reputation_container, reputation_id) =
+    let (reputation_container, reputation_id, _reputation_key) =
         make_contract(reputation_wasm, reputation_params_bytes);
 
     info!("Creating reputation contract: {:?}", reputation_id);
@@ -74,7 +74,7 @@ pub async fn create_store_contracts(
         harvest_common::to_cbor(&store_state).map_err(|e| format!("serialize store state: {e}"))?;
 
     let store_wasm = include_bytes!("../../public/contracts/store_contract.wasm");
-    let (store_container, store_id) = make_contract(store_wasm, store_params_bytes);
+    let (store_container, store_id, store_key) = make_contract(store_wasm, store_params_bytes);
 
     info!("Creating store contract: {:?}", store_id);
     super::put_contract(store_container, WrappedState::new(store_state_bytes)).await?;
@@ -91,7 +91,8 @@ pub async fn create_store_contracts(
         .map_err(|e| format!("serialize mailbox state: {e}"))?;
 
     let mailbox_wasm = include_bytes!("../../public/contracts/mailbox_contract.wasm");
-    let (mailbox_container, mailbox_id) = make_contract(mailbox_wasm, mailbox_params_bytes);
+    let (mailbox_container, mailbox_id, _mailbox_key) =
+        make_contract(mailbox_wasm, mailbox_params_bytes);
 
     info!("Creating mailbox contract: {:?}", mailbox_id);
     super::put_contract(mailbox_container, WrappedState::new(mailbox_state_bytes)).await?;
@@ -120,6 +121,9 @@ pub async fn create_store_contracts(
     );
 
     // Update app state
+    // Serialize the store contract key for later use in updates
+    let store_key_bytes = harvest_common::to_cbor(&store_key).ok();
+
     super::APP_STATE
         .write()
         .my_stores
@@ -129,30 +133,51 @@ pub async fn create_store_contracts(
             store_contract_id: store_id.as_bytes().to_vec(),
             reputation_contract_id: reputation_id.as_bytes().to_vec(),
             mailbox_contract_id: mailbox_id.as_bytes().to_vec(),
+            store_contract_key: store_key_bytes,
         });
 
     Ok(())
 }
 
-/// Submit a signed listing as a delta update to a store contract.
+/// Submit a signed listing to a store contract.
+///
+/// Looks up the store's `ContractKey` from the stored registration data
+/// and sends the listing as a delta update.
 #[cfg(target_arch = "wasm32")]
-pub async fn submit_listing(
-    _store_contract_key: &freenet_stdlib::prelude::ContractKey,
-    _listing: AuthorizedListing,
+pub async fn submit_listing_by_id(
+    store_contract_id: &[u8],
+    listing: AuthorizedListing,
 ) -> Result<(), String> {
     use dioxus::logger::tracing::info;
+    use dioxus::prelude::ReadableExt;
     use freenet_stdlib::prelude::*;
 
-    let delta = vec![_listing];
+    // Find the stored ContractKey for this store
+    let contract_key: ContractKey = {
+        let state = super::APP_STATE.read();
+        let key_bytes = state
+            .my_stores
+            .values()
+            .flat_map(|stores| stores.iter())
+            .find(|s| s.store_contract_id == store_contract_id)
+            .and_then(|s| s.store_contract_key.as_ref())
+            .ok_or("store contract key not found -- store may not be fully created yet")?
+            .clone();
+        harvest_common::from_cbor(&key_bytes)
+            .map_err(|e| format!("deserialize contract key: {e}"))?
+    };
+
+    let title = listing.listing.title.clone();
+    let delta = vec![listing];
     let delta_bytes =
         harvest_common::to_cbor(&delta).map_err(|e| format!("serialize listing delta: {e}"))?;
 
     super::update_contract(
-        _store_contract_key,
+        &contract_key,
         UpdateData::Delta(StateDelta::from(delta_bytes)),
     )
     .await?;
 
-    info!("Submitted listing to store contract");
+    info!("Submitted listing '{}' to store contract", title);
     Ok(())
 }

@@ -72,6 +72,8 @@ pub struct PendingStoreCreation {
 pub struct PendingListing {
     pub fingerprint: String,
     pub listing: harvest_common::listing::Listing,
+    /// Store contract ID to submit the signed listing to.
+    pub store_contract_id: Option<Vec<u8>>,
 }
 
 /// State for a store we're browsing.
@@ -289,7 +291,6 @@ impl AppState {
                 certificate_pem,
             } => {
                 info!("Received signature from ghostkey delegate");
-                // Check if we have a pending listing waiting for this signature
                 if let Some(pending) = self.pending_listing.take() {
                     let authorized = AuthorizedListing {
                         listing: pending.listing,
@@ -301,7 +302,25 @@ impl AppState {
                         "Constructed AuthorizedListing: {}",
                         authorized.listing.title
                     );
-                    // Store it for submission to the store contract
+
+                    // Submit to the store contract if we know which one
+                    #[cfg(target_arch = "wasm32")]
+                    if let Some(store_id) = pending.store_contract_id {
+                        let listing = authorized.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            if let Err(e) =
+                                crate::gateway::store_ops::submit_listing_by_id(&store_id, listing)
+                                    .await
+                            {
+                                dioxus::logger::tracing::error!("Failed to submit listing: {}", e);
+                                crate::gateway::APP_STATE
+                                    .write()
+                                    .notifications
+                                    .push(format!("Failed to submit listing: {e}"));
+                            }
+                        });
+                    }
+
                     self.signed_listings_ready.push(authorized);
                 } else {
                     info!("SignResult received but no pending listing");

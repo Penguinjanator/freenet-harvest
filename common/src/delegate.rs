@@ -139,6 +139,10 @@ pub struct StoreRegistration {
     pub store_contract_id: Vec<u8>,
     pub reputation_contract_id: Vec<u8>,
     pub mailbox_contract_id: Vec<u8>,
+    /// Serialized ContractKey for the store contract (needed for updates).
+    /// This includes both the instance ID and the code hash.
+    #[serde(default)]
+    pub store_contract_key: Option<Vec<u8>>,
 }
 
 /// A record of a feedback token exchange, stored locally by the delegate.
