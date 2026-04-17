@@ -39,8 +39,23 @@ pub struct AppState {
     /// RSA public keys for our identities (fingerprint -> DER bytes).
     pub rsa_public_keys: HashMap<String, Vec<u8>>,
 
+    /// A listing that's been submitted for signing and is waiting for
+    /// the ghostkey delegate's SignResult response.
+    pub pending_listing: Option<PendingListing>,
+
+    /// Signed listings ready to be submitted to the store contract.
+    /// The UI should pick these up and send them as contract updates.
+    pub signed_listings_ready: Vec<AuthorizedListing>,
+
     /// Pending messages/events for the UI to display.
     pub notifications: Vec<String>,
+}
+
+/// A listing awaiting signature from the ghostkey delegate.
+#[derive(Clone, Debug)]
+pub struct PendingListing {
+    pub fingerprint: String,
+    pub listing: harvest_common::listing::Listing,
 }
 
 /// State for a store we're browsing.
@@ -200,9 +215,36 @@ impl AppState {
                 self.ghostkeys = keys;
             }
 
+            ghostkey_common::GhostkeyResponse::SignResult {
+                scoped_payload,
+                signature,
+                certificate_pem,
+            } => {
+                info!("Received signature from ghostkey delegate");
+                // Check if we have a pending listing waiting for this signature
+                if let Some(pending) = self.pending_listing.take() {
+                    let authorized = AuthorizedListing {
+                        listing: pending.listing,
+                        scoped_payload,
+                        signature,
+                        certificate_pem,
+                    };
+                    info!(
+                        "Constructed AuthorizedListing: {}",
+                        authorized.listing.title
+                    );
+                    // Store it for submission to the store contract
+                    self.signed_listings_ready.push(authorized);
+                } else {
+                    info!("SignResult received but no pending listing");
+                }
+            }
+
             ghostkey_common::GhostkeyResponse::Error { message } => {
                 self.notifications
                     .push(format!("Ghostkey error: {message}"));
+                // Clear pending listing on error
+                self.pending_listing = None;
             }
 
             _ => {
