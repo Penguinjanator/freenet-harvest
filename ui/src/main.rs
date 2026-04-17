@@ -4,6 +4,7 @@
 
 mod components;
 mod gateway;
+mod messaging;
 mod state;
 
 fn main() {

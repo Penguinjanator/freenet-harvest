@@ -35,6 +35,8 @@ serde_json = { workspace = true }
 ed25519-dalek = { workspace = true }
 blake3 = { workspace = true }
 bs58 = { workspace = true }
+x25519-dalek = { workspace = true }
+aes-gcm = { workspace = true }
 
 # Utilities
 chrono = { workspace = true }
