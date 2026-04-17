@@ -112,7 +112,14 @@ pub fn App() -> Element {
     rsx! {
         div { class: "harvest-app",
             header { class: "harvest-header",
-                h1 { class: "harvest-title", "Harvest" }
+                div { class: "harvest-title-group",
+                    img {
+                        class: "harvest-logo",
+                        src: "harvest-logo.svg",
+                        alt: "Harvest",
+                    }
+                    h1 { class: "harvest-title", "Harvest" }
+                }
                 nav { class: "harvest-nav",
                     span { class: "{status_class}", "{connection_status}" }
                     button {
