@@ -112,8 +112,16 @@ fn follow_reputation_link(_reputation_id: Vec<u8>) {
     {
         let reputation_id = _reputation_id;
         wasm_bindgen_futures::spawn_local(async move {
-            let contract_id =
-                freenet_stdlib::prelude::ContractInstanceId::from_bytes(&reputation_id);
+            if reputation_id.len() != 32 {
+                error!(
+                    "Reputation contract ID is not 32 bytes: {}",
+                    reputation_id.len()
+                );
+                return;
+            }
+            let mut id_bytes = [0u8; 32];
+            id_bytes.copy_from_slice(&reputation_id);
+            let contract_id = freenet_stdlib::prelude::ContractInstanceId::new(id_bytes);
             if let Err(e) = super::get_contract(&contract_id, true).await {
                 error!("Failed to subscribe to reputation contract: {}", e);
             }
