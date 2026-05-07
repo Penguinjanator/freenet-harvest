@@ -7,13 +7,14 @@ use crate::gateway::APP_STATE;
 #[component]
 pub fn MyStore() -> Element {
     let app_state = APP_STATE.read();
+    let in_flight = app_state.request_any_access_in_flight;
 
     rsx! {
         div {
             h2 { "My Store" }
 
             if app_state.ghostkeys.is_empty() {
-                NoIdentity {}
+                NoIdentity { in_flight: in_flight }
             } else {
                 IdentityList {
                     ghostkeys: app_state.ghostkeys.clone(),
@@ -21,22 +22,105 @@ pub fn MyStore() -> Element {
                     rsa_keys: app_state.rsa_public_keys.clone(),
                     has_harvest_delegate: app_state.harvest_delegate_key.is_some(),
                 }
+                ConnectAnother { in_flight: in_flight }
             }
         }
     }
 }
 
 #[component]
-fn NoIdentity() -> Element {
+fn NoIdentity(in_flight: bool) -> Element {
     rsx! {
         div { class: "card empty-state",
-            p { "No ghostkey identities found." }
             p {
-                "To create a store, you need a ghostkey identity. Visit the "
-                "Ghostkey Manager to import or create one via a Freenet donation."
+                "Harvest needs a ghostkey identity to sign your store listings."
+            }
+            p {
+                "If you've already created one, share it with Harvest below. "
+                "Otherwise, visit the Ghostkey Vault to create one."
+            }
+            div { style: "margin-top: 16px;",
+                button {
+                    class: "btn btn-primary",
+                    disabled: in_flight,
+                    onclick: move |_| connect_ghostkey(),
+                    if in_flight { "Waiting for vault…" } else { "Connect a ghostkey" }
+                }
             }
         }
     }
+}
+
+/// Lets a user with one or more already-connected ghostkeys request
+/// access to ANOTHER one. Without this, the empty-state's "Connect"
+/// button disappears after the first successful share and there's no
+/// path to add a second identity.
+#[component]
+fn ConnectAnother(in_flight: bool) -> Element {
+    rsx! {
+        div { style: "margin-top: 16px;",
+            button {
+                class: "btn",
+                disabled: in_flight,
+                onclick: move |_| connect_ghostkey(),
+                if in_flight { "Waiting for vault…" } else { "Connect another ghostkey" }
+            }
+        }
+    }
+}
+
+/// Send a `RequestAnyAccess` request to the ghostkey delegate. The
+/// delegate emits a `RequestUserInput` that the gateway shell-page
+/// renders as an overlay; the user picks one of their stored
+/// ghostkeys (or denies). On approval the delegate replies with a
+/// one-element `GhostKeyList` for the chosen key, which the response
+/// handler folds into APP_STATE.ghostkeys -- our `IdentityList`
+/// renders as soon as it appears.
+fn connect_ghostkey() {
+    use ghostkey_common::GhostkeyRequest;
+
+    // Snapshot delegate key + check the in-flight flag in a single
+    // borrow. If we're already mid-request, drop the click so rapid
+    // double-clicks don't queue duplicate prompts (and overwrite each
+    // other's GhostKeyList responses on completion).
+    let key = {
+        let state = APP_STATE.read();
+        if state.request_any_access_in_flight {
+            dioxus::logger::tracing::info!(
+                "RequestAnyAccess already in flight; ignoring duplicate click"
+            );
+            return;
+        }
+        match state.ghostkey_delegate_key.clone() {
+            Some(k) => k,
+            None => {
+                dioxus::logger::tracing::warn!(
+                    "Ghostkey delegate not yet registered; cannot request access"
+                );
+                APP_STATE
+                    .write()
+                    .notifications
+                    .push("Still connecting to the gateway — please try again in a moment.".into());
+                return;
+            }
+        }
+    };
+
+    APP_STATE.write().request_any_access_in_flight = true;
+    spawn(async move {
+        let payload = match ghostkey_common::to_cbor(&GhostkeyRequest::RequestAnyAccess) {
+            Ok(p) => p,
+            Err(e) => {
+                dioxus::logger::tracing::error!("Failed to encode RequestAnyAccess: {e}");
+                APP_STATE.write().request_any_access_in_flight = false;
+                return;
+            }
+        };
+        if let Err(e) = crate::gateway::send_delegate_message(&key, payload).await {
+            dioxus::logger::tracing::error!("Failed to send RequestAnyAccess: {e}");
+            APP_STATE.write().request_any_access_in_flight = false;
+        }
+    });
 }
 
 #[component]
