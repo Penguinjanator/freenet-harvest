@@ -37,9 +37,12 @@ echo "Synced all WASMs to ui/public/contracts/"
 description = "Build the Dioxus UI"
 dependencies = ["sync-wasm", "build-contracts"]
 script = '''
+set -e
 cd ui && dx build --${BUILD_PROFILE}
-# dx doesn't copy CSS from assets/ to the build output root, so copy manually
-cp ui/assets/harvest.css target/dx/harvest-ui/${BUILD_PROFILE}/web/public/harvest.css
+# dx doesn't copy CSS from assets/ to the build output root, so copy
+# manually. Path is relative to `ui/` because we cd'd above and the
+# script runs as one shell so the cwd persists.
+cp assets/harvest.css ../target/dx/harvest-ui/${BUILD_PROFILE}/web/public/harvest.css
 echo "CSS copied to build output"
 '''
 
