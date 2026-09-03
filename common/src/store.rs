@@ -333,7 +333,11 @@ fn enforce_order_cap(orders: &mut BTreeMap<OrderId, AuthorizedOrder>) {
             );
             // `!terminal` sorts terminal orders (false) ahead of active ones
             // (true), so they are the first candidates dropped below.
-            (!terminal, record.order.created_at.timestamp_millis(), id.clone())
+            (
+                !terminal,
+                record.order.created_at.timestamp_millis(),
+                id.clone(),
+            )
         })
         .collect();
     ranked.sort();
@@ -403,7 +407,10 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
                 return Err("order filed under a key that is not its own id".to_string());
             }
             record
-                .verify(&parameters.seller_verifying_key, &parameters.trusted_bitcoin_bridges)
+                .verify(
+                    &parameters.seller_verifying_key,
+                    &parameters.trusted_bitcoin_bridges,
+                )
                 .map_err(|e| format!("order {id} invalid: {e}"))?;
         }
         Ok(())
@@ -416,7 +423,13 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
     ) -> Self::Summary {
         self.orders
             .iter()
-            .map(|(id, record)| (id.clone(), record.status.rank(), order_content_digest(record)))
+            .map(|(id, record)| {
+                (
+                    id.clone(),
+                    record.status.rank(),
+                    order_content_digest(record),
+                )
+            })
             .collect()
     }
 
@@ -475,7 +488,10 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
         };
         for record in incoming {
             record
-                .verify(&parameters.seller_verifying_key, &parameters.trusted_bitcoin_bridges)
+                .verify(
+                    &parameters.seller_verifying_key,
+                    &parameters.trusted_bitcoin_bridges,
+                )
                 .map_err(|e| format!("order {} delta invalid: {e}", record.order.id))?;
             merge_order(&mut self.orders, record.clone());
         }
@@ -559,10 +575,7 @@ mod order_tests {
     /// Sign `data` as a ghostkey-delegate `ScopedPayload` would, without
     /// pulling in `ghostkey-common` -- same technique as
     /// `listing::tests::make_authorized_listing_with_requestor`.
-    fn sign_scoped<T: serde::Serialize>(
-        signing_key: &SigningKey,
-        data: &T,
-    ) -> (Vec<u8>, Vec<u8>) {
+    fn sign_scoped<T: serde::Serialize>(signing_key: &SigningKey, data: &T) -> (Vec<u8>, Vec<u8>) {
         #[derive(serde::Serialize)]
         struct TestScopedPayload {
             requestor: TestRequestor,
@@ -767,8 +780,7 @@ mod order_tests {
         let awaiting =
             make_authorized_order(&seller, order.clone(), OrderStatus::AwaitingPayment, None);
         let proof = make_payment_proof(&order, &bridge, 1);
-        let paid =
-            make_authorized_order(&seller, order.clone(), OrderStatus::Paid, Some(proof));
+        let paid = make_authorized_order(&seller, order.clone(), OrderStatus::Paid, Some(proof));
 
         let mut a = orders_of([(order.id.clone(), awaiting.clone())]);
         let b = orders_of([(order.id.clone(), paid.clone())]);
@@ -819,12 +831,7 @@ mod order_tests {
             ),
             (
                 order_y.id.clone(),
-                make_authorized_order(
-                    &seller,
-                    order_y.clone(),
-                    OrderStatus::AwaitingPayment,
-                    None,
-                ),
+                make_authorized_order(&seller, order_y.clone(), OrderStatus::AwaitingPayment, None),
             ),
         ]);
         // c: X fulfilled (higher still), Y paid.
@@ -907,12 +914,12 @@ mod order_tests {
         );
 
         // The winner must be whichever record has the greater CBOR bytes.
-        let expected_winner = if crate::to_cbor(&record_1).unwrap() > crate::to_cbor(&record_2).unwrap()
-        {
-            &record_1
-        } else {
-            &record_2
-        };
+        let expected_winner =
+            if crate::to_cbor(&record_1).unwrap() > crate::to_cbor(&record_2).unwrap() {
+                &record_1
+            } else {
+                &record_2
+            };
         assert_eq!(
             crate::to_cbor(&a_then_b.orders[&order.id]).unwrap(),
             crate::to_cbor(expected_winner).unwrap(),
@@ -921,7 +928,9 @@ mod order_tests {
 
         // Idempotent: merging the winner into itself changes nothing.
         let mut winner_twice = a_then_b.clone();
-        winner_twice.merge(&StoreStateV1::default(), &p, &a_then_b).unwrap();
+        winner_twice
+            .merge(&StoreStateV1::default(), &p, &a_then_b)
+            .unwrap();
         assert_eq!(
             crate::to_cbor(&a_then_b).unwrap(),
             crate::to_cbor(&winner_twice).unwrap()
@@ -955,7 +964,11 @@ mod order_tests {
     /// `enforce_order_cap` is a structural function that never calls
     /// `verify`. Building thousands of genuinely-signed-and-proved orders
     /// just to exercise pruning would be needlessly slow.
-    fn synthetic_order(seed: u8, created_at_secs: i64, status: OrderStatus) -> (OrderId, AuthorizedOrder) {
+    fn synthetic_order(
+        seed: u8,
+        created_at_secs: i64,
+        status: OrderStatus,
+    ) -> (OrderId, AuthorizedOrder) {
         let ts = timestamp(created_at_secs);
         let listing_id = ListingId::new("seller", &ts, "Widget");
         let id = OrderId::new("seller", &listing_id, &ts, &format!("buyer-{seed}"));
@@ -1002,7 +1015,8 @@ mod order_tests {
         // one's profile, then checking the terminal-tier one is gone and
         // the active one survives.
         for i in 3..(MAX_ORDERS as u16 + 3) {
-            let (id, rec) = synthetic_order((i % 256) as u8, 3_000 + i as i64, OrderStatus::Cancelled);
+            let (id, rec) =
+                synthetic_order((i % 256) as u8, 3_000 + i as i64, OrderStatus::Cancelled);
             orders.insert(id, rec);
         }
         assert!(orders.len() > MAX_ORDERS);

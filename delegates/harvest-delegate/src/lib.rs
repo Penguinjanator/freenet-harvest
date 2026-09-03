@@ -137,18 +137,18 @@ fn handle_request(
             )])
         }
         Err(harvest_decode_err) => {
-            let request: BitcoinDelegateRequest = from_cbor(payload).map_err(|bitcoin_decode_err| {
-                DelegateError::Other(format!(
-                    "payload is neither a HarvestDelegateRequest ({harvest_decode_err}) nor a \
+            let request: BitcoinDelegateRequest =
+                from_cbor(payload).map_err(|bitcoin_decode_err| {
+                    DelegateError::Other(format!(
+                        "payload is neither a HarvestDelegateRequest ({harvest_decode_err}) nor a \
                      BitcoinDelegateRequest ({bitcoin_decode_err})"
-                ))
-            })?;
+                    ))
+                })?;
 
             let response = bitcoin::handle(ctx, request)?;
 
-            let response_bytes = to_cbor(&response).map_err(|e| {
-                DelegateError::Other(format!("serialize bitcoin response: {e}"))
-            })?;
+            let response_bytes = to_cbor(&response)
+                .map_err(|e| DelegateError::Other(format!("serialize bitcoin response: {e}")))?;
 
             Ok(vec![OutboundDelegateMsg::ApplicationMessage(
                 ApplicationMessage::new(response_bytes),

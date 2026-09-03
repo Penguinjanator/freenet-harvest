@@ -135,7 +135,11 @@ pub async fn associate_order(
 /// Configure which bridge to use and how to authorize to it.
 #[cfg(target_arch = "wasm32")]
 pub async fn configure_bridge(endpoint: BridgeEndpoint) -> Result<(), String> {
-    send_request(|request_id| BitcoinDelegateRequest::ConfigureBridge { request_id, endpoint }).await
+    send_request(|request_id| BitcoinDelegateRequest::ConfigureBridge {
+        request_id,
+        endpoint,
+    })
+    .await
 }
 
 #[cfg(not(target_arch = "wasm32"))]

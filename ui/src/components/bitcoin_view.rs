@@ -169,10 +169,19 @@ fn BridgeStatusBar(
 ) -> Element {
     let health = bridge_health(bridge_loaded, &bridge, network, &tip);
     let (dot_class, label) = match health {
-        BridgeHealth::NotConfigured => ("btc-dot unknown", "No Bitcoin bridge configured for this build yet".to_string()),
-        BridgeHealth::WaitingForData => ("btc-dot unknown", "Connecting to the Bitcoin bridge…".to_string()),
+        BridgeHealth::NotConfigured => (
+            "btc-dot unknown",
+            "No Bitcoin bridge configured for this build yet".to_string(),
+        ),
+        BridgeHealth::WaitingForData => (
+            "btc-dot unknown",
+            "Connecting to the Bitcoin bridge…".to_string(),
+        ),
         BridgeHealth::Online => ("btc-dot online", "Online".to_string()),
-        BridgeHealth::Stale => ("btc-dot offline", "No recent blocks -- bridge may be behind".to_string()),
+        BridgeHealth::Stale => (
+            "btc-dot offline",
+            "No recent blocks -- bridge may be behind".to_string(),
+        ),
     };
 
     rsx! {
@@ -271,7 +280,12 @@ fn OrdersSection(orders: Vec<AuthorizedOrder>, app_state_snapshot: BitcoinState)
         .collect();
     let other: Vec<&AuthorizedOrder> = orders
         .iter()
-        .filter(|o| matches!(o.status, OrderStatus::Cancelled | OrderStatus::PaymentReversed))
+        .filter(|o| {
+            matches!(
+                o.status,
+                OrderStatus::Cancelled | OrderStatus::PaymentReversed
+            )
+        })
         .collect();
 
     rsx! {
@@ -320,9 +334,10 @@ fn live_address_for_order(
     bitcoin: &BitcoinState,
     order: &harvest_common::payment::Order,
 ) -> Option<AddressView> {
-    let watch = bitcoin.watches.iter().find(|w| {
-        w.network == order.network && w.script_pubkey == order.payment_script_pubkey
-    })?;
+    let watch = bitcoin
+        .watches
+        .iter()
+        .find(|w| w.network == order.network && w.script_pubkey == order.payment_script_pubkey)?;
     let contract_id_bs58 = watch.contract_id.as_deref()?;
     let bytes = bs58::decode(contract_id_bs58).into_vec().ok()?;
     bitcoin.addresses.get(&bytes).cloned()
@@ -333,8 +348,12 @@ fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> Element {
     let o = &order.order;
     let (status_class, status_text) = match order.status {
         OrderStatus::AwaitingPayment => match &live {
-            Some(l) if l.confirmed_sats > 0 => ("btc-pill paid", "Payment seen on chain".to_string()),
-            Some(l) if l.pending_sats > 0 => ("btc-pill pending", "Payment seen, unconfirmed".to_string()),
+            Some(l) if l.confirmed_sats > 0 => {
+                ("btc-pill paid", "Payment seen on chain".to_string())
+            }
+            Some(l) if l.pending_sats > 0 => {
+                ("btc-pill pending", "Payment seen, unconfirmed".to_string())
+            }
             _ => ("btc-pill waiting", "Awaiting payment".to_string()),
         },
         OrderStatus::Paid => ("btc-pill paid", "Paid".to_string()),
@@ -360,7 +379,11 @@ fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> Element {
 // ---------------------------------------------------------------------------
 
 #[component]
-fn WatchListSection(watches: Vec<WatchedPayment>, network: BitcoinNetwork, has_ghostkey: bool) -> Element {
+fn WatchListSection(
+    watches: Vec<WatchedPayment>,
+    network: BitcoinNetwork,
+    has_ghostkey: bool,
+) -> Element {
     // Manual watches only -- ones tied to an order are already visible above
     // and would otherwise be shown twice.
     let manual: Vec<&WatchedPayment> = watches.iter().filter(|w| w.order_id.is_none()).collect();

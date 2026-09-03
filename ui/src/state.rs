@@ -9,7 +9,10 @@ use harvest_common::mailbox::EncryptedMessage;
 use harvest_common::payment::AuthorizedOrder;
 use harvest_common::reputation::FeedbackEntry;
 use harvest_common::store::StoreInfoV1;
-use harvest_common::{BitcoinDelegateResponse, BridgeEndpoint, HarvestDelegateResponse, StoreRegistration, WatchedPayment};
+use harvest_common::{
+    BitcoinDelegateResponse, BridgeEndpoint, HarvestDelegateResponse, StoreRegistration,
+    WatchedPayment,
+};
 use std::collections::{HashMap, HashSet};
 
 use freenet_bitcoin_common::BitcoinNetwork;
@@ -129,10 +132,9 @@ impl AppState {
         // small single-field composables and could in principle both fail
         // to deserialize as each other only by luck of field naming.
         if let Some(&network) = self.bitcoin.tip_contract_network.get(&contract_id) {
-            if let Ok(tip_state) =
-                freenet_bitcoin_common::from_cbor::<freenet_bitcoin_common::BitcoinTipStateV1>(
-                    &state_bytes,
-                )
+            if let Ok(tip_state) = freenet_bitcoin_common::from_cbor::<
+                freenet_bitcoin_common::BitcoinTipStateV1,
+            >(&state_bytes)
             {
                 self.apply_tip_state(network, &tip_state);
                 return;
@@ -476,9 +478,10 @@ impl AppState {
                 self.bitcoin.in_flight.remove(&request_id);
                 match result {
                     Ok(watch) => self.upsert_watch(watch),
-                    Err(e) => self
-                        .notifications
-                        .push(format!("Couldn't watch address: {}", friendly_bridge_error(&e))),
+                    Err(e) => self.notifications.push(format!(
+                        "Couldn't watch address: {}",
+                        friendly_bridge_error(&e)
+                    )),
                 }
             }
 
@@ -567,8 +570,7 @@ impl AppState {
                     // invents data.
                     #[cfg(target_arch = "wasm32")]
                     {
-                        let url =
-                            crate::gateway::bitcoin_config::default_bridge_url().to_string();
+                        let url = crate::gateway::bitcoin_config::default_bridge_url().to_string();
                         wasm_bindgen_futures::spawn_local(async move {
                             crate::gateway::bitcoin_bridge_http::refresh_bridge_status(url).await;
                         });
@@ -642,10 +644,15 @@ impl AppState {
                     freenet_bitcoin_common::OutpointStatus::Unconfirmed { value_sats } => {
                         (value_sats, TxRowStatus::Unconfirmed)
                     }
-                    freenet_bitcoin_common::OutpointStatus::Confirmed { value_sats, anchor } => {
-                        (value_sats, TxRowStatus::Confirmed { anchor_height: anchor.height })
+                    freenet_bitcoin_common::OutpointStatus::Confirmed { value_sats, anchor } => (
+                        value_sats,
+                        TxRowStatus::Confirmed {
+                            anchor_height: anchor.height,
+                        },
+                    ),
+                    freenet_bitcoin_common::OutpointStatus::Retracted => {
+                        (0, TxRowStatus::Retracted)
                     }
-                    freenet_bitcoin_common::OutpointStatus::Retracted => (0, TxRowStatus::Retracted),
                 };
                 TxRow {
                     // Reversed (big-endian) byte order -- the form block
@@ -708,7 +715,12 @@ impl AppState {
     /// subscribed to its address contract.
     fn upsert_watch(&mut self, watch: WatchedPayment) {
         self.register_watch_contract(&watch);
-        match self.bitcoin.watches.iter_mut().find(|w| w.key() == watch.key()) {
+        match self
+            .bitcoin
+            .watches
+            .iter_mut()
+            .find(|w| w.key() == watch.key())
+        {
             Some(existing) => *existing = watch,
             None => self.bitcoin.watches.push(watch),
         }
@@ -744,7 +756,9 @@ impl AppState {
             );
             return;
         }
-        self.bitcoin.tip_contract_network.insert(bytes.clone(), network);
+        self.bitcoin
+            .tip_contract_network
+            .insert(bytes.clone(), network);
         self.bitcoin.tips.entry(network).or_insert_with(|| TipView {
             network,
             tip_height: None,

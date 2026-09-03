@@ -69,7 +69,9 @@ pub async fn refresh_bridge_status(base_url: String) {
         Ok(status) => {
             let mut app = super::APP_STATE.write();
             for net in status.networks {
-                let Ok(network) = net.network.parse::<freenet_bitcoin_common::BitcoinNetwork>()
+                let Ok(network) = net
+                    .network
+                    .parse::<freenet_bitcoin_common::BitcoinNetwork>()
                 else {
                     dioxus::logger::tracing::warn!(
                         "Bridge at {base_url} reported an unrecognized network: {}",

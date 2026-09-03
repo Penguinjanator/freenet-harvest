@@ -107,9 +107,7 @@ fn decode_base58check(address: &str) -> Result<(u8, Vec<u8>), String> {
         .with_check(None)
         .into_vec()
         .map_err(|e| format!("not a valid Bitcoin address: {e}"))?;
-    let (version, payload) = bytes
-        .split_first()
-        .ok_or("empty address payload")?;
+    let (version, payload) = bytes.split_first().ok_or("empty address payload")?;
     Ok((*version, payload.to_vec()))
 }
 
@@ -123,9 +121,11 @@ mod tests {
 
     #[test]
     fn parses_mainnet_p2wpkh() {
-        let script =
-            address_to_script_pubkey("BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4", BitcoinNetwork::Bitcoin)
-                .unwrap();
+        let script = address_to_script_pubkey(
+            "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4",
+            BitcoinNetwork::Bitcoin,
+        )
+        .unwrap();
         assert_eq!(script[0], 0x00, "witness v0 opcode");
         assert_eq!(script[1], 20, "P2WPKH program length");
     }
@@ -164,10 +164,11 @@ mod tests {
 
     #[test]
     fn rejects_p2pkh_on_wrong_network() {
-        assert!(
-            address_to_script_pubkey("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", BitcoinNetwork::Signet)
-                .is_err()
-        );
+        assert!(address_to_script_pubkey(
+            "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+            BitcoinNetwork::Signet
+        )
+        .is_err());
     }
 
     #[test]

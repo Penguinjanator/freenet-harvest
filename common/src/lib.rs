@@ -20,15 +20,13 @@ pub mod util;
 pub use bitcoin_delegate::{
     BitcoinDelegateRequest, BitcoinDelegateResponse, BridgeAuthMode, BridgeEndpoint, WatchedPayment,
 };
-pub use payment::{
-    AuthorizedOrder, Order, OrderId, OrderPaymentProof, OrderStatus, ProofError,
-};
 pub use delegate::{
     HarvestDelegateRequest, HarvestDelegateResponse, StoreRegistration, TransactionRecord,
 };
 pub use feedback::{FeedbackCategory, FeedbackToken, FeedbackTokenMsg};
 pub use listing::{AuthorizedListing, Listing, ListingId, ListingKind, PriceInfo};
 pub use mailbox::{ConversationId, EncryptedMessage, MailboxParameters, MailboxStateV1};
+pub use payment::{AuthorizedOrder, Order, OrderId, OrderPaymentProof, OrderStatus, ProofError};
 pub use reputation::{FeedbackEntry, ReputationParameters, ReputationStateV1};
 pub use store::{StoreParameters, StoreStateV1};
 

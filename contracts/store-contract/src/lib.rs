@@ -124,7 +124,10 @@ impl ContractInterface for Contract {
 
         let mut wanted_ids: Vec<ContractInstanceId> = Vec::new();
         for record in store_state.orders.orders.values() {
-            if !matches!(record.status, OrderStatus::Paid | OrderStatus::PaymentReversed) {
+            if !matches!(
+                record.status,
+                OrderStatus::Paid | OrderStatus::PaymentReversed
+            ) {
                 continue;
             }
             let addr_params = record
@@ -161,7 +164,10 @@ impl ContractInterface for Contract {
         // see the section header above for why this never affects the
         // verdict.
         for record in store_state.orders.orders.values() {
-            if !matches!(record.status, OrderStatus::Paid | OrderStatus::PaymentReversed) {
+            if !matches!(
+                record.status,
+                OrderStatus::Paid | OrderStatus::PaymentReversed
+            ) {
                 continue;
             }
             let addr_params = record
@@ -353,7 +359,7 @@ mod tests {
             amount_sats: 50_000,
             network: BitcoinNetwork::Signet,
             payment_script_pubkey: script.to_vec(),
-        payment_hash: None,
+            payment_hash: None,
             payment_hash: None,
             payment_address: "tb1qtest".into(),
             required_confirmations: 1,
@@ -363,23 +369,36 @@ mod tests {
 
     fn make_paid_order(seller: &SigningKey, bridge: &SigningKey, order: Order) -> AuthorizedOrder {
         let addr_params = order.bitcoin_params(vec![]);
-        let (spv, txid, block_hash) =
-            payment_proof(&order.payment_script_pubkey, order.amount_sats, 1, [7u8; 32]);
+        let (spv, txid, block_hash) = payment_proof(
+            &order.payment_script_pubkey,
+            order.amount_sats,
+            1,
+            [7u8; 32],
+        );
         let claim_body = freenet_bitcoin_common::ClaimBody {
             script_id: addr_params.script_id(),
             network: order.network,
-            as_of: BlockAnchor { height: 100, hash: block_hash },
+            as_of: BlockAnchor {
+                height: 100,
+                hash: block_hash,
+            },
             claim: Claim::ConfirmedOutput {
                 outpoint: OutPoint { txid, vout: 0 },
                 value_sats: order.amount_sats,
-                anchor: BlockAnchor { height: 100, hash: block_hash },
+                anchor: BlockAnchor {
+                    height: 100,
+                    hash: block_hash,
+                },
                 spv,
             },
         };
         let claim = freenet_bitcoin_common::SignedClaim::sign(bridge, &claim_body).unwrap();
         let tip_body = freenet_bitcoin_common::TipEntryBody {
             network: order.network,
-            anchor: BlockAnchor { height: 100, hash: BlockHash([9u8; 32]) },
+            anchor: BlockAnchor {
+                height: 100,
+                hash: BlockHash([9u8; 32]),
+            },
             prev_hash: BlockHash([8u8; 32]),
             block_time: 1_700_000_000,
             tx_count: 1,
@@ -402,7 +421,11 @@ mod tests {
 
     /// A `StoreStateV1` holding exactly one genuinely-Paid order, encoded as
     /// the raw bytes `validate_state` receives.
-    fn paid_store_state_bytes(seller: &SigningKey, bridge: &SigningKey, order: Order) -> (Vec<u8>, OrderId) {
+    fn paid_store_state_bytes(
+        seller: &SigningKey,
+        bridge: &SigningKey,
+        order: Order,
+    ) -> (Vec<u8>, OrderId) {
         let id = order.id.clone();
         let record = make_paid_order(seller, bridge, order);
         let state = StoreStateV1 {

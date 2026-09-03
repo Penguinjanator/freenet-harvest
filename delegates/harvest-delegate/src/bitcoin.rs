@@ -368,7 +368,10 @@ mod tests {
     #[test]
     fn order_driven_watch_shares_apply_watch_with_manual_watch() {
         let mut watches = Vec::new();
-        apply_watch(&mut watches, watch(BitcoinNetwork::Signet, 1, Some("manual label")));
+        apply_watch(
+            &mut watches,
+            watch(BitcoinNetwork::Signet, 1, Some("manual label")),
+        );
 
         let order_id = OrderId([9u8; 16]);
         let order_watch = WatchedPayment {

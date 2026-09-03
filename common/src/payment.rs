@@ -258,9 +258,15 @@ pub enum ProofError {
     /// The claims are about a script that is not this order's destination.
     WrongScript,
     /// Confirmed, but not deeply enough yet.
-    InsufficientConfirmations { have: u32, need: u32 },
+    InsufficientConfirmations {
+        have: u32,
+        need: u32,
+    },
     /// Not enough value reached the script.
-    InsufficientValue { have_sats: u64, need_sats: u64 },
+    InsufficientValue {
+        have_sats: u64,
+        need_sats: u64,
+    },
     /// The most recent evidence says the payment is no longer on chain.
     Reversed,
     /// A Lightning proof was offered for an order that has no payment hash,
@@ -274,7 +280,10 @@ impl std::fmt::Display for ProofError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProofError::NoTrustedBridges => {
-                write!(f, "this store trusts no Bitcoin bridge, so no payment can be proven")
+                write!(
+                    f,
+                    "this store trusts no Bitcoin bridge, so no payment can be proven"
+                )
             }
             ProofError::BadTip(e) => write!(f, "chain tip evidence invalid: {e}"),
             ProofError::BadClaim(e) => write!(f, "payment evidence invalid: {e}"),
@@ -283,12 +292,21 @@ impl std::fmt::Display for ProofError {
             ProofError::InsufficientConfirmations { have, need } => {
                 write!(f, "payment has {have} confirmations, needs {need}")
             }
-            ProofError::InsufficientValue { have_sats, need_sats } => {
-                write!(f, "payment of {have_sats} sats is short of {need_sats} sats")
+            ProofError::InsufficientValue {
+                have_sats,
+                need_sats,
+            } => {
+                write!(
+                    f,
+                    "payment of {have_sats} sats is short of {need_sats} sats"
+                )
             }
             ProofError::Reversed => write!(f, "the payment was reorganized off the chain"),
             ProofError::WrongRail => {
-                write!(f, "the evidence is for a different payment method than the order")
+                write!(
+                    f,
+                    "the evidence is for a different payment method than the order"
+                )
             }
             ProofError::PreimageMismatch => {
                 write!(f, "the preimage does not settle this order's invoice")
@@ -353,10 +371,7 @@ fn verify_on_chain_proof(
         network: order.network,
         trusted_bridges: trusted_bridges.to_vec(),
     };
-    let tip = proof
-        .tip
-        .verify(&tip_params)
-        .map_err(ProofError::BadTip)?;
+    let tip = proof.tip.verify(&tip_params).map_err(ProofError::BadTip)?;
     if tip.network != order.network {
         return Err(ProofError::NetworkMismatch);
     }
@@ -493,9 +508,7 @@ impl AuthorizedOrder {
                     .status_scoped_payload
                     .as_ref()
                     .zip(self.status_signature.as_ref())
-                    .ok_or_else(|| {
-                        format!("{:?} requires the seller's signature", self.status)
-                    })?;
+                    .ok_or_else(|| format!("{:?} requires the seller's signature", self.status))?;
                 crate::listing::verify_scoped_signature(
                     sp,
                     sig,
