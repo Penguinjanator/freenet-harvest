@@ -14,6 +14,7 @@ no-sync = []
 [dependencies]
 harvest-common = { workspace = true }
 ghostkey-common = { workspace = true }
+freenet-bitcoin-common = { workspace = true }
 
 # UI Framework
 dioxus = { workspace = true }
@@ -34,9 +35,16 @@ serde_json = { workspace = true }
 # Crypto
 ed25519-dalek = { workspace = true }
 blake3 = { workspace = true }
-bs58 = { workspace = true }
+# "check" feature enables Base58Check decoding, needed to turn a legacy
+# P2PKH/P2SH address string into its scriptPubKey (see gateway/bitcoin_address.rs).
+bs58 = { workspace = true, features = ["check"] }
 x25519-dalek = { workspace = true }
 aes-gcm = { workspace = true }
+# Bech32/Bech32m decoding for SegWit address parsing (P2WPKH/P2WSH/P2TR).
+# Not a workspace dependency -- only the UI needs to parse user-typed
+# addresses into scriptPubKey bytes; every other crate in this workspace
+# only ever handles scriptPubKey bytes directly.
+bech32 = "0.11"
 
 # Utilities
 chrono = { workspace = true }

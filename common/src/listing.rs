@@ -524,6 +524,8 @@ mod tests {
         let parent = StoreStateV1::default();
         let params = StoreParameters {
             seller_verifying_key: verifying_key,
+            trusted_bitcoin_bridges: vec![],
+            bitcoin_address_code_hash: None,
         };
 
         use freenet_scaffold::ComposableState;
@@ -579,6 +581,8 @@ mod tests {
         let parent = StoreStateV1::default();
         let params = StoreParameters {
             seller_verifying_key: verifying_key,
+            trusted_bitcoin_bridges: vec![],
+            bitcoin_address_code_hash: None,
         };
 
         use freenet_scaffold::ComposableState;

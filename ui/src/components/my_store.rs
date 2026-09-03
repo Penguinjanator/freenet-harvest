@@ -76,7 +76,7 @@ fn ConnectAnother(in_flight: bool) -> Element {
 /// one-element `GhostKeyList` for the chosen key, which the response
 /// handler folds into APP_STATE.ghostkeys -- our `IdentityList`
 /// renders as soon as it appears.
-fn connect_ghostkey() {
+pub(crate) fn connect_ghostkey() {
     use ghostkey_common::GhostkeyRequest;
 
     // Snapshot delegate key + check the in-flight flag in a single

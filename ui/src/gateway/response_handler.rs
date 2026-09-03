@@ -77,12 +77,22 @@ fn handle_contract_response(response: ContractResponse) {
             }
         }
 
-        ContractResponse::UpdateNotification { key, update } => {
+        ContractResponse::UpdateNotification { key, update: _ } => {
             info!("Update notification for contract {:?}", key);
-            let contract_id = key.as_bytes().to_vec();
-            let update_bytes = update.unwrap_delta().as_ref().to_vec();
-            let mut app = APP_STATE.write();
-            app.on_contract_update(contract_id, update_bytes);
+            // Re-GET the authoritative full state rather than trying to
+            // apply `update` in place. `update` is very often a genuine
+            // delta -- for composable states (store, bitcoin tip/address)
+            // that's a *different* wire shape from the full state (e.g.
+            // `StoreStateV1Delta` has `orders: Option<Vec<AuthorizedOrder>>`
+            // where `StoreStateV1` has `orders: OrdersV1`), so re-parsing
+            // delta bytes as full state silently fails and the update gets
+            // dropped -- exactly the bug that would have made "realtime"
+            // updates invisible. Re-GET is more traffic but always correct;
+            // proper client-side delta application would need each
+            // contract's `ComposableState::apply_delta` (and its
+            // `Parameters`) wired into the UI, which isn't done anywhere in
+            // this codebase yet.
+            request_full_state(key);
         }
 
         _ => {
@@ -102,6 +112,21 @@ fn check_for_reputation_link(state_bytes: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(reputation_id.to_vec())
+}
+
+/// Re-GET a contract's full state (re-subscribing is a harmless no-op if we
+/// already are). See the long comment at the `UpdateNotification` call site
+/// for why this exists instead of applying `update` in place.
+fn request_full_state(_key: freenet_stdlib::prelude::ContractKey) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let instance_id = *_key.id();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = super::get_contract(&instance_id, true).await {
+                error!("Failed to re-GET contract after update notification: {}", e);
+            }
+        });
+    }
 }
 
 /// Subscribe to a reputation contract that a store links to.
@@ -151,8 +176,23 @@ fn handle_delegate_response(
                                 let mut app = APP_STATE.write();
                                 app.on_ghostkey_response(gk_response);
                             }
-                            Err(e) => {
-                                error!("Unknown delegate response from {:?} (err: {e})", key);
+                            Err(_) => {
+                                // Try the harvest delegate's Bitcoin surface
+                                match from_cbor::<harvest_common::BitcoinDelegateResponse>(
+                                    &msg.payload,
+                                ) {
+                                    Ok(btc_response) => {
+                                        info!("Bitcoin delegate response: {:?}", btc_response);
+                                        let mut app = APP_STATE.write();
+                                        app.on_bitcoin_delegate_response(btc_response);
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "Unknown delegate response from {:?} (err: {e})",
+                                            key
+                                        );
+                                    }
+                                }
                             }
                         }
                     }

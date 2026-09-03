@@ -6,10 +6,13 @@
 use dioxus::logger::tracing::info;
 use harvest_common::listing::AuthorizedListing;
 use harvest_common::mailbox::EncryptedMessage;
+use harvest_common::payment::AuthorizedOrder;
 use harvest_common::reputation::FeedbackEntry;
 use harvest_common::store::StoreInfoV1;
-use harvest_common::{HarvestDelegateResponse, StoreRegistration};
-use std::collections::HashMap;
+use harvest_common::{BitcoinDelegateResponse, BridgeEndpoint, HarvestDelegateResponse, StoreRegistration, WatchedPayment};
+use std::collections::{HashMap, HashSet};
+
+use freenet_bitcoin_common::BitcoinNetwork;
 
 /// The main application state.
 #[derive(Clone, Debug, Default)]
@@ -63,6 +66,10 @@ pub struct AppState {
 
     /// Pending messages/events for the UI to display.
     pub notifications: Vec<String>,
+
+    /// Bitcoin/Payments state: bridge config, private watch list, and live
+    /// on-chain data mirrored from subscribed Bitcoin contracts.
+    pub bitcoin: BitcoinState,
 }
 
 /// Details for a store being created, waiting for RSA key generation.
@@ -90,6 +97,9 @@ pub struct PendingListing {
 pub struct BrowsingStore {
     pub info: Option<StoreInfoV1>,
     pub listings: Vec<AuthorizedListing>,
+    /// Orders placed against this store (buyer or seller side -- the store
+    /// contract carries both). Payments-first UI groups these by status.
+    pub orders: Vec<AuthorizedOrder>,
     /// Reputation contract ID (extracted from StoreInfoV1 on first load).
     pub reputation_contract_id: Option<Vec<u8>>,
     /// Mailbox contract ID (will be set when we know it).
@@ -112,6 +122,32 @@ impl AppState {
             return;
         }
 
+        // Try Bitcoin tip / address contracts first. Which one a contract id
+        // names is decided when we start subscribing to it (see
+        // `register_tip_contract` / `register_watch_contract`), not by
+        // guessing from the bytes -- a tip and an address state are both
+        // small single-field composables and could in principle both fail
+        // to deserialize as each other only by luck of field naming.
+        if let Some(&network) = self.bitcoin.tip_contract_network.get(&contract_id) {
+            if let Ok(tip_state) =
+                freenet_bitcoin_common::from_cbor::<freenet_bitcoin_common::BitcoinTipStateV1>(
+                    &state_bytes,
+                )
+            {
+                self.apply_tip_state(network, &tip_state);
+                return;
+            }
+        }
+        if let Some(&network) = self.bitcoin.address_contract_network.get(&contract_id) {
+            if let Ok(addr_state) = freenet_bitcoin_common::from_cbor::<
+                freenet_bitcoin_common::BitcoinAddressStateV1,
+            >(&state_bytes)
+            {
+                self.apply_address_state(contract_id, network, &addr_state);
+                return;
+            }
+        }
+
         // Try store contract first
         if let Ok(store_state) =
             harvest_common::from_cbor::<harvest_common::store::StoreStateV1>(&state_bytes)
@@ -125,6 +161,7 @@ impl AppState {
             let store = self.browsing_stores.entry(contract_id.clone()).or_default();
             store.info = Some(store_state.info.info);
             store.listings = store_state.listings.listings;
+            store.orders = store_state.orders.orders.into_values().collect();
             store.reputation_contract_id = Some(reputation_id.clone());
 
             // Register the reverse mapping so incoming reputation state
@@ -177,17 +214,6 @@ impl AppState {
             "Received unknown contract state ({} bytes)",
             state_bytes.len()
         );
-    }
-
-    /// Handle a contract update notification (delta).
-    pub fn on_contract_update(&mut self, contract_id: Vec<u8>, update_bytes: Vec<u8>) {
-        // Deltas for our contract types can be applied incrementally.
-        // For reputation, a delta is Vec<FeedbackEntry> (new entries to append).
-        // For store, a delta is StoreStateV1Delta (composable).
-        // For now, we re-GET the full state on update notification.
-        // This is correct but inefficient -- proper delta application can be
-        // added once the basic flow works end-to-end.
-        self.on_contract_state(contract_id, update_bytes);
     }
 
     /// Handle a response from the harvest delegate.
@@ -442,4 +468,370 @@ impl AppState {
             }
         }
     }
+
+    /// Handle a response from the Bitcoin surface of the harvest delegate.
+    pub fn on_bitcoin_delegate_response(&mut self, response: BitcoinDelegateResponse) {
+        match response {
+            BitcoinDelegateResponse::Watched { request_id, result } => {
+                self.bitcoin.in_flight.remove(&request_id);
+                match result {
+                    Ok(watch) => self.upsert_watch(watch),
+                    Err(e) => self
+                        .notifications
+                        .push(format!("Couldn't watch address: {}", friendly_bridge_error(&e))),
+                }
+            }
+
+            BitcoinDelegateResponse::Unwatched { request_id, result } => {
+                self.bitcoin.in_flight.remove(&request_id);
+                if let Err(e) = result {
+                    self.notifications.push(format!(
+                        "Couldn't stop watching: {}",
+                        friendly_bridge_error(&e)
+                    ));
+                }
+                // The delegate is authoritative on the watch list; refresh
+                // from it rather than guessing locally which row to drop,
+                // so a partial failure never leaves the UI out of sync.
+                #[cfg(target_arch = "wasm32")]
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(e) = crate::gateway::bitcoin_ops::list_watched().await {
+                        dioxus::logger::tracing::error!("Failed to refresh watch list: {e}");
+                    }
+                });
+            }
+
+            BitcoinDelegateResponse::WatchList { watches } => {
+                for w in &watches {
+                    self.register_watch_contract(w);
+                }
+                self.bitcoin.watches = watches;
+                self.bitcoin.watches_loaded = true;
+            }
+
+            BitcoinDelegateResponse::OrderAssociated { request_id, result } => {
+                self.bitcoin.in_flight.remove(&request_id);
+                if let Err(e) = result {
+                    self.notifications
+                        .push(format!("Couldn't link payment to order: {e}"));
+                }
+            }
+
+            BitcoinDelegateResponse::BridgeConfigured { request_id, result } => {
+                self.bitcoin.in_flight.remove(&request_id);
+                match result {
+                    Ok(()) => {
+                        #[cfg(target_arch = "wasm32")]
+                        wasm_bindgen_futures::spawn_local(async move {
+                            if let Err(e) = crate::gateway::bitcoin_ops::get_bridge().await {
+                                dioxus::logger::tracing::error!(
+                                    "Failed to refresh bridge config: {e}"
+                                );
+                            }
+                        });
+                    }
+                    Err(e) => self
+                        .notifications
+                        .push(format!("Couldn't configure bridge: {e}")),
+                }
+            }
+
+            BitcoinDelegateResponse::Bridge { endpoint } => {
+                self.bitcoin.bridge_loaded = true;
+                self.bitcoin.bridge = endpoint.clone();
+                if let Some(ep) = endpoint {
+                    self.register_tip_contract(ep.network);
+                }
+            }
+
+            // `BitcoinDelegateRequest`/`Response` are `#[non_exhaustive]` in
+            // harvest-common, so a future variant lands here silently rather
+            // than failing to build. Worth re-auditing on every bump.
+            #[allow(clippy::wildcard_enum_match_arm)]
+            _ => {
+                info!("Unhandled bitcoin delegate response: {:?}", response);
+            }
+        }
+    }
+
+    /// Fold a chain-tip contract's state into the live view for `network`.
+    fn apply_tip_state(
+        &mut self,
+        network: BitcoinNetwork,
+        state: &freenet_bitcoin_common::BitcoinTipStateV1,
+    ) {
+        let recent = state.blocks.recent(8);
+        let last_block_time = recent.first().map(|b| b.block_time);
+        let view = self.bitcoin.tips.entry(network).or_insert_with(|| TipView {
+            network,
+            tip_height: None,
+            last_block_time: None,
+            recent_blocks: Vec::new(),
+        });
+        view.tip_height = state.tip_height();
+        view.last_block_time = last_block_time;
+        view.recent_blocks = recent
+            .into_iter()
+            .map(|b| BlockRow {
+                height: b.anchor.height,
+                tx_count: b.tx_count,
+                block_time: b.block_time,
+            })
+            .collect();
+    }
+
+    /// Fold an address contract's state into the live view for that watch.
+    fn apply_address_state(
+        &mut self,
+        contract_id: Vec<u8>,
+        network: BitcoinNetwork,
+        state: &freenet_bitcoin_common::BitcoinAddressStateV1,
+    ) {
+        // `min_confirmations = 1`: this is the generic watch-list view, not
+        // an order-specific check, so "confirmed" here means "on chain at
+        // all" rather than meeting any particular order's threshold. Orders
+        // apply their own `required_confirmations` via `verify_payment_proof`
+        // when a payment is actually being proven.
+        let tip_height = self
+            .bitcoin
+            .tips
+            .get(&network)
+            .and_then(|t| t.tip_height)
+            .unwrap_or(0);
+        let confirmed_sats = state.claims.confirmed_value_sats(tip_height, 1);
+        let pending_sats = state.claims.pending_value_sats(tip_height, 1);
+
+        let mut txs: Vec<TxRow> = state
+            .claims
+            .outpoint_statuses()
+            .into_iter()
+            .map(|(op, status)| {
+                let (value_sats, row_status) = match status {
+                    freenet_bitcoin_common::OutpointStatus::Unconfirmed { value_sats } => {
+                        (value_sats, TxRowStatus::Unconfirmed)
+                    }
+                    freenet_bitcoin_common::OutpointStatus::Confirmed { value_sats, anchor } => {
+                        (value_sats, TxRowStatus::Confirmed { anchor_height: anchor.height })
+                    }
+                    freenet_bitcoin_common::OutpointStatus::Retracted => (0, TxRowStatus::Retracted),
+                };
+                TxRow {
+                    // Reversed (big-endian) byte order -- the form block
+                    // explorers and wallets display, not Bitcoin's internal
+                    // little-endian order.
+                    txid_display: op.txid.to_display_string(),
+                    value_sats,
+                    status: row_status,
+                }
+            })
+            .collect();
+        // Newest first: unconfirmed, then confirmed by descending height,
+        // then retracted last.
+        txs.sort_by_key(|t| std::cmp::Reverse(tx_sort_rank(&t.status)));
+
+        let view = self
+            .bitcoin
+            .addresses
+            .entry(contract_id)
+            .or_insert_with(|| AddressView {
+                network,
+                scanned_to: None,
+                confirmed_sats: 0,
+                pending_sats: 0,
+                txs: Vec::new(),
+            });
+        view.network = network;
+        view.scanned_to = state.scanned_to();
+        view.confirmed_sats = confirmed_sats;
+        view.pending_sats = pending_sats;
+        view.txs = txs;
+    }
+
+    /// Note that `watch` names an address contract, recording the network it
+    /// belongs to and subscribing to it if we haven't already.
+    fn register_watch_contract(&mut self, watch: &WatchedPayment) {
+        let Some(contract_id_bs58) = watch.contract_id.as_deref() else {
+            return;
+        };
+        let Ok(bytes) = bs58::decode(contract_id_bs58).into_vec() else {
+            return;
+        };
+        if bytes.len() != 32 {
+            return;
+        }
+        self.bitcoin
+            .address_contract_network
+            .insert(bytes.clone(), watch.network);
+        if self.bitcoin.subscribed.insert(bytes.clone()) {
+            #[cfg(target_arch = "wasm32")]
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(e) = crate::gateway::bitcoin_ops::subscribe_contract(&bytes).await {
+                    dioxus::logger::tracing::error!("Failed to subscribe address contract: {e}");
+                }
+            });
+        }
+    }
+
+    /// Insert or replace a watch by its stable key, and ensure we're
+    /// subscribed to its address contract.
+    fn upsert_watch(&mut self, watch: WatchedPayment) {
+        self.register_watch_contract(&watch);
+        match self.bitcoin.watches.iter_mut().find(|w| w.key() == watch.key()) {
+            Some(existing) => *existing = watch,
+            None => self.bitcoin.watches.push(watch),
+        }
+    }
+
+    /// Ensure the given network's chain-tip contract is subscribed, if we
+    /// know its contract id. See `crate::gateway::bitcoin_config` for where
+    /// that id comes from -- there is no well-known deployment yet, so this
+    /// is a no-op until one is configured.
+    pub fn register_tip_contract(&mut self, network: BitcoinNetwork) {
+        let Some(id_bs58) = crate::gateway::bitcoin_config::well_known_tip_contract_id(network)
+        else {
+            return;
+        };
+        let Ok(bytes) = bs58::decode(id_bs58).into_vec() else {
+            return;
+        };
+        if bytes.len() != 32 {
+            return;
+        }
+        self.bitcoin.tip_contract_network.insert(bytes.clone(), network);
+        self.bitcoin.tips.entry(network).or_insert_with(|| TipView {
+            network,
+            tip_height: None,
+            last_block_time: None,
+            recent_blocks: Vec::new(),
+        });
+        if self.bitcoin.subscribed.insert(bytes.clone()) {
+            #[cfg(target_arch = "wasm32")]
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(e) = crate::gateway::bitcoin_ops::subscribe_contract(&bytes).await {
+                    dioxus::logger::tracing::error!("Failed to subscribe tip contract: {e}");
+                }
+            });
+        }
+    }
+}
+
+/// Ordering key for a transaction row: unconfirmed first, then confirmed by
+/// descending anchor height, then retracted last.
+fn tx_sort_rank(status: &TxRowStatus) -> (u8, u32) {
+    match status {
+        TxRowStatus::Unconfirmed => (2, u32::MAX),
+        TxRowStatus::Confirmed { anchor_height } => (1, *anchor_height),
+        TxRowStatus::Retracted => (0, 0),
+    }
+}
+
+/// Map a raw bridge/delegate error string to something a user can act on.
+/// The delegate's errors are `String`s meant for logs (see
+/// `BitcoinDelegateResponse::Watched`'s `Result<_, String>`), not a typed
+/// error channel, so this is a best-effort keyword match rather than an
+/// exhaustive mapping.
+pub fn friendly_bridge_error(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    if lower.contains("ghost key") || lower.contains("ghostkey") || lower.contains("not authorized")
+    {
+        "This bridge is only available to Ghost Key holders. Connect a Ghost Key and try again."
+            .to_string()
+    } else if lower.contains("rate limit") {
+        "The bridge is rate-limiting requests right now -- try again shortly.".to_string()
+    } else if lower.contains("unsupported network") {
+        "This bridge doesn't support that Bitcoin network.".to_string()
+    } else if lower.contains("not synced") || lower.contains("still syncing") {
+        "The bridge is still syncing with the Bitcoin chain -- try again shortly.".to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Bitcoin/Payments state: bridge config, the user's private watch list, and
+/// live on-chain data mirrored from subscribed Bitcoin contracts.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BitcoinState {
+    /// The bridge the harvest delegate is configured to use, if any.
+    pub bridge: Option<BridgeEndpoint>,
+    /// Whether we've heard back from `GetBridge` at least once -- lets the
+    /// UI distinguish "still loading" from "no bridge configured".
+    pub bridge_loaded: bool,
+    /// The user's private watch list, as reported by the delegate.
+    pub watches: Vec<WatchedPayment>,
+    pub watches_loaded: bool,
+    /// Bitcoin delegate request ids awaiting a response, so a specific
+    /// button can show "watching..." rather than a global spinner.
+    pub in_flight: HashSet<u64>,
+    pub next_request_id: u64,
+    /// Per-network live chain tip, once that network's tip contract is
+    /// subscribed.
+    pub tips: HashMap<BitcoinNetwork, TipView>,
+    /// Per-contract-id live address view (claims folded into balances/txs),
+    /// keyed by the address contract's instance id bytes.
+    pub addresses: HashMap<Vec<u8>, AddressView>,
+    /// Contract instance ids (tip and address) we've already issued a
+    /// GET+subscribe for, so state churn doesn't resubscribe repeatedly.
+    pub subscribed: HashSet<Vec<u8>>,
+    /// Tip contract id -> network, so an incoming state/update routes to
+    /// the right `TipView` without guessing from the bytes.
+    pub tip_contract_network: HashMap<Vec<u8>, BitcoinNetwork>,
+    /// Address contract id -> network, same purpose for `AddressView`.
+    pub address_contract_network: HashMap<Vec<u8>, BitcoinNetwork>,
+}
+
+impl BitcoinState {
+    /// Allocate the next request id for a `BitcoinDelegateRequest`.
+    pub fn next_request_id(&mut self) -> u64 {
+        self.next_request_id += 1;
+        self.next_request_id
+    }
+}
+
+/// Live view of one network's chain tip, mirrored from its
+/// `BitcoinTipContract`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TipView {
+    pub network: BitcoinNetwork,
+    pub tip_height: Option<u32>,
+    /// Header timestamp (Bitcoin's clock) of the most recent block. Display
+    /// only -- e.g. "X minutes ago" computed against the browser's own
+    /// clock, never trusted as authoritative.
+    pub last_block_time: Option<u32>,
+    /// Newest first.
+    pub recent_blocks: Vec<BlockRow>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlockRow {
+    pub height: u32,
+    pub tx_count: u32,
+    pub block_time: u32,
+}
+
+/// Live view of one watched address, mirrored from its
+/// `BitcoinAddressContract`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AddressView {
+    pub network: BitcoinNetwork,
+    /// The highest height any trusted bridge has scanned this script to.
+    /// `None` means "not synchronized yet", distinct from "no activity".
+    pub scanned_to: Option<u32>,
+    pub confirmed_sats: u64,
+    pub pending_sats: u64,
+    /// Newest first (see `tx_sort_rank`).
+    pub txs: Vec<TxRow>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TxRow {
+    pub txid_display: String,
+    pub value_sats: u64,
+    pub status: TxRowStatus,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TxRowStatus {
+    Unconfirmed,
+    Confirmed { anchor_height: u32 },
+    Retracted,
 }

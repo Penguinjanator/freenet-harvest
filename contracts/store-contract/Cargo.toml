@@ -8,12 +8,21 @@ description = "Harvest store contract: per-seller product listings with ghostkey
 
 [dependencies]
 harvest-common = { workspace = true }
+freenet-bitcoin-common = { workspace = true }
 freenet-stdlib = { workspace = true }
 freenet-scaffold = { workspace = true }
 ciborium = { workspace = true }
 serde = { workspace = true }
 ed25519-dalek = { workspace = true }
+blake3 = { workspace = true }
 getrandom = { workspace = true }
+
+[dev-dependencies]
+# Enables `freenet_bitcoin_common::spv::testing`, so tests build genuine SPV
+# proofs and address-contract fixtures rather than stubbing verification.
+freenet-bitcoin-common = { workspace = true, features = ["test-support"] }
+chrono = { workspace = true }
+bs58 = { workspace = true }
 
 [lib]
 crate-type = ["cdylib", "rlib"]

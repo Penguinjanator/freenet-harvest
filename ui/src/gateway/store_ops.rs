@@ -65,6 +65,14 @@ pub async fn create_store_contracts(
     // 2. Store contract (initially empty, version 0)
     let store_params = harvest_common::store::StoreParameters {
         seller_verifying_key: seller_vk,
+        // No Bitcoin bridge configured at store-creation time yet -- an
+        // empty trust list is the documented safe default (no order on
+        // this store can ever validate as `Paid` until the seller
+        // configures a trusted bridge). Wiring this up to the Bitcoin
+        // section's bridge configuration is follow-up work, not part of
+        // creating the store's other two contracts here.
+        trusted_bitcoin_bridges: Vec::new(),
+        bitcoin_address_code_hash: None,
     };
     let store_params_bytes = harvest_common::to_cbor(&store_params)
         .map_err(|e| format!("serialize store params: {e}"))?;

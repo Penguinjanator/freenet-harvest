@@ -582,3 +582,144 @@ h4 {
   color: var(--text-muted);
   font-weight: 300;
 }
+
+/* ---- Bitcoin / Payments ---- */
+
+.btc-status-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-sm) var(--space-md);
+  margin-bottom: var(--space-lg);
+  font-size: 0.85rem;
+}
+
+.btc-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.btc-dot.online { background: var(--accent); }
+.btc-dot.offline { background: #b44; }
+.btc-dot.unknown { background: var(--text-muted); }
+
+.btc-status-text {
+  color: var(--text-secondary);
+}
+
+.btc-status-network {
+  font-family: var(--font-display);
+  font-weight: 700;
+  color: var(--text-primary);
+  text-transform: capitalize;
+}
+
+.btc-status-sep {
+  color: var(--border);
+}
+
+/* ---- Recent blocks ---- */
+
+.btc-block-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.btc-block-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+
+.btc-block-row:last-child {
+  border-bottom: none;
+}
+
+.btc-block-height {
+  font-family: var(--font-display);
+  font-weight: 700;
+  color: var(--accent);
+  min-width: 5rem;
+}
+
+.btc-block-txcount {
+  color: var(--text-secondary);
+}
+
+.btc-block-time {
+  margin-left: auto;
+  font-size: 0.8rem;
+}
+
+/* ---- Payment status pills ---- */
+
+.btc-pill {
+  font-family: var(--font-body);
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0.2rem 0.6rem;
+  border-radius: 3px;
+}
+
+.btc-pill.paid {
+  background: var(--accent);
+  color: var(--color-cream);
+}
+
+.btc-pill.pending,
+.btc-pill.waiting {
+  background: transparent;
+  border: 1px solid var(--accent-warm);
+  color: var(--accent-warm);
+}
+
+.btc-pill.reversed {
+  background: #b44;
+  color: white;
+}
+
+.btc-pill.cancelled {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+/* ---- Transaction rows ---- */
+
+.btc-tx-row {
+  display: flex;
+  gap: var(--space-sm);
+  font-size: 0.8rem;
+  margin-top: var(--space-xs);
+}
+
+.btc-tx-id {
+  font-family: monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 12rem;
+}
+
+.btc-tx-amount {
+  flex-shrink: 0;
+}
+
+.btc-tx-status {
+  flex-shrink: 0;
+  margin-left: auto;
+}

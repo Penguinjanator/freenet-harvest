@@ -142,8 +142,17 @@ pub struct Order {
     /// always uses `payment_script_pubkey`; several address encodings can
     /// denote the same script, and only the script appears on chain.
     pub payment_address: String,
-    /// Confirmations required before this order counts as paid.
+    /// Confirmations required before this order counts as paid. On-chain only;
+    /// a Lightning payment is final the moment the preimage exists.
     pub required_confirmations: u32,
+    /// For a Lightning order, the invoice's payment hash.
+    ///
+    /// Public for the same reason a scriptPubKey is: without it nobody but the
+    /// two parties could verify the payment, which defeats the purpose.
+    /// `#[serde(default)]` so orders written before this field existed still
+    /// decode.
+    #[serde(default)]
+    pub payment_hash: Option<[u8; 32]>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -162,9 +171,9 @@ impl Order {
     }
 }
 
-/// Bridge-signed evidence that an order's payment reached the chain.
+/// Bridge-signed evidence that an order's payment reached the *chain*.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub struct OrderPaymentProof {
+pub struct OnChainPaymentProof {
     /// Every claim the bridges have published about the qualifying outpoints,
     /// not merely the winning one.
     ///
@@ -177,6 +186,64 @@ pub struct OrderPaymentProof {
     /// A bridge-signed chain tip, so confirmation depth is itself attested
     /// rather than asserted by whoever submitted the proof.
     pub tip: SignedTipEntry,
+}
+
+/// Proof that an order was paid, by whichever rail carried the payment.
+///
+/// # Why this is an enum today rather than when Lightning arrives
+///
+/// A contract's state format is frozen at publish: changing it produces new
+/// WASM, a new contract key, and orphaned state. Adding a second payment rail
+/// later would therefore be a migration, not an edit. Shaping the type for it
+/// now costs nothing and removes that migration from the future.
+///
+/// # The two rails verify very differently, and it is worth knowing how
+///
+/// **On-chain** payments are publicly observable, so proof is a set of
+/// bridge-signed observations, each carrying SPV evidence a reader checks
+/// against the transaction and the block headers.
+///
+/// **Lightning** payments are, by design, *not* publicly observable — there is
+/// no on-chain record of a routed payment, so no bridge can watch for one and
+/// the entire SPV apparatus has nothing to look at. What Lightning provides
+/// instead is the **preimage**: the payer ends up holding `r` where
+/// `SHA256(r) == payment_hash`. The order publishes the payment hash (exactly
+/// where an on-chain order publishes its scriptPubKey) and the proof is `r`.
+/// Verification is a single hash, with no bridge in the picture at all.
+///
+/// That makes the Lightning path *simpler* to verify, not harder, and it
+/// sidesteps the watch-list privacy problem entirely since there is nothing to
+/// watch. The genuinely hard part of Lightning is operational — a seller needs
+/// an always-on node with inbound liquidity — and none of that difficulty
+/// lives in this file.
+///
+/// ## What the preimage does and does not prove
+///
+/// It proves the invoice with that hash was settled. It does **not** identify
+/// who paid, and the seller who issued the invoice knows `r` from the outset,
+/// so a seller can always mark their own order paid. That asymmetry is
+/// harmless here because it runs against the seller's own interest: the
+/// dispute that actually matters is a seller falsely claiming they were *not*
+/// paid, and the buyer refutes that by presenting `r`, which they could only
+/// have obtained by settling the invoice.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub enum OrderPaymentProof {
+    OnChain(OnChainPaymentProof),
+    Lightning(LightningPaymentProof),
+}
+
+impl OrderPaymentProof {
+    /// Convenience for the common on-chain case.
+    pub fn on_chain(claims: Vec<SignedClaim>, tip: SignedTipEntry) -> Self {
+        OrderPaymentProof::OnChain(OnChainPaymentProof { claims, tip })
+    }
+}
+
+/// The preimage settling a Lightning invoice.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct LightningPaymentProof {
+    /// `r` such that `SHA256(r)` equals the order's `payment_hash`.
+    pub preimage: [u8; 32],
 }
 
 /// Why a payment proof was rejected. Distinguished so the UI can say something
@@ -196,6 +263,11 @@ pub enum ProofError {
     InsufficientValue { have_sats: u64, need_sats: u64 },
     /// The most recent evidence says the payment is no longer on chain.
     Reversed,
+    /// A Lightning proof was offered for an order that has no payment hash,
+    /// or an on-chain proof for one that has no script.
+    WrongRail,
+    /// `SHA256(preimage)` does not equal the order's payment hash.
+    PreimageMismatch,
 }
 
 impl std::fmt::Display for ProofError {
@@ -215,6 +287,12 @@ impl std::fmt::Display for ProofError {
                 write!(f, "payment of {have_sats} sats is short of {need_sats} sats")
             }
             ProofError::Reversed => write!(f, "the payment was reorganized off the chain"),
+            ProofError::WrongRail => {
+                write!(f, "the evidence is for a different payment method than the order")
+            }
+            ProofError::PreimageMismatch => {
+                write!(f, "the preimage does not settle this order's invoice")
+            }
         }
     }
 }
@@ -229,6 +307,44 @@ pub fn verify_payment_proof(
     proof: &OrderPaymentProof,
     trusted_bridges: &[BridgeId],
 ) -> Result<u64, ProofError> {
+    match proof {
+        OrderPaymentProof::OnChain(p) => verify_on_chain_proof(order, p, trusted_bridges),
+        OrderPaymentProof::Lightning(p) => verify_lightning_proof(order, p),
+    }
+}
+
+/// Verify a Lightning payment: one hash, no bridge, no chain.
+///
+/// Note there is no confirmation depth to check. A settled Lightning payment
+/// is final immediately; there is no reorg that can undo it, which is why
+/// `required_confirmations` does not appear here.
+pub fn verify_lightning_proof(
+    order: &Order,
+    proof: &LightningPaymentProof,
+) -> Result<u64, ProofError> {
+    let Some(expected) = order.payment_hash else {
+        return Err(ProofError::WrongRail);
+    };
+    let got: [u8; 32] = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(proof.preimage);
+        h.finalize().into()
+    };
+    if got != expected {
+        return Err(ProofError::PreimageMismatch);
+    }
+    Ok(order.amount_sats)
+}
+
+fn verify_on_chain_proof(
+    order: &Order,
+    proof: &OnChainPaymentProof,
+    trusted_bridges: &[BridgeId],
+) -> Result<u64, ProofError> {
+    if order.payment_script_pubkey.is_empty() {
+        return Err(ProofError::WrongRail);
+    }
     if trusted_bridges.is_empty() {
         return Err(ProofError::NoTrustedBridges);
     }
@@ -388,5 +504,139 @@ impl AuthorizedOrder {
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lightning_tests {
+    use super::*;
+    use freenet_bitcoin_common::BitcoinNetwork;
+
+    fn sha256(b: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b);
+        h.finalize().into()
+    }
+
+    fn lightning_order(payment_hash: Option<[u8; 32]>) -> Order {
+        let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let listing_id = ListingId::new("seller", &ts, "Widget");
+        Order {
+            id: OrderId::new("seller", &listing_id, &ts, "buyer"),
+            listing_id,
+            buyer_fingerprint: "buyer".into(),
+            seller_fingerprint: "seller".into(),
+            amount_sats: 50_000,
+            network: BitcoinNetwork::Bitcoin,
+            // A Lightning order has no on-chain destination at all.
+            payment_script_pubkey: Vec::new(),
+            payment_address: String::new(),
+            payment_hash,
+            required_confirmations: 0,
+            created_at: ts,
+        }
+    }
+
+    #[test]
+    fn a_correct_preimage_settles_a_lightning_order() {
+        let preimage = [42u8; 32];
+        let order = lightning_order(Some(sha256(&preimage)));
+        let proof = OrderPaymentProof::Lightning(LightningPaymentProof { preimage });
+        // No bridge is consulted: the trusted-bridge list is irrelevant here,
+        // which is the point -- a Lightning payment needs no observer.
+        assert_eq!(verify_payment_proof(&order, &proof, &[]).unwrap(), 50_000);
+    }
+
+    #[test]
+    fn a_wrong_preimage_is_rejected() {
+        let order = lightning_order(Some(sha256(&[42u8; 32])));
+        let proof = OrderPaymentProof::Lightning(LightningPaymentProof {
+            preimage: [7u8; 32],
+        });
+        assert_eq!(
+            verify_payment_proof(&order, &proof, &[]),
+            Err(ProofError::PreimageMismatch)
+        );
+    }
+
+    #[test]
+    fn a_lightning_proof_cannot_settle_an_on_chain_order() {
+        // Rails must not be interchangeable: presenting a preimage for an
+        // order that expects an on-chain payment would otherwise be a way to
+        // mark it paid with no payment at all.
+        let mut order = lightning_order(None);
+        order.payment_script_pubkey = vec![0x00, 0x14, 0xaa, 0xbb];
+        let proof = OrderPaymentProof::Lightning(LightningPaymentProof {
+            preimage: [42u8; 32],
+        });
+        assert_eq!(
+            verify_payment_proof(&order, &proof, &[]),
+            Err(ProofError::WrongRail)
+        );
+    }
+
+    #[test]
+    fn an_on_chain_proof_cannot_settle_a_lightning_order() {
+        let order = lightning_order(Some(sha256(&[1u8; 32])));
+        let proof = OrderPaymentProof::on_chain(vec![], dummy_tip());
+        assert_eq!(
+            verify_payment_proof(&order, &proof, &[]),
+            Err(ProofError::WrongRail)
+        );
+    }
+
+    fn dummy_tip() -> SignedTipEntry {
+        SignedTipEntry {
+            body_cbor: Vec::new(),
+            bridge: freenet_bitcoin_common::BridgeId([0u8; 32]),
+            signature: Vec::new(),
+        }
+    }
+
+    /// The wire format must be able to represent both rails, so that adding
+    /// Lightning support later is a code change rather than a state migration.
+    #[test]
+    fn both_rails_round_trip_through_cbor() {
+        let ln = OrderPaymentProof::Lightning(LightningPaymentProof {
+            preimage: [9u8; 32],
+        });
+        let bytes = crate::to_cbor(&ln).unwrap();
+        assert_eq!(crate::from_cbor::<OrderPaymentProof>(&bytes).unwrap(), ln);
+    }
+
+    /// An order written before `payment_hash` existed must still decode.
+    #[test]
+    fn orders_without_a_payment_hash_still_decode() {
+        #[derive(serde::Serialize)]
+        struct OldOrder {
+            id: OrderId,
+            listing_id: ListingId,
+            buyer_fingerprint: String,
+            seller_fingerprint: String,
+            amount_sats: u64,
+            network: BitcoinNetwork,
+            payment_script_pubkey: Vec<u8>,
+            payment_address: String,
+            required_confirmations: u32,
+            created_at: chrono::DateTime<chrono::Utc>,
+        }
+        let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let listing_id = ListingId::new("seller", &ts, "Widget");
+        let old = OldOrder {
+            id: OrderId::new("seller", &listing_id, &ts, "buyer"),
+            listing_id,
+            buyer_fingerprint: "buyer".into(),
+            seller_fingerprint: "seller".into(),
+            amount_sats: 1,
+            network: BitcoinNetwork::Signet,
+            payment_script_pubkey: vec![0x00, 0x14],
+            payment_address: "tb1q".into(),
+            required_confirmations: 1,
+            created_at: ts,
+        };
+        let bytes = crate::to_cbor(&old).unwrap();
+        let decoded: Order = crate::from_cbor(&bytes).expect("old orders must still decode");
+        assert_eq!(decoded.payment_hash, None);
     }
 }

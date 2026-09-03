@@ -1,4 +1,5 @@
 mod app;
+mod bitcoin_view;
 mod listing_form;
 mod message_view;
 mod my_store;

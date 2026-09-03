@@ -1,5 +1,6 @@
 #![allow(unexpected_cfgs)]
 
+mod bitcoin;
 mod handlers;
 
 use freenet_stdlib::prelude::{
@@ -7,7 +8,35 @@ use freenet_stdlib::prelude::{
     InboundDelegateMsg, MessageOrigin, OutboundDelegateMsg, Parameters,
 };
 
-use harvest_common::{from_cbor, to_cbor, HarvestDelegateRequest, HarvestDelegateResponse};
+use harvest_common::{
+    from_cbor, to_cbor, BitcoinDelegateRequest, HarvestDelegateRequest, HarvestDelegateResponse,
+};
+
+// RSA key generation (`InitReputationKeys`) and blind signing
+// (`BlindSignFeedbackToken`) need real randomness, via `rsa::rand_core::OsRng`.
+// `getrandom` (which `OsRng` sits on) has no OS backend on
+// `wasm32-unknown-unknown`, so the workspace enables its "custom" feature --
+// but that feature only *allows* registering a source, it doesn't provide
+// one. Without this registration the crate fails to LINK (missing
+// `__getrandom_custom` symbol), not merely to produce bad randomness at
+// runtime, so this was a pre-existing latent build break, independent of
+// anything Bitcoin-related, that just hadn't been exercised by a fresh
+// `cargo build --target wasm32-unknown-unknown` in this checkout.
+//
+// The entropy source is the delegate host's own RNG
+// (`freenet_stdlib::rand::rand_bytes`, backed by `__frnt__rand__rand_bytes`),
+// never a JS/browser API -- a delegate does not run in a browser. Per
+// `getrandom::register_custom_getrandom!`'s docs, registration must happen in
+// the root binary crate; this delegate IS that root (compiled directly to a
+// `cdylib`, no separate `main.rs`), so registering here is correct. The
+// registration is a no-op on every other target (native `cargo test` keeps
+// using the OS RNG), so this cannot change test behavior.
+fn harvest_delegate_getrandom(buf: &mut [u8]) -> Result<(), getrandom::Error> {
+    let bytes = freenet_stdlib::rand::rand_bytes(buf.len() as u32);
+    buf.copy_from_slice(&bytes);
+    Ok(())
+}
+getrandom::register_custom_getrandom!(harvest_delegate_getrandom);
 
 pub struct HarvestDelegate;
 
@@ -85,17 +114,47 @@ fn handle_request(
     ctx: &mut DelegateCtx,
     payload: &[u8],
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-    let request: HarvestDelegateRequest = from_cbor(payload)
-        .map_err(|e| DelegateError::Other(format!("deserialize request: {e}")))?;
+    // The Bitcoin payment surface (`harvest_common::bitcoin_delegate`) is
+    // deliberately NOT folded into `HarvestDelegateRequest`/`Response` as new
+    // variants -- that enum is owned by a different, concurrently-edited
+    // workstream, and adding variants there would mean editing a file this
+    // change doesn't need to touch. Instead we dispatch on which request
+    // enum the payload actually decodes as. Both enums use externally-tagged
+    // CBOR (the variant name is part of the encoding), so a
+    // `BitcoinDelegateRequest` payload fails to decode as a
+    // `HarvestDelegateRequest` with an "unknown variant" error rather than
+    // silently misparsing into the wrong shape, which is what makes this
+    // fallback safe rather than ambiguous.
+    match from_cbor::<HarvestDelegateRequest>(payload) {
+        Ok(request) => {
+            let response = handlers::handle(ctx, request);
 
-    let response = handlers::handle(ctx, request);
+            let response_bytes = to_cbor(&response)
+                .map_err(|e| DelegateError::Other(format!("serialize response: {e}")))?;
 
-    let response_bytes =
-        to_cbor(&response).map_err(|e| DelegateError::Other(format!("serialize response: {e}")))?;
+            Ok(vec![OutboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(response_bytes),
+            )])
+        }
+        Err(harvest_decode_err) => {
+            let request: BitcoinDelegateRequest = from_cbor(payload).map_err(|bitcoin_decode_err| {
+                DelegateError::Other(format!(
+                    "payload is neither a HarvestDelegateRequest ({harvest_decode_err}) nor a \
+                     BitcoinDelegateRequest ({bitcoin_decode_err})"
+                ))
+            })?;
 
-    Ok(vec![OutboundDelegateMsg::ApplicationMessage(
-        ApplicationMessage::new(response_bytes),
-    )])
+            let response = bitcoin::handle(ctx, request)?;
+
+            let response_bytes = to_cbor(&response).map_err(|e| {
+                DelegateError::Other(format!("serialize bitcoin response: {e}"))
+            })?;
+
+            Ok(vec![OutboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(response_bytes),
+            )])
+        }
+    }
 }
 
 /// Handle a contract state change notification.

@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 
+use super::bitcoin_view::BitcoinView;
 use super::my_store::MyStore;
 use super::reputation_view::ReputationView;
 use super::store_view::StoreView;
@@ -10,6 +11,7 @@ enum Route {
     Browse,
     MyStore,
     Reputation,
+    Payments,
 }
 
 #[component]
@@ -39,6 +41,28 @@ pub fn App() -> Element {
                     Ok(key) => {
                         dioxus::logger::tracing::info!("Harvest delegate registered: {:?}", key);
                         crate::gateway::APP_STATE.write().harvest_delegate_key = Some(key);
+
+                        // Kick off the Bitcoin surface: bridge config (needed
+                        // for the first-run status panel, no credential
+                        // required) and the private watch list. Each of
+                        // these subscribes to whatever Bitcoin contracts it
+                        // learns about as its response arrives -- see
+                        // `AppState::on_bitcoin_delegate_response`.
+                        if let Err(e) = crate::gateway::bitcoin_ops::get_bridge().await {
+                            dioxus::logger::tracing::error!("Failed to fetch bridge config: {e}");
+                        }
+                        if let Err(e) = crate::gateway::bitcoin_ops::list_watched().await {
+                            dioxus::logger::tracing::error!("Failed to fetch watch list: {e}");
+                        }
+                        // No bridge may be configured for the active/default
+                        // network yet, in which case there's nothing to
+                        // subscribe to until one is. Try the default network
+                        // directly too, so the first-run panel gets live
+                        // data even before any watch or bridge config exists.
+                        let default_network = crate::gateway::bitcoin_config::default_network();
+                        crate::gateway::APP_STATE
+                            .write()
+                            .register_tip_contract(default_network);
                     }
                     Err(e) => {
                         dioxus::logger::tracing::error!(
@@ -132,6 +156,11 @@ pub fn App() -> Element {
                         onclick: move |_| current_route.set(Route::Reputation),
                         "Reputation"
                     }
+                    button {
+                        class: if current_route() == Route::Payments { "nav-btn active" } else { "nav-btn" },
+                        onclick: move |_| current_route.set(Route::Payments),
+                        "Payments"
+                    }
                 }
             }
 
@@ -141,6 +170,7 @@ pub fn App() -> Element {
                 Route::Browse => rsx! { StoreView {} },
                 Route::MyStore => rsx! { MyStore {} },
                 Route::Reputation => rsx! { ReputationView {} },
+                Route::Payments => rsx! { BitcoinView {} },
             }
 
             // Footer with build timestamp

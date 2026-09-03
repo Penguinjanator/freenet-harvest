@@ -2,6 +2,9 @@
 //!
 //! Handles WebSocket connection, delegate registration, and contract operations.
 
+pub mod bitcoin_address;
+pub mod bitcoin_config;
+pub mod bitcoin_ops;
 mod connection;
 mod delegate_api;
 pub mod response_handler;
