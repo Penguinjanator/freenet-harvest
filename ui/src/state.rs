@@ -540,7 +540,39 @@ impl AppState {
                 self.bitcoin.bridge_loaded = true;
                 self.bitcoin.bridge = endpoint.clone();
                 if let Some(ep) = endpoint {
+                    // Covers the (currently hypothetical) case of a
+                    // well-known/pinned deployment -- see
+                    // `gateway::bitcoin_config`.
                     self.register_tip_contract(ep.network);
+                    // The real discovery path today: ask the bridge itself
+                    // over plain HTTP, which the delegate cannot do on our
+                    // behalf (no outbound-HTTP host function exists for
+                    // delegates). See `gateway::bitcoin_bridge_http`.
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let url = ep.url.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            crate::gateway::bitcoin_bridge_http::refresh_bridge_status(url).await;
+                        });
+                    }
+                } else {
+                    // No bridge configured yet -- true first run. Try the
+                    // default, which is the user's OWN machine.
+                    //
+                    // This is what makes the first-run panel show live Bitcoin
+                    // data with no credential and no configuration, for anyone
+                    // running their own bridge. If none is running the fetch
+                    // fails and the panel keeps saying no bridge is
+                    // configured, which is the honest outcome; it never
+                    // invents data.
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let url =
+                            crate::gateway::bitcoin_config::default_bridge_url().to_string();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            crate::gateway::bitcoin_bridge_http::refresh_bridge_status(url).await;
+                        });
+                    }
                 }
             }
 
@@ -683,18 +715,33 @@ impl AppState {
     }
 
     /// Ensure the given network's chain-tip contract is subscribed, if we
-    /// know its contract id. See `crate::gateway::bitcoin_config` for where
-    /// that id comes from -- there is no well-known deployment yet, so this
-    /// is a no-op until one is configured.
+    /// know its contract id from a well-known/pinned deployment. See
+    /// `crate::gateway::bitcoin_config` for where that id would come from --
+    /// there is no such deployment today, so this is a no-op. The real
+    /// discovery path is `register_tip_contract_with_id`, driven by the
+    /// bridge's own `/v1/status` self-report (see
+    /// `gateway::bitcoin_bridge_http::refresh_bridge_status`).
     pub fn register_tip_contract(&mut self, network: BitcoinNetwork) {
         let Some(id_bs58) = crate::gateway::bitcoin_config::well_known_tip_contract_id(network)
         else {
             return;
         };
+        self.register_tip_contract_with_id(network, id_bs58);
+    }
+
+    /// Register a network's chain-tip contract id, from wherever it was
+    /// discovered, and subscribe to it if we haven't already.
+    pub fn register_tip_contract_with_id(&mut self, network: BitcoinNetwork, id_bs58: &str) {
         let Ok(bytes) = bs58::decode(id_bs58).into_vec() else {
+            dioxus::logger::tracing::warn!(
+                "Bridge reported a tip contract id that isn't valid bs58: {id_bs58}"
+            );
             return;
         };
         if bytes.len() != 32 {
+            dioxus::logger::tracing::warn!(
+                "Bridge reported a tip contract id that isn't 32 bytes: {id_bs58}"
+            );
             return;
         }
         self.bitcoin.tip_contract_network.insert(bytes.clone(), network);

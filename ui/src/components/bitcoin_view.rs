@@ -19,7 +19,7 @@ use dioxus::prelude::*;
 
 use freenet_bitcoin_common::BitcoinNetwork;
 use harvest_common::payment::{AuthorizedOrder, OrderStatus};
-use harvest_common::WatchedPayment;
+use harvest_common::{BridgeEndpoint, WatchedPayment};
 
 use crate::gateway::{bitcoin_address, bitcoin_config, bitcoin_ops, APP_STATE};
 use crate::state::{friendly_bridge_error, AddressView, BitcoinState, TipView, TxRowStatus};
@@ -29,6 +29,8 @@ pub fn BitcoinView() -> Element {
     let app_state = APP_STATE.read();
     let network = active_network(&app_state.bitcoin);
     let tip = app_state.bitcoin.tips.get(&network).cloned();
+    let bridge_loaded = app_state.bitcoin.bridge_loaded;
+    let bridge = app_state.bitcoin.bridge.clone();
     let orders = my_orders(&app_state);
     let watches = app_state.bitcoin.watches.clone();
     let watches_loaded = app_state.bitcoin.watches_loaded;
@@ -52,10 +54,10 @@ pub fn BitcoinView() -> Element {
                 }
             }
 
-            BridgeStatusBar { network, tip: tip.clone() }
+            BridgeStatusBar { bridge_loaded, bridge: bridge.clone(), network, tip: tip.clone() }
 
             if show_first_run {
-                FirstRunPanel { network, tip, has_ghostkey }
+                FirstRunPanel { bridge_loaded, bridge, network, tip, has_ghostkey }
             } else {
                 if !orders.is_empty() {
                     OrdersSection { orders, app_state_snapshot: app_state.bitcoin.clone() }
@@ -110,17 +112,32 @@ fn my_orders(app_state: &crate::state::AppState) -> Vec<AuthorizedOrder> {
 
 #[derive(Clone, Copy, PartialEq)]
 enum BridgeHealth {
-    /// A tip contract for this network isn't known to this build yet -- see
-    /// `gateway::bitcoin_config`. Not the user's fault; say so plainly.
-    NotWired,
+    /// `GetBridge` has answered and no bridge is configured. Real state of
+    /// the world today: there is no canonical default bridge published
+    /// anywhere yet (`freenet-bitcoin/deploy/` is empty), so this is
+    /// expected, not an error -- say so plainly rather than looking broken.
+    NotConfigured,
+    /// A bridge is configured but we haven't yet learned its tip contract
+    /// id (still waiting on `GetBridge`, or the `/v1/status` fetch is in
+    /// flight or hasn't resolved), or we have the id but no data has
+    /// arrived from the subscription yet.
     WaitingForData,
     Online,
     Stale,
 }
 
-fn bridge_health(network: BitcoinNetwork, tip: &Option<TipView>) -> BridgeHealth {
-    if bitcoin_config::well_known_tip_contract_id(network).is_none() {
-        return BridgeHealth::NotWired;
+fn bridge_health(
+    bridge_loaded: bool,
+    bridge: &Option<BridgeEndpoint>,
+    network: BitcoinNetwork,
+    tip: &Option<TipView>,
+) -> BridgeHealth {
+    if !bridge_loaded || bridge.is_none() {
+        return if bridge_loaded {
+            BridgeHealth::NotConfigured
+        } else {
+            BridgeHealth::WaitingForData
+        };
     }
     let Some(tip) = tip else {
         return BridgeHealth::WaitingForData;
@@ -144,10 +161,15 @@ fn bridge_health(network: BitcoinNetwork, tip: &Option<TipView>) -> BridgeHealth
 }
 
 #[component]
-fn BridgeStatusBar(network: BitcoinNetwork, tip: Option<TipView>) -> Element {
-    let health = bridge_health(network, &tip);
+fn BridgeStatusBar(
+    bridge_loaded: bool,
+    bridge: Option<BridgeEndpoint>,
+    network: BitcoinNetwork,
+    tip: Option<TipView>,
+) -> Element {
+    let health = bridge_health(bridge_loaded, &bridge, network, &tip);
     let (dot_class, label) = match health {
-        BridgeHealth::NotWired => ("btc-dot unknown", "Bridge not configured for this build yet".to_string()),
+        BridgeHealth::NotConfigured => ("btc-dot unknown", "No Bitcoin bridge configured for this build yet".to_string()),
         BridgeHealth::WaitingForData => ("btc-dot unknown", "Connecting to the Bitcoin bridge…".to_string()),
         BridgeHealth::Online => ("btc-dot online", "Online".to_string()),
         BridgeHealth::Stale => ("btc-dot offline", "No recent blocks -- bridge may be behind".to_string()),
@@ -177,7 +199,13 @@ fn BridgeStatusBar(network: BitcoinNetwork, tip: Option<TipView>) -> Element {
 // ---------------------------------------------------------------------------
 
 #[component]
-fn FirstRunPanel(network: BitcoinNetwork, tip: Option<TipView>, has_ghostkey: bool) -> Element {
+fn FirstRunPanel(
+    bridge_loaded: bool,
+    bridge: Option<BridgeEndpoint>,
+    network: BitcoinNetwork,
+    tip: Option<TipView>,
+    has_ghostkey: bool,
+) -> Element {
     rsx! {
         div { class: "card",
             h3 { "Live on {network.as_str()}" }
@@ -188,8 +216,10 @@ fn FirstRunPanel(network: BitcoinNetwork, tip: Option<TipView>, has_ghostkey: bo
                 _ => rsx! {
                     p { class: "text-muted text-italic",
                         "No chain data yet. "
-                        if bitcoin_config::well_known_tip_contract_id(network).is_none() {
-                            "This build doesn't have a Bitcoin bridge configured for {network.as_str()} yet."
+                        if !bridge_loaded {
+                            "Connecting…"
+                        } else if bridge.is_none() {
+                            "This build has no Bitcoin bridge configured for {network.as_str()} yet."
                         } else {
                             "Waiting for the bridge to report the chain tip…"
                         }

@@ -9,21 +9,19 @@
 //! is a hash over its WASM code plus its `BitcoinTipParameters` (network +
 //! trusted bridge keys).
 //!
-//! There is no deployed bridge or published tip contract yet (as of this
-//! writing `freenet-bitcoin/bridge/src/main.rs` is `fn main(){}`), so there
-//! is nothing real to pin here. This module is the single place that will
-//! need to change once one exists -- analogous to how
-//! `harvest_common::HARVEST_WEBAPP_CONTRACT_ID` pins the webapp container id
-//! from a checked-in file. Until then every lookup here returns `None` and
-//! the UI shows an honest "bridge not configured yet" state rather than
-//! fabricated data.
+//! A bridge now exists (`freenet-bitcoin/bridge`, deployed on nova against
+//! signet), but its tip-contract id deliberately stays OUT of this file.
 //!
-//! TODO(bitcoin-bridge-deployment): once freenet.org (or any operator)
-//! deploys a `BitcoinTipContract`, fill in its bs58 `ContractInstanceId`
-//! below, one per network it serves. Per-address contract ids never belong
-//! here -- those are learned per-watch from
-//! `harvest_common::WatchedPayment::contract_id`, reported by the delegate
-//! after a successful `Watch`.
+//! A `BitcoinTipContract`'s id is a hash over its WASM plus its parameters,
+//! and its parameters include `trusted_bridges`, which is per-deployment
+//! rather than a fixed per-network constant. A compiled-in id would therefore
+//! go stale on any re-key -- including a bare version bump -- and the failure
+//! is silent: every read comes back looking like "this network has no data
+//! yet". So the id is fetched at runtime from the bridge's unauthenticated
+//! `GET /v1/status`, which reports it (see `bitcoin_bridge_http`).
+//!
+//! What CANNOT be discovered at runtime is which bridge to ask in the first
+//! place, so that is the one thing defaulted here.
 
 use freenet_bitcoin_common::BitcoinNetwork;
 
@@ -46,4 +44,28 @@ pub fn well_known_tip_contract_id(network: BitcoinNetwork) -> Option<&'static st
 /// deployment would live.
 pub fn default_network() -> BitcoinNetwork {
     BitcoinNetwork::Signet
+}
+
+/// The bridge to ask before the user has configured one.
+///
+/// # Why localhost, and not a freenet.org URL
+///
+/// Defaulting to the user's own machine matches what the architecture actually
+/// recommends: running your own bridge is the real answer to bridge-operator
+/// correlation, because an operator necessarily learns which scripts it has
+/// been asked to synchronize. A default that points everyone at one operator
+/// would quietly make the privacy-worst option the path of least resistance.
+///
+/// It also fails honestly. If no local bridge is running the fetch simply
+/// fails and the UI says no bridge is configured, rather than showing data
+/// from a service the user never chose.
+///
+/// A hosted freenet.org bridge is a genuine product decision that has not been
+/// made: it needs a published URL, a decision about who signs for it, and --
+/// because it would be internet-facing rather than loopback -- the Ghost Key
+/// authorization policy switched on and rate limiting configured. Until then,
+/// pointing the default at a URL that does not exist would be worse than
+/// pointing it at one that might.
+pub fn default_bridge_url() -> &'static str {
+    "http://127.0.0.1:8431"
 }
