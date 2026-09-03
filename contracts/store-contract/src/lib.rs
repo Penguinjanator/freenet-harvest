@@ -360,7 +360,6 @@ mod tests {
             network: BitcoinNetwork::Signet,
             payment_script_pubkey: script.to_vec(),
             payment_hash: None,
-            payment_hash: None,
             payment_address: "tb1qtest".into(),
             required_confirmations: 1,
             created_at: ts,

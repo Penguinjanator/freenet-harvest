@@ -46,7 +46,15 @@ x25519-dalek = { version = "2.0", features = ["static_secrets", "getrandom"] }
 aes-gcm = "0.10"
 
 # Utilities
-chrono = { version = "0.4", features = ["serde"] }
+# default-features = false is load-bearing, not tidiness. chrono's default
+# `wasmbind` feature imports __wbindgen_placeholder__ /
+# __wbindgen_externref_xform__, which the Freenet contract runtime does not
+# register -- so a module built with it compiles, publishes, and then fails to
+# instantiate with no useful error. See freenet/harvest#8.
+#
+# The UI declares its own chrono WITH defaults: it is browser wasm, not a
+# contract, so wasmbind is correct there.
+chrono = { version = "0.4", default-features = false, features = ["serde", "alloc"] }
 getrandom = { version = "0.2", features = ["custom"] }
 
 # Dioxus UI

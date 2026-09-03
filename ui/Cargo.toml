@@ -51,7 +51,9 @@ aes-gcm = { workspace = true }
 bech32 = "0.11"
 
 # Utilities
-chrono = { workspace = true }
+# Browser wasm, not a contract, so `wasmbind` is correct here -- the workspace
+# default disables it because it makes CONTRACT modules unloadable.
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "wasmbind"] }
 getrandom = { version = "0.2", features = ["js", "wasm-bindgen", "js-sys"], default-features = false }
 
 # Freenet

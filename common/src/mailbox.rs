@@ -109,18 +109,35 @@ pub type MailboxSummary = HashSet<[u8; 24]>;
 pub type MailboxDelta = Vec<EncryptedMessage>;
 
 impl MailboxStateV1 {
-    /// Verify state: no duplicate nonces, all messages within TTL.
-    pub fn verify(&self, now: DateTime<Utc>) -> Result<(), String> {
+    /// A deterministic reference "now" derived from the state itself.
+    ///
+    /// A contract must NOT read the host clock: its verdict has to be a pure
+    /// function of its inputs, or two peers evaluating identical bytes at
+    /// different moments disagree and never converge. `freenet_stdlib::time::now()`
+    /// is deprecated for contracts for exactly this reason and is staged to
+    /// trap (freenet-core#5465).
+    ///
+    /// So TTL is measured against the newest message the mailbox holds, not
+    /// against wall-clock time. Every peer computes the same value from the
+    /// same bytes. The trade is that a mailbox which stops receiving stops
+    /// ageing -- pruning resumes the moment a new message arrives, which is
+    /// also the only moment the size matters.
+    pub fn reference_now(&self) -> Option<DateTime<Utc>> {
+        self.messages.iter().map(|m| m.timestamp).max()
+    }
+
+    /// Verify state: no duplicate nonces.
+    ///
+    /// TTL is deliberately NOT enforced here. It used to be, and it made a
+    /// mailbox permanently invalid the moment any single message aged out:
+    /// `verify` rejected the WHOLE state rather than pruning, so the mailbox
+    /// could never shed anything and never recover. Pruning belongs in
+    /// `apply_delta`, which is where it now lives.
+    pub fn verify(&self) -> Result<(), String> {
         let mut seen_nonces = HashSet::new();
         for msg in &self.messages {
             if !seen_nonces.insert(msg.nonce) {
                 return Err("duplicate message nonce".into());
-            }
-            let age = now.signed_duration_since(msg.timestamp).num_seconds();
-            if age > MESSAGE_TTL_SECS {
-                return Err(format!(
-                    "message older than TTL: {age}s > {MESSAGE_TTL_SECS}s"
-                ));
             }
         }
         Ok(())
@@ -145,11 +162,11 @@ impl MailboxStateV1 {
     }
 
     /// Apply a delta: add new messages, prune expired ones.
-    pub fn apply_delta(
-        &mut self,
-        delta: &Option<MailboxDelta>,
-        now: DateTime<Utc>,
-    ) -> Result<(), String> {
+    ///
+    /// "Expired" is measured against [`Self::reference_now`] -- the newest
+    /// timestamp present once the delta is merged -- not against a host clock,
+    /// so every peer prunes identically from identical bytes.
+    pub fn apply_delta(&mut self, delta: &Option<MailboxDelta>) -> Result<(), String> {
         if let Some(new_messages) = delta {
             let existing_nonces: HashSet<_> = self.messages.iter().map(|m| m.nonce).collect();
 
@@ -157,18 +174,19 @@ impl MailboxStateV1 {
                 if existing_nonces.contains(&msg.nonce) {
                     continue;
                 }
-                // Accept messages within a reasonable time window
-                let age = now.signed_duration_since(msg.timestamp).num_seconds();
-                if age > MESSAGE_TTL_SECS {
-                    continue; // silently drop expired messages
-                }
                 self.messages.push(msg.clone());
             }
         }
 
         // Prune expired messages
-        self.messages
-            .retain(|m| now.signed_duration_since(m.timestamp).num_seconds() <= MESSAGE_TTL_SECS);
+        // Derived after the merge so an incoming message can advance the
+        // reference point, which is what lets a live mailbox shed old entries.
+        let reference = self.reference_now();
+        self.messages.retain(|m| {
+            reference
+                .map(|r| r.signed_duration_since(m.timestamp).num_seconds() <= MESSAGE_TTL_SECS)
+                .unwrap_or(true)
+        });
 
         // Sort deterministically by nonce for CRDT convergence
         self.messages.sort_by(|a, b| a.nonce.cmp(&b.nonce));
@@ -216,5 +234,87 @@ mod tests {
     fn test_unpad_rejects_corrupt_data() {
         assert!(unpad_from_bucket(&[0, 0, 0]).is_err()); // too short
         assert!(unpad_from_bucket(&[255, 255, 0, 0]).is_err()); // length exceeds data
+    }
+}
+
+#[cfg(test)]
+mod determinism_tests {
+    use super::*;
+
+    fn msg(nonce: u8, secs: i64) -> EncryptedMessage {
+        EncryptedMessage {
+            conversation_id: ConversationId([1u8; 32]),
+            sender_public_key: vec![9u8; 32],
+            ciphertext: vec![0u8; 64],
+            timestamp: DateTime::from_timestamp(secs, 0).unwrap(),
+            nonce: [nonce; 24],
+        }
+    }
+
+    /// The property the clock removal exists for: two peers that receive the
+    /// same messages in different orders must end up with byte-identical
+    /// state. With `Utc::now()` they could not -- each read its own wall clock
+    /// and pruned a different set.
+    #[test]
+    fn pruning_is_order_independent() {
+        let base = 1_700_000_000;
+        let old = msg(1, base);
+        let recent = msg(2, base + MESSAGE_TTL_SECS + 10);
+        let newer = msg(3, base + MESSAGE_TTL_SECS + 20);
+
+        let mut a = MailboxStateV1::default();
+        a.apply_delta(&Some(vec![old.clone(), recent.clone(), newer.clone()]))
+            .unwrap();
+
+        let mut b = MailboxStateV1::default();
+        b.apply_delta(&Some(vec![newer, recent, old])).unwrap();
+
+        assert_eq!(
+            crate::to_cbor(&a).unwrap(),
+            crate::to_cbor(&b).unwrap(),
+            "identical messages in a different order must produce identical bytes"
+        );
+    }
+
+    /// TTL still does something: a message older than the window relative to
+    /// the newest one is dropped.
+    #[test]
+    fn messages_older_than_the_window_are_pruned() {
+        let base = 1_700_000_000;
+        let mut m = MailboxStateV1::default();
+        m.apply_delta(&Some(vec![
+            msg(1, base),
+            msg(2, base + MESSAGE_TTL_SECS + 100),
+        ]))
+        .unwrap();
+        assert_eq!(m.messages.len(), 1, "the stale message should be gone");
+        assert_eq!(m.messages[0].nonce, [2u8; 24]);
+    }
+
+    /// A mailbox whose messages all fit the window keeps every one.
+    #[test]
+    fn a_fresh_mailbox_keeps_everything() {
+        let base = 1_700_000_000;
+        let mut m = MailboxStateV1::default();
+        m.apply_delta(&Some(vec![
+            msg(1, base),
+            msg(2, base + 60),
+            msg(3, base + 120),
+        ]))
+        .unwrap();
+        assert_eq!(m.messages.len(), 3);
+    }
+
+    /// The regression that made a mailbox permanently unusable: `verify` used
+    /// to reject the WHOLE state if any single message had aged out, so it
+    /// could never shed anything and never recover.
+    #[test]
+    fn an_old_message_does_not_invalidate_the_whole_mailbox() {
+        let mut m = MailboxStateV1::default();
+        m.messages.push(msg(1, 0)); // epoch: ancient by any measure
+        assert!(
+            m.verify().is_ok(),
+            "an aged message must not make the entire mailbox invalid"
+        );
     }
 }

@@ -244,7 +244,11 @@ fn handle_begin_transaction(
         our_token,
         our_blinded_token,
         blind_signature: None,
-        created_at: Utc::now(),
+        // A delegate MAY read the host clock -- unlike a contract, whose
+        // verdict must be a pure function of its inputs. This uses the host's
+        // clock via the runtime rather than chrono's `wasmbind` backend, which
+        // would make the module unloadable.
+        created_at: freenet_stdlib::time::now(),
     };
 
     let record_bytes = match to_cbor(&record) {
