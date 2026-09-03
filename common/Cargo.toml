@@ -7,6 +7,8 @@ repository.workspace = true
 description = "Shared types for the Harvest decentralized marketplace on Freenet: store/listing/reputation schemas and feedback-token protocol messages."
 
 [dependencies]
+freenet-bitcoin-common = { workspace = true }
+hex = { workspace = true }
 freenet-stdlib = { workspace = true }
 freenet-scaffold = { workspace = true }
 freenet-scaffold-macro = { workspace = true }

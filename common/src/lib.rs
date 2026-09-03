@@ -6,15 +6,23 @@
 
 #![deny(unsafe_code)]
 
+pub mod bitcoin_delegate;
 pub mod delegate;
 pub mod feedback;
 pub mod listing;
 pub mod mailbox;
+pub mod payment;
 pub mod reputation;
 pub mod store;
 pub mod util;
 
 // Re-exports for convenience
+pub use bitcoin_delegate::{
+    BitcoinDelegateRequest, BitcoinDelegateResponse, BridgeAuthMode, BridgeEndpoint, WatchedPayment,
+};
+pub use payment::{
+    AuthorizedOrder, Order, OrderId, OrderPaymentProof, OrderStatus, ProofError,
+};
 pub use delegate::{
     HarvestDelegateRequest, HarvestDelegateResponse, StoreRegistration, TransactionRecord,
 };

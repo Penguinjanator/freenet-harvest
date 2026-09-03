@@ -18,6 +18,11 @@ repository = "https://github.com/freenet/harvest"
 [workspace.dependencies]
 # Internal
 harvest-common = { path = "common" }
+# Local path dependency for the prototype. Switch to a git or crates.io
+# dependency before this leaves one machine -- a path dep does not survive a
+# clone, and CI would fail on it.
+freenet-bitcoin-common = { path = "../freenet-bitcoin/common" }
+hex = "0.4"
 
 # Freenet ecosystem
 freenet-stdlib = { version = "0.6", features = ["contract"] }
