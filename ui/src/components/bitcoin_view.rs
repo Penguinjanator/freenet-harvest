@@ -132,15 +132,23 @@ fn bridge_health(
     network: BitcoinNetwork,
     tip: &Option<TipView>,
 ) -> BridgeHealth {
-    if !bridge_loaded || bridge.is_none() {
-        return if bridge_loaded {
+    // Health is judged on whether CHAIN DATA is arriving, not on whether a
+    // bridge endpoint happens to be configured in the delegate.
+    //
+    // Those are different things: tip data reaches us by subscribing to the
+    // public tip contract, which needs no endpoint and no credential at all.
+    // Judging on the endpoint made the bar report "no bridge configured" while
+    // live blocks were visibly streaming in beside it -- the status
+    // contradicting the data directly under it.
+    //
+    // An endpoint is needed to ask a bridge to START WATCHING a new address,
+    // which is a separate question surfaced at the point the user tries it.
+    let Some(tip) = tip else {
+        return if bridge_loaded && bridge.is_none() {
             BridgeHealth::NotConfigured
         } else {
             BridgeHealth::WaitingForData
         };
-    }
-    let Some(tip) = tip else {
-        return BridgeHealth::WaitingForData;
     };
     let Some(last_block_time) = tip.last_block_time else {
         return BridgeHealth::WaitingForData;
@@ -171,7 +179,7 @@ fn BridgeStatusBar(
     let (dot_class, label) = match health {
         BridgeHealth::NotConfigured => (
             "btc-dot unknown",
-            "No Bitcoin bridge configured for this build yet".to_string(),
+            "No chain data yet -- no bridge is publishing for this network".to_string(),
         ),
         BridgeHealth::WaitingForData => (
             "btc-dot unknown",

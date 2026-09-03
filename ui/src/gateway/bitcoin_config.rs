@@ -20,8 +20,32 @@
 //! yet". So the id is fetched at runtime from the bridge's unauthenticated
 //! `GET /v1/status`, which reports it (see `bitcoin_bridge_http`).
 //!
-//! What CANNOT be discovered at runtime is which bridge to ask in the first
-//! place, so that is the one thing defaulted here.
+//! ## Why runtime discovery over HTTP does NOT work, and this file matters again
+//!
+//! The plan was for the browser to fetch `<bridge>/v1/status` and read the id
+//! from there. **The gateway's Content-Security-Policy forbids it.** A webapp
+//! is served with `connect-src http://127.0.0.1:7509 blob: data:`, so it may
+//! talk to its own gateway and nothing else. The fetch is refused:
+//!
+//! ```text
+//! Refused to connect to 'http://127.0.0.1:8431/v1/status' because it
+//! violates the document's Content Security Policy.
+//! ```
+//!
+//! That is not a bug to route around -- it is the sandbox doing its job. A
+//! Freenet webapp reaches the network through its node, not through arbitrary
+//! HTTP. So the values below are build-time configuration, and the HTTP path
+//! is kept only for a non-gateway context (local `dx serve`) where CSP does
+//! not apply.
+//!
+//! **This is a stopgap and it has the exact staleness problem the constant was
+//! meant to avoid**: a contract rebuild re-keys the tip contract and this file
+//! goes quietly wrong. The durable fix is a POINTER RECORD -- a fixed-address,
+//! author-signed contract naming the current code hash, read over the
+//! WebSocket like any other contract, which is what `freenet-migrate`'s
+//! pointer mechanism exists for and what ghostkeys already does. Until that is
+//! in place, treat the constants below as needing an update whenever
+//! `legacy_contracts.toml` gains an entry.
 
 use freenet_bitcoin_common::BitcoinNetwork;
 
@@ -31,10 +55,12 @@ pub fn well_known_tip_contract_id(network: BitcoinNetwork) -> Option<&'static st
     match network {
         BitcoinNetwork::Bitcoin => None,
         BitcoinNetwork::Testnet4 => None,
-        // Signet is the network a demo bridge would most plausibly run
-        // first (trivial difficulty, no real money at stake) -- still None
-        // until one is actually deployed and this constant is filled in.
-        BitcoinNetwork::Signet => None,
+        // The bridge deployed on nova, observing signet. Derived from
+        // BitcoinTipParameters { network: Signet, trusted_bridges: [that
+        // bridge] } plus the tip contract's code hash.
+        //
+        // Re-derive with: curl -s <bridge>/v1/status
+        BitcoinNetwork::Signet => Some("B24HMUFasG3Yd1EJxfzb3qTPos1tLMiKo5gYiKwaihqT"),
         BitcoinNetwork::Regtest => None,
     }
 }
@@ -69,3 +95,19 @@ pub fn default_network() -> BitcoinNetwork {
 pub fn default_bridge_url() -> &'static str {
     "http://127.0.0.1:8431"
 }
+
+/// Signing key of the bridge whose observations this build accepts.
+///
+/// This is trust policy, not addressing: it says whose signature on a Bitcoin
+/// fact this app will believe. It is deliberately a build-time constant
+/// because changing it changes who you trust, which should never happen
+/// silently at runtime.
+pub const TRUSTED_BRIDGE_ID_BS58: &str = "4MZnDAQWccEWXBUb1wt4iTEkDi6Z2MCcZ9WQN1umRsVL";
+
+/// Code hash of the `BitcoinAddressContract` build this app derives keys from.
+///
+/// Needed to compute a watched address's contract id locally, since the
+/// gateway CSP rules out asking the bridge. Goes stale on any contract
+/// rebuild -- see the module docs on the pointer-record fix.
+pub const ADDRESS_CONTRACT_CODE_HASH_HEX: &str =
+    "3b5f1df28497b1cfb365798cb86fc87a7e45480d47c79e22f09b9f801e95463f";

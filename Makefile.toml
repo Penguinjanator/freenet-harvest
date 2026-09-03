@@ -42,6 +42,9 @@ cd ui && dx build --${BUILD_PROFILE}
 # manually. Path is relative to `ui/` because we cd'd above and the
 # script runs as one shell so the cwd persists.
 cp assets/harvest.css ../target/dx/harvest-ui/${BUILD_PROFILE}/web/public/harvest.css
+# The logo is referenced by harvest.css but dx does not copy it either, so the
+# published app 404s on it. Same class of gap as the CSS.
+cp assets/harvest-logo.svg ../target/dx/harvest-ui/${BUILD_PROFILE}/web/public/harvest-logo.svg
 echo "CSS copied to build output"
 '''
 
