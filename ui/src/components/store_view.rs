@@ -108,6 +108,53 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                     ListingCard { listing: listing.clone() }
                 }
             }
+
+            StoreInvoices { orders: store.orders.clone() }
+        }
+    }
+}
+
+/// The invoices a store has issued, as a buyer sees them.
+///
+/// They are on the store contract and public, which is not an oversight:
+/// decentralized payment verification is impossible unless everyone can see
+/// what was owed and where it was to be paid. That is application semantics
+/// requiring publication, and quite different from publishing a user's private
+/// list of addresses they happen to be interested in -- which Harvest refuses
+/// to do anywhere (see `harvest_common::bitcoin_delegate`).
+///
+/// Every invoice goes through the SAME `OrderCard` the seller's own payments
+/// panel uses, so the per-invoice bridge check travels with it. That check is
+/// the one a buyer most needs and is easiest to leave out of a second copy:
+/// the trusted-bridge set moved onto the order to make rotation possible, so
+/// two invoices from one store may name different observers, and an invoice
+/// whose "Paid" verdict would rest on a stranger's signature has to say so
+/// before the buyer sends anything.
+#[component]
+fn StoreInvoices(orders: Vec<harvest_common::payment::AuthorizedOrder>) -> Element {
+    if orders.is_empty() {
+        return rsx! {};
+    }
+    let mut sorted = orders;
+    sorted.sort_by_key(|o| std::cmp::Reverse(o.order.created_at));
+    let bitcoin = crate::gateway::APP_STATE.read().bitcoin.clone();
+
+    rsx! {
+        div { style: "margin-top: 24px;",
+            h4 { "Invoices" }
+            p { class: "text-muted",
+                "Pay the address shown on an invoice for the exact amount. Anyone can "
+                "check the evidence that settles it, so neither you nor the seller has to "
+                "be taken at their word about the payment."
+            }
+            super::invoice_form::PaymentWatchNote {}
+            for order in sorted.iter() {
+                super::bitcoin_view::OrderCard {
+                    key: "{order.order.id}",
+                    order: order.clone(),
+                    live: super::bitcoin_view::live_address_for_order(&bitcoin, &order.order),
+                }
+            }
         }
     }
 }

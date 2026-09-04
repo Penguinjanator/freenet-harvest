@@ -339,7 +339,7 @@ fn OrdersSection(orders: Vec<AuthorizedOrder>, app_state_snapshot: BitcoinState)
 /// the moment it hits the mempool, well before the store contract's own
 /// `Paid` transition (which needs a fully-formed, sufficiently-confirmed
 /// proof) lands.
-fn live_address_for_order(
+pub(crate) fn live_address_for_order(
     bitcoin: &BitcoinState,
     order: &harvest_common::payment::Order,
 ) -> Option<AddressView> {
@@ -386,8 +386,12 @@ fn short_bridge(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
+/// One invoice, as both the seller's payments panel and a buyer looking at
+/// the store see it. Shared rather than duplicated: the bridge warning below
+/// is the check a buyer has to make before parting with coin, and a second
+/// copy of this card is how one of them ends up without it.
 #[component]
-fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> Element {
+pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> Element {
     let o = &order.order;
     let unrecognised = unrecognised_bridges(o);
     let bridge_note = if o.trusted_bridges.is_empty() {
@@ -431,7 +435,18 @@ fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> Element {
                 span { class: "{status_class}", "{status_text}" }
             }
             p { class: "text-muted", "Order {o.id.short()} · {o.network.as_str()}" }
-            p { class: "seller-id", "{o.payment_address}" }
+            // A readonly input rather than a paragraph, so the address can be
+            // selected and copied without hand-transcribing 42 characters --
+            // the same thing the store share link does, and for the same
+            // reason. A clipboard button is not the alternative it looks like:
+            // the app runs in the gateway's sandboxed iframe, where the
+            // clipboard API is not reliably available, and a copy button that
+            // silently does nothing is worse than a field that visibly works.
+            input {
+                class: "form-input",
+                readonly: true,
+                value: "{o.payment_address}",
+            }
             match bridge_note {
                 BridgeNote::None => rsx! {
                     p { class: "text-warning",

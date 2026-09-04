@@ -325,6 +325,15 @@ fn IdentityCard(
                                 }
                             }
 
+                            // Payments sit under the store they belong to,
+                            // not under the identity: an invoice is issued on
+                            // one store's contract, and a seller with two
+                            // stores has to be able to tell which.
+                            super::invoice_form::StorePayments {
+                                store_contract_id: card.contract_id.clone(),
+                                seller_fingerprint: fp.clone(),
+                            }
+
                             if editing_store() == Some(card.contract_id.clone()) {
                                 StoreDetailsForm {
                                     heading: if card.gap.is_some() { "Publish Store Details" } else { "Edit Store Details" },
