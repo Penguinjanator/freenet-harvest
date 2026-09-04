@@ -35,11 +35,14 @@
 use freenet_stdlib::prelude::{DelegateCtx, DelegateError};
 
 use harvest_common::bitcoin_delegate::{
-    BitcoinDelegateRequest, BitcoinDelegateResponse, BridgeEndpoint, WatchedPayment,
+    BitcoinDelegateRequest, BitcoinDelegateResponse, BridgeEndpoint, DerivedAddress,
+    PaymentXpubStatus, WatchedPayment,
 };
 use harvest_common::{from_cbor, to_cbor, OrderId};
 
 use freenet_bitcoin_common::BitcoinNetwork;
+
+use crate::bip32::{AccountXpub, MAX_ORDER_INDEX};
 
 /// Secret key holding the whole watch list, as CBOR of `Vec<WatchedPayment>`.
 ///
@@ -54,6 +57,25 @@ pub(crate) const BITCOIN_WATCHES_KEY: &[u8] = b"harvest:bitcoin:watches:v1";
 
 /// Secret key holding the configured bridge, as CBOR of `Option<BridgeEndpoint>`.
 pub(crate) const BITCOIN_BRIDGE_KEY: &[u8] = b"harvest:bitcoin:bridge:v1";
+
+/// Secret key holding the seller's payment xpub and derivation counter, as
+/// CBOR of `Option<PaymentXpubStatus>`.
+///
+/// Versioned for the same reason as [`BITCOIN_WATCHES_KEY`]: this crate has no
+/// secret-migration registry, so the version in the key IS the mechanism.
+///
+/// # Why the counter is a secret rather than derived from anything
+///
+/// "Next unused index" cannot be recovered by looking at the network. The
+/// orders a store has issued are public, but they name SCRIPTS, not indices,
+/// and recovering an index from a script means re-deriving forward until one
+/// matches -- which finds the highest index ever USED, not the highest ever
+/// HANDED OUT. Those differ every time an invoice is abandoned after its
+/// address was shown to a buyer, and the difference is exactly an address
+/// reuse. So the counter is authoritative state, and losing it (a delegate
+/// re-key with no export handshake, say) means the seller should set a fresh
+/// xpub rather than resume.
+pub(crate) const BITCOIN_PAYMENT_XPUB_KEY: &[u8] = b"harvest:bitcoin:payment-xpub:v1";
 
 fn load_watches(ctx: &DelegateCtx) -> Vec<WatchedPayment> {
     ctx.get_secret(BITCOIN_WATCHES_KEY)
@@ -77,6 +99,34 @@ fn save_bridge(ctx: &mut DelegateCtx, endpoint: &BridgeEndpoint) {
     if let Ok(bytes) = to_cbor(&Some(endpoint.clone())) {
         ctx.set_secret(BITCOIN_BRIDGE_KEY, &bytes);
     }
+}
+
+fn load_payment_xpub(ctx: &DelegateCtx) -> Option<PaymentXpubStatus> {
+    ctx.get_secret(BITCOIN_PAYMENT_XPUB_KEY)
+        .and_then(|bytes| from_cbor::<Option<PaymentXpubStatus>>(&bytes).ok())
+        .flatten()
+}
+
+/// Persist the xpub record.
+///
+/// The encoding failure is propagated rather than swallowed the way the other
+/// savers swallow theirs, and the difference matters: a dropped watch-list
+/// write costs a watch the user can re-add, but a dropped counter write means
+/// the next derivation hands out the SAME index again -- two invoices on one
+/// address, which is the failure this whole path exists to prevent. So it
+/// turns into a failed derivation rather than an address the caller believes
+/// is fresh.
+///
+/// `DelegateCtx::set_secret` itself returns nothing, so a host that refused
+/// the write is indistinguishable from one that took it. That is a real
+/// residual: it would show up as the same index being handed out twice. There
+/// is no way to detect it from here, and inventing one would mean reading the
+/// secret back, which the same host controls.
+fn save_payment_xpub(ctx: &mut DelegateCtx, status: &PaymentXpubStatus) -> Result<(), String> {
+    let bytes = to_cbor(&Some(status.clone()))
+        .map_err(|e| format!("could not encode the payment key record: {e}"))?;
+    ctx.set_secret(BITCOIN_PAYMENT_XPUB_KEY, &bytes);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +188,64 @@ fn apply_associate_order(
         }
         None => Err("no watch for that network/script -- call Watch first".into()),
     }
+}
+
+/// Validate an account xpub and build the record to store for it.
+///
+/// Resets the counter to 0, deliberately: an index only means anything
+/// relative to the key it derives from, so carrying the old count forward
+/// would skip addresses in the new wallet for no reason. Invoices already
+/// issued are unaffected -- an `Order` names a script, not a key.
+fn apply_set_payment_xpub(
+    xpub: &str,
+    network: BitcoinNetwork,
+) -> Result<PaymentXpubStatus, String> {
+    let account = AccountXpub::parse(xpub)?;
+    if !account.accepts_network(network) {
+        return Err(format!(
+            "that account key is not for {}. Check the network your wallet exported it \
+             for -- a mainnet key here would put real bitcoin on your invoices.",
+            network.as_str()
+        ));
+    }
+    // Derive index 0 now rather than at the first invoice. A key that parses
+    // but cannot derive would otherwise be discovered only when a seller was
+    // halfway through issuing an invoice to a waiting buyer.
+    account.order_address(0, network)?;
+
+    Ok(PaymentXpubStatus {
+        xpub: xpub.trim().to_string(),
+        network,
+        next_index: 0,
+    })
+}
+
+/// Hand out the next address and advance the counter.
+///
+/// Takes `&mut` and mutates BEFORE returning, so an index is consumed by
+/// being handed out rather than by the invoice that asked for it succeeding.
+/// That is the conservative direction: an abandoned invoice burns an index
+/// (harmless, and bounded by the wallet's gap limit), whereas advancing only
+/// on success would re-issue an address that had already been shown to a
+/// buyer.
+fn apply_derive_order_address(status: &mut PaymentXpubStatus) -> Result<DerivedAddress, String> {
+    if status.next_index > MAX_ORDER_INDEX {
+        return Err(
+            "this account key has handed out every address it can. Set a fresh account \
+             key to keep issuing invoices."
+                .to_string(),
+        );
+    }
+    let account = AccountXpub::parse(&status.xpub)?;
+    let index = status.next_index;
+    let (script_pubkey, address) = account.order_address(index, status.network)?;
+    status.next_index = index + 1;
+    Ok(DerivedAddress {
+        index,
+        network: status.network,
+        script_pubkey,
+        address,
+    })
 }
 
 /// Add or refresh a watch because a Harvest order now has a Bitcoin payment
@@ -252,6 +360,42 @@ pub fn handle(
         BitcoinDelegateRequest::GetBridge => BitcoinDelegateResponse::Bridge {
             endpoint: load_bridge(ctx),
         },
+
+        BitcoinDelegateRequest::SetPaymentXpub {
+            request_id,
+            xpub,
+            network,
+        } => {
+            let result = apply_set_payment_xpub(&xpub, network).and_then(|status| {
+                save_payment_xpub(ctx, &status)?;
+                Ok(status)
+            });
+            BitcoinDelegateResponse::PaymentXpubSet { request_id, result }
+        }
+
+        BitcoinDelegateRequest::GetPaymentXpub => BitcoinDelegateResponse::PaymentXpub {
+            status: load_payment_xpub(ctx),
+        },
+
+        BitcoinDelegateRequest::DeriveOrderAddress { request_id } => {
+            let result = match load_payment_xpub(ctx) {
+                None => Err(
+                    "no payment key is set for this store yet. Add your wallet's native \
+                     SegWit account key before issuing an invoice."
+                        .to_string(),
+                ),
+                Some(mut status) => apply_derive_order_address(&mut status).and_then(|derived| {
+                    // Save the advanced counter BEFORE the address leaves
+                    // here. If persisting fails the address is discarded
+                    // rather than returned, because a caller that received it
+                    // may show it to a buyer while the delegate still believes
+                    // the index is unused.
+                    save_payment_xpub(ctx, &status)?;
+                    Ok(derived)
+                }),
+            };
+            BitcoinDelegateResponse::OrderAddress { request_id, result }
+        }
 
         // `BitcoinDelegateRequest` is `#[non_exhaustive]` in harvest-common,
         // so this match must keep a wildcard even though every variant that
@@ -393,6 +537,92 @@ mod tests {
         // there is only one code path, not two with different semantics.
         assert_eq!(watches.len(), 1);
         assert_eq!(watches[0].order_id, Some(order_id));
+    }
+
+    /// The BIP-84 account key for the specification's own test mnemonic,
+    /// re-encoded under the test-network version so it can stand in for a
+    /// seller's signet wallet export.
+    fn signet_vpub() -> String {
+        let mut bytes = bs58::decode(
+            "zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs",
+        )
+        .with_check(None)
+        .into_vec()
+        .expect("the BIP-84 vector must decode");
+        bytes[..4].copy_from_slice(&0x045f_1cf6u32.to_be_bytes());
+        bs58::encode(bytes).with_check().into_string()
+    }
+
+    #[test]
+    fn a_valid_account_key_starts_the_counter_at_zero() {
+        let status = apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet)
+            .expect("a BIP-84 test-network key must be accepted");
+        assert_eq!(status.next_index, 0);
+        assert_eq!(status.network, BitcoinNetwork::Signet);
+    }
+
+    /// The seller's declared network has to agree with the key's own version,
+    /// or a mainnet key gets filed as a signet one and the next invoice asks
+    /// for real bitcoin.
+    #[test]
+    fn a_key_for_the_wrong_network_is_refused() {
+        let err = apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Bitcoin)
+            .expect_err("must refuse");
+        assert!(err.contains("bitcoin"), "unhelpful error: {err}");
+    }
+
+    /// THE property. An index is consumed by being handed out, so no two
+    /// invoices can be given one script -- see `bip32`'s module docs for why
+    /// sharing one would let a single payment settle two orders.
+    #[test]
+    fn each_derivation_consumes_its_index_and_yields_a_new_script() {
+        let mut status =
+            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet).expect("accepted");
+
+        let mut seen = std::collections::HashSet::new();
+        for expected_index in 0..8u32 {
+            let derived = apply_derive_order_address(&mut status).expect("derive");
+            assert_eq!(derived.index, expected_index);
+            assert_eq!(status.next_index, expected_index + 1);
+            assert!(
+                seen.insert(derived.script_pubkey.clone()),
+                "index {expected_index} reused a script"
+            );
+            assert!(derived.address.starts_with("tb1q"), "{}", derived.address);
+        }
+    }
+
+    /// Replacing the key restarts the count: indices only mean anything
+    /// relative to the key they derive from, so carrying the old one forward
+    /// would skip addresses in the new wallet for nothing.
+    #[test]
+    fn setting_a_new_key_restarts_the_counter() {
+        let mut status =
+            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet).expect("accepted");
+        apply_derive_order_address(&mut status).expect("derive");
+        apply_derive_order_address(&mut status).expect("derive");
+        assert_eq!(status.next_index, 2);
+
+        let replaced =
+            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet).expect("accepted");
+        assert_eq!(replaced.next_index, 0);
+    }
+
+    /// Running off the end of public derivation must refuse rather than wrap,
+    /// because wrapping means handing out index 0 a second time.
+    #[test]
+    fn exhausting_the_key_refuses_rather_than_wrapping() {
+        let mut status =
+            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet).expect("accepted");
+        status.next_index = crate::bip32::MAX_ORDER_INDEX + 1;
+
+        let err = apply_derive_order_address(&mut status).expect_err("must refuse");
+        assert!(err.contains("every address"), "unhelpful error: {err}");
+        assert_eq!(
+            status.next_index,
+            crate::bip32::MAX_ORDER_INDEX + 1,
+            "a refused derivation must not advance the counter"
+        );
     }
 
     /// A private label must never end up in anything shaped for the wire to

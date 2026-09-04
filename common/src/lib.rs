@@ -27,7 +27,8 @@ pub mod util;
 
 // Re-exports for convenience
 pub use bitcoin_delegate::{
-    BitcoinDelegateRequest, BitcoinDelegateResponse, BridgeAuthMode, BridgeEndpoint, WatchedPayment,
+    BitcoinDelegateRequest, BitcoinDelegateResponse, BridgeAuthMode, BridgeEndpoint,
+    DerivedAddress, PaymentXpubStatus, WatchedPayment,
 };
 pub use delegate::{
     HarvestDelegateRequest, HarvestDelegateResponse, StoreRegistration, TransactionRecord,

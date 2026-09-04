@@ -1,5 +1,6 @@
 #![allow(unexpected_cfgs)]
 
+mod bip32;
 mod bitcoin;
 mod handlers;
 mod markers;

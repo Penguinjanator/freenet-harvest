@@ -45,6 +45,7 @@ pub(crate) fn all_secret_key_shapes(fp: &str, tx_id: &str) -> Vec<Vec<u8>> {
         TX_INDEX_KEY.to_vec(),
         crate::bitcoin::BITCOIN_WATCHES_KEY.to_vec(),
         crate::bitcoin::BITCOIN_BRIDGE_KEY.to_vec(),
+        crate::bitcoin::BITCOIN_PAYMENT_XPUB_KEY.to_vec(),
         crate::markers::marker_secret_key("v1.store.aa.bb"),
     ]
 }
