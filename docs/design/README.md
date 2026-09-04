@@ -51,3 +51,18 @@ commitments go into "Alice's public record", which is right. The implementation 
 them in the per-store contract, and one ghostkey may create unlimited stores — so a
 buyer counting a seller's outstanding orders sees a fraction of what the bond backs,
 which defeats the exposure cap entirely.
+
+**The block anchor can be backdated.** The explainer argues that a commitment cannot
+be made to look old, "because looking old requires having published early, which is
+exactly the behaviour being forced". This is wrong, and it matters, because the
+complaint window rests on it. A block hash proves a commitment was signed *no earlier*
+than that block — a lower bound only — and every past block hash is public. So a
+seller can anchor a fresh commitment to an old block, have readers close it
+immediately, and read zero exposure while taking orders.
+
+Two rules neutralise it. A buyer pays only if the anchor is within about six blocks of
+the tip. And a *paid* order takes its clock from the payment's own block height, which
+comes from the SPV proof and cannot be forged; the anchor then governs only unpaid
+orders, where backdating merely closes a phantom nobody paid for.
+
+See issue #8 for the full contract topology this implies.
