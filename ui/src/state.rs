@@ -107,12 +107,17 @@ pub struct AppState {
     /// Signature requests sent to the ghostkey delegate and not yet
     /// answered, oldest first.
     ///
-    /// `SignResult` carries no correlation id, so arrival order is the only
-    /// thing tying an answer to its request. A single field could not stay
-    /// correct once two kinds of signature existed: publishing a store signs
-    /// its info, and the seller can start a listing immediately afterwards,
-    /// so both can be outstanding at once and the wrong one would consume the
-    /// answer. A queue keeps them in the order they were asked for.
+    /// A single field could not stay correct once two kinds of signature
+    /// existed: publishing a store signs its info, and the seller can start a
+    /// listing immediately afterwards, so both can be outstanding at once and
+    /// the wrong one would consume the answer.
+    ///
+    /// `SignResult` carries no correlation id, but arrival order is NOT what
+    /// ties an answer to its request -- the scoped payload names the bytes
+    /// that were signed, and `signed_message_bytes` matches on those, so an
+    /// answer that comes back out of order still finds its own request. The
+    /// queue is the collection of what is outstanding, oldest first for
+    /// legibility; it is not the correlation mechanism.
     pub pending_signatures: std::collections::VecDeque<PendingSignature>,
 
     /// Ghostkey certificates by fingerprint, as the delegate reports them.
@@ -1704,12 +1709,21 @@ impl AppState {
     }
 
     /// Ensure the given network's chain-tip contract is subscribed, if we
-    /// know its contract id from a well-known/pinned deployment. See
-    /// `crate::gateway::bitcoin_config` for where that id would come from --
-    /// there is no such deployment today, so this is a no-op. The real
-    /// discovery path is `register_tip_contract_with_id`, driven by the
-    /// bridge's own `/v1/status` self-report (see
-    /// `gateway::bitcoin_bridge_http::refresh_bridge_status`).
+    /// know its contract id from a well-known/pinned deployment.
+    ///
+    /// `crate::gateway::bitcoin_config` supplies that id, and it is no longer
+    /// empty: signet names the tip contract of the bridge deployed on nova,
+    /// so this is a real subscription on that network and a no-op on the
+    /// other three. That constant is a stopgap and goes silently stale on any
+    /// contract rebuild -- see that module's docs, which explain why the
+    /// runtime `/v1/status` lookup this was meant to replace is refused by
+    /// the gateway's content-security policy, and why a pointer record is the
+    /// durable fix.
+    ///
+    /// `register_tip_contract_with_id` is the other entry point, taking an id
+    /// discovered at runtime from the bridge's `/v1/status` self-report (see
+    /// `gateway::bitcoin_bridge_http::refresh_bridge_status`), which works
+    /// under `dx serve` where no CSP applies.
     pub fn register_tip_contract(&mut self, network: BitcoinNetwork) {
         let Some(id_bs58) = crate::gateway::bitcoin_config::well_known_tip_contract_id(network)
         else {
