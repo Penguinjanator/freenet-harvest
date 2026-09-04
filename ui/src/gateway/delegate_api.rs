@@ -51,7 +51,7 @@ pub async fn get_contract(
         info!("GET contract (subscribe={subscribe}): {:?}", contract_key);
 
         let request = ClientRequest::ContractOp(ContractRequest::Get {
-            key: contract_key.clone(),
+            key: *contract_key,
             return_contract_code: false,
             subscribe,
             blocking_subscribe: false,
@@ -92,7 +92,7 @@ pub async fn update_contract(
     #[cfg(target_arch = "wasm32")]
     {
         let request = ClientRequest::ContractOp(ContractRequest::Update {
-            key: contract_key.clone(),
+            key: *contract_key,
             data,
         });
 

@@ -124,8 +124,8 @@ pub async fn create_store_contracts(
         let code = ContractCode::from(wasm.to_vec());
         let params = Parameters::from(params_bytes);
         let wrapped = WrappedContract::new(Arc::new(code), params);
-        let key = wrapped.key().clone();
-        let instance_id = ContractInstanceId::from(key.clone());
+        let key = *wrapped.key();
+        let instance_id = ContractInstanceId::from(key);
         let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(wrapped));
         (container, instance_id, key)
     }

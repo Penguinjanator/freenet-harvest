@@ -74,16 +74,14 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
 fn send_message(_store_contract_id: Vec<u8>, _content: String) {
     #[cfg(target_arch = "wasm32")]
     {
-        use crate::messaging::{EphemeralKeypair, MessageContent, PlaintextMessage};
-        use harvest_common::mailbox::ConversationId;
-
         let store_contract_id = _store_contract_id;
         let content = _content;
 
         wasm_bindgen_futures::spawn_local(async move {
-            // Generate ephemeral keypair for this conversation
-            let keypair = EphemeralKeypair::generate();
-            let our_public = keypair.public_key;
+            // No keypair is generated here yet. Generating one and dropping it
+            // unused only looked like progress -- the ephemeral key has to be
+            // derived against the seller's public key, which is step 1 of the
+            // TODO below, so it belongs with the rest of the flow.
 
             // For now, we need the seller's public key to encrypt.
             // This would come from the store info or a key exchange protocol.

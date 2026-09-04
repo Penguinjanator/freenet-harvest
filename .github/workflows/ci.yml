@@ -43,12 +43,39 @@ jobs:
         run: cargo test --locked --workspace
 
   wasm:
-    name: contracts and delegate build to wasm
+    name: contracts, delegate and UI build to wasm
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install && rustup show
       - uses: Swatinem/rust-cache@v2
+
+      # The UI is a wasm32 artifact too, and until this step nothing in CI
+      # ever compiled it for that target. The native job above builds it for
+      # the host, where every `#[cfg(target_arch = "wasm32")]` block -- which
+      # is most of the UI's actual logic, including all of store creation --
+      # is compiled out and therefore unchecked. A change that breaks the
+      # browser build passed CI green, and so did dead code inside those
+      # blocks: three arguments to `create_store_contracts` were accepted and
+      # silently ignored for as long as the function existed, which is
+      # precisely what `unused_variables` reports and nothing ever ran it.
+      #
+      # Warnings are denied so this cannot rot back into a wall of ignored
+      # output. The one exemption is `clippy::for_kv_map`, which fires on
+      # `common/src/payment.rs` -- `harvest-common` is a path dependency, so
+      # lint flags reach it, and it compiles into the contract WASM where any
+      # edit moves a panic location and re-keys the contract. Exempting the
+      # lint is the cheap half of that trade; editing `common` is not.
+      #
+      # Deliberately not `RUSTFLAGS`: that would apply to the contract build
+      # below, and nothing that can perturb a contract's compilation belongs
+      # anywhere near it.
+      - name: clippy the UI for wasm32
+        run: >
+          cargo clippy --locked -p harvest-ui
+          --target wasm32-unknown-unknown
+          -- -D warnings -A clippy::for_kv_map
+
       - name: install b3sum
         run: command -v b3sum || cargo install b3sum --locked
 
