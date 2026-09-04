@@ -1,0 +1,41 @@
+# Superseded generations of the Harvest mailbox contract.
+#
+# See README.md in this directory for the rules. Oldest first; the CURRENT
+# generation is derived from the WASM this build ships and is never listed
+# here.
+#
+# Instance ids are derived per owner: `BLAKE3(code_hash || cbor(
+# MailboxParameters))`, whose single field is the owner's ghostkey verifying
+# key. Like the store contract and unlike the reputation contract, that makes
+# every generation derivable from the ghostkey alone, with no dependency on
+# the delegate's secrets.
+#
+# The state is a set of encrypted messages deduplicated by nonce, with pruning
+# by a TTL measured against the newest message the mailbox holds. Folding an
+# old generation forward can therefore re-admit a message the successor had
+# already pruned; that is harmless and self-correcting, because `apply_delta`
+# re-runs the same deterministic prune on the folded result.
+
+[[entry]]
+version = "V1"
+description = "First mailbox contract; store creation flow and contract WASM embedding"
+date = "2026-04-16"
+code_hash = "db0b1c286442209e76eb7f507d945803ae9ebf6582e9f1b2714d57d7b03703cc"
+
+[[entry]]
+version = "V2"
+description = "Superseded by the Bitcoin payments work (shared harvest-common is compiled into every contract)"
+date = "2026-09-02"
+code_hash = "a2819d2967e92510d0e1b7a5ece5c2261fbd04f4ec8b4fbdabd6f58d2ff0ea9d"
+
+[[entry]]
+version = "V3"
+description = "Superseded by the chrono wasmbind fix (harvest#8) -- the module built before it could not be instantiated at all"
+date = "2026-09-03"
+code_hash = "99fc27fab5a87d274fb32a5772a4f670cad6821700a7e4c54eaec783c6aa1358"
+
+[[entry]]
+version = "V4"
+description = "Superseded by the freenet-stdlib 0.6 -> 0.8.5 bump taken to adopt freenet-migrate"
+date = "2026-09-04"
+code_hash = "61154e38ca91b5dbf0e4c1c3fa5ad36b4ed56f058dbc8418d20781213e613f4e"

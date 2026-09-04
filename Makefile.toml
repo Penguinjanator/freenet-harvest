@@ -147,3 +147,13 @@ args = ["test", "--workspace"]
 description = "Run clippy on all targets"
 command = "cargo"
 args = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+
+# --- Migration ---
+
+[tasks.code-hashes]
+description = "Print the current code hashes and refuse if one is already recorded as superseded"
+dependencies = ["build-contract-wasm"]
+# The logic lives in a script rather than inline here so CI can run the SAME
+# check without needing cargo-make on the runner. Two copies of a guard drift,
+# and the copy that drifts is the one nobody is watching.
+script = "./scripts/check-code-hashes.sh"

@@ -1,0 +1,41 @@
+# Superseded generations of the Harvest store contract.
+#
+# See README.md in this directory for the rules. Oldest first; the CURRENT
+# generation is derived from the WASM this build ships and is never listed
+# here.
+#
+# Instance ids are derived per seller: `BLAKE3(code_hash || cbor(StoreParameters))`, where the
+# parameters are the seller's ghostkey verifying key plus the (empty / None)
+# Bitcoin defaults `create_store_contracts` publishes with. That makes every
+# generation's store instance derivable from the seller's ghostkey ALONE --
+# the probe does not need the delegate to have survived to find an old store.
+#
+# The state is a `#[composable]` CRDT merged by the contract's own
+# `update_state`, so folding an old generation forward is the same operation
+# the network runs between peers -- not a bespoke merge whose correctness has
+# to be argued separately.
+
+[[entry]]
+version = "V1"
+description = "First store contract; store creation flow and contract WASM embedding"
+date = "2026-04-16"
+code_hash = "4d7ad3c31238a4b7a45095ae8722df52f9931a5362568ed2c63b3f36a96c711d"
+
+[[entry]]
+version = "V2"
+description = "Superseded by the Bitcoin payments work: orders, payment proofs and the trusted-bridge parameters all changed the compiled bytes"
+date = "2026-09-02"
+code_hash = "0227238dccae77ef9f49d06b685fa3fed95fe63b292d7d7a4fa9d6ad3f42caa8"
+
+[[entry]]
+version = "V3"
+description = "Superseded by the chrono wasmbind fix (harvest#8) -- the module built before it imported __wbindgen_placeholder__ and could not be instantiated at all"
+date = "2026-09-03"
+code_hash = "ccc61113e758c463ab03a55612ac28a480c4733e9a82eb961566cf6496205233"
+
+[[entry]]
+version = "V4"
+description = "Superseded by the freenet-stdlib 0.6 -> 0.8.5 bump, taken so freenet-migrate could be adopted at all (0.6 and 0.8 cannot co-link). Built with --remap-path-prefix; V1-V3 were not, which is why their bytes carry absolute paths"
+date = "2026-09-04"
+code_hash = "df0e8dfbc12071b1ab80d1b5c05aa6a9265b9b4141669a740f04f96363118d4a"
+

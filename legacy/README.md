@@ -1,0 +1,41 @@
+# Predecessor generations
+
+A Freenet contract lives at `BLAKE3(BLAKE3(wasm) || parameters)` and a delegate
+at `BLAKE3(BLAKE3(wasm) || parameters)`. **The compiled bytes are the address.**
+Any change to codegen -- a source edit, a direct or transitive dependency bump,
+a rustc upgrade, a `cargo fmt` that moves a panic location -- moves every
+instance to a new address, and the new address starts empty while the user's
+data sits at the old one.
+
+Each file here lists the **superseded** code hashes of one artifact, oldest
+first. `ui/src/migrate.rs` walks them, derives each predecessor's instance id
+from `(code_hash, current parameters)`, probes it, and folds what it finds into
+the current generation.
+
+## Rules
+
+* **Superseded hashes only.** The current generation is derived at runtime from
+  the WASM this build ships and is deliberately never written down -- a
+  hardcoded "current" hash goes stale silently on the next rebuild.
+* **Record the outgoing hash BEFORE rebuilding.** `cargo make code-hashes`
+  prints the current hash; append it here, then rebuild. That task also *fails*
+  if the current hash already appears in a registry, which is the sign that a
+  rebuild happened without the entry being appended.
+* **Never delete a row.** A removed generation is a generation nothing probes.
+* **Verify a hash rather than copying it.** Every hash below was produced by
+  hashing the committed artifact out of git history:
+  `git show <commit>:ui/public/contracts/<artifact>.wasm | b3sum --no-names`.
+  That works because the UI embeds these files with `include_bytes!`, so the
+  committed bytes at a commit *are* the bytes that were deployed from it.
+
+## Why the files live at the repo root, and the codegen in `ui/build.rs`
+
+The probe runs client-side in the UI, so `harvest-ui` is the crate that needs
+the generated consts and the crate whose `build.rs` emits them.
+
+The TOML itself sits at the repo root rather than under `ui/` for one reason
+that matters: `harvest-common` is compiled *into* all three contracts, so
+anything codegen'd there would make **editing a registry re-key every contract
+it describes** -- a migration registry that causes the migration it records.
+The root keeps the registries visibly outside the contract build graph, and
+lets `cargo make code-hashes` and CI read them without reaching into a crate.

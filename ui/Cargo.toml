@@ -58,6 +58,15 @@ getrandom = { version = "0.2", features = ["js", "wasm-bindgen", "js-sys"], defa
 
 # Freenet
 freenet-stdlib = { workspace = true, features = ["net"] }
+# The probe driver and the delegate export/import entry points. "ui" is the
+# native+wasm profile, which is what a browser app wants -- and it keeps the
+# migration logic testable natively, since none of it is behind a wasm gate.
+freenet-migrate = { workspace = true, features = ["ui"] }
 
 [build-dependencies]
 chrono = "0.4"
+# Turns legacy/*.toml into the lineage consts src/migrate.rs walks. Also
+# re-derives each delegate row's key from its code hash and fails the build on
+# a mismatch, so a mistyped registry is a build error rather than a probe that
+# silently targets nothing.
+freenet-migrate-build = "0.2"

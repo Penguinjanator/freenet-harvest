@@ -89,6 +89,20 @@ jobs:
       - name: build contract and delegate wasm
         run: ./scripts/build-contract-wasm.sh
 
+      # The registries under `legacy/` list SUPERSEDED generations only. If a
+      # current hash turns up in one, the lineage no longer describes reality
+      # -- either the entry was added and the artifact never rebuilt, or the
+      # change that moved it was reverted -- and the probe would walk to its
+      # own instance and report a successful migration having moved nothing.
+      # Nothing says so at runtime, which is why it is checked here.
+      #
+      # Runs the same script `cargo make code-hashes` runs, so the check
+      # developers get locally and the check CI enforces cannot drift apart.
+      # It reuses the build above rather than building again: these bytes are
+      # network addresses and there is exactly one build path for them.
+      - name: current code hashes are not recorded as superseded
+        run: ./scripts/check-code-hashes.sh
+
   # WHAT THIS ANSWERS, AND WHY IT IS NOT THE DRIFT GUARD'S QUESTION.
   #
   # `contract-drift.yml` is a RELATIVE check: did this PR move an address

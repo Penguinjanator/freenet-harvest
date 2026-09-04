@@ -1,0 +1,59 @@
+# Superseded generations of the Harvest delegate.
+#
+# See README.md in this directory for the rules. Oldest first; the CURRENT
+# generation is derived from the WASM this build ships and is never listed
+# here.
+#
+# A delegate's secrets live at `secrets_dir/<delegate-key>/` on the node, so a
+# re-key strands EVERY secret this delegate holds: the RSA reputation keypair,
+# the transaction records, the per-identity store registry, and the Bitcoin
+# watch list and bridge config. None of it is on the network, so nothing else
+# can recover it.
+#
+# `delegate_key` is `BLAKE3(code_hash || params)` and Harvest's delegate params
+# are EMPTY (`register_delegate` passes `Parameters::from(Vec::new())`), so the
+# key is `BLAKE3(code_hash)`. It is recorded explicitly rather than derived at
+# runtime because it is the address the old delegate actually had; the build
+# re-derives it and FAILS if a row disagrees, so a typo here is a build error
+# rather than a probe that quietly targets nothing.
+#
+# WHAT THESE ROWS CAN AND CANNOT RECOVER. The export/import handshake needs the
+# PREDECESSOR delegate to answer an export request, and no generation before V5
+# has an export handler -- `handle_request` in V1-V4 rejects any payload that is
+# neither a `HarvestDelegateRequest` nor a `BitcoinDelegateRequest`. So these
+# four rows are recorded for completeness and for the record of what was
+# deployed, and the sweep will classify every one of them `Unresponsive`: it
+# adopts nothing and, correctly, seals nothing, so it retries forever at no
+# cost but recovers nothing. Secrets held under V1-V4 are lost.
+#
+# That is not an argument against recording them. It is the argument for
+# adopting the export handler NOW: from V5 forward a re-key is survivable, and
+# every release that ships without it adds another unrecoverable generation.
+
+[[entry]]
+version = "V1"
+description = "First delegate; RSA blind signing, listing management and transaction state. Also the WASM at ded0e3a -- 4feb95b built it and ded0e3a embedded the same bytes. No export handler, so its secrets are not recoverable"
+date = "2026-04-16"
+code_hash = "1fa5776b332464a22a99ca80d0079cf82120cfc57b195023af8bd6ec8dfd0bfd"
+delegate_key = "832c75e1fd092b41d3d85567307660e15a095e5c29b466fe9657b205ee95eadb"
+
+[[entry]]
+version = "V2"
+description = "Superseded by the Bitcoin payments work: the BitcoinDelegateRequest surface, the watch list and the bridge config. No export handler"
+date = "2026-09-02"
+code_hash = "2f805880b45c83ab25271e0da1e9528ab6a3f7e96dae730e4b5465227654877d"
+delegate_key = "3c0ea2c4e22fa0201c821387afc3f7dcce798775e242f41e77a79b180c4988f3"
+
+[[entry]]
+version = "V3"
+description = "Superseded by the chrono wasmbind fix and the getrandom custom-source registration (harvest#7, harvest#8) -- before those the module did not link or did not instantiate. No export handler"
+date = "2026-09-03"
+code_hash = "ddcecc5b3f1abd49194f103fec424ce6ad38f0ac8359a4bad92d9125ae43085e"
+delegate_key = "b7732bb753f7b2b7a99c175cd548d9c7d75f53091095379f4f7a7d6caa816379"
+
+[[entry]]
+version = "V4"
+description = "Superseded by the freenet-stdlib 0.6 -> 0.8.5 bump taken to adopt freenet-migrate. The last generation with no export handler"
+date = "2026-09-04"
+code_hash = "57b467532105613f28829c0fac8a4d72d0a146593d6d64430892f5ce7009027a"
+delegate_key = "325bcfe3545934d812a613772e06878a3902f09d5c25d2dc32f7f1e111d506d8"
