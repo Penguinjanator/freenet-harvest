@@ -93,8 +93,6 @@ pub enum OrderStatus {
     AwaitingPayment,
     /// A qualifying payment has been proven on chain.
     Paid,
-    /// The seller has marked the order fulfilled.
-    Fulfilled,
     /// A previously-proven payment was reorged out of the chain.
     ///
     /// This exists so a reorg is a forward transition rather than a
@@ -110,13 +108,34 @@ impl OrderStatus {
     /// Rank used to keep status monotonic under merge. A merge takes the
     /// higher rank, so two peers that saw transitions in different orders
     /// still agree.
+    ///
+    /// # The invariant this ordering has to hold
+    ///
+    /// **No status a party can assert by signature may outrank one that is
+    /// evidenced by Bitcoin.** Rank is permanent -- a merge never comes back
+    /// down -- so whatever sits at the top is what the order says forever,
+    /// and putting a self-signed status there hands one party a veto over the
+    /// chain.
+    ///
+    /// There used to be a `Fulfilled` at rank 4, above `PaymentReversed`, and
+    /// it was seller-signed. A seller could therefore bury a genuine reorg
+    /// under a status they issued themselves, and a scammer could mark every
+    /// order fulfilled and read as carrying no outstanding exposure at all --
+    /// which is what the bond in `docs/design/incentive-mechanism.md` is
+    /// measured against. It is deleted rather than demoted: below `Paid` it
+    /// would be unreachable in practice, since it is only ever meaningful
+    /// after payment, and a status that cannot survive its own merge is worse
+    /// than no status.
+    ///
+    /// `Cancelled` is seller-signed too, but it outranks only
+    /// `AwaitingPayment` and is beaten by `Paid`, so a payment always
+    /// overrides a cancellation. That is the right direction.
     pub fn rank(self) -> u8 {
         match self {
             OrderStatus::AwaitingPayment => 0,
             OrderStatus::Cancelled => 1,
             OrderStatus::Paid => 2,
             OrderStatus::PaymentReversed => 3,
-            OrderStatus::Fulfilled => 4,
         }
     }
 }
@@ -469,7 +488,7 @@ pub struct AuthorizedOrder {
     /// Evidence for `Paid` / `PaymentReversed`. Absent while awaiting payment.
     pub payment_proof: Option<OrderPaymentProof>,
     /// Seller's signature over `(order.id, status)` for the transitions only
-    /// the seller may make (`Fulfilled`, `Cancelled`).
+    /// the seller may make -- today just `Cancelled`.
     pub status_scoped_payload: Option<Vec<u8>>,
     pub status_signature: Option<Vec<u8>>,
 }
@@ -547,7 +566,7 @@ impl AuthorizedOrder {
                     Err(e) => Err(format!("reversal evidence invalid: {e}")),
                 }
             }
-            OrderStatus::Fulfilled | OrderStatus::Cancelled => {
+            OrderStatus::Cancelled => {
                 let (sp, sig) = self
                     .status_scoped_payload
                     .as_ref()
@@ -560,6 +579,117 @@ impl AuthorizedOrder {
                     &(self.order.id.clone(), self.status),
                 )
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    /// Who gets to assert a status.
+    #[derive(PartialEq, Debug)]
+    enum Authority {
+        /// The order's initial state; nobody asserts it.
+        Initial,
+        /// A signature from the seller, and nothing else, makes it true.
+        SellerSignature,
+        /// Bridge-signed Bitcoin observations make it true, and any peer can
+        /// check them.
+        BitcoinEvidence,
+    }
+
+    /// The classification `AuthorizedOrder::verify` actually implements.
+    ///
+    /// Written as a `match` on purpose: adding a status to `OrderStatus`
+    /// stops this compiling until somebody decides which side of the line it
+    /// belongs on, which is the decision that was got wrong.
+    fn authority(status: OrderStatus) -> Authority {
+        match status {
+            OrderStatus::AwaitingPayment => Authority::Initial,
+            OrderStatus::Cancelled => Authority::SellerSignature,
+            OrderStatus::Paid | OrderStatus::PaymentReversed => Authority::BitcoinEvidence,
+        }
+    }
+
+    const ALL: [OrderStatus; 4] = [
+        OrderStatus::AwaitingPayment,
+        OrderStatus::Cancelled,
+        OrderStatus::Paid,
+        OrderStatus::PaymentReversed,
+    ];
+
+    /// Rank is a permanent, monotonic maximum under merge, so whichever
+    /// status sits highest is what the order says forever. A status one party
+    /// can assert with their own signature must therefore never outrank one
+    /// evidenced by Bitcoin -- otherwise that party holds a veto over the
+    /// chain.
+    ///
+    /// `Fulfilled` was seller-signed and sat at the very top, above
+    /// `PaymentReversed`, so a seller could bury a genuine reorg under a
+    /// status they issued themselves. It is deleted; this is what stops it
+    /// (or anything like it) coming back.
+    #[test]
+    fn no_seller_signed_status_outranks_a_bitcoin_evidenced_one() {
+        for signed in ALL
+            .iter()
+            .filter(|s| authority(**s) == Authority::SellerSignature)
+        {
+            for evidenced in ALL
+                .iter()
+                .filter(|s| authority(**s) == Authority::BitcoinEvidence)
+            {
+                assert!(
+                    signed.rank() < evidenced.rank(),
+                    "{signed:?} is asserted by the seller's own signature but outranks                      {evidenced:?}, which is evidenced by Bitcoin -- the seller can then                      bury the chain's verdict permanently"
+                );
+            }
+        }
+    }
+
+    /// Ranks must be distinct, or merge's tie-break falls through to raw CBOR
+    /// bytes between two statuses that mean different things.
+    #[test]
+    fn every_status_has_its_own_rank() {
+        let mut ranks: Vec<u8> = ALL.iter().map(|s| s.rank()).collect();
+        ranks.sort_unstable();
+        let before = ranks.len();
+        ranks.dedup();
+        assert_eq!(ranks.len(), before, "two statuses share a rank");
+    }
+
+    /// Deleting a variant is a wire-format change, and the only safe way for
+    /// it to fail is loudly.
+    ///
+    /// Ciborium encodes a fieldless variant as its NAME, not its index, so
+    /// removing `Fulfilled` from the middle of the enum does not renumber
+    /// `PaymentReversed` or `Cancelled` -- old bytes for those still mean
+    /// what they always meant, and old bytes for `Fulfilled` fail to decode
+    /// rather than silently becoming some other status. That distinction is
+    /// the whole safety argument for the deletion, so it is pinned here.
+    #[test]
+    fn a_deleted_status_fails_to_decode_rather_than_becoming_another_one() {
+        let fulfilled = crate::to_cbor(&"Fulfilled").unwrap();
+        assert!(
+            crate::from_cbor::<OrderStatus>(&fulfilled).is_err(),
+            "an order written as Fulfilled must not decode as anything at all"
+        );
+
+        for status in ALL {
+            let bytes = crate::to_cbor(&status).unwrap();
+            assert_eq!(
+                crate::from_cbor::<OrderStatus>(&bytes).unwrap(),
+                status,
+                "{status:?} must round-trip"
+            );
+            // The encoding is the variant's name. If this ever became an
+            // index, deleting a variant would silently reinterpret every
+            // status above it.
+            assert_eq!(
+                bytes,
+                crate::to_cbor(&format!("{status:?}")).unwrap(),
+                "{status:?} must encode as its own name"
+            );
         }
     }
 }

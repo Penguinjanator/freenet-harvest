@@ -284,7 +284,7 @@ fn OrdersSection(orders: Vec<AuthorizedOrder>, app_state_snapshot: BitcoinState)
         .collect();
     let paid: Vec<&AuthorizedOrder> = orders
         .iter()
-        .filter(|o| matches!(o.status, OrderStatus::Paid | OrderStatus::Fulfilled))
+        .filter(|o| o.status == OrderStatus::Paid)
         .collect();
     let other: Vec<&AuthorizedOrder> = orders
         .iter()
@@ -365,7 +365,6 @@ fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> Element {
             _ => ("btc-pill waiting", "Awaiting payment".to_string()),
         },
         OrderStatus::Paid => ("btc-pill paid", "Paid".to_string()),
-        OrderStatus::Fulfilled => ("btc-pill paid", "Fulfilled".to_string()),
         OrderStatus::PaymentReversed => ("btc-pill reversed", "Payment reversed".to_string()),
         OrderStatus::Cancelled => ("btc-pill cancelled", "Cancelled".to_string()),
     };

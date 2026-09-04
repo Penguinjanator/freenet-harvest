@@ -309,8 +309,8 @@ fn merge_order(orders: &mut BTreeMap<OrderId, AuthorizedOrder>, incoming: Author
 /// Drop the least-relevant orders if `orders` is over [`MAX_ORDERS`].
 ///
 /// Priority for keeping an order is, from least to most important: first,
-/// whether its status is terminal (`Fulfilled`, `Cancelled`,
-/// `PaymentReversed` -- nothing further will ever happen to it); second,
+/// whether its status is terminal (`Cancelled`, `PaymentReversed` --
+/// nothing further will ever happen to it); second,
 /// how old it is (`Order::created_at`); third, its id, purely as a
 /// tie-breaker so the ordering is total. Terminal orders are dropped before
 /// any order still awaiting resolution, and within a tier the oldest goes
@@ -329,7 +329,7 @@ fn enforce_order_cap(orders: &mut BTreeMap<OrderId, AuthorizedOrder>) {
         .map(|(id, record)| {
             let terminal = matches!(
                 record.status,
-                OrderStatus::Fulfilled | OrderStatus::Cancelled | OrderStatus::PaymentReversed
+                OrderStatus::Cancelled | OrderStatus::PaymentReversed
             );
             // `!terminal` sorts terminal orders (false) ahead of active ones
             // (true), so they are the first candidates dropped below.
@@ -597,7 +597,7 @@ mod order_tests {
     }
 
     /// Build a fully authorized order: seller-signed terms, and -- for
-    /// `Fulfilled`/`Cancelled` -- a seller-signed status transition too.
+    /// `Cancelled` -- a seller-signed status transition too.
     fn make_authorized_order(
         seller: &SigningKey,
         order: Order,
@@ -606,7 +606,7 @@ mod order_tests {
     ) -> AuthorizedOrder {
         let (scoped_payload, signature) = sign_scoped(seller, &order);
         let (status_scoped_payload, status_signature) = match status {
-            OrderStatus::Fulfilled | OrderStatus::Cancelled => {
+            OrderStatus::Cancelled => {
                 let (sp, sig) = sign_scoped(seller, &(order.id.clone(), status));
                 (Some(sp), Some(sig))
             }
@@ -1044,11 +1044,29 @@ mod order_tests {
                 make_authorized_order(&seller, order_y.clone(), OrderStatus::AwaitingPayment, None),
             ),
         ]);
-        // c: X fulfilled (higher still), Y paid.
+        // c: X's payment reorged out (higher still), Y paid.
+        //
+        // `PaymentReversed` is the top rank now that `Fulfilled` is gone, and
+        // unlike `Fulfilled` it has to carry real evidence -- so this builds a
+        // genuine confirmation-then-retraction pair for X.
+        let (x_confirmed, x_outpoint) =
+            confirmed_claim(&order_x, &bridge, order_x.amount_sats, 100);
+        let x_reversal = OrderPaymentProof::on_chain(
+            vec![
+                x_confirmed,
+                retraction_claim(&order_x, &bridge, x_outpoint, 101),
+            ],
+            signed_tip(&order_x, &bridge, 101),
+        );
         let c = orders_of([
             (
                 order_x.id.clone(),
-                make_authorized_order(&seller, order_x.clone(), OrderStatus::Fulfilled, None),
+                make_authorized_order(
+                    &seller,
+                    order_x.clone(),
+                    OrderStatus::PaymentReversed,
+                    Some(x_reversal),
+                ),
             ),
             (
                 order_y.id.clone(),
@@ -1082,7 +1100,10 @@ mod order_tests {
 
         // And the converged result actually reflects the higher-ranked
         // status for both orders.
-        assert_eq!(ab_c.orders[&order_x.id].status, OrderStatus::Fulfilled);
+        assert_eq!(
+            ab_c.orders[&order_x.id].status,
+            OrderStatus::PaymentReversed
+        );
         assert_eq!(ab_c.orders[&order_y.id].status, OrderStatus::Paid);
     }
 
