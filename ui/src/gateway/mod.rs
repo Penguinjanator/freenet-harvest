@@ -13,7 +13,8 @@ pub mod store_ops;
 
 pub use connection::{connect, ConnectionStatus};
 pub use delegate_api::{
-    get_contract, put_contract, register_delegate, send_delegate_message, update_contract,
+    get_contract, get_contract_by_id, put_contract, register_delegate, send_delegate_message,
+    update_contract,
 };
 
 use dioxus::prelude::*;

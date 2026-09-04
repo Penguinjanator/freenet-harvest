@@ -113,6 +113,20 @@ pub struct BrowsingStore {
     pub mailbox_messages: Vec<EncryptedMessage>,
 }
 
+/// GET-and-subscribe a contract we learned about from a delegate
+/// registration or from another contract's state. Failures are logged rather
+/// than propagated: these are background refreshes, not user actions.
+fn subscribe_in_background(what: &'static str, contract_id: Vec<u8>) {
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = crate::gateway::get_contract_by_id(&contract_id).await {
+            dioxus::logger::tracing::error!("Failed to subscribe to {what} contract: {e}");
+        }
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (what, contract_id);
+}
+
 impl AppState {
     /// Start browsing a store: subscribe to it and prepare state.
     pub fn begin_browsing(&mut self, store_contract_id: Vec<u8>) {
@@ -280,6 +294,35 @@ impl AppState {
                 ghostkey_fingerprint,
                 stores,
             } => {
+                // A store created in this session is already in `my_stores`
+                // but is not necessarily in the delegate's registry yet --
+                // `RegisterStore` and `ListStores` can be in flight at the
+                // same time. Letting an empty answer replace a non-empty
+                // entry would make a brand new store disappear from the UI
+                // moments after it was created, so only an answer that
+                // actually names stores replaces what we already have.
+                if stores.is_empty() {
+                    if let Some(known) = self.my_stores.get(&ghostkey_fingerprint) {
+                        info!(
+                            "Delegate reports no stores for {} -- keeping {} already known",
+                            ghostkey_fingerprint,
+                            known.len()
+                        );
+                        return;
+                    }
+                }
+                info!(
+                    "Delegate reports {} store(s) for {}",
+                    stores.len(),
+                    ghostkey_fingerprint
+                );
+                // Nothing else re-fetches these after a reload: the seller's
+                // own store is subscribed at creation time and never again,
+                // so without this the Browse tab is empty for the very seller
+                // who owns the store.
+                for registration in &stores {
+                    subscribe_in_background("store", registration.store_contract_id.clone());
+                }
                 self.my_stores.insert(ghostkey_fingerprint, stores);
             }
 
@@ -299,6 +342,28 @@ impl AppState {
         match response {
             ghostkey_common::GhostkeyResponse::GhostKeyList { keys } => {
                 info!("Received {} ghostkeys", keys.len());
+
+                // Learning which identities we can act for is the first
+                // moment we can ask the delegate what stores each of them
+                // owns. We can't do this at startup: `ListStores` is
+                // scoped to a fingerprint, and no fingerprint is known
+                // until the vault shares one -- Harvest deliberately does
+                // not call `ListGhostKeys` any more (see the comment in
+                // `components::App`). Without this, `my_stores` stays
+                // empty after every page reload and the seller is offered
+                // "Create Store" for a store they already have.
+                #[cfg(target_arch = "wasm32")]
+                for fingerprint in keys.iter().map(|k| k.fingerprint.clone()) {
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Err(e) =
+                            crate::gateway::store_ops::list_stores(fingerprint.clone()).await
+                        {
+                            dioxus::logger::tracing::error!(
+                                "Failed to list stores for {fingerprint}: {e}"
+                            );
+                        }
+                    });
+                }
                 // If any ghostkey has verifying_key_bytes and we have a pending
                 // store creation for it, fill in the key
                 for key in &keys {

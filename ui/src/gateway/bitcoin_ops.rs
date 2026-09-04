@@ -152,11 +152,7 @@ pub async fn configure_bridge(_endpoint: BridgeEndpoint) -> Result<(), String> {
 /// through the normal response handler, exactly like any other contract.
 #[cfg(target_arch = "wasm32")]
 pub async fn subscribe_contract(contract_id: &[u8]) -> Result<(), String> {
-    let id_bytes: [u8; 32] = contract_id
-        .try_into()
-        .map_err(|_| "contract id must be 32 bytes".to_string())?;
-    let instance_id = freenet_stdlib::prelude::ContractInstanceId::new(id_bytes);
-    super::get_contract(&instance_id, true).await
+    super::get_contract_by_id(contract_id).await
 }
 
 #[cfg(not(target_arch = "wasm32"))]

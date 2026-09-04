@@ -72,6 +72,18 @@ pub async fn get_contract(
     }
 }
 
+/// GET-and-subscribe a contract by its raw 32-byte instance id.
+///
+/// Contract ids reach the UI as `Vec<u8>` -- from delegate registrations and
+/// from other contracts' state -- so this is the one place that checks the
+/// length before turning them into a `ContractInstanceId`.
+pub async fn get_contract_by_id(contract_id: &[u8]) -> Result<(), String> {
+    let id_bytes: [u8; 32] = contract_id
+        .try_into()
+        .map_err(|_| "contract id must be 32 bytes".to_string())?;
+    get_contract(&ContractInstanceId::new(id_bytes), true).await
+}
+
 /// Send a contract update (delta or full state).
 pub async fn update_contract(
     contract_key: &ContractKey,

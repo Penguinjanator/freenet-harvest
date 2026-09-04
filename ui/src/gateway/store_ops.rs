@@ -189,3 +189,36 @@ pub async fn submit_listing_by_id(
     info!("Submitted listing '{}' to store contract", title);
     Ok(())
 }
+
+/// Ask the harvest delegate which stores are registered for a ghostkey
+/// identity.
+///
+/// Registrations live in the delegate's own secret storage, which survives a
+/// page reload; `AppState::my_stores` does not. Without asking, a seller who
+/// refreshes the page is shown "Create Store" again for an identity that
+/// already owns one, with no way back to it -- the store, its listings and
+/// its mailbox are all still on the network, but the UI has forgotten which
+/// contracts they are.
+#[cfg(target_arch = "wasm32")]
+pub async fn list_stores(ghostkey_fingerprint: String) -> Result<(), String> {
+    use dioxus::prelude::ReadableExt;
+
+    let delegate_key = super::APP_STATE
+        .read()
+        .harvest_delegate_key
+        .clone()
+        .ok_or("harvest delegate not registered")?;
+
+    let request = harvest_common::HarvestDelegateRequest::ListStores {
+        ghostkey_fingerprint,
+    };
+    let payload =
+        harvest_common::to_cbor(&request).map_err(|e| format!("serialize ListStores: {e}"))?;
+
+    super::send_delegate_message(&delegate_key, payload).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn list_stores(_ghostkey_fingerprint: String) -> Result<(), String> {
+    Err("delegate messaging requires WASM".into())
+}
