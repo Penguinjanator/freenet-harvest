@@ -21,7 +21,7 @@ harvest-common = { path = "common" }
 # Local path dependency for the prototype. Switch to a git or crates.io
 # dependency before this leaves one machine -- a path dep does not survive a
 # clone, and CI would fail on it.
-freenet-bitcoin-common = { path = "../freenet-bitcoin/common" }
+freenet-bitcoin-common = { git = "https://github.com/freenet/freenet-bitcoin", branch = "main" }
 hex = "0.4"
 
 # Freenet ecosystem
