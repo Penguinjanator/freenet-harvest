@@ -38,8 +38,13 @@ const MAX_ENCODED_LEN: usize = 44;
 /// errors in the network, or that names a contract nobody holds, produces no
 /// response at all, so a timeout is the only thing that ever ends the Browse
 /// tab's "Loading store..." message.
+///
+/// Shared with `state::subscribe_to_own_store`, which needs the same
+/// deadline for the same reason: a store whose state never arrives has to
+/// become a known fact eventually, or "still loading" and "nothing there"
+/// stay indistinguishable forever.
 #[cfg(target_arch = "wasm32")]
-const LINK_LOAD_TIMEOUT_MS: u32 = 30_000;
+pub(crate) const LINK_LOAD_TIMEOUT_MS: u32 = 30_000;
 
 /// Look up `name` in an `a=1&b=2` parameter string, tolerating the leading
 /// `#` or `?` that `location.hash()` / `location.search()` include.

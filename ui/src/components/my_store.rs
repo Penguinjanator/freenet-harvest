@@ -16,6 +16,12 @@ struct StoreCard {
     gap: Option<StoreDetailsGap>,
     /// Current values, to fill the form with when editing.
     details: StoreDetails,
+    /// Whether we actually know what this store has published: its state has
+    /// arrived, or the GET for it gave up. False means the form below would
+    /// be filled with empty strings that look like lost details, and an edit
+    /// submitted from it could not be given a version the contract accepts.
+    /// See `state::AppState::store_details_are_resolved`.
+    details_resolved: bool,
 }
 
 #[component]
@@ -222,6 +228,8 @@ fn IdentityCard(
                             .map(|i| i.payment_instructions.clone())
                             .unwrap_or_default(),
                     },
+                    details_resolved: app_state
+                        .store_details_are_resolved(&store.store_contract_id),
                     contract_id: store.store_contract_id.clone(),
                 })
             })
@@ -276,47 +284,60 @@ fn IdentityCard(
                             }
                         }
 
-                        // The repair prompt. Says what is wrong and what
-                        // publishing fixes, rather than offering a bare form
-                        // and leaving the seller to guess why it is there.
-                        if let Some(gap) = card.gap {
-                            p { class: "text-warning", "{gap.message()}" }
-                        }
-
-                        button {
-                            class: if card.gap.is_some() { "btn btn-sm btn-primary" } else { "btn btn-sm btn-outline" },
-                            onclick: {
-                                let id = card.contract_id.clone();
-                                move |_| {
-                                    let id = id.clone();
-                                    if editing_store() == Some(id.clone()) {
-                                        editing_store.set(None);
-                                    } else {
-                                        editing_store.set(Some(id));
-                                    }
-                                }
-                            },
-                            if editing_store() == Some(card.contract_id.clone()) {
-                                "Cancel"
-                            } else if card.gap.is_some() {
-                                "Publish details"
-                            } else {
-                                "Edit details"
+                        // Nothing is offered until we know what the store
+                        // has published. Before this, the button said "Edit
+                        // details" and the form opened filled with empty
+                        // strings -- which reads as details that have been
+                        // lost, so the seller retypes them, and the edit is
+                        // then published at a version the store contract
+                        // discards as stale.
+                        if !card.details_resolved {
+                            p { class: "text-muted text-italic",
+                                "Loading this store's published details…"
                             }
-                        }
+                        } else {
+                            // The repair prompt. Says what is wrong and what
+                            // publishing fixes, rather than offering a bare form
+                            // and leaving the seller to guess why it is there.
+                            if let Some(gap) = card.gap {
+                                p { class: "text-warning", "{gap.message()}" }
+                            }
 
-                        if editing_store() == Some(card.contract_id.clone()) {
-                            StoreDetailsForm {
-                                heading: if card.gap.is_some() { "Publish Store Details" } else { "Edit Store Details" },
-                                submit_label: "Publish",
-                                initial: card.details.clone(),
-                                on_submit: {
+                            button {
+                                class: if card.gap.is_some() { "btn btn-sm btn-primary" } else { "btn btn-sm btn-outline" },
+                                onclick: {
                                     let id = card.contract_id.clone();
-                                    move |details: StoreDetails| {
-                                        editing_store.set(None);
-                                        publish_store_details(id.clone(), details);
+                                    move |_| {
+                                        let id = id.clone();
+                                        if editing_store() == Some(id.clone()) {
+                                            editing_store.set(None);
+                                        } else {
+                                            editing_store.set(Some(id));
+                                        }
                                     }
                                 },
+                                if editing_store() == Some(card.contract_id.clone()) {
+                                    "Cancel"
+                                } else if card.gap.is_some() {
+                                    "Publish details"
+                                } else {
+                                    "Edit details"
+                                }
+                            }
+
+                            if editing_store() == Some(card.contract_id.clone()) {
+                                StoreDetailsForm {
+                                    heading: if card.gap.is_some() { "Publish Store Details" } else { "Edit Store Details" },
+                                    submit_label: "Publish",
+                                    initial: card.details.clone(),
+                                    on_submit: {
+                                        let id = card.contract_id.clone();
+                                        move |details: StoreDetails| {
+                                            editing_store.set(None);
+                                            publish_store_details(id.clone(), details);
+                                        }
+                                    },
+                                }
                             }
                         }
                     }

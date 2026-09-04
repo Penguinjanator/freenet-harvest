@@ -62,6 +62,28 @@ pub struct AppState {
     /// and each of those re-triggers the reputation follow-on GET too.
     pub subscribed_stores: HashSet<Vec<u8>>,
 
+    /// Stores we asked the gateway for and which never answered, so we know
+    /// nothing is published at that address rather than merely not knowing
+    /// yet.
+    ///
+    /// The distinction is the whole point. `browsing_stores[id].info == None`
+    /// conflates "the GET is still in flight" with "there is nothing there",
+    /// and publishing the seller's details needs a version one past whatever
+    /// is published now -- so treating the first as the second guesses
+    /// version 1 for a store the network may hold at version 5, and the
+    /// contract's last-writer-wins merge drops the edit silently. See
+    /// `publish_store_details`.
+    pub store_state_unavailable: HashSet<Vec<u8>>,
+
+    /// The highest store-info version we have queued for signing per store,
+    /// which the contract has not necessarily accepted yet.
+    ///
+    /// Local state only catches up when the update round-trips, so two edits
+    /// submitted before that happens would both compute the same next
+    /// version and the second would lose to the first. Remembering what we
+    /// asked for closes that window without waiting on the network.
+    pub last_queued_store_version: HashMap<Vec<u8>, u32>,
+
     /// Ghostkey identities available to us. Each successful
     /// `RequestAnyAccess` response merges (deduped by fingerprint) into
     /// this list rather than replacing it, so users can connect a
@@ -448,6 +470,39 @@ fn subscribe_in_background(what: &'static str, contract_id: Vec<u8>) {
     let _ = (what, contract_id);
 }
 
+/// GET-and-subscribe one of the seller's own stores, and record the answer
+/// either way.
+///
+/// Unlike `subscribe_in_background`, a silent failure here is not harmless.
+/// Whether the store's state arrives is what tells `publish_store_details`
+/// which version to publish at, so "no answer" has to become a recorded
+/// conclusion rather than staying indefinitely ambiguous -- otherwise a
+/// store stranded mid-creation could never be repaired, and one that is
+/// merely slow could be overwritten at version 1.
+fn subscribe_to_own_store(contract_id: Vec<u8>) {
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        use dioxus::prelude::WritableExt;
+        if let Err(e) = crate::gateway::get_contract_by_id(&contract_id).await {
+            dioxus::logger::tracing::error!("Failed to subscribe to store contract: {e}");
+            crate::gateway::APP_STATE
+                .write()
+                .note_store_state_unavailable(&contract_id);
+            return;
+        }
+        // `get_contract_by_id` reports only failures to SEND the GET. One
+        // that dead-ends in the network produces no response at all, so a
+        // deadline is the only thing that ever ends the wait -- the same
+        // reasoning, and the same deadline, as a link-opened store.
+        gloo_timers::future::TimeoutFuture::new(crate::store_link::LINK_LOAD_TIMEOUT_MS).await;
+        crate::gateway::APP_STATE
+            .write()
+            .note_store_state_unavailable(&contract_id);
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = contract_id;
+}
+
 impl AppState {
     /// Start browsing a store: prepare its state and make it the store the
     /// Browse tab shows. The caller is responsible for the GET/subscribe.
@@ -570,6 +625,42 @@ impl AppState {
         self.subscribed_stores.insert(store_contract_id.to_vec())
     }
 
+    /// Record that a store's GET went out and nothing came back within the
+    /// deadline, so "no local state" now means "nothing is published there"
+    /// rather than "not yet".
+    ///
+    /// Returns whether the conclusion was recorded. State that arrived while
+    /// the deadline was still running wins: the GET answering late is not a
+    /// failure, and a store that is genuinely there must never be treated as
+    /// empty, because that is exactly what makes an edit publish at version 1
+    /// over a higher version and vanish.
+    pub fn note_store_state_unavailable(&mut self, store_contract_id: &[u8]) -> bool {
+        if self
+            .browsing_stores
+            .get(store_contract_id)
+            .is_some_and(|store| store.info.is_some())
+        {
+            return false;
+        }
+        warn!(
+            "No state came back for store {:?} -- treating it as never published",
+            &store_contract_id[..8.min(store_contract_id.len())]
+        );
+        self.store_state_unavailable
+            .insert(store_contract_id.to_vec())
+    }
+
+    /// Whether the seller's own store details can be shown and edited yet:
+    /// either its state has arrived, or the GET for it gave up. While
+    /// neither is true the form would be filled with empty strings, which
+    /// reads as lost details and invites the seller to retype them.
+    pub fn store_details_are_resolved(&self, store_contract_id: &[u8]) -> bool {
+        self.browsing_stores
+            .get(store_contract_id)
+            .is_some_and(|store| store.info.is_some())
+            || self.store_state_unavailable.contains(store_contract_id)
+    }
+
     /// Record which store a mailbox contract belongs to, and subscribe to the
     /// mailbox so its state actually arrives.
     ///
@@ -661,6 +752,9 @@ impl AppState {
             if self.active_store_id.is_none() {
                 self.active_store_id = Some(contract_id.clone());
             }
+
+            // Whatever we concluded from a timeout, the state is here now.
+            self.store_state_unavailable.remove(&contract_id);
 
             let store = self.browsing_stores.entry(contract_id.clone()).or_default();
             store.info = Some(store_state.info.info);
@@ -789,14 +883,49 @@ impl AppState {
                 )
             })?;
 
-        // One past whatever is published now. A store that has never
-        // published anything is at version 0, so this is 1 -- the first
-        // version the contract actually verifies.
-        let next_version = self
+        // One past whatever is published now -- which means knowing what is
+        // published now, and refusing to guess when we do not.
+        //
+        // `map_or(0, ..)` used to answer "version 0" for a store whose state
+        // had simply not arrived yet, and that is a reachable state, not a
+        // hypothetical: after a reload `my_stores` fills from the local
+        // delegate immediately while store state comes over the network. In
+        // that window the seller saw a form full of empty strings, retyped
+        // their details, and submitted at version 1 -- which
+        // `StoreInfoV1::apply_delta` drops as stale against whatever the
+        // network holds, with `return Ok(())` and no error anywhere. The UI
+        // said "Publishing your store's details…" and the edit was gone.
+        // Retrying recomputed 1 and lost again.
+        let published_version = match self
             .browsing_stores
             .get(store_contract_id)
             .and_then(|store| store.info.as_ref())
-            .map_or(0, |info| info.version)
+        {
+            Some(info) => info.version,
+            // The GET gave up, so there is nothing published to be stale
+            // against. This is the store stranded mid-creation, and it
+            // publishes at version 1 as before.
+            None if self.store_state_unavailable.contains(store_contract_id) => 0,
+            None => {
+                return Err(
+                    "this store's details haven't loaded yet -- publishing now would \
+                            overwrite them with a version the store contract rejects. Try again \
+                            in a moment."
+                        .to_string(),
+                )
+            }
+        };
+
+        // A second edit submitted before the first round-trips would
+        // otherwise recompute the same version and lose to it, since local
+        // state only catches up when the update comes back.
+        let next_version = published_version
+            .max(
+                self.last_queued_store_version
+                    .get(store_contract_id)
+                    .copied()
+                    .unwrap_or(0),
+            )
             .saturating_add(1);
 
         self.pending_store_edit = Some(PendingStoreEdit {
@@ -845,6 +974,13 @@ impl AppState {
             &edit.store_contract_id[..8.min(edit.store_contract_id.len())],
             info.version
         );
+        // Remember what we asked for, so a second edit submitted before this
+        // one round-trips lands past it rather than tying with it.
+        let queued = self
+            .last_queued_store_version
+            .entry(edit.store_contract_id.clone())
+            .or_insert(info.version);
+        *queued = (*queued).max(info.version);
         self.queue_store_info_signature(edit.ghostkey_fingerprint, edit.store_contract_id, info);
         true
     }
@@ -991,7 +1127,7 @@ impl AppState {
                     .unwrap_or_default();
                 for (store_contract_id, mailbox_contract_id) in registrations {
                     if self.note_store_subscribed(&store_contract_id) {
-                        subscribe_in_background("store", store_contract_id.clone());
+                        subscribe_to_own_store(store_contract_id.clone());
                     }
                     self.register_store_mailbox(&store_contract_id, &mailbox_contract_id);
                 }
@@ -2370,11 +2506,92 @@ mod tests {
         assert_eq!(info.store_name, "Bean Shop");
     }
 
-    /// A store stranded mid-creation may have no state locally at all. It
-    /// still publishes at version 1 rather than being skipped.
+    /// "No local state" has two causes and they need opposite answers, which
+    /// is what the version this publishes at depends on.
+    ///
+    /// This is the benign one: the GET for the store ran out of time, so
+    /// nothing is published at that address and version 1 is right. A store
+    /// stranded mid-creation is the case that reaches it.
     #[test]
-    fn a_store_with_no_local_state_still_publishes_at_version_one() {
+    fn a_store_confirmed_to_have_nothing_published_publishes_at_version_one() {
         let mut state = seller_with_store(None);
+        state
+            .certificates
+            .insert(FINGERPRINT.to_string(), "cert".to_string());
+        assert!(state.note_store_state_unavailable(&STORE_ID));
+
+        state
+            .publish_store_details(&STORE_ID, typed_details())
+            .expect("the seller owns this store");
+
+        assert_eq!(
+            queued_store_info(&state).expect("queued").version,
+            1,
+            "nothing published means the next version is the first one"
+        );
+    }
+
+    /// And this is the broken one, which the old test could not tell apart
+    /// from the case above: state that simply has not arrived yet.
+    ///
+    /// After a reload `my_stores` fills from the local delegate immediately
+    /// while store state comes over the network, so the seller saw a form of
+    /// empty strings, retyped their details, and published at version 1 --
+    /// which `StoreInfoV1::apply_delta` drops as stale with `return Ok(())`
+    /// while the UI reported success. Retrying recomputed 1 and lost again.
+    /// Refusing is the only honest answer: we do not know what to publish
+    /// past.
+    #[test]
+    fn an_edit_before_the_store_state_arrives_is_refused_rather_than_guessed() {
+        let mut state = seller_with_store(None);
+        state
+            .certificates
+            .insert(FINGERPRINT.to_string(), "cert".to_string());
+
+        let error = state
+            .publish_store_details(&STORE_ID, typed_details())
+            .expect_err("the version is not knowable yet");
+
+        assert!(
+            error.contains("haven't loaded yet"),
+            "the seller has to be told what to do about it, got: {error}"
+        );
+        assert!(
+            queued_store_info(&state).is_none(),
+            "nothing may be queued for signing at a guessed version"
+        );
+        assert!(
+            state.pending_store_edit.is_none(),
+            "and nothing may be left waiting on a certificate either"
+        );
+    }
+
+    /// State arriving after the deadline fired wins. Treating a store that
+    /// is genuinely there as empty is exactly the failure the refusal above
+    /// exists to prevent, so a late answer has to undo the conclusion.
+    #[test]
+    fn state_arriving_late_overrides_the_deadline_that_gave_up_on_it() {
+        let mut state = seller_with_store(None);
+        state.note_store_state_unavailable(&STORE_ID);
+        assert!(state.store_details_are_resolved(&STORE_ID));
+
+        // The real arrival path, not a hand-set field: whatever the deadline
+        // concluded has to be undone by the state actually landing.
+        let store_state = harvest_common::store::StoreStateV1 {
+            info: harvest_common::store::AuthorizedStoreInfoV1 {
+                info: published_info(4, "Bean Shop", REPUTATION_ID),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        state.on_contract_state(
+            STORE_ID.to_vec(),
+            harvest_common::to_cbor(&store_state).expect("store state encodes"),
+        );
+        assert!(
+            !state.store_state_unavailable.contains(STORE_ID.as_slice()),
+            "state that arrived has to clear the deadline's conclusion"
+        );
         state
             .certificates
             .insert(FINGERPRINT.to_string(), "cert".to_string());
@@ -2385,8 +2602,59 @@ mod tests {
 
         assert_eq!(
             queued_store_info(&state).expect("queued").version,
-            1,
-            "nothing published means the next version is the first one"
+            5,
+            "the version has to come from the state that actually arrived"
+        );
+    }
+
+    /// A store whose state has not arrived offers no edit form at all, so
+    /// the seller never sees empty fields that look like lost details.
+    #[test]
+    fn a_store_is_not_editable_until_we_know_what_it_published() {
+        let mut state = seller_with_store(None);
+        assert!(!state.store_details_are_resolved(&STORE_ID));
+
+        state.note_store_state_unavailable(&STORE_ID);
+        assert!(state.store_details_are_resolved(&STORE_ID));
+
+        let mut arrived = seller_with_store(Some(published_info(1, "Bean Shop", REPUTATION_ID)));
+        assert!(arrived.store_details_are_resolved(&STORE_ID));
+        assert!(
+            !arrived.note_store_state_unavailable(&STORE_ID),
+            "a deadline must not overrule state that already arrived"
+        );
+    }
+
+    /// Local state only catches up when the update round-trips, so a second
+    /// edit submitted before that would recompute the same version and lose
+    /// to the first -- the same silent-discard shape, reachable by an
+    /// impatient double-click.
+    #[test]
+    fn a_second_edit_lands_past_the_first_rather_than_tying_with_it() {
+        let mut state = seller_with_store(Some(published_info(3, "Old Name", REPUTATION_ID)));
+        state
+            .certificates
+            .insert(FINGERPRINT.to_string(), "cert".to_string());
+
+        state
+            .publish_store_details(&STORE_ID, typed_details())
+            .expect("the seller owns this store");
+        state
+            .publish_store_details(&STORE_ID, typed_details())
+            .expect("the seller owns this store");
+
+        let versions: Vec<u32> = state
+            .pending_signatures
+            .iter()
+            .filter_map(|pending| match pending {
+                PendingSignature::StoreInfo(info) => Some(info.info.version),
+                PendingSignature::Listing(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            versions,
+            vec![4, 5],
+            "the second edit has to be past the first, not tied with it"
         );
     }
 
