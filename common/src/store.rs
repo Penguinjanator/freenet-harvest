@@ -976,6 +976,61 @@ mod order_tests {
         assert!(err.contains("still proves payment"), "got: {err}");
     }
 
+    /// **Pins a KNOWN GAP, not desired behaviour.** Invert this test when the
+    /// gap closes -- if it starts failing because someone made the proof
+    /// complete, that is the fix landing, not a regression.
+    ///
+    /// The submitter picks `proof.claims`. Here the same reorg produces two
+    /// bridge-signed claims, and the only difference between "paid" and
+    /// "reversed" is which of them the submitter chose to hand over. Every
+    /// other check passes identically in both cases: the confirmation is
+    /// genuinely signed, genuinely about this script, and genuinely deep
+    /// enough against the supplied tip.
+    ///
+    /// See `OnChainPaymentProof`'s doc comment for why this cannot be closed
+    /// in `verify_on_chain_proof`, in `merge_order`, or via the related
+    /// contract, and for the bridge-signed claim-set commitment that would
+    /// close it.
+    #[test]
+    fn a_withheld_retraction_is_not_currently_detected() {
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let p = params(&seller, &bridge);
+        let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+
+        let (confirmed, outpoint) = confirmed_claim(&order, &bridge, order.amount_sats, 100);
+        let retracted = retraction_claim(&order, &bridge, outpoint, 101);
+        let tip = signed_tip(&order, &bridge, 101);
+
+        // Both claims: the reorg is visible, and the order is reversed.
+        assert_eq!(
+            crate::payment::verify_payment_proof(
+                &order,
+                &OrderPaymentProof::on_chain(vec![confirmed.clone(), retracted], tip.clone()),
+                &p.trusted_bitcoin_bridges,
+            ),
+            Err(crate::payment::ProofError::Reversed),
+        );
+
+        // The retraction withheld, and nothing else changed: the very same
+        // confirmation, against the very same current tip, now validates as a
+        // completed payment.
+        let curated = OrderPaymentProof::on_chain(vec![confirmed], tip);
+        assert_eq!(
+            crate::payment::verify_payment_proof(&order, &curated, &p.trusted_bitcoin_bridges),
+            Ok(order.amount_sats),
+            "KNOWN GAP: omitting the retraction still validates as paid",
+        );
+
+        let record =
+            make_authorized_order(&seller, order.clone(), OrderStatus::Paid, Some(curated));
+        let state = orders_of([(order.id.clone(), record)]);
+        assert!(
+            state.verify(&StoreStateV1::default(), &p).is_ok(),
+            "KNOWN GAP: the contract accepts the curated proof as a paid order",
+        );
+    }
+
     // -----------------------------------------------------------------
     // Merge properties
     // -----------------------------------------------------------------

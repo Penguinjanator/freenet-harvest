@@ -33,6 +33,14 @@
 //! The related contract is therefore used for **discovery and
 //! cross-checking**, never as the thing that can make existing state invalid.
 //!
+//! ### What embedding costs
+//!
+//! Self-containment cuts both ways: the evidence a verifier sees is the
+//! evidence the *submitter chose to send*, and no check inside a pure function
+//! can distinguish a complete claim set from a curated one. That is a real,
+//! currently-open gap, written up on [`OnChainPaymentProof`] along with why it
+//! cannot be closed here and what would close it.
+//!
 //! ## What happens if the payment is later reorged out
 //!
 //! Nothing retroactively invalidates the order, because that would mean state
@@ -191,16 +199,74 @@ impl Order {
 }
 
 /// Bridge-signed evidence that an order's payment reached the *chain*.
+///
+/// # KNOWN GAP: the claim set is chosen by whoever submits it
+///
+/// Everything below is checked: each claim carries a bridge signature over a
+/// body naming this script and an `as_of` chain position, and the verifier
+/// re-runs the same fold the address contract would. What is **not** checked,
+/// and cannot be checked with the evidence this type carries, is whether the
+/// set is *complete*.
+///
+/// A submitter who holds a bridge-signed confirmation from before a reorg and
+/// the bridge-signed retraction that followed it can present the first and
+/// omit the second. Every remaining check passes: the confirmation is
+/// genuinely signed, genuinely about this script, and genuinely deep enough
+/// against the supplied tip. The fold has nothing to fold it against, so the
+/// order validates as `Paid` on a payment that is no longer on the chain.
+///
+/// ## Why it cannot be fixed inside this function
+///
+/// - **The contract may not consult the address contract as an authority.**
+///   That is the convergence argument in this module's header, and it is not
+///   negotiable: related state replicates on its own schedule, so gating on it
+///   would let two peers holding byte-identical state disagree about whether
+///   it is valid. The store contract does fetch it (`validate_state`), but
+///   only ever to log a discrepancy.
+/// - **It cannot be fixed in the merge either**, which is the tempting place,
+///   since `merge_order` holds both records and could demand that a reversal's
+///   claims be a superset of the `Paid` record's. That breaks convergence in
+///   the other direction: a peer that already holds the `Paid` record would
+///   reject what a peer holding only `AwaitingPayment` accepts, and the two
+///   would never agree.
+/// - **A freshness rule is unavailable.** A contract has no clock, so "this
+///   tip is recent" is not a question it can ask.
+///
+/// ## The shape of the real fix
+///
+/// The missing ingredient is a bridge-signed **commitment to the complete
+/// claim set**, which belongs upstream in `freenet-bitcoin` rather than here.
+/// `Claim::ScannedTo` already means "I have published everything I found for
+/// this script as of `as_of`" and carries no payload; giving it a root over
+/// the digests of every claim the bridge holds for that script would make the
+/// assertion checkable. Verification here would then require:
+///
+/// 1. a `ScannedTo` from a trusted bridge whose `as_of.height` is at least the
+///    supplied tip's height -- so a current tip cannot be paired with a stale
+///    claim set, which is precisely the split this attack relies on; and
+/// 2. that recomputing the root over exactly the supplied claims reproduces
+///    the signed one -- so omitting any claim is detectable.
+///
+/// That needs no change to this type's wire format, since `ScannedTo` travels
+/// in `claims` like any other claim. It does not close everything: a submitter
+/// can still present a matched stale pair (old tip AND old set), but then
+/// depth is measured against the old tip, so a reorg shallower than
+/// `required_confirmations` no longer suffices.
+///
+/// Until then, a party acting on `Paid` -- shipping goods, say -- should
+/// cross-check the live `BitcoinAddressContract` in its own client rather than
+/// trusting the embedded proof alone. That check is unavailable to the
+/// contract but perfectly available to an application.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct OnChainPaymentProof {
-    /// Every claim the bridges have published about the qualifying outpoints,
-    /// not merely the winning one.
+    /// The claims the submitter has chosen to present about the qualifying
+    /// outpoints.
     ///
-    /// The whole history is required because a verifier re-runs the same fold
-    /// the submitter did, and a fold given only the favourable subset would
-    /// reach a different — and more optimistic — answer. Handing over just the
-    /// confirmation while withholding a later retraction is exactly the attack
-    /// this defends against.
+    /// The intent is the bridges' whole published history, not merely the
+    /// favourable subset, because the verifier re-runs the same fold the
+    /// address contract would and a fold given a curated subset reaches a more
+    /// optimistic answer. But nothing here can tell a complete set from a
+    /// curated one -- see this type's doc comment.
     pub claims: Vec<SignedClaim>,
     /// A bridge-signed chain tip, so confirmation depth is itself attested
     /// rather than asserted by whoever submitted the proof.
@@ -412,8 +478,10 @@ fn verify_on_chain_proof(
     }
 
     // Re-run exactly the fold the address contract would: group by outpoint,
-    // highest as_of wins. Feeding the full history in is what makes a
-    // withheld retraction impossible to exploit.
+    // highest as_of wins. Note what this does and does not establish: given
+    // the full history it reaches the address contract's own answer, but the
+    // history is whatever the submitter supplied, and a withheld retraction is
+    // invisible here. See `OnChainPaymentProof`'s doc comment.
     let mut by_outpoint: std::collections::BTreeMap<_, Vec<_>> = std::collections::BTreeMap::new();
     for b in &bodies {
         if let Some(op) = b.claim.outpoint() {
