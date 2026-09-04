@@ -11,6 +11,7 @@ pub mod delegate;
 pub mod feedback;
 pub mod listing;
 pub mod mailbox;
+pub mod migration;
 pub mod payment;
 pub mod reputation;
 pub mod store;

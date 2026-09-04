@@ -24,6 +24,30 @@ fn stores_key(fp: &str) -> Vec<u8> {
 }
 const TX_INDEX_KEY: &[u8] = b"harvest:tx_index";
 
+/// Every shape of secret key this delegate writes, for a sample fingerprint
+/// and transaction id.
+///
+/// Exists so `migration`'s tests can assert that all of them fall under the
+/// prefix an export covers. A key builder that stopped starting with
+/// `harvest:` would be silently omitted from every future migration -- no
+/// error, no warning, just a secret that does not arrive -- and nothing else
+/// connects the two.
+///
+/// Keep in step with the builders above and with `crate::bitcoin`'s two
+/// constants.
+#[cfg(test)]
+pub(crate) fn all_secret_key_shapes(fp: &str, tx_id: &str) -> Vec<Vec<u8>> {
+    vec![
+        rsa_sk_key(fp),
+        rsa_pk_key(fp),
+        tx_key(tx_id),
+        stores_key(fp),
+        TX_INDEX_KEY.to_vec(),
+        crate::bitcoin::BITCOIN_WATCHES_KEY.to_vec(),
+        crate::bitcoin::BITCOIN_BRIDGE_KEY.to_vec(),
+    ]
+}
+
 fn load_tx_index(ctx: &DelegateCtx) -> Vec<String> {
     ctx.get_secret(TX_INDEX_KEY)
         .and_then(|bytes| from_cbor(&bytes).ok())

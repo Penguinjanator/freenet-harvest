@@ -2,12 +2,14 @@
 
 mod bitcoin;
 mod handlers;
+mod migration;
 
 use freenet_stdlib::prelude::{
     delegate, ApplicationMessage, DelegateCtx, DelegateError, DelegateInterface,
     InboundDelegateMsg, MessageOrigin, OutboundDelegateMsg, Parameters,
 };
 
+use harvest_common::migration::HarvestMigrationRequest;
 use harvest_common::{
     from_cbor, to_cbor, BitcoinDelegateRequest, HarvestDelegateRequest, HarvestDelegateResponse,
 };
@@ -73,7 +75,7 @@ impl DelegateInterface for HarvestDelegate {
                         "cannot process an already processed message".into(),
                     ));
                 }
-                handle_request(ctx, &app_msg.payload)
+                handle_request(ctx, origin.as_ref(), &app_msg.payload)
             }
 
             // Contract notifications are delivered when a subscribed contract's
@@ -112,8 +114,27 @@ impl DelegateInterface for HarvestDelegate {
 
 fn handle_request(
     ctx: &mut DelegateCtx,
+    origin: Option<&MessageOrigin>,
     payload: &[u8],
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    // A migration export is tried FIRST, and it is the one branch that must
+    // not fall through to the others. It is the only request whose answer is
+    // this delegate's private keys, so it is the only one whose authorization
+    // matters -- and `migration::handle` is where that check lives. Trying it
+    // after a failed decode of something else would still be correct, but
+    // putting it first keeps the security-relevant path at the top rather than
+    // reached by exhaustion.
+    //
+    // The trial decode is sound for the same reason the two below are: all
+    // three enums are externally-tagged, so the variant name is part of the
+    // encoding, and `ExportSecrets` appears in none of the others. A payload
+    // for one fails to decode as another with "unknown variant" rather than
+    // misparsing into the wrong shape. Add a colliding variant name and this
+    // stops being true.
+    if let Ok(request) = from_cbor::<HarvestMigrationRequest>(payload) {
+        return migration::handle(ctx, origin, request);
+    }
+
     // The Bitcoin payment surface (`harvest_common::bitcoin_delegate`) is
     // deliberately NOT folded into `HarvestDelegateRequest`/`Response` as new
     // variants -- that enum is owned by a different, concurrently-edited

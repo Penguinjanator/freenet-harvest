@@ -14,6 +14,11 @@ freenet-main-delegate = []
 harvest-common = { workspace = true }
 freenet-bitcoin-common = { workspace = true }
 freenet-stdlib = { workspace = true }
+# The delegate half: `handle_export_request` plus the origin policy that gates
+# it. Answering a successor's export request is the ONLY way this generation's
+# secrets can ever leave the node, so shipping without it makes this generation
+# permanently unrecoverable -- see src/migration.rs.
+freenet-migrate = { workspace = true, features = ["delegate"] }
 serde = { workspace = true }
 ciborium = { workspace = true }
 chrono = { workspace = true }

@@ -50,10 +50,10 @@ use freenet_bitcoin_common::BitcoinNetwork;
 /// ever changes incompatibly, add a `v2` key, have the loader fall back to
 /// reading `v1` and upgrading it in memory, and write future saves under
 /// `v2` -- don't reuse `v1` for an incompatible shape.
-const BITCOIN_WATCHES_KEY: &[u8] = b"harvest:bitcoin:watches:v1";
+pub(crate) const BITCOIN_WATCHES_KEY: &[u8] = b"harvest:bitcoin:watches:v1";
 
 /// Secret key holding the configured bridge, as CBOR of `Option<BridgeEndpoint>`.
-const BITCOIN_BRIDGE_KEY: &[u8] = b"harvest:bitcoin:bridge:v1";
+pub(crate) const BITCOIN_BRIDGE_KEY: &[u8] = b"harvest:bitcoin:bridge:v1";
 
 fn load_watches(ctx: &DelegateCtx) -> Vec<WatchedPayment> {
     ctx.get_secret(BITCOIN_WATCHES_KEY)
