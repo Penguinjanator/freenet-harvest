@@ -278,6 +278,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             "ddcecc5b3f1abd49194f103fec424ce6ad38f0ac8359a4bad92d9125ae43085e".to_string(),
             "57b467532105613f28829c0fac8a4d72d0a146593d6d64430892f5ce7009027a".to_string(),
             "230c2b581c4fa44de16cd9705413d099dfc5bff0634130907c1b81e0cee05c42".to_string(),
+            // V6, from `git show ea94a33:ui/public/contracts/harvest_delegate.wasm`.
+            // Superseded by moving the migration marker into this delegate's
+            // own secret store.
+            "d6a387917599b8ae3746dd41f7ad45d2cc008adb7f4f98b26156ed66032e4aec".to_string(),
         ],
     );
 }

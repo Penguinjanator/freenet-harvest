@@ -64,3 +64,10 @@ description = "Superseded by the per-order Bitcoin bridge list and the payment-p
 date = "2026-09-04"
 code_hash = "230c2b581c4fa44de16cd9705413d099dfc5bff0634130907c1b81e0cee05c42"
 delegate_key = "ad56614dde8916d635462fe1504f2e2de98f954891f015abdbada28c30754eb6"
+
+[[entry]]
+version = "V6"
+description = "Superseded by moving the migration repeat-gate marker out of the browser's localStorage and into this delegate's own secret store, under `harvest:migrate:` (GetMigrationMarker / SetMigrationMarker). Recorded because the bytes were committed and could have been run, not because they were ever published. Carries the export handler, so its secrets -- markers included -- are recoverable by a successor"
+date = "2026-09-04"
+code_hash = "d6a387917599b8ae3746dd41f7ad45d2cc008adb7f4f98b26156ed66032e4aec"
+delegate_key = "da8d30151f66c8ac6f012cb65460a3b40982a1dac8f6795fe14dc93d1a655d7c"
