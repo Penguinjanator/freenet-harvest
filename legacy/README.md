@@ -23,6 +23,19 @@ falls. **If you edit a parameter struct, that split is part of the change**,
 and skipping it fails silently: every probe comes back `NotFound` and the
 sweep reports a clean migration having looked at addresses that never existed.
 
+CI will now tell you when that happens. `contract-drift.yml` compares the
+derived ADDRESS on both sides of a PR, not just the compiled WASM, so a
+parameters-only change is a red check naming the artifact and the byte counts
+(`56 -> 69 bytes`) instead of nothing at all. It used to be nothing at all:
+both guards compared the WASM, so the `StoreParameters` change above passed
+them both, truthfully, and was caught only because someone measured the CBOR by
+hand. The derivation lives in `common/src/bin/harvest-addresses.rs`, which
+encodes the live parameter structs with the same encoder the app publishes
+with; `cargo make code-hashes` prints the same addresses locally.
+
+Note what the red check does NOT do for you: it says the address moved, and
+the split in `ui/src/migrate.rs` is still yours to write.
+
 ## Rules
 
 * **Superseded hashes only.** The current generation is derived at runtime from

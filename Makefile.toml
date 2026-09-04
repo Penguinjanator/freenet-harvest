@@ -151,7 +151,7 @@ args = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
 # --- Migration ---
 
 [tasks.code-hashes]
-description = "Print the current code hashes and refuse if one is already recorded as superseded"
+description = "Print the current ADDRESSES (code hash + parameters) and refuse if a code hash is already recorded as superseded"
 dependencies = ["build-contract-wasm"]
 # The logic lives in a script rather than inline here so CI can run the SAME
 # check without needing cargo-make on the runner. Two copies of a guard drift,
