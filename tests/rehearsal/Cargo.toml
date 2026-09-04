@@ -1,0 +1,32 @@
+# Deliberately its own workspace: this harness is NOT a member of the Harvest
+# workspace, so building or locking it can never move a dependency version that
+# the contracts compile against -- and therefore can never re-key an artifact.
+[workspace]
+
+[package]
+name = "harvest-migration-rehearsal"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+harvest-common = { path = "../../common" }
+ghostkey-common = "0.3"
+freenet-stdlib = { version = "0.8.5", features = ["net"] }
+freenet-migrate = { version = "0.6", default-features = false, features = ["ui"] }
+freenet-scaffold = "0.2.2"
+ed25519-dalek = { version = "2.1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+blake3 = "1"
+hex = "0.4"
+bs58 = "0.5"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.27"
+futures = "0.3"
+
+[build-dependencies]
+# The same codegen ui/build.rs runs, over the same legacy/*.toml, so the probe
+# here walks the ids the app walks rather than a copy of them.
+freenet-migrate-build = "0.2"
