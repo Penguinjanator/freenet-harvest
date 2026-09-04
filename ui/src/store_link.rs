@@ -107,6 +107,25 @@ fn current_page_url() -> Option<String> {
     None
 }
 
+/// The label shown beside a store's share link.
+///
+/// A seller with more than one store gets one link per store, and the links
+/// are 44 random-looking characters apart -- without a label there is no way
+/// to tell which is which. Prefer the store's own name; fall back to a short
+/// prefix of its contract id, which is what the seller sees elsewhere in the
+/// UI. The fallback is not a rare path today: a store's state may not have
+/// arrived yet, and stores currently carry an empty name.
+pub fn store_label(store_contract_id: &[u8], store_name: Option<&str>) -> String {
+    match store_name.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => name.to_string(),
+        None => {
+            let encoded = bs58::encode(store_contract_id).into_string();
+            let prefix: String = encoded.chars().take(8).collect();
+            format!("Store {prefix}...")
+        }
+    }
+}
+
 /// If this page was opened with a store link, start browsing that store.
 ///
 /// Called once the websocket is up. It deliberately does not wait for the
@@ -206,6 +225,31 @@ mod tests {
         let store = id(5).encode();
         assert!(parse_store_id(&format!("#store={}", &store[..store.len() - 2])).is_none());
         assert!(parse_store_id(&format!("#store={store}{store}")).is_none());
+    }
+
+    #[test]
+    fn a_store_is_labelled_by_its_name_when_it_has_one() {
+        assert_eq!(store_label(&[1u8; 32], Some("Bean Shop")), "Bean Shop");
+    }
+
+    /// Store names are empty today, so this is the path the seller actually
+    /// sees -- it has to identify the store, not read as a bug.
+    #[test]
+    fn a_nameless_store_is_labelled_by_its_id() {
+        let label = store_label(&[1u8; 32], None);
+        let encoded = ContractInstanceId::new([1u8; 32]).encode();
+        assert_eq!(label, format!("Store {}...", &encoded[..8]));
+
+        // Whitespace is not a name either.
+        assert_eq!(store_label(&[1u8; 32], Some("   ")), label);
+        assert_eq!(store_label(&[1u8; 32], Some("")), label);
+    }
+
+    /// Two stores must not get the same label, or labelling them was
+    /// pointless.
+    #[test]
+    fn two_nameless_stores_get_different_labels() {
+        assert_ne!(store_label(&[1u8; 32], None), store_label(&[2u8; 32], None));
     }
 
     /// A link long enough to be a denial of service is refused before it

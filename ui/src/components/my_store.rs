@@ -167,10 +167,36 @@ fn IdentityCard(
     // Buyers can only reach a store through a link the seller sends them, so
     // the seller has to be able to see it. Built here rather than in rsx
     // because it needs the page URL, which native builds don't have.
-    let share_links: Vec<String> = stores
-        .iter()
-        .filter_map(|store| crate::store_link::share_link(&store.store_contract_id))
-        .collect();
+    //
+    // Each link is labelled: a seller with two stores otherwise gets two
+    // 44-character links with nothing to tell them apart.
+    let share_links: Vec<(String, String)> = {
+        let app_state = APP_STATE.read();
+        stores
+            .iter()
+            .filter_map(|store| {
+                if store.store_contract_id.len() != 32 {
+                    // Dropping this silently left the seller a link short
+                    // with no indication which store was missing.
+                    dioxus::logger::tracing::warn!(
+                        "Store registration has a {}-byte contract id, not 32 -- no share link",
+                        store.store_contract_id.len()
+                    );
+                    return None;
+                }
+                let name = app_state
+                    .browsing_stores
+                    .get(&store.store_contract_id)
+                    .and_then(|browsing| browsing.info.as_ref())
+                    .map(|info| info.store_name.clone());
+                let link = crate::store_link::share_link(&store.store_contract_id)?;
+                Some((
+                    crate::store_link::store_label(&store.store_contract_id, name.as_deref()),
+                    link,
+                ))
+            })
+            .collect()
+    };
 
     rsx! {
         div { class: "identity-card",
@@ -209,11 +235,14 @@ fn IdentityCard(
                 p { class: "text-muted",
                     "Share this link so buyers can open your store:"
                 }
-                for link in &share_links {
-                    input {
-                        class: "form-input",
-                        readonly: true,
-                        value: "{link}",
+                for (store_label, link) in &share_links {
+                    div { class: "store-share-row",
+                        span { class: "store-share-label", "{store_label}" }
+                        input {
+                            class: "form-input",
+                            readonly: true,
+                            value: "{link}",
+                        }
                     }
                 }
             }

@@ -520,6 +520,17 @@ h4 {
   font-size: 0.85rem;
 }
 
+.store-share-row + .store-share-row {
+  margin-top: var(--space-xs);
+}
+
+.store-share-label {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
 .identity-name {
   font-family: var(--font-display);
   font-weight: 700;
