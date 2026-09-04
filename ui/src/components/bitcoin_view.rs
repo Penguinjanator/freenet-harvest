@@ -48,9 +48,10 @@ pub fn BitcoinView() -> Element {
 
             div { class: "info-box",
                 p {
-                    "Harvest can prove a Bitcoin payment happened without trusting any one party: "
-                    "a bridge attests what it saw on chain, and anyone can verify the signed evidence. "
-                    "Orders here show real payment status as it confirms on chain."
+                    "A bridge attests what it saw on chain, and anyone can check the signed "
+                    "evidence it carries \u{2014} so neither buyer nor seller has to be taken at "
+                    "their word about a payment. You do have to trust the bridge itself for what "
+                    "is on the chain. Orders here show real payment status as it confirms."
                 }
             }
 

@@ -37,10 +37,15 @@ superseded design, not this one.
 **Lightning is not required.** The explainer states that proof of payment needs a
 Lightning preimage, because "an on-chain Bitcoin payment produces no such secret".
 That was true when it was written. Since then `freenet-bitcoin` has grown a working
-SPV implementation — a pure function verifying a Bitcoin payment from the raw
-transaction, a Merkle branch, and block-header proof-of-work. Combined with the
-unique per-order address each order already gets, an on-chain payment now yields a
-proof with the property the design needs: it cannot exist unless the buyer paid.
+SPV implementation — a pure function checking a claimed Bitcoin payment against the
+raw transaction, a Merkle branch, and the target each block header names. Combined
+with the unique per-order address each order already gets, an on-chain payment now
+yields a proof close enough to what the design needs: it cannot exist unless a
+trusted bridge signed it, and it fixes the amount and destination against a real
+transaction rather than against the bridge's word. It is not trustless — nothing
+anchors a header to Bitcoin, so a trusted bridge could assert a payment that never
+happened — but it does not require the seller's cooperation, which is the property
+the mechanism actually rests on.
 
 What is genuinely lost is that a preimage is *secret* while an on-chain proof is
 *public*, so Lightning additionally protects against a leaked confession. That is a
@@ -62,7 +67,10 @@ immediately, and read zero exposure while taking orders.
 
 Two rules neutralise it. A buyer pays only if the anchor is within about six blocks of
 the tip. And a *paid* order takes its clock from the payment's own block height, which
-comes from the SPV proof and cannot be forged; the anchor then governs only unpaid
-orders, where backdating merely closes a phantom nobody paid for.
+comes from the bridge-signed claim rather than from the seller; the anchor then governs
+only unpaid orders, where backdating merely closes a phantom nobody paid for. Note the
+height is the bridge's assertion, not something the SPV proof establishes — a block
+header does not carry its own height — so this moves the trust from the seller to the
+bridge rather than removing it.
 
 See issue #8 for the full contract topology this implies.

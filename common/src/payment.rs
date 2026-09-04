@@ -11,10 +11,30 @@
 //!
 //! # How an order becomes Paid
 //!
-//! Not by anybody's say-so. The transition carries an [`OrderPaymentProof`]:
-//! the actual bridge-signed Bitcoin observations, plus a bridge-signed chain
-//! tip to measure confirmations against. Any peer can verify it, so any peer
-//! can submit it — the buyer's own client normally does.
+//! Not by the seller's say-so, and not by the buyer's. The transition carries
+//! an [`OrderPaymentProof`]: the actual bridge-signed Bitcoin observations,
+//! plus a bridge-signed chain tip to measure confirmations against. Any peer
+//! can verify it, so any peer can submit it — the buyer's own client normally
+//! does.
+//!
+//! # What the proof is trusted for
+//!
+//! **The bridges named in the order are trusted for chain state.** They assert
+//! which blocks are on Bitcoin, what height each is at, and where the tip is,
+//! and nothing in this verification checks any of that against the network.
+//! Confirmation depth is arithmetic over two of those assertions — the claim's
+//! `anchor.height` and the signed tip's height. A holder of a trusted bridge
+//! key can therefore settle an order that was never paid, which is why the
+//! trusted-bridge list is part of what the seller signs and why the UI flags
+//! bridges the build does not recognise.
+//!
+//! The SPV evidence inside each claim is still doing real work: it fixes the
+//! amount and the destination out of the transaction the txid commits to, and
+//! the claim is bound to this order's script and network. So a bridge cannot
+//! misreport what a real transaction paid, or to whom, and cannot repoint
+//! somebody else's payment at this order. That is defence in depth against a
+//! lying bridge, not a substitute for trusting one — see
+//! `freenet_bitcoin_common::spv` for the boundary in full.
 //!
 //! ## Why the proof is embedded rather than fetched
 //!
@@ -348,7 +368,9 @@ pub struct OnChainPaymentProof {
 ///
 /// **On-chain** payments are publicly observable, so proof is a set of
 /// bridge-signed observations, each carrying SPV evidence a reader checks
-/// against the transaction and the block headers.
+/// against the transaction and the block headers. That check binds the amount
+/// and destination to a real transaction; which blocks are on Bitcoin stays
+/// the bridges' assertion.
 ///
 /// **Lightning** payments are, by design, *not* publicly observable — there is
 /// no on-chain record of a routed payment, so no bridge can watch for one and
@@ -721,7 +743,10 @@ fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u
 /// The order *terms* are signed by the seller: only they may issue an invoice
 /// against their own store. The `Paid` transition is not signed by anybody —
 /// it is authorized by [`OrderPaymentProof`], which any peer can verify, so
-/// nobody has to be trusted to report a payment honestly.
+/// neither party has to be taken at their word about payment.
+///
+/// The order's trusted bridges do have to be taken at their word about chain
+/// state; see this module's docs.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AuthorizedOrder {
     pub order: Order,

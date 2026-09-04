@@ -9,8 +9,14 @@ Bitcoin.
 - Orders in the store contract, with a monotonic status lattice and merge laws
   asserted on exact bytes.
 - `AwaitingPayment → Paid` gated on bridge-signed Bitcoin evidence that any
-  peer re-verifies (raw transaction, Merkle branch, block-header work), not on
-  anyone's say-so.
+  peer re-verifies (raw transaction, Merkle branch, block-header work) rather
+  than on a bare seller signature. The re-verification fixes the amount and the
+  destination out of the transaction the txid commits to, so a bridge cannot
+  misreport what a real transaction paid. **The bridge is trusted for chain
+  state**: nothing anchors a header to Bitcoin, and confirmation depth is
+  arithmetic over the claim's asserted block height and a bridge-signed tip, so
+  a trusted bridge key can assert a payment that never happened. See
+  `freenet-bitcoin`'s `docs/trust-boundaries.md`.
 - The store contract reaches a paid order's `BitcoinAddressContract` through
   Freenet's real related-contract mechanism, respecting the one-round limit —
   as a strictly additive cross-check that can never make valid state invalid.
