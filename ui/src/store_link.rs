@@ -28,6 +28,11 @@ use freenet_stdlib::prelude::ContractInstanceId;
 /// The parameter naming the store to open.
 const STORE_PARAM: &str = "store";
 
+/// bs58 of 32 bytes is 43 or 44 characters. Anything longer cannot be a
+/// contract id, and refusing it before decoding keeps a pathological link
+/// from spending quadratic time in `bs58::decode`.
+const MAX_ENCODED_LEN: usize = 44;
+
 /// How long a linked store has to arrive before the user is told it could not
 /// be opened. `get_contract` reports only failures to *send* the GET; one that
 /// errors in the network, or that names a contract nobody holds, produces no
@@ -57,6 +62,9 @@ fn param<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
 /// nothing, not something else.
 pub fn parse_store_id(raw: &str) -> Option<ContractInstanceId> {
     let encoded = param(raw, STORE_PARAM)?;
+    if encoded.len() > MAX_ENCODED_LEN {
+        return None;
+    }
     let bytes: [u8; 32] = bs58::decode(encoded).into_vec().ok()?.try_into().ok()?;
     Some(ContractInstanceId::new(bytes))
 }
@@ -198,6 +206,18 @@ mod tests {
         let store = id(5).encode();
         assert!(parse_store_id(&format!("#store={}", &store[..store.len() - 2])).is_none());
         assert!(parse_store_id(&format!("#store={store}{store}")).is_none());
+    }
+
+    /// A link long enough to be a denial of service is refused before it
+    /// reaches `bs58::decode`, which is quadratic in the input length.
+    #[test]
+    fn rejects_an_absurdly_long_id_without_decoding_it() {
+        let padding = "1".repeat(100_000);
+        assert!(parse_store_id(&format!("#store={padding}")).is_none());
+        // The longest id that is still worth decoding is accepted.
+        let store = id(1);
+        assert!(store.encode().len() <= MAX_ENCODED_LEN);
+        assert_eq!(parse_store_id(&format!("#store={store}")), Some(store));
     }
 
     #[test]
