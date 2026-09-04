@@ -394,6 +394,7 @@ fn initiate_store_creation(_fingerprint: String, _details: StoreDetails) {
                 store_name: details.store_name,
                 description: details.description,
                 payment_instructions: details.payment_instructions,
+                rsa_public_key_der: None,
             });
 
             // Step 1: Request the ghostkey certificate to get the verifying key

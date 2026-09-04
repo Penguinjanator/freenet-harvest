@@ -105,15 +105,63 @@ pub struct AppState {
     pub bitcoin: BitcoinState,
 }
 
-/// Details for a store being created, waiting for RSA key generation.
+/// Details for a store being created, waiting on the two delegate responses
+/// that supply the rest of its inputs. See `start_store_creation_if_ready`.
 #[derive(Clone, Debug)]
 pub struct PendingStoreCreation {
     pub ghostkey_fingerprint: String,
     pub seller_verifying_key_bytes: [u8; 32],
+    /// Filled by the ghostkey delegate's `Certificate` (or `GhostKeyDetail`)
+    /// response. Empty until it arrives.
     pub certificate_pem: String,
     pub store_name: String,
     pub description: String,
     pub payment_instructions: String,
+    /// Filled by the harvest delegate's `ReputationKeysInitialized` response.
+    /// `None` until it arrives.
+    pub rsa_public_key_der: Option<Vec<u8>>,
+}
+
+/// Publish the three contracts of a store whose inputs are all present.
+///
+/// Split out of `AppState::start_store_creation_if_ready` so the gate itself
+/// compiles and is testable off-target: everything below here needs a browser.
+#[cfg(target_arch = "wasm32")]
+fn spawn_store_creation(pending: PendingStoreCreation) {
+    let PendingStoreCreation {
+        ghostkey_fingerprint,
+        seller_verifying_key_bytes,
+        certificate_pem,
+        store_name,
+        description,
+        payment_instructions,
+        rsa_public_key_der,
+    } = pending;
+    // The gate only releases once this is `Some`; treat it as a no-op rather
+    // than a panic if that ever stops being true.
+    let Some(rsa_public_key_der) = rsa_public_key_der else {
+        return;
+    };
+
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = crate::gateway::store_ops::create_store_contracts(
+            ghostkey_fingerprint,
+            seller_verifying_key_bytes,
+            rsa_public_key_der,
+            certificate_pem,
+            store_name,
+            description,
+            payment_instructions,
+        )
+        .await
+        {
+            dioxus::logger::tracing::error!("Store creation failed: {}", e);
+            crate::gateway::APP_STATE
+                .write()
+                .notifications
+                .push(format!("Store creation failed: {e}"));
+        }
+    });
 }
 
 /// Something waiting on the ghostkey delegate's `SignResult`.
@@ -461,6 +509,54 @@ impl AppState {
         );
     }
 
+    /// Publish a new store's contracts, once every input creation needs has
+    /// arrived.
+    ///
+    /// `initiate_store_creation` fires two requests together -- `GetCertificate`
+    /// to the ghostkey delegate and `InitReputationKeys` to the harvest
+    /// delegate -- and the two answer independently, in whichever order they
+    /// happen to. So neither response can assume it is the last one, and the
+    /// decision to proceed belongs here rather than in either handler.
+    ///
+    /// Before this gate, `ReputationKeysInitialized` took the pending creation
+    /// and went ahead on its own. A certificate arriving second was then
+    /// written into a slot already emptied, and silently discarded: the store
+    /// published with an empty `certificate_pem`, leaving a buyer no trust
+    /// chain to check the seller against. That was already wrong for the
+    /// reputation contract; it became worse once the certificate started
+    /// travelling inside the *signed* `StoreInfoV1`, where correcting it means
+    /// a fresh signature rather than an edit.
+    ///
+    /// Waiting is the safe direction. Every response that means the
+    /// certificate will never arrive -- `Error`, `AccessDenied`,
+    /// `NoIdentityAvailable`, `PermissionDenied` -- already clears
+    /// `pending_store_creation` and tells the user, so this cannot leave a
+    /// creation waiting forever on an answer that is not coming.
+    fn start_store_creation_if_ready(&mut self) {
+        let ready = matches!(
+            self.pending_store_creation.as_ref(),
+            Some(pending)
+                if !pending.certificate_pem.is_empty()
+                    && pending.rsa_public_key_der.is_some()
+        );
+        if !ready {
+            return;
+        }
+        let Some(pending) = self.pending_store_creation.take() else {
+            return;
+        };
+
+        info!(
+            "Store creation inputs complete for {} -- publishing contracts",
+            pending.ghostkey_fingerprint
+        );
+
+        #[cfg(target_arch = "wasm32")]
+        spawn_store_creation(pending);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = pending;
+    }
+
     /// Handle a response from the harvest delegate.
     pub fn on_delegate_response(&mut self, response: HarvestDelegateResponse) {
         match response {
@@ -472,37 +568,12 @@ impl AppState {
                 self.rsa_public_keys
                     .insert(ghostkey_fingerprint.clone(), rsa_public_key_der.clone());
 
-                // If we have a pending store creation for this fingerprint,
-                // trigger the contract creation flow
-                if let Some(pending) = self.pending_store_creation.take() {
+                if let Some(pending) = self.pending_store_creation.as_mut() {
                     if pending.ghostkey_fingerprint == ghostkey_fingerprint {
-                        #[cfg(target_arch = "wasm32")]
-                        {
-                            wasm_bindgen_futures::spawn_local(async move {
-                                if let Err(e) = crate::gateway::store_ops::create_store_contracts(
-                                    pending.ghostkey_fingerprint,
-                                    pending.seller_verifying_key_bytes,
-                                    rsa_public_key_der,
-                                    pending.certificate_pem,
-                                    pending.store_name,
-                                    pending.description,
-                                    pending.payment_instructions,
-                                )
-                                .await
-                                {
-                                    dioxus::logger::tracing::error!("Store creation failed: {}", e);
-                                    crate::gateway::APP_STATE
-                                        .write()
-                                        .notifications
-                                        .push(format!("Store creation failed: {e}"));
-                                }
-                            });
-                        }
-                    } else {
-                        // Wrong fingerprint -- put it back
-                        self.pending_store_creation = Some(pending);
+                        pending.rsa_public_key_der = Some(rsa_public_key_der);
                     }
                 }
+                self.start_store_creation_if_ready();
             }
 
             HarvestDelegateResponse::RsaPublicKey {
@@ -730,6 +801,7 @@ impl AppState {
                         info!("Updated pending store creation with certificate");
                     }
                 }
+                self.start_store_creation_if_ready();
             }
 
             ghostkey_common::GhostkeyResponse::GhostKeyDetail {
@@ -744,6 +816,7 @@ impl AppState {
                         pending.certificate_pem = certificate_pem;
                     }
                 }
+                self.start_store_creation_if_ready();
             }
 
             ghostkey_common::GhostkeyResponse::Error { message } => {
@@ -1434,6 +1507,115 @@ mod tests {
         let mut state = AppState::default();
         state.on_ghostkey_response(sign_result());
         assert!(state.signed_listings_ready.is_empty());
+    }
+
+    fn pending_creation() -> PendingStoreCreation {
+        PendingStoreCreation {
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            seller_verifying_key_bytes: [7u8; 32],
+            certificate_pem: String::new(),
+            store_name: "Bean Shop".to_string(),
+            description: String::new(),
+            payment_instructions: String::new(),
+            rsa_public_key_der: None,
+        }
+    }
+
+    fn rsa_keys_initialized(fingerprint: &str) -> HarvestDelegateResponse {
+        HarvestDelegateResponse::ReputationKeysInitialized {
+            ghostkey_fingerprint: fingerprint.to_string(),
+            rsa_public_key_der: vec![9u8; 8],
+        }
+    }
+
+    fn certificate(fingerprint: &str) -> ghostkey_common::GhostkeyResponse {
+        ghostkey_common::GhostkeyResponse::Certificate {
+            fingerprint: fingerprint.to_string(),
+            certificate_pem: "-----BEGIN CERT-----".to_string(),
+        }
+    }
+
+    /// A seller who has asked to create a store, with neither delegate
+    /// answer in yet.
+    fn state_awaiting_creation() -> AppState {
+        AppState {
+            pending_store_creation: Some(pending_creation()),
+            ..AppState::default()
+        }
+    }
+
+    /// The race this exists to close. `initiate_store_creation` asks the
+    /// ghostkey delegate for the certificate and the harvest delegate for the
+    /// RSA key at the same time, and they answer independently. The RSA
+    /// answer used to take the pending creation and publish immediately, so a
+    /// certificate arriving second was written into a slot that was already
+    /// empty and thrown away -- and the store went onto the network with no
+    /// certificate for a buyer to check the seller against.
+    ///
+    /// The RSA answer must therefore leave the creation waiting.
+    #[test]
+    fn the_rsa_key_alone_does_not_start_store_creation() {
+        let mut state = state_awaiting_creation();
+
+        state.on_delegate_response(rsa_keys_initialized(FINGERPRINT));
+
+        let pending = state
+            .pending_store_creation
+            .as_ref()
+            .expect("creation must wait for the certificate, not publish without it");
+        assert!(pending.certificate_pem.is_empty());
+        assert!(pending.rsa_public_key_der.is_some(), "the key was recorded");
+    }
+
+    /// The certificate landing second completes the inputs and releases the
+    /// creation -- carrying the certificate with it, which is the whole point.
+    #[test]
+    fn the_certificate_arriving_second_is_not_lost() {
+        let mut state = state_awaiting_creation();
+
+        state.on_delegate_response(rsa_keys_initialized(FINGERPRINT));
+        assert!(state.pending_store_creation.is_some());
+
+        state.on_ghostkey_response(certificate(FINGERPRINT));
+
+        assert!(
+            state.pending_store_creation.is_none(),
+            "both inputs are present, so creation must have started"
+        );
+    }
+
+    /// And the other order works too: neither response is privileged, so
+    /// whichever lands second is the one that releases the creation.
+    #[test]
+    fn the_rsa_key_arriving_second_is_not_lost() {
+        let mut state = state_awaiting_creation();
+
+        state.on_ghostkey_response(certificate(FINGERPRINT));
+        let pending = state
+            .pending_store_creation
+            .as_ref()
+            .expect("creation must wait for the RSA key");
+        assert!(!pending.certificate_pem.is_empty(), "the cert was recorded");
+
+        state.on_delegate_response(rsa_keys_initialized(FINGERPRINT));
+        assert!(state.pending_store_creation.is_none());
+    }
+
+    /// Both answers name a fingerprint, and an answer for a different
+    /// identity must not complete this creation's inputs.
+    #[test]
+    fn another_identitys_answers_do_not_start_this_creation() {
+        let mut state = state_awaiting_creation();
+
+        state.on_delegate_response(rsa_keys_initialized("someone-else"));
+        state.on_ghostkey_response(certificate("someone-else"));
+
+        let pending = state
+            .pending_store_creation
+            .as_ref()
+            .expect("this creation is still waiting on its own answers");
+        assert!(pending.certificate_pem.is_empty());
+        assert!(pending.rsa_public_key_der.is_none());
     }
 
     /// A delegate error or a denied prompt invalidates everything queued --
