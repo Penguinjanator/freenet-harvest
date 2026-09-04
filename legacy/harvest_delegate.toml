@@ -20,15 +20,18 @@
 # WHAT THESE ROWS CAN AND CANNOT RECOVER. The export/import handshake needs the
 # PREDECESSOR delegate to answer an export request, and no generation before V5
 # has an export handler -- `handle_request` in V1-V4 rejects any payload that is
-# neither a `HarvestDelegateRequest` nor a `BitcoinDelegateRequest`. So these
-# four rows are recorded for completeness and for the record of what was
+# neither a `HarvestDelegateRequest` nor a `BitcoinDelegateRequest`. So the
+# V1-V4 rows are recorded for completeness and for the record of what was
 # deployed, and the sweep will classify every one of them `Unresponsive`: it
 # adopts nothing and, correctly, seals nothing, so it retries forever at no
 # cost but recovers nothing. Secrets held under V1-V4 are lost.
 #
-# That is not an argument against recording them. It is the argument for
-# adopting the export handler NOW: from V5 forward a re-key is survivable, and
-# every release that ships without it adds another unrecoverable generation.
+# From V5 on a re-key IS survivable, which is why adopting the export handler
+# was worth doing rather than deferring: every generation recorded since is one
+# whose secrets a successor can ask for. Keep it that way -- a release that
+# ships without it adds another unrecoverable generation, and from V7 the cost
+# of losing one includes the Bitcoin derivation counter, whose loss means an
+# address handed out twice (see that row).
 
 [[entry]]
 version = "V1"
@@ -71,3 +74,10 @@ description = "Superseded by moving the migration repeat-gate marker out of the 
 date = "2026-09-04"
 code_hash = "d6a387917599b8ae3746dd41f7ad45d2cc008adb7f4f98b26156ed66032e4aec"
 delegate_key = "da8d30151f66c8ac6f012cb65460a3b40982a1dac8f6795fe14dc93d1a655d7c"
+
+[[entry]]
+version = "V7"
+description = "Superseded by the per-order Bitcoin payment address: the successor gained the BIP-84 public-derivation module and a new secret, `harvest:bitcoin:payment-xpub:v1`, holding the seller's account key AND its derivation counter. Carries the export handler, which matters more here than usual: that counter cannot be recovered from anywhere else. The orders a store has issued are public but they name SCRIPTS, not indices, so re-deriving forward finds the highest index ever USED rather than the highest ever HANDED OUT -- and the gap between those is exactly an address issued twice"
+date = "2026-09-04"
+code_hash = "f6d6543524d359f54379bd9b0d79f5106a72d1d205b44b04f6375db74fde7e91"
+delegate_key = "50c46d944bf7acb8ca4a947da6583bff3870bbf584ef0146869678e089c1dfc8"

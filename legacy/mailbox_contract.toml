@@ -45,3 +45,9 @@ version = "V5"
 description = "Superseded by the per-order Bitcoin bridge list and the payment-proof claim bounds. Both changes are in `harvest-common`, which is compiled into every artifact here, so the bytes moved. Nothing this contract itself does changed"
 date = "2026-09-04"
 code_hash = "a00fd23796d2d87c6652749ac2365a94bf060f27f5fbe5e70929cc6635c19433"
+
+[[entry]]
+version = "V6"
+description = "Superseded by the per-order Bitcoin payment address: `harvest-common` gained the payment-xpub and order-address surface on `BitcoinDelegateRequest`, and it is compiled into every artifact here, so the bytes moved. Nothing this contract itself does changed"
+date = "2026-09-04"
+code_hash = "e49cb3038b321a895850adcf594e09b6a5a698b7ba469a991a529910493628dc"

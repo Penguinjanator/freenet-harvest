@@ -229,6 +229,9 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 "ccc61113e758c463ab03a55612ac28a480c4733e9a82eb961566cf6496205233",
                 "df0e8dfbc12071b1ab80d1b5c05aa6a9265b9b4141669a740f04f96363118d4a",
                 "186f7784628f0f773dd711c91a35d822e2f1111fe052328227f924977df2d2c0",
+                // V6, from `git show 94a3fd1:ui/public/contracts/store_contract.wasm`.
+                // Superseded by the per-order Bitcoin payment address.
+                "9add809b5af3b735114e0683fac23a459a1d3dde447cf4f921ced9a0719611cf",
             ],
         ),
         (
@@ -239,6 +242,8 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 "7f345c69a800288fe2eb649319cf9b34587953f8161976cc412ab4d308ad35da",
                 "c9a939f9a93648f1571193228ccd2fd8331a9970f7c3d934b5b0d646f8cae2ca",
                 "5c4d0eec19bf023c32c1723fc6676e43ecc1638922e952ab06c572b407350750",
+                // V6, from `git show 94a3fd1:ui/public/contracts/reputation_contract.wasm`.
+                "fd91d10d8100cec85ce5719290b57b2c56908352c31f5038fe0e78168eca9f35",
             ],
         ),
         (
@@ -249,6 +254,8 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 "99fc27fab5a87d274fb32a5772a4f670cad6821700a7e4c54eaec783c6aa1358",
                 "61154e38ca91b5dbf0e4c1c3fa5ad36b4ed56f058dbc8418d20781213e613f4e",
                 "a00fd23796d2d87c6652749ac2365a94bf060f27f5fbe5e70929cc6635c19433",
+                // V6, from `git show 94a3fd1:ui/public/contracts/mailbox_contract.wasm`.
+                "e49cb3038b321a895850adcf594e09b6a5a698b7ba469a991a529910493628dc",
             ],
         ),
     ];
@@ -282,6 +289,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // Superseded by moving the migration marker into this delegate's
             // own secret store.
             "d6a387917599b8ae3746dd41f7ad45d2cc008adb7f4f98b26156ed66032e4aec".to_string(),
+            // V7, from `git show 94a3fd1:ui/public/contracts/harvest_delegate.wasm`.
+            // Superseded by the per-order Bitcoin payment address, which added
+            // the BIP-84 derivation module and the payment-xpub secret.
+            "f6d6543524d359f54379bd9b0d79f5106a72d1d205b44b04f6375db74fde7e91".to_string(),
         ],
     );
 }
@@ -534,28 +545,47 @@ fn superseded_store_generations_are_probed_under_their_own_parameter_encoding() 
         "every recorded generation must be probed"
     );
 
-    // Newest-first, and every recorded generation predates the split, so each
-    // id must be the LEGACY derivation and none may be the current one.
+    // Newest-first, each generation derived under the encoding IT was
+    // published with: the legacy shape at or below the split, today's above.
     let mut newest_first: Vec<_> = store_lineage().iter().collect();
     newest_first.sort_by_key(|e| std::cmp::Reverse(e.generation));
 
+    let mut seen_legacy = false;
+    let mut seen_current = false;
     for (entry, got) in newest_first.iter().zip(&candidates) {
-        assert!(
-            entry.generation <= LAST_LEGACY_STORE_PARAM_GENERATION,
-            "generation {} postdates the split; this test needs updating to expect \
-             the current encoding for it",
-            entry.generation
-        );
-        let expected = current_id(&entry.code_hash, &legacy);
-        let wrong = current_id(&entry.code_hash, &current);
+        let legacy_side = entry.generation <= LAST_LEGACY_STORE_PARAM_GENERATION;
+        let (expected, wrong) = if legacy_side {
+            seen_legacy = true;
+            (
+                current_id(&entry.code_hash, &legacy),
+                current_id(&entry.code_hash, &current),
+            )
+        } else {
+            seen_current = true;
+            (
+                current_id(&entry.code_hash, &current),
+                current_id(&entry.code_hash, &legacy),
+            )
+        };
         assert_ne!(expected, wrong);
         assert_eq!(
-            *got, expected,
+            *got,
+            expected,
             "generation {} must be probed at its real address, not at one derived \
-             from today's parameters -- which it was never published under",
-            entry.generation
+             from the {} parameter encoding -- which it was never published under",
+            entry.generation,
+            if legacy_side { "current" } else { "legacy" }
         );
     }
+
+    // Both branches have to be exercised, or this test stops being about the
+    // split at all: with generations on only one side of it, deriving every
+    // id under one encoding would pass.
+    assert!(
+        seen_legacy && seen_current,
+        "the lineage must span the parameter split for this test to mean anything \
+         (legacy seen: {seen_legacy}, current seen: {seen_current})"
+    );
 }
 
 // --- sealing ------------------------------------------------------------
