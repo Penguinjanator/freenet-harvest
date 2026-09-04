@@ -1131,6 +1131,131 @@ mod order_tests {
     }
 
     // -----------------------------------------------------------------
+    // Bounding the claim vector
+    //
+    // A trusted bridge's claims are PUBLIC, so anyone can harvest genuine
+    // ones and resubmit them. Each verification costs an Ed25519 check plus
+    // SHA256d over up to 64 KB of transaction, and `OrdersV1::verify` re-runs
+    // every order's proof on every state validation, for up to `MAX_ORDERS`
+    // orders. The vector used to have no length cap, no dedup and no byte
+    // budget at all.
+    // -----------------------------------------------------------------
+
+    /// A junk claim with a distinct digest, for the checks that must fire
+    /// BEFORE any signature is verified. Nothing here would survive
+    /// `SignedClaim::verify`, which is the point: if the bound is applied
+    /// after verification these come back as `BadClaim` instead.
+    fn junk_claim(seed: u32, body_len: usize) -> SignedClaim {
+        let mut body_cbor = seed.to_le_bytes().to_vec();
+        body_cbor.resize(body_len.max(4), 0u8);
+        SignedClaim {
+            body_cbor,
+            bridge: BridgeId(bridge_key().verifying_key().to_bytes()),
+            signature: vec![0u8; 64],
+        }
+    }
+
+    /// Duplicates must cost a hash, not a signature verification.
+    ///
+    /// The observable form of "deduped BEFORE verifying": the count cap is on
+    /// DISTINCT claims, so a proof carrying far more duplicates than the cap
+    /// still verifies. Remove the dedup and the same proof is rejected as
+    /// `TooManyClaims`.
+    #[test]
+    fn duplicate_claims_are_deduplicated_rather_than_reverified() {
+        let bridge = bridge_key();
+        let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+        let (confirmed, _) = confirmed_claim(&order, &bridge, order.amount_sats, 100);
+        let tip = signed_tip(&order, &bridge, 100);
+
+        // Comfortably more copies than the cap on distinct claims, and --
+        // asserted, not assumed -- comfortably inside the byte budget, so a
+        // failure here can only be about the dedup.
+        let copies = crate::payment::MAX_PROOF_CLAIMS * 6;
+        let claims = vec![confirmed; copies];
+        assert!(
+            crate::to_cbor(&claims).unwrap().len() < crate::payment::MAX_PROOF_CLAIM_BYTES,
+            "this fixture must sit inside the byte budget, or it tests the wrong bound"
+        );
+
+        assert_eq!(
+            crate::payment::verify_payment_proof(&order, &OrderPaymentProof::on_chain(claims, tip)),
+            Ok(order.amount_sats),
+            "{copies} copies of one genuine claim are one claim, and must cost one \
+             verification -- not {copies} of them"
+        );
+    }
+
+    /// The cap on distinct claims, and that it fires before verification.
+    ///
+    /// The claims here are junk: if the cap were applied after the
+    /// verification loop this would come back `BadClaim`, having already paid
+    /// for every signature check the cap exists to prevent.
+    #[test]
+    fn more_distinct_claims_than_the_cap_are_refused_before_any_are_verified() {
+        let bridge = bridge_key();
+        let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+        let tip = signed_tip(&order, &bridge, 100);
+
+        let over = crate::payment::MAX_PROOF_CLAIMS + 1;
+        let claims: Vec<SignedClaim> = (0..over as u32).map(|i| junk_claim(i, 8)).collect();
+
+        assert_eq!(
+            crate::payment::verify_payment_proof(&order, &OrderPaymentProof::on_chain(claims, tip)),
+            Err(crate::payment::ProofError::TooManyClaims {
+                have: over,
+                cap: crate::payment::MAX_PROOF_CLAIMS,
+            }),
+        );
+    }
+
+    /// A count cap is not a memory bound: claim size is set by whoever made
+    /// the Bitcoin transaction, and one `ConfirmedOutput` may carry a 64 KB
+    /// raw transaction. Two claims can be under any count cap and still be
+    /// megabytes.
+    #[test]
+    fn claims_over_the_byte_budget_are_refused_even_when_few() {
+        let bridge = bridge_key();
+        let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+        let tip = signed_tip(&order, &bridge, 100);
+
+        // Two claims -- far under `MAX_PROOF_CLAIMS` -- but together over the
+        // byte budget. A count cap alone would wave these through.
+        let half = crate::payment::MAX_PROOF_CLAIM_BYTES;
+        let claims = vec![junk_claim(1, half), junk_claim(2, half)];
+        assert!(claims.len() < crate::payment::MAX_PROOF_CLAIMS);
+
+        assert!(
+            matches!(
+                crate::payment::verify_payment_proof(
+                    &order,
+                    &OrderPaymentProof::on_chain(claims, tip)
+                ),
+                Err(crate::payment::ProofError::ClaimsTooLarge { .. })
+            ),
+            "a proof over the byte budget must be refused on its size, not decoded and \
+             verified first"
+        );
+    }
+
+    /// The bounds must not refuse an ordinary, honest proof.
+    #[test]
+    fn an_ordinary_proof_is_nowhere_near_either_bound() {
+        let bridge = bridge_key();
+        let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+        let (confirmed, _) = confirmed_claim(&order, &bridge, order.amount_sats, 100);
+        let bytes = crate::to_cbor(&vec![confirmed]).unwrap().len();
+        assert!(
+            bytes * crate::payment::MAX_PROOF_CLAIMS < crate::payment::MAX_PROOF_CLAIM_BYTES,
+            "a full complement of {} ordinary claims is {} bytes, over the {} budget -- the \
+             two bounds contradict each other and honest proofs will be refused",
+            crate::payment::MAX_PROOF_CLAIMS,
+            bytes * crate::payment::MAX_PROOF_CLAIMS,
+            crate::payment::MAX_PROOF_CLAIM_BYTES,
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Merge properties
     // -----------------------------------------------------------------
 

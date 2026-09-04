@@ -321,6 +321,14 @@ pub struct OnChainPaymentProof {
     /// address contract would and a fold given a curated subset reaches a more
     /// optimistic answer. But nothing here can tell a complete set from a
     /// curated one -- see this type's doc comment.
+    ///
+    /// Bounded on submission by [`MAX_PROOF_CLAIM_BYTES`] and, after
+    /// deduplication, by [`MAX_PROOF_CLAIMS`]. Those bounds sit in tension
+    /// with "whole published history": a payment script whose genuine history
+    /// runs past 32 distinct claims has no representable proof, and the order
+    /// against it cannot be settled. That is the intended trade -- a
+    /// per-invoice script that busy is not a payment destination -- but it is
+    /// a real edge, and it is the reason the cap is not tighter still.
     pub claims: Vec<SignedClaim>,
     /// A bridge-signed chain tip, so confirmation depth is itself attested
     /// rather than asserted by whoever submitted the proof.
@@ -413,6 +421,17 @@ pub enum ProofError {
     WrongRail,
     /// `SHA256(preimage)` does not equal the order's payment hash.
     PreimageMismatch,
+    /// More distinct claims than [`MAX_PROOF_CLAIMS`], each of which would
+    /// cost a signature verification.
+    TooManyClaims {
+        have: usize,
+        cap: usize,
+    },
+    /// The submitted claims exceed [`MAX_PROOF_CLAIM_BYTES`].
+    ClaimsTooLarge {
+        have_bytes: usize,
+        budget: usize,
+    },
 }
 
 impl std::fmt::Display for ProofError {
@@ -449,6 +468,18 @@ impl std::fmt::Display for ProofError {
             }
             ProofError::PreimageMismatch => {
                 write!(f, "the preimage does not settle this order's invoice")
+            }
+            ProofError::TooManyClaims { have, cap } => {
+                write!(
+                    f,
+                    "payment evidence holds {have} distinct claims, cap is {cap}"
+                )
+            }
+            ProofError::ClaimsTooLarge { have_bytes, budget } => {
+                write!(
+                    f,
+                    "payment evidence is {have_bytes} bytes, budget is {budget}"
+                )
             }
         }
     }
@@ -491,12 +522,102 @@ pub fn verify_lightning_proof(
     Ok(order.amount_sats)
 }
 
+/// Hard cap on the number of DISTINCT claims one payment proof may carry.
+///
+/// This is the bound on the expensive work: each distinct claim costs an
+/// Ed25519 verification plus, for a `ConfirmedOutput`, full SPV verification
+/// (SHA256d over a transaction of up to `MAX_RAW_TX` = 64 KB, a Merkle branch,
+/// and up to 25 block headers). `OrdersV1::verify` re-runs every order's proof
+/// on every state validation, and a store may hold `MAX_ORDERS` orders, so
+/// this multiplies.
+///
+/// 32 is generous for what a legitimate proof needs. An order's payment script
+/// is a destination for one invoice: it sees one payment, occasionally two,
+/// plus whatever retraction/re-confirmation churn a reorg produces and one
+/// `ScannedTo` per trusted bridge. The address contract's own set is capped at
+/// `freenet_bitcoin_common::address_state::MAX_CLAIMS` = 512, but that cap is
+/// sized for a REUSED address; a per-order script that needed 32 claims to
+/// prove one payment is not a payment destination.
+///
+/// This counts distinct claims, not submitted ones, because it is the
+/// signature verifications it exists to bound and duplicates never reach one.
+/// `MAX_PROOF_CLAIM_BYTES` is what bounds the submitted vector.
+pub const MAX_PROOF_CLAIMS: usize = 32;
+
+/// Byte budget for a payment proof's claims, measured on their actual CBOR
+/// encoding.
+///
+/// # Why a byte budget as well as a count
+///
+/// A count cap *reads* like a memory bound and is not one: claim size is set
+/// by whoever made the Bitcoin transaction, not by us, and a single
+/// `ConfirmedOutput` claim can carry a 64 KB raw transaction. The same
+/// reasoning is written up at length on
+/// `freenet_bitcoin_common::address_state::MAX_CLAIM_BYTES`, whose value this
+/// matches deliberately: a proof is drawn from one address contract's claim
+/// set, so it has no business being larger than that whole set.
+///
+/// It also does a job the count cap cannot. The count cap is applied to
+/// *distinct* claims, so on its own it would let a submitter send an unbounded
+/// vector of duplicates and pay only for the dedup. This budget bounds the
+/// submitted vector, and therefore the dedup itself: at a floor of roughly 160
+/// bytes for the smallest possible claim, it admits under ~1,700 submitted
+/// claims, i.e. that many BLAKE3 hashes over small inputs, which is nothing
+/// next to one signature verification.
+pub const MAX_PROOF_CLAIM_BYTES: usize = 256 * 1024;
+
+/// A claim's cost against [`MAX_PROOF_CLAIM_BYTES`], measured on the encoding
+/// that actually travels rather than on the fields' logical sizes.
+///
+/// An unencodable claim is charged the maximum, so it is refused rather than
+/// admitted for free.
+fn claim_cost(claim: &SignedClaim) -> usize {
+    crate::to_cbor(claim).map(|b| b.len()).unwrap_or(usize::MAX)
+}
+
+/// The distinct claims in `claims`, in submission order, keyed by
+/// [`SignedClaim::digest`].
+///
+/// `digest` is a BLAKE3 over the bridge id, the signed body bytes and the
+/// signature, so two claims share one only if they are byte-identical -- there
+/// is no way to smuggle a differing claim past it.
+fn distinct_claims(claims: &[SignedClaim]) -> Vec<&SignedClaim> {
+    let mut seen = std::collections::BTreeSet::new();
+    claims
+        .iter()
+        .filter(|c| seen.insert(c.digest()))
+        .collect::<Vec<_>>()
+}
+
 fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u64, ProofError> {
     if order.payment_script_pubkey.is_empty() {
         return Err(ProofError::WrongRail);
     }
     if order.trusted_bridges.is_empty() {
         return Err(ProofError::NoTrustedBridges);
+    }
+
+    // Bound the work BEFORE doing any crypto at all -- see
+    // `MAX_PROOF_CLAIM_BYTES` and `MAX_PROOF_CLAIMS` for what each bounds and
+    // why one of them is not enough on its own. The byte budget comes first
+    // because everything after it, dedup included, is linear in the submitted
+    // bytes.
+    let mut submitted_bytes: usize = 0;
+    for c in &proof.claims {
+        submitted_bytes = submitted_bytes.saturating_add(claim_cost(c));
+        if submitted_bytes > MAX_PROOF_CLAIM_BYTES {
+            return Err(ProofError::ClaimsTooLarge {
+                have_bytes: submitted_bytes,
+                budget: MAX_PROOF_CLAIM_BYTES,
+            });
+        }
+    }
+    let distinct = distinct_claims(&proof.claims);
+    if distinct.len() > MAX_PROOF_CLAIMS {
+        return Err(ProofError::TooManyClaims {
+            have: distinct.len(),
+            cap: MAX_PROOF_CLAIMS,
+        });
     }
 
     let tip_params = freenet_bitcoin_common::BitcoinTipParameters {
@@ -512,11 +633,20 @@ fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u
     let addr_params = order.bitcoin_params();
     let expected_script = addr_params.script_id();
 
-    // Verify every claim's signature and that it is about THIS script. A claim
-    // about some other address would otherwise let an attacker prove payment
-    // with somebody else's transaction.
-    let mut bodies = Vec::with_capacity(proof.claims.len());
-    for c in &proof.claims {
+    // Verify every DISTINCT claim's signature and that it is about THIS
+    // script. A claim about some other address would otherwise let an
+    // attacker prove payment with somebody else's transaction.
+    //
+    // Iterating `distinct_claims` rather than `proof.claims` is what keeps a
+    // duplicate from ever reaching `SignedClaim::verify`: there is no path in
+    // this function that verifies a claim outside this loop. A bridge's
+    // claims are public, so anyone can harvest genuine ones and resubmit them
+    // hundreds of times; each one costs an Ed25519 verify plus SHA256d over
+    // up to 64 KB of transaction, and `OrdersV1::verify` re-runs the lot on
+    // every single state validation, for up to `MAX_ORDERS` orders. Deduping
+    // first makes a duplicate cost one BLAKE3 hash instead.
+    let mut bodies = Vec::with_capacity(distinct.len());
+    for c in distinct {
         let body = c.verify(&addr_params).map_err(ProofError::BadClaim)?;
         if body.script_id != expected_script {
             return Err(ProofError::WrongScript);
