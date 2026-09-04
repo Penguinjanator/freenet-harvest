@@ -120,6 +120,24 @@ pub struct AppState {
     /// legibility; it is not the correlation mechanism.
     pub pending_signatures: std::collections::VecDeque<PendingSignature>,
 
+    /// Invoices the seller has asked to issue, waiting on the payment address
+    /// the delegate is deriving for each, keyed by the `DeriveOrderAddress`
+    /// request id.
+    ///
+    /// A map rather than a queue, and keyed rather than positional, for the
+    /// same reason `pending_signatures` matches on signed bytes: the answer
+    /// carries its own correlation (`OrderAddress::request_id`), and an
+    /// address grafted onto the wrong invoice would send a buyer's payment to
+    /// another buyer's order.
+    ///
+    /// A `BTreeMap` specifically. Request ids are allocated in issue order, so
+    /// iteration is chronological rather than arbitrary -- but the reason it
+    /// is worth stating is the test: with a `HashMap`, "take whichever entry
+    /// comes first" is right often enough by luck that a test for the
+    /// correlation passes under that mutation about half the time, which is to
+    /// say it is not testing the correlation at all.
+    pub pending_invoices: std::collections::BTreeMap<u64, PendingInvoice>,
+
     /// Ghostkey certificates by fingerprint, as the delegate reports them.
     ///
     /// A store's details carry the seller's certificate so a buyer can check
@@ -285,6 +303,109 @@ fn spawn_store_info_signature(fingerprint: String, pending: PendingStoreInfo) {
     });
 }
 
+/// Wrap a freshly-signed invoice as the record the store contract stores.
+///
+/// `AwaitingPayment`, with no proof and no status signature, is the only
+/// status a newly-issued invoice may carry, and the constraint is structural
+/// rather than a convention: `Paid` is authorized by bridge-signed evidence
+/// rather than by anybody's say-so, and `AuthorizedOrder::verify` rejects a
+/// record claiming it without evidence the whole network can check. So there
+/// is nothing here for a seller to assert about payment, and this function
+/// takes no argument that would let one try.
+fn authorize_new_order(
+    order: harvest_common::payment::Order,
+    scoped_payload: Vec<u8>,
+    signature: Vec<u8>,
+) -> harvest_common::payment::AuthorizedOrder {
+    harvest_common::payment::AuthorizedOrder {
+        order,
+        scoped_payload,
+        signature,
+        status: harvest_common::payment::OrderStatus::AwaitingPayment,
+        payment_proof: None,
+        status_scoped_payload: None,
+        status_signature: None,
+    }
+}
+
+/// Ask the harvest delegate for the next payment address.
+///
+/// The invoice is already registered under `request_id` by the time this runs
+/// (see `AppState::issue_invoice`). If the send fails, withdraw it: nothing
+/// will answer, and an entry left behind would sit in `pending_invoices`
+/// forever waiting for an id that was never asked about.
+#[cfg(target_arch = "wasm32")]
+fn spawn_order_address_request(request_id: u64) {
+    wasm_bindgen_futures::spawn_local(async move {
+        use dioxus::prelude::WritableExt;
+
+        if let Err(e) = crate::gateway::bitcoin_ops::derive_order_address(request_id).await {
+            dioxus::logger::tracing::error!("Failed to request a payment address: {e}");
+            let mut state = crate::gateway::APP_STATE.write();
+            state.pending_invoices.remove(&request_id);
+            state.bitcoin.in_flight.remove(&request_id);
+            state
+                .notifications
+                .push(format!("Could not issue the invoice: {e}"));
+        }
+    });
+}
+
+/// Ask the ghostkey delegate to sign an invoice.
+///
+/// Same discipline as `spawn_store_info_signature`: the request is queued
+/// before this runs, and a failed send withdraws it rather than leaving an
+/// entry that would consume an unrelated signature.
+#[cfg(target_arch = "wasm32")]
+fn spawn_order_signature(pending: PendingOrder) {
+    wasm_bindgen_futures::spawn_local(async move {
+        use dioxus::prelude::{ReadableExt, WritableExt};
+
+        let queued = PendingSignature::Order(pending.clone());
+        let withdraw = |reason: String| {
+            dioxus::logger::tracing::error!("{reason}");
+            let mut state = crate::gateway::APP_STATE.write();
+            state.withdraw_pending_signature(&queued);
+            state
+                .notifications
+                .push(format!("Could not issue the invoice: {reason}"));
+        };
+
+        let Some(delegate_key) = crate::gateway::APP_STATE
+            .read()
+            .ghostkey_delegate_key
+            .clone()
+        else {
+            withdraw("ghostkey delegate not registered".to_string());
+            return;
+        };
+        // What the delegate signs is the CBOR of the order itself;
+        // `AuthorizedOrder::verify_terms` checks the scoped payload wraps
+        // exactly these bytes.
+        let message = match harvest_common::to_cbor(&pending.order) {
+            Ok(message) => message,
+            Err(e) => {
+                withdraw(format!("serialize the invoice for signing: {e}"));
+                return;
+            }
+        };
+        let request = ghostkey_common::GhostkeyRequest::SignMessage {
+            fingerprint: pending.fingerprint.clone(),
+            message,
+        };
+        let payload = match ghostkey_common::to_cbor(&request) {
+            Ok(payload) => payload,
+            Err(e) => {
+                withdraw(format!("serialize SignMessage: {e}"));
+                return;
+            }
+        };
+        if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
+            withdraw(format!("send the invoice for signing: {e}"));
+        }
+    });
+}
+
 /// The details a seller types about their own store.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StoreDetails {
@@ -390,6 +511,7 @@ impl PendingStoreEdit {
 pub enum PendingSignature {
     Listing(PendingListing),
     StoreInfo(PendingStoreInfo),
+    Order(PendingOrder),
 }
 
 impl PendingSignature {
@@ -400,8 +522,84 @@ impl PendingSignature {
         match self {
             PendingSignature::Listing(pending) => harvest_common::to_cbor(&pending.listing),
             PendingSignature::StoreInfo(pending) => harvest_common::to_cbor(&pending.info),
+            PendingSignature::Order(pending) => harvest_common::to_cbor(&pending.order),
         }
     }
+}
+
+/// What a seller has typed to issue one invoice, before it has an address.
+///
+/// Deliberately not an `Order`: an `Order` cannot exist without a payment
+/// destination, and getting one is a round trip through the delegate. Keeping
+/// the half-formed thing in its own type means there is no moment where a
+/// partially-filled `Order` could be signed or published.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingInvoice {
+    pub store_contract_id: Vec<u8>,
+    pub seller_fingerprint: String,
+    pub listing_id: harvest_common::listing::ListingId,
+    /// Only for the notification the seller sees; nothing signed depends on it.
+    pub listing_title: String,
+    /// Ghostkey fingerprint of the buyer this invoice is for. May be empty --
+    /// see [`AppState::issue_invoice`].
+    pub buyer_fingerprint: String,
+    pub amount_sats: u64,
+    pub required_confirmations: u32,
+}
+
+/// A fully-formed invoice awaiting the seller's signature.
+#[derive(Clone, Debug)]
+pub struct PendingOrder {
+    pub fingerprint: String,
+    pub order: harvest_common::payment::Order,
+    pub store_contract_id: Vec<u8>,
+}
+
+/// Build the invoice an address has just completed.
+///
+/// Pure, and separated from the response handler for the usual reason: this is
+/// where the fields that decide whether an invoice can EVER be settled get
+/// filled in, and it needs to be assertable without a browser.
+///
+/// The two Bitcoin fields are the ones with history. Both used to be store
+/// PARAMETERS, hashed into the store's address and therefore frozen for its
+/// life, which meant every store the UI created was permanently incapable of
+/// accepting an on-chain payment. They now travel per-order under the seller's
+/// signature -- so they have to be populated HERE, on every invoice, and an
+/// invoice that names no bridge is unpayable from the moment it is signed
+/// (`verify_payment_proof` returns `NoTrustedBridges`) with nothing about it
+/// looking wrong. That is why a malformed bridge constant is an error rather
+/// than an empty list.
+pub fn order_for_invoice(
+    pending: &PendingInvoice,
+    derived: &harvest_common::DerivedAddress,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Result<harvest_common::payment::Order, String> {
+    use harvest_common::payment::{Order, OrderId};
+
+    let trusted_bridges = crate::gateway::bitcoin_config::default_trusted_bridges()?;
+    Ok(Order {
+        id: OrderId::new(
+            &pending.seller_fingerprint,
+            &pending.listing_id,
+            &created_at,
+            &pending.buyer_fingerprint,
+        ),
+        listing_id: pending.listing_id.clone(),
+        buyer_fingerprint: pending.buyer_fingerprint.clone(),
+        seller_fingerprint: pending.seller_fingerprint.clone(),
+        amount_sats: pending.amount_sats,
+        network: derived.network,
+        payment_script_pubkey: derived.script_pubkey.clone(),
+        payment_address: derived.address.clone(),
+        required_confirmations: pending.required_confirmations,
+        // On-chain only. Lightning invoices are a separate path that nothing
+        // in Harvest issues yet.
+        payment_hash: None,
+        trusted_bridges,
+        bitcoin_address_code_hash: crate::gateway::bitcoin_config::address_contract_code_hash(),
+        created_at,
+    })
 }
 
 /// The message a `SignResult`'s scoped payload was built around, i.e. the
@@ -1014,6 +1212,121 @@ impl AppState {
         let _ = ghostkey_fingerprint;
     }
 
+    /// Start issuing an invoice against a listing in a store the seller owns.
+    ///
+    /// # Why the seller issues this and not the buyer
+    ///
+    /// `AuthorizedOrder::verify_terms` checks a ghostkey-scoped SELLER
+    /// signature over the whole `Order`, so a buyer cannot create one at all.
+    /// "Buyer clicks Buy" would need buyer-to-seller messaging, which is a
+    /// separate decision; a seller handing over an invoice needs nothing that
+    /// does not already exist, and is how a small seller works anyway.
+    ///
+    /// # What this starts, and what finishes it
+    ///
+    /// Two round trips, neither of which can be skipped. The delegate derives
+    /// a fresh payment address (`OrderAddress`), and only then is there an
+    /// `Order` to sign; the ghostkey delegate signs it (`SignResult`), and
+    /// only then is there something the store contract will accept. Errors are
+    /// returned rather than swallowed so the form can say why nothing
+    /// happened.
+    pub fn issue_invoice(&mut self, invoice: PendingInvoice) -> Result<(), String> {
+        if invoice.amount_sats == 0 {
+            return Err("an invoice needs an amount in satoshis".to_string());
+        }
+        if invoice.required_confirmations == 0 {
+            return Err(
+                "an invoice needs at least one confirmation, or a payment could count as \
+                 settled while it is still only in the mempool"
+                    .to_string(),
+            );
+        }
+        // The store has to be one of ours, and the fingerprint that signs has
+        // to be the one that owns it -- the store contract verifies every
+        // order against `StoreParameters::seller_verifying_key`, so an invoice
+        // signed by any other identity is rejected with nothing to say why.
+        let owner = self
+            .my_stores
+            .iter()
+            .find(|(_, stores)| {
+                stores
+                    .iter()
+                    .any(|s| s.store_contract_id == invoice.store_contract_id)
+            })
+            .map(|(fingerprint, _)| fingerprint.clone())
+            .ok_or("this store is not one of yours -- nothing to issue an invoice on")?;
+        if owner != invoice.seller_fingerprint {
+            return Err(format!(
+                "this store belongs to {owner}, so only that identity can issue invoices \
+                 on it"
+            ));
+        }
+        if self.bitcoin.payment_xpub.is_none() {
+            return Err(
+                "add your wallet's payment key before issuing an invoice, or there is \
+                 nowhere for the buyer to pay"
+                    .to_string(),
+            );
+        }
+
+        // Register before sending, and un-register if the send fails: the
+        // answer can arrive as soon as the send returns, and an `OrderAddress`
+        // matching no pending invoice is dropped -- which would burn a
+        // derivation index for nothing.
+        let request_id = self.bitcoin.next_request_id();
+        self.bitcoin.in_flight.insert(request_id);
+        self.pending_invoices.insert(request_id, invoice);
+
+        #[cfg(target_arch = "wasm32")]
+        spawn_order_address_request(request_id);
+        Ok(())
+    }
+
+    /// Turn a freshly-derived address into a signed, published invoice.
+    ///
+    /// Split from the response handler so the part that decides what gets
+    /// signed is testable without a browser; only the delegate round trip
+    /// below needs one.
+    fn complete_invoice(&mut self, request_id: u64, derived: harvest_common::DerivedAddress) {
+        let Some(invoice) = self.pending_invoices.remove(&request_id) else {
+            // The index this consumed is gone either way -- see
+            // `apply_derive_order_address` in the delegate on why an index is
+            // spent when it is handed out. Say so rather than failing silently.
+            warn!(
+                "A payment address arrived for request {request_id}, which matches no \
+                 invoice we are waiting on -- dropping it"
+            );
+            return;
+        };
+
+        let order = match order_for_invoice(&invoice, &derived, chrono::Utc::now()) {
+            Ok(order) => order,
+            Err(e) => {
+                self.notifications
+                    .push(format!("Could not build the invoice: {e}"));
+                return;
+            }
+        };
+        info!(
+            "Issuing invoice {} for '{}' ({} sats) to {}",
+            order.id.short(),
+            invoice.listing_title,
+            order.amount_sats,
+            order.payment_address
+        );
+
+        let pending = PendingOrder {
+            fingerprint: invoice.seller_fingerprint,
+            order,
+            store_contract_id: invoice.store_contract_id,
+        };
+        self.pending_signatures
+            .push_back(PendingSignature::Order(pending.clone()));
+
+        #[cfg(target_arch = "wasm32")]
+        spawn_order_signature(pending);
+    }
+
     /// Publish a new store's contracts, once every input creation needs has
     /// arrived.
     ///
@@ -1401,6 +1714,42 @@ impl AppState {
                         #[cfg(not(target_arch = "wasm32"))]
                         let _ = authorized;
                     }
+                    Some(PendingSignature::Order(pending)) => {
+                        let authorized =
+                            authorize_new_order(pending.order, scoped_payload, signature);
+                        info!(
+                            "Constructed AuthorizedOrder {} for {} sats",
+                            authorized.order.id.short(),
+                            authorized.order.amount_sats
+                        );
+
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            let store_id = pending.store_contract_id;
+                            wasm_bindgen_futures::spawn_local(async move {
+                                if let Err(e) = crate::gateway::store_ops::submit_order_by_id(
+                                    &store_id, authorized,
+                                )
+                                .await
+                                {
+                                    dioxus::logger::tracing::error!(
+                                        "Failed to publish the invoice: {}",
+                                        e
+                                    );
+                                    crate::gateway::APP_STATE
+                                        .write()
+                                        .notifications
+                                        .push(format!(
+                                        "The invoice was signed but could not be published: {e}"
+                                    ));
+                                }
+                            });
+                        }
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            let _ = (authorized, pending.store_contract_id);
+                        }
+                    }
                     None => {
                         warn!(
                             "SignResult matches none of the {} outstanding signature request(s) \
@@ -1640,6 +1989,58 @@ impl AppState {
                         });
                     }
                 }
+            }
+
+            BitcoinDelegateResponse::PaymentXpubSet { request_id, result } => {
+                self.bitcoin.in_flight.remove(&request_id);
+                match result {
+                    Ok(status) => {
+                        info!(
+                            "Payment key recorded for {}, next index {}",
+                            status.network.as_str(),
+                            status.next_index
+                        );
+                        self.bitcoin.payment_xpub = Some(status);
+                        self.bitcoin.payment_xpub_loaded = true;
+                    }
+                    // Every rejection here names something the seller can act
+                    // on -- the wrong export, the wrong network, the wrong
+                    // depth -- so it is shown verbatim rather than reduced to
+                    // "invalid key".
+                    Err(e) => self
+                        .notifications
+                        .push(format!("Couldn't use that payment key: {e}")),
+                }
+            }
+
+            BitcoinDelegateResponse::PaymentXpub { status } => {
+                self.bitcoin.payment_xpub = status;
+                self.bitcoin.payment_xpub_loaded = true;
+            }
+
+            BitcoinDelegateResponse::OrderAddress { request_id, result } => {
+                self.bitcoin.in_flight.remove(&request_id);
+                match result {
+                    Ok(derived) => self.complete_invoice(request_id, derived),
+                    Err(e) => {
+                        // Drop the invoice: without an address there is
+                        // nothing to sign, and leaving it queued would leave
+                        // the form looking as though something were still in
+                        // progress.
+                        self.pending_invoices.remove(&request_id);
+                        self.notifications
+                            .push(format!("Couldn't get a payment address: {e}"));
+                    }
+                }
+                // The stored counter has advanced whatever happened here (see
+                // the delegate's `apply_derive_order_address`), so re-read it
+                // rather than letting the UI show a stale index.
+                #[cfg(target_arch = "wasm32")]
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(e) = crate::gateway::bitcoin_ops::get_payment_xpub().await {
+                        dioxus::logger::tracing::error!("Failed to refresh the payment key: {e}");
+                    }
+                });
             }
 
             // `BitcoinDelegateRequest`/`Response` are `#[non_exhaustive]` in
@@ -1974,6 +2375,12 @@ pub struct BitcoinState {
     /// The user's private watch list, as reported by the delegate.
     pub watches: Vec<WatchedPayment>,
     pub watches_loaded: bool,
+    /// The account public key invoices derive their payment addresses from.
+    pub payment_xpub: Option<harvest_common::PaymentXpubStatus>,
+    /// Whether `GetPaymentXpub` has answered at least once. Distinguishes "no
+    /// key configured" from "we have not asked yet", so the seller is not
+    /// prompted to add one before we know whether they already have.
+    pub payment_xpub_loaded: bool,
     /// Bitcoin delegate request ids awaiting a response, so a specific
     /// button can show "watching..." rather than a global spinner.
     pub in_flight: HashSet<u64>,
@@ -2486,7 +2893,7 @@ mod tests {
             .iter()
             .find_map(|pending| match pending {
                 PendingSignature::StoreInfo(store_info) => Some(&store_info.info),
-                PendingSignature::Listing(_) => None,
+                PendingSignature::Listing(_) | PendingSignature::Order(_) => None,
             })
     }
 
@@ -2744,7 +3151,7 @@ mod tests {
             .iter()
             .filter_map(|pending| match pending {
                 PendingSignature::StoreInfo(info) => Some(info.info.version),
-                PendingSignature::Listing(_) => None,
+                PendingSignature::Listing(_) | PendingSignature::Order(_) => None,
             })
             .collect();
         assert_eq!(
@@ -3210,5 +3617,460 @@ mod tests {
             .message()
             .expect("a failure has to say so")
             .contains("Ghost Key"));
+    }
+}
+
+/// The seller-issued invoice path: everything from "the seller filled in the
+/// form" to "a signed order is on its way to the store contract", minus the
+/// two delegate round trips a browser would carry.
+#[cfg(test)]
+mod invoice_tests {
+    use super::*;
+
+    use freenet_bitcoin_common::BitcoinNetwork;
+    use harvest_common::listing::ListingId;
+    use harvest_common::{DerivedAddress, PaymentXpubStatus};
+
+    const SELLER: &str = "seller-fp";
+    const STORE_ID: [u8; 32] = [9u8; 32];
+
+    fn listing_id() -> ListingId {
+        ListingId::new(SELLER, &chrono::Utc::now(), "Widget")
+    }
+
+    fn invoice() -> PendingInvoice {
+        PendingInvoice {
+            store_contract_id: STORE_ID.to_vec(),
+            seller_fingerprint: SELLER.to_string(),
+            listing_id: listing_id(),
+            listing_title: "Widget".to_string(),
+            buyer_fingerprint: "buyer-fp".to_string(),
+            amount_sats: 50_000,
+            required_confirmations: 1,
+        }
+    }
+
+    fn derived(index: u32) -> DerivedAddress {
+        DerivedAddress {
+            index,
+            network: BitcoinNetwork::Signet,
+            script_pubkey: vec![0x00, 0x14, index as u8],
+            address: format!("tb1qexample{index}"),
+        }
+    }
+
+    /// A seller who owns `STORE_ID` and has a payment key configured.
+    fn seller_with_a_store() -> AppState {
+        let mut state = AppState::default();
+        state.my_stores.insert(
+            SELLER.to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE_ID.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+            }],
+        );
+        state.bitcoin.payment_xpub = Some(PaymentXpubStatus {
+            xpub: "vpub-placeholder".to_string(),
+            network: BitcoinNetwork::Signet,
+            next_index: 0,
+        });
+        state.bitcoin.payment_xpub_loaded = true;
+        state
+    }
+
+    fn address_answer(request_id: u64, index: u32) -> BitcoinDelegateResponse {
+        BitcoinDelegateResponse::OrderAddress {
+            request_id,
+            result: Ok(derived(index)),
+        }
+    }
+
+    /// A `SignResult` shaped the way the ghostkey delegate answers: the
+    /// request's own message, wrapped verbatim as `ScopedPayload::payload`.
+    fn sign_result_for(pending: &PendingSignature) -> ghostkey_common::GhostkeyResponse {
+        let scoped = ghostkey_common::ScopedPayload {
+            requestor: harvest_common::expected_harvest_requestor(),
+            payload: pending.signed_bytes().expect("serialize signed message"),
+        };
+        ghostkey_common::GhostkeyResponse::SignResult {
+            scoped_payload: harvest_common::to_cbor(&scoped).expect("serialize scoped payload"),
+            signature: vec![4, 5, 6],
+            certificate_pem: String::new(),
+        }
+    }
+
+    fn queued_order(state: &AppState) -> harvest_common::payment::Order {
+        state
+            .pending_signatures
+            .iter()
+            .find_map(|pending| match pending {
+                PendingSignature::Order(order) => Some(order.order.clone()),
+                _ => None,
+            })
+            .expect("an invoice should be queued for signing")
+    }
+
+    /// The regression that made the whole payment path unreachable in the
+    /// other direction: an invoice naming no bridge can never be proven paid
+    /// -- `verify_payment_proof` returns `NoTrustedBridges` -- and nothing
+    /// about it looks wrong until a buyer has already sent coin. Every store
+    /// the UI created was in exactly that state while the bridge list was a
+    /// store parameter.
+    #[test]
+    fn an_issued_invoice_names_the_bridges_that_can_settle_it() {
+        let order = order_for_invoice(&invoice(), &derived(0), chrono::Utc::now())
+            .expect("the build's constants must be usable");
+
+        assert!(
+            !order.trusted_bridges.is_empty(),
+            "an invoice with no trusted bridge can never be proven paid"
+        );
+        assert_eq!(
+            order.trusted_bridges[0].to_bs58(),
+            crate::gateway::bitcoin_config::TRUSTED_BRIDGE_ID_BS58
+        );
+        // The other field that moved onto the order for the same reason. It
+        // is optional by design, but the build knows its own value, so an
+        // invoice that omits it has silently lost the store contract's
+        // related-contract cross-check.
+        assert!(
+            order.bitcoin_address_code_hash.is_some(),
+            "the build knows the address contract's code hash; an invoice should carry it"
+        );
+    }
+
+    /// The address the delegate derived has to be the one the invoice
+    /// actually asks the buyer to pay, in BOTH forms -- verification uses the
+    /// script and the buyer reads the address.
+    #[test]
+    fn an_issued_invoice_carries_the_derived_destination() {
+        let derived = derived(3);
+        let order = order_for_invoice(&invoice(), &derived, chrono::Utc::now()).expect("build");
+
+        assert_eq!(order.payment_script_pubkey, derived.script_pubkey);
+        assert_eq!(order.payment_address, derived.address);
+        assert_eq!(order.network, derived.network);
+    }
+
+    /// Register-before-send, so an answer that arrives the instant the send
+    /// returns finds its invoice rather than being dropped.
+    #[test]
+    fn issuing_an_invoice_registers_it_before_anything_is_sent() {
+        let mut state = seller_with_a_store();
+        state.issue_invoice(invoice()).expect("should be accepted");
+
+        assert_eq!(state.pending_invoices.len(), 1);
+        let request_id = *state.pending_invoices.keys().next().expect("one entry");
+        assert!(
+            state.bitcoin.in_flight.contains(&request_id),
+            "the request should show as in flight"
+        );
+    }
+
+    /// The correlation that matters. Two invoices can be in flight at once,
+    /// and an address grafted onto the wrong one would ask a buyer to pay
+    /// against another buyer's order.
+    #[test]
+    fn an_address_completes_the_invoice_that_asked_for_it() {
+        let mut state = seller_with_a_store();
+
+        let mut first = invoice();
+        first.amount_sats = 10_000;
+        first.buyer_fingerprint = "buyer-one".to_string();
+        let mut second = invoice();
+        second.amount_sats = 20_000;
+        second.buyer_fingerprint = "buyer-two".to_string();
+
+        state.issue_invoice(first).expect("accepted");
+        let first_id = *state.pending_invoices.keys().next().expect("one entry");
+        state.issue_invoice(second).expect("accepted");
+        let second_id = *state
+            .pending_invoices
+            .keys()
+            .find(|id| **id != first_id)
+            .expect("two entries");
+
+        // Answer the SECOND one first: `OrderAddress` is matched by its id,
+        // not by arrival order, so out-of-order answers are the case that has
+        // to work -- and answering the LATER one first is what distinguishes
+        // a real lookup from "take whichever invoice is at hand".
+        state.on_bitcoin_delegate_response(address_answer(second_id, 5));
+
+        let order = queued_order(&state);
+        assert_eq!(order.amount_sats, 20_000);
+        assert_eq!(order.buyer_fingerprint, "buyer-two");
+        assert_eq!(order.payment_address, derived(5).address);
+        assert!(
+            state.pending_invoices.contains_key(&first_id),
+            "the other invoice must still be waiting for its own address"
+        );
+
+        // And the one left behind gets its OWN address, not the leftover.
+        state.on_bitcoin_delegate_response(address_answer(first_id, 9));
+        let both: Vec<(String, String)> = state
+            .pending_signatures
+            .iter()
+            .filter_map(|pending| match pending {
+                PendingSignature::Order(o) => Some((
+                    o.order.buyer_fingerprint.clone(),
+                    o.order.payment_address.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            both,
+            vec![
+                ("buyer-two".to_string(), derived(5).address),
+                ("buyer-one".to_string(), derived(9).address),
+            ],
+            "each invoice must carry the address derived for it"
+        );
+        assert!(state.pending_invoices.is_empty());
+    }
+
+    /// An answer for an invoice nobody is waiting on is dropped, not applied
+    /// to whatever happens to be pending.
+    #[test]
+    fn an_unmatched_address_is_dropped() {
+        let mut state = seller_with_a_store();
+        state.issue_invoice(invoice()).expect("accepted");
+        let waiting = *state.pending_invoices.keys().next().expect("one entry");
+
+        state.on_bitcoin_delegate_response(address_answer(waiting + 1000, 0));
+
+        assert!(state.pending_invoices.contains_key(&waiting));
+        assert!(
+            state.pending_signatures.is_empty(),
+            "nothing should have been queued for signing"
+        );
+    }
+
+    /// A refusal from the delegate clears the invoice rather than leaving the
+    /// form looking as though something were still in progress.
+    #[test]
+    fn a_refused_address_clears_the_invoice() {
+        let mut state = seller_with_a_store();
+        state.issue_invoice(invoice()).expect("accepted");
+        let waiting = *state.pending_invoices.keys().next().expect("one entry");
+
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::OrderAddress {
+            request_id: waiting,
+            result: Err("no payment key is set".to_string()),
+        });
+
+        assert!(state.pending_invoices.is_empty());
+        assert!(state.pending_signatures.is_empty());
+        assert!(!state.notifications.is_empty(), "the seller must be told");
+    }
+
+    /// The signature answer has to find the invoice it belongs to by the bytes
+    /// that were signed, not by queue position -- a store edit or a listing
+    /// can be outstanding at the same time.
+    #[test]
+    fn a_signature_finds_its_invoice_among_other_outstanding_requests() {
+        let mut state = seller_with_a_store();
+        state
+            .pending_signatures
+            .push_back(PendingSignature::Listing(PendingListing {
+                fingerprint: SELLER.to_string(),
+                listing: harvest_common::listing::Listing {
+                    id: listing_id(),
+                    title: "Other".to_string(),
+                    description: String::new(),
+                    kind: harvest_common::listing::ListingKind::Sale,
+                    price: None,
+                    created_at: chrono::Utc::now(),
+                },
+                store_contract_id: None,
+            }));
+        state.issue_invoice(invoice()).expect("accepted");
+        let waiting = *state.pending_invoices.keys().next().expect("one entry");
+        state.on_bitcoin_delegate_response(address_answer(waiting, 0));
+        assert_eq!(state.pending_signatures.len(), 2);
+
+        let order_request = state
+            .pending_signatures
+            .iter()
+            .find(|p| matches!(p, PendingSignature::Order(_)))
+            .expect("the invoice is queued")
+            .clone();
+        state.on_ghostkey_response(sign_result_for(&order_request));
+
+        assert_eq!(
+            state.pending_signatures.len(),
+            1,
+            "only the invoice's request should have been consumed"
+        );
+        assert!(matches!(
+            state.pending_signatures.front(),
+            Some(PendingSignature::Listing(_))
+        ));
+    }
+
+    /// The store contract verifies every order against the store's own
+    /// `seller_verifying_key`, so an invoice signed by any other connected
+    /// identity is rejected with nothing to say why. Refuse it here, where
+    /// there is something to say.
+    #[test]
+    fn only_the_stores_owner_can_issue_invoices_on_it() {
+        let mut state = seller_with_a_store();
+        let mut wrong = invoice();
+        wrong.seller_fingerprint = "somebody-else".to_string();
+
+        let err = state.issue_invoice(wrong).expect_err("must refuse");
+        assert!(err.contains(SELLER), "unhelpful error: {err}");
+        assert!(state.pending_invoices.is_empty());
+    }
+
+    #[test]
+    fn a_store_that_is_not_ours_is_refused() {
+        let mut state = seller_with_a_store();
+        let mut elsewhere = invoice();
+        elsewhere.store_contract_id = vec![42u8; 32];
+
+        let err = state.issue_invoice(elsewhere).expect_err("must refuse");
+        assert!(err.contains("not one of yours"), "unhelpful error: {err}");
+    }
+
+    /// Without a payment key there is nowhere for the buyer to pay, and the
+    /// delegate would refuse anyway -- but a form error is a better answer
+    /// than a burned round trip and a notification.
+    #[test]
+    fn an_invoice_without_a_payment_key_is_refused_up_front() {
+        let mut state = seller_with_a_store();
+        state.bitcoin.payment_xpub = None;
+
+        let err = state.issue_invoice(invoice()).expect_err("must refuse");
+        assert!(err.contains("payment key"), "unhelpful error: {err}");
+        assert!(state.pending_invoices.is_empty());
+    }
+
+    #[test]
+    fn an_invoice_for_nothing_is_refused() {
+        let mut state = seller_with_a_store();
+        let mut free = invoice();
+        free.amount_sats = 0;
+        assert!(state.issue_invoice(free).is_err());
+    }
+
+    /// Zero confirmations would let a payment count as settled while it is
+    /// still only in the mempool, i.e. while it can still be replaced.
+    #[test]
+    fn an_invoice_requiring_no_confirmations_is_refused() {
+        let mut state = seller_with_a_store();
+        let mut instant = invoice();
+        instant.required_confirmations = 0;
+        assert!(state.issue_invoice(instant).is_err());
+    }
+
+    /// "No key configured" and "we have not asked yet" have to stay distinct,
+    /// or the seller is prompted to add a key they may already have.
+    #[test]
+    fn the_delegate_reports_the_key_it_stored() {
+        let mut state = AppState::default();
+        assert!(!state.bitcoin.payment_xpub_loaded);
+
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::PaymentXpub { status: None });
+        assert!(
+            state.bitcoin.payment_xpub_loaded,
+            "an empty answer is still an answer -- it means no key is set"
+        );
+        assert!(state.bitcoin.payment_xpub.is_none());
+
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::PaymentXpubSet {
+            request_id: 1,
+            result: Ok(PaymentXpubStatus {
+                xpub: "vpub-placeholder".to_string(),
+                network: BitcoinNetwork::Signet,
+                next_index: 4,
+            }),
+        });
+        assert_eq!(
+            state.bitcoin.payment_xpub.as_ref().map(|s| s.next_index),
+            Some(4)
+        );
+    }
+
+    /// A rejected key is reported verbatim: every rejection the delegate can
+    /// produce names something the seller can fix (the wrong export, the
+    /// wrong network, the wrong depth), and reducing it to "invalid key"
+    /// throws that away.
+    #[test]
+    fn a_rejected_payment_key_is_reported_to_the_seller() {
+        let mut state = AppState::default();
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::PaymentXpubSet {
+            request_id: 1,
+            result: Err("that is a legacy account key (xpub/tpub)".to_string()),
+        });
+
+        assert!(state.bitcoin.payment_xpub.is_none());
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("legacy account key")));
+    }
+}
+
+#[cfg(test)]
+mod authorized_order_tests {
+    use super::*;
+
+    use freenet_bitcoin_common::BitcoinNetwork;
+    use harvest_common::listing::ListingId;
+    use harvest_common::payment::{Order, OrderId, OrderStatus};
+
+    fn order() -> Order {
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let listing_id = ListingId::new("seller", &created_at, "Widget");
+        Order {
+            id: OrderId::new("seller", &listing_id, &created_at, "buyer"),
+            listing_id,
+            buyer_fingerprint: "buyer".to_string(),
+            seller_fingerprint: "seller".to_string(),
+            amount_sats: 50_000,
+            network: BitcoinNetwork::Signet,
+            payment_script_pubkey: vec![0x00, 0x14, 0xaa],
+            payment_address: "tb1qexample".to_string(),
+            required_confirmations: 1,
+            payment_hash: None,
+            trusted_bridges: vec![freenet_bitcoin_common::BridgeId([3u8; 32])],
+            bitcoin_address_code_hash: None,
+            created_at,
+        }
+    }
+
+    /// A seller may say what is owed and where; they may NOT say it was paid.
+    /// `Paid` outranks everything a seller can assert and is evidenced by
+    /// bridge-signed observations, so a record claiming it without proof is
+    /// rejected by `AuthorizedOrder::verify` -- with nothing to say why, which
+    /// is indistinguishable from the invoice never having been sent.
+    #[test]
+    fn a_newly_issued_invoice_only_ever_awaits_payment() {
+        let authorized = authorize_new_order(order(), vec![1, 2, 3], vec![4, 5, 6]);
+
+        assert_eq!(authorized.status, OrderStatus::AwaitingPayment);
+        assert!(
+            authorized.payment_proof.is_none(),
+            "there is no payment to prove yet"
+        );
+        assert!(
+            authorized.status_scoped_payload.is_none() && authorized.status_signature.is_none(),
+            "the only seller-signed status transition is Cancelled, which this is not"
+        );
+    }
+
+    /// The signature the delegate returned has to travel with the record
+    /// verbatim: `verify_terms` checks it over the scoped payload, and the
+    /// scoped payload against a re-encoding of the order.
+    #[test]
+    fn the_signature_travels_with_the_terms_it_covers() {
+        let authorized = authorize_new_order(order(), vec![1, 2, 3], vec![4, 5, 6]);
+
+        assert_eq!(authorized.scoped_payload, vec![1, 2, 3]);
+        assert_eq!(authorized.signature, vec![4, 5, 6]);
+        assert_eq!(authorized.order, order());
     }
 }

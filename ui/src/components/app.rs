@@ -60,6 +60,12 @@ pub fn App() -> Element {
                         if let Err(e) = crate::gateway::bitcoin_ops::list_watched().await {
                             dioxus::logger::tracing::error!("Failed to fetch watch list: {e}");
                         }
+                        // And the seller's payment key, so "My Store" knows
+                        // whether it can offer to issue an invoice at all
+                        // rather than prompting for a key that is already set.
+                        if let Err(e) = crate::gateway::bitcoin_ops::get_payment_xpub().await {
+                            dioxus::logger::tracing::error!("Failed to fetch payment key: {e}");
+                        }
                         // No bridge may be configured for the active/default
                         // network yet, in which case there's nothing to
                         // subscribe to until one is. Try the default network

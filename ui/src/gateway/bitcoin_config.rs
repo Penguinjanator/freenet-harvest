@@ -111,3 +111,55 @@ pub const TRUSTED_BRIDGE_ID_BS58: &str = "4MZnDAQWccEWXBUb1wt4iTEkDi6Z2MCcZ9WQN1
 /// rebuild -- see the module docs on the pointer-record fix.
 pub const ADDRESS_CONTRACT_CODE_HASH_HEX: &str =
     "3b5f1df28497b1cfb365798cb86fc87a7e45480d47c79e22f09b9f801e95463f";
+
+/// The bridge set a freshly-issued invoice names, as an `Order` carries it.
+///
+/// An `Order::trusted_bridges` that is empty can never be proven paid --
+/// `verify_payment_proof` returns `NoTrustedBridges` outright -- so an invoice
+/// issued without this would be unpayable from the moment it was signed, and
+/// nothing about it would look wrong. That is exactly what happened while the
+/// bridge list was a store parameter: every store the UI created was published
+/// with an empty list and was permanently incapable of accepting a payment.
+///
+/// Returning a `Result` rather than defaulting to an empty list is the point:
+/// a malformed constant must stop an invoice being issued, not quietly issue
+/// one that cannot be settled.
+pub fn default_trusted_bridges() -> Result<Vec<freenet_bitcoin_common::BridgeId>, String> {
+    freenet_bitcoin_common::BridgeId::from_bs58(TRUSTED_BRIDGE_ID_BS58)
+        .map(|id| vec![id])
+        .map_err(|e| format!("the build's trusted bridge id is unusable: {e}"))
+}
+
+/// [`ADDRESS_CONTRACT_CODE_HASH_HEX`] as the 32 bytes an `Order` carries.
+///
+/// `None` for a malformed constant rather than an error, because this field is
+/// genuinely optional: it drives only the store contract's additive-only
+/// related-contract cross-check, and `None` skips that check and forfeits
+/// nothing else (the embedded payment proof stays authoritative either way).
+/// So an unusable constant must not block issuing an invoice -- unlike the
+/// bridge list above, which decides whether the invoice can ever be settled.
+pub fn address_contract_code_hash() -> Option<[u8; 32]> {
+    let bytes = hex::decode(ADDRESS_CONTRACT_CODE_HASH_HEX).ok()?;
+    <[u8; 32]>::try_from(bytes).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both constants are hand-maintained (see the module docs on why they
+    /// cannot be discovered at runtime), so a typo in either is a real
+    /// possibility -- and the consequence of a bad bridge id is an invoice
+    /// that can never be proven paid.
+    #[test]
+    fn the_builds_bitcoin_constants_parse() {
+        let bridges = default_trusted_bridges().expect("the trusted bridge id must parse");
+        assert_eq!(bridges.len(), 1);
+        assert_eq!(bridges[0].to_bs58(), TRUSTED_BRIDGE_ID_BS58);
+
+        assert!(
+            address_contract_code_hash().is_some(),
+            "the address contract code hash must be 32 hex-encoded bytes"
+        );
+    }
+}
