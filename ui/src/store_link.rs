@@ -56,10 +56,18 @@ pub fn parse_store_id(raw: &str) -> Option<ContractInstanceId> {
 /// Build the link a seller shares for one of their stores: the page they are
 /// on, with the store id in the fragment.
 ///
-/// Any existing fragment is replaced; an existing query string is kept, since
-/// the gateway may have put it there.
+/// Everything from the first `#` or `?` onwards is dropped. The query string
+/// in particular must go: Harvest runs inside the shell's sandboxed iframe,
+/// whose src carries `__sandbox=1`, so `window.location.href` inside the app
+/// always has it. That parameter is interpreted by Freenet's web server --
+/// it makes the gateway serve the raw contract HTML with no shell, no bridge
+/// and no websocket -- so a shared link that kept it would load a dead page
+/// for the buyer. freenet-core strips it from its own redirects for the same
+/// reason. Nothing else the gateway puts in the query string belongs in a
+/// link handed to someone else either (`authToken` is the obvious one), and
+/// the store id itself travels in the fragment.
 pub fn store_link(page_url: &str, store: &ContractInstanceId) -> String {
-    let base = page_url.split('#').next().unwrap_or(page_url);
+    let base = page_url.split(['#', '?']).next().unwrap_or(page_url);
     format!("{base}#{STORE_PARAM}={store}")
 }
 
@@ -181,13 +189,18 @@ mod tests {
         assert_eq!(parse_store_id(fragment), Some(store));
     }
 
+    /// The query string must not survive into a shared link: inside the
+    /// shell's iframe it carries `__sandbox=1`, which makes the gateway serve
+    /// the buyer a shell-less page that can never connect. See `store_link`.
     #[test]
-    fn building_a_link_replaces_any_existing_fragment_and_keeps_the_query() {
+    fn building_a_link_replaces_the_fragment_and_drops_the_query() {
         let store = id(2);
-        let link = store_link("http://host/app/?authToken=abc#store=stale", &store);
-        assert_eq!(
-            link,
-            format!("http://host/app/?authToken=abc#store={store}")
-        );
+        let link = store_link("http://host/app/?__sandbox=1#store=stale", &store);
+        assert_eq!(link, format!("http://host/app/#store={store}"));
+
+        // A credential is not in the shell's iframe URL today, but if one
+        // ever were, sharing it would be worse than a broken link.
+        let link = store_link("http://host/app/?authToken=abc", &store);
+        assert_eq!(link, format!("http://host/app/#store={store}"));
     }
 }
