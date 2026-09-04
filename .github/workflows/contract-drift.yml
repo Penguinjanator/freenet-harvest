@@ -26,13 +26,14 @@ name: contract drift
 # saying out loud that they moved.
 #
 # WHAT THIS JOB DOES NOT CHECK: whether the artifacts committed under
-# `ui/public/contracts/` match the current source. They do not, today -- they
-# were built with an older toolchain and older dependency versions and are not
-# reproducible (they carry absolute paths from the machine that built them).
-# Refreshing them is a deliberate re-key that has to be decided, not smuggled
-# into a CI change, so it is filed separately. This job is a RELATIVE check:
-# it answers "does this PR move the address", which is the question a
-# dependency bump raises.
+# `ui/public/contracts/` match the current source. This job is a RELATIVE
+# check -- it answers "does this PR move the address", which is the question a
+# dependency bump raises -- and it never reads the committed files at all.
+# That is `ci.yml`'s `wasm-staleness` job, which rebuilds and compares the
+# committed bytes. The two are complementary and neither substitutes for the
+# other: a PR can leave the address alone while shipping a stale artifact, and
+# refreshing a stale artifact is itself a re-key this job then has to
+# acknowledge.
 
 on:
   pull_request:

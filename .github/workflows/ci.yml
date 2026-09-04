@@ -82,8 +82,97 @@ jobs:
       # The contracts and the delegate are wasm32-only artifacts and are NOT
       # covered by the native job above -- `cargo test` compiles them for the
       # host, which links differently. A dependency bump can compile clean on
-      # the host and fail to link for wasm32 (that is exactly how the currently
-      # committed delegate ended up with an unresolvable `env.__getrandom_custom`
-      # import; see freenet/harvest#7). Build them for the real target.
+      # the host and fail to link for wasm32 (that is how a previously
+      # committed delegate ended up with an unresolvable
+      # `env.__getrandom_custom` import; see freenet/harvest#7). Build them for
+      # the real target.
       - name: build contract and delegate wasm
         run: ./scripts/build-contract-wasm.sh
+
+  # WHAT THIS ANSWERS, AND WHY IT IS NOT THE DRIFT GUARD'S QUESTION.
+  #
+  # `contract-drift.yml` is a RELATIVE check: did this PR move an address
+  # compared with its merge base. It rebuilds both sides and compares them to
+  # each other, and never looks at `ui/public/contracts/` at all. So a
+  # committed artifact can drift arbitrarily far from the source it claims to
+  # be built from and the drift guard stays green.
+  #
+  # That gap is not hypothetical -- it is how the committed artifacts ended up
+  # carrying 45/63/24/43 absolute `/home/...` paths from the machine that built
+  # them, matching no build anyone else could reproduce, while every check
+  # passed.
+  #
+  # It matters because these bytes ARE what ships: `gateway::store_ops` embeds
+  # them with `include_bytes!`, so the contract every store is created under is
+  # the committed file, not whatever the source would compile to. A stale
+  # artifact means the code under review is not the code deployed.
+  #
+  # HOW TO FIX A RED CHECK HERE: `cargo make sync-wasm`, then commit the four
+  # files. If that moves an address, the drift guard will say so and the
+  # re-key has to be decided (label `contract-rekey-acknowledged`), which is
+  # exactly the intended order.
+  wasm-staleness:
+    name: committed contract wasm matches a fresh build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Same reasoning as the jobs above: rust-toolchain.toml pins the
+      # compiler, and the compiler decides the bytes. Naming a version here
+      # would let the two drift and turn this check into noise.
+      - run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: install b3sum
+        run: command -v b3sum || cargo install b3sum --locked
+
+      # The same build script the drift guard and `cargo make sync-wasm` use.
+      # Its `--remap-path-prefix` flags are what make this comparison possible
+      # at all: without them the runner's checkout and $CARGO_HOME leak into
+      # the binary and no two machines ever agree.
+      - name: compare the committed artifacts with a fresh build
+        run: |
+          set -uo pipefail
+          ./scripts/build-contract-wasm.sh || exit 1
+          stale=0
+          {
+            echo "## Committed contract WASM vs a fresh build"
+            echo
+            echo "| artifact | committed | rebuilt | |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for a in reputation_contract store_contract mailbox_contract harvest_delegate; do
+            committed="ui/public/contracts/$a.wasm"
+            built="target/wasm32-unknown-unknown/release/$a.wasm"
+            # A missing file is a failure, never a silent skip -- an artifact
+            # that is not there is one the UI cannot embed.
+            if [ ! -f "$committed" ]; then
+              echo "::error::$committed is missing; run 'cargo make sync-wasm' and commit it"
+              echo "| \`$a\` | — | — | :x: missing |" >> "$GITHUB_STEP_SUMMARY"
+              stale=1
+              continue
+            fi
+            c="$(b3sum "$committed" | cut -d' ' -f1)"
+            b="$(b3sum "$built" | cut -d' ' -f1)"
+            if [ "$c" = "$b" ]; then
+              echo "up to date: $a  $c"
+              echo "| \`$a\` | \`${c:0:16}…\` | \`${b:0:16}…\` | up to date |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::$committed is STALE: committed $c, rebuilt $b"
+              echo "| \`$a\` | \`${c:0:16}…\` | \`${b:0:16}…\` | :warning: **STALE** |" >> "$GITHUB_STEP_SUMMARY"
+              stale=1
+            fi
+          done
+          echo >> "$GITHUB_STEP_SUMMARY"
+          if [ "$stale" = 0 ]; then
+            echo "Every committed artifact matches a fresh build." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "::error::The committed WASM under ui/public/contracts/ does not match this source. Those bytes are what 'include_bytes!' ships, so the deployed contract is not the reviewed one. Run 'cargo make sync-wasm' and commit the four files."
+          {
+            echo "The UI embeds these files with \`include_bytes!\`, so they are what a"
+            echo "store is actually created under -- not whatever the source would compile to."
+            echo
+            echo "Fix: \`cargo make sync-wasm\`, then commit \`ui/public/contracts/*.wasm\`."
+            echo "If that moves an address, \`contract drift\` will say so and the re-key"
+            echo "has to be acknowledged, which is the intended order."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1

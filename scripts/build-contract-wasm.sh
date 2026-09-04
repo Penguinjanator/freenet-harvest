@@ -17,10 +17,13 @@
 #      the checkout directory and `$CARGO_HOME` leak into panic-location
 #      strings baked into the binary, so the same source produces different
 #      bytes on two machines. The artifacts committed under
-#      `ui/public/contracts/` today were built WITHOUT this and carry
-#      `/home/<user>/.cargo/registry/...` strings; they are therefore not
-#      reproducible by anyone else. `-Zremap-path-scope`/`trim-paths` would be
-#      tidier but is unstable on the pinned stable toolchain.
+#      `ui/public/contracts/` were once built WITHOUT this and carried 45, 63,
+#      24 and 43 `/home/<user>/...` strings respectively, matching no build
+#      anyone else could reproduce; they have since been rebuilt with it and
+#      carry none. CI's `wasm-staleness` job keeps them that way by comparing
+#      the committed bytes against a fresh build on every PR.
+#      `-Zremap-path-scope`/`trim-paths` would be tidier but is unstable on the
+#      pinned stable toolchain.
 #
 # This is the ONE build path for these artifacts. `cargo make sync-wasm` calls
 # it, and CI's drift guard calls it, so the hashes CI reports are the hashes a
