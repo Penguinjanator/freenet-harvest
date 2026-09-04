@@ -148,10 +148,17 @@ pub async fn register_delegate(delegate_wasm: &[u8]) -> Result<DelegateKey, Stri
         let container = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate));
         let key = container.key().clone();
 
+        // `DelegateRequest::DEFAULT_CIPHER` / `DEFAULT_NONCE` existed in
+        // freenet-stdlib 0.6 and are gone in 0.8. Zeroes are the correct
+        // replacement rather than a placeholder: since freenet-core#4140 the
+        // node IGNORES the client-supplied cipher and nonce entirely and
+        // derives a per-delegate key from its own KEK, so these bytes never
+        // reach any cryptographic operation. ghostkeys does the same thing for
+        // the same reason (`ui/src/api/delegate.rs`).
         let request = ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate {
             delegate: container,
-            cipher: DelegateRequest::DEFAULT_CIPHER,
-            nonce: DelegateRequest::DEFAULT_NONCE,
+            cipher: [0u8; 32],
+            nonce: [0u8; 24],
         });
 
         let mut api = super::WEB_API.write();

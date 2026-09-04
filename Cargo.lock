@@ -1442,9 +1442,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.6.1"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4aa02deacddb55332a7dcb6ef3b3afef6e633d4fcbc3730df4f1e34cd7ce84d2"
+checksum = "b62aeba7634d1ae5c2d02f78db33ee40442511858275be5be2099d24a13b2559"
 dependencies = [
  "bincode",
  "blake3",
@@ -1629,9 +1629,9 @@ dependencies = [
 
 [[package]]
 name = "ghostkey-common"
-version = "0.2.4"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "588d94e053b5da56b9e3e7ed0e860a7ac0fab4a6f29903607eb87a5ae95f1eb2"
+checksum = "92ea36af38ec33104315d5b6f8c8a2aa4ff7996b6c43136f8184989023e444f5"
 dependencies = [
  "ciborium",
  "freenet-stdlib",

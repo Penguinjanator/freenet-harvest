@@ -73,7 +73,10 @@ pub const LEGACY_HARVEST_WEBAPP_CONTRACT_IDS: &[&str] = &[];
 static EXPECTED_HARVEST_REQUESTOR: std::sync::LazyLock<ghostkey_common::SignatureRequestor> =
     std::sync::LazyLock::new(|| {
         use freenet_stdlib::prelude::ContractInstanceId;
-        let id = ContractInstanceId::from_bytes(HARVEST_WEBAPP_CONTRACT_ID)
+        // `from_bytes` under freenet-stdlib 0.6; renamed to `from_base58` in
+        // 0.8 because the old name read as "raw 32 bytes" when it always
+        // parsed base58 TEXT. Same function, and the constant is base58.
+        let id = ContractInstanceId::from_base58(HARVEST_WEBAPP_CONTRACT_ID)
             .expect("HARVEST_WEBAPP_CONTRACT_ID must parse as a valid ContractInstanceId");
         ghostkey_common::SignatureRequestor::WebApp(id)
     });

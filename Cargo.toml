@@ -25,10 +25,23 @@ freenet-bitcoin-common = { git = "https://github.com/freenet/freenet-bitcoin", b
 hex = "0.4"
 
 # Freenet ecosystem
-freenet-stdlib = { version = "0.6", features = ["contract"] }
+# 0.8.5 is what freenet-core, River and freenet-bitcoin are on. The bump from
+# 0.6 is not cosmetic and not optional: `freenet-migrate` links against
+# stdlib 0.8, and `__frnt_set_id` is unconditionally `#[no_mangle]` in both
+# 0.6 and 0.8, so the two versions cannot co-link in one wasm module. Adopting
+# the migration crate at all therefore requires this bump -- and the bump
+# itself re-keys all four artifacts, which is why generation 4 is recorded in
+# every registry under `legacy/`.
+freenet-stdlib = { version = "0.8.5", features = ["contract"] }
 freenet-scaffold = "0.2.2"
 freenet-scaffold-macro = "0.2.2"
-ghostkey-common = "0.2.3"
+# 0.3.0 is the first release built against freenet-stdlib 0.8; 0.2.x pulls 0.6
+# and would reintroduce the co-link conflict above.
+ghostkey-common = "0.3"
+
+# Upgrade migration: predecessor lineages, the contract probe driver, and the
+# delegate secret-export primitives. See `legacy/*.toml` and `ui/src/migrate.rs`.
+freenet-migrate = { version = "0.6", default-features = false }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
