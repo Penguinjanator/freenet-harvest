@@ -143,7 +143,7 @@ fn IdentityList(
             for gk in &ghostkeys {
                 IdentityCard {
                     identity: gk.clone(),
-                    has_store: my_stores.contains_key(&gk.fingerprint),
+                    stores: my_stores.get(&gk.fingerprint).cloned().unwrap_or_default(),
                     has_rsa_key: rsa_keys.contains_key(&gk.fingerprint),
                     has_harvest_delegate: has_harvest_delegate,
                 }
@@ -155,13 +155,22 @@ fn IdentityList(
 #[component]
 fn IdentityCard(
     identity: ghostkey_common::GhostKeyInfo,
-    has_store: bool,
+    stores: Vec<harvest_common::StoreRegistration>,
     has_rsa_key: bool,
     has_harvest_delegate: bool,
 ) -> Element {
     let mut show_listing_form = use_signal(|| false);
     let mut show_store_form = use_signal(|| false);
     let fp = identity.fingerprint.clone();
+    let has_store = !stores.is_empty();
+
+    // Buyers can only reach a store through a link the seller sends them, so
+    // the seller has to be able to see it. Built here rather than in rsx
+    // because it needs the page URL, which native builds don't have.
+    let share_links: Vec<String> = stores
+        .iter()
+        .filter_map(|store| crate::store_link::share_link(&store.store_contract_id))
+        .collect();
 
     rsx! {
         div { class: "identity-card",
@@ -190,6 +199,21 @@ fn IdentityCard(
                         disabled: !has_harvest_delegate,
                         onclick: move |_| show_store_form.toggle(),
                         if show_store_form() { "Cancel" } else { "Create Store" }
+                    }
+                }
+            }
+        }
+
+        if !share_links.is_empty() {
+            div { class: "store-share",
+                p { class: "text-muted",
+                    "Share this link so buyers can open your store:"
+                }
+                for link in &share_links {
+                    input {
+                        class: "form-input",
+                        readonly: true,
+                        value: "{link}",
                     }
                 }
             }

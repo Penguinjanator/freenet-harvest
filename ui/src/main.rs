@@ -7,6 +7,7 @@ mod document_title;
 mod gateway;
 mod messaging;
 mod state;
+mod store_link;
 
 fn main() {
     dioxus::logger::initialize_default();

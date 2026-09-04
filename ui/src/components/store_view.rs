@@ -6,21 +6,46 @@ use crate::gateway::APP_STATE;
 #[component]
 pub fn StoreView() -> Element {
     let app_state = APP_STATE.read();
+
+    // Prefer the store a link named; fall back to any store whose state has
+    // actually arrived. `browsing_stores` also holds placeholder entries with
+    // no info yet, so picking the map's first entry can show "no store" while
+    // a perfectly good one is loaded.
     let store_entry = app_state
-        .browsing_stores
-        .iter()
-        .next()
-        .map(|(k, v)| (k.clone(), v.clone()));
+        .active_store_id
+        .as_ref()
+        .and_then(|id| {
+            app_state
+                .browsing_stores
+                .get(id)
+                .map(|s| (id.clone(), s.clone()))
+        })
+        .filter(|(_, store)| store.info.is_some())
+        .or_else(|| {
+            app_state
+                .browsing_stores
+                .iter()
+                .find(|(_, store)| store.info.is_some())
+                .map(|(k, v)| (k.clone(), v.clone()))
+        });
+
+    // A link was followed but the store's state hasn't come back yet.
+    let awaiting_link = store_entry.is_none() && app_state.active_store_id.is_some();
 
     rsx! {
         div {
             h2 { "Store" }
 
             match store_entry {
-                Some((contract_id, ref store)) if store.info.is_some() => {
-                    rsx! { LoadedStore { store: store.clone(), contract_id: contract_id } }
+                Some((contract_id, store)) => {
+                    rsx! { LoadedStore { store: store, contract_id: contract_id } }
                 }
-                _ => {
+                None if awaiting_link => {
+                    rsx! {
+                        p { class: "text-muted text-italic", "Loading store..." }
+                    }
+                }
+                None => {
                     rsx! {
                         p { class: "text-muted text-italic",
                             "No store loaded. Share a store link to browse listings."

@@ -511,6 +511,15 @@ h4 {
   margin-bottom: var(--space-sm);
 }
 
+.store-share {
+  margin: 0 0 var(--space-md);
+}
+
+.store-share p {
+  margin-bottom: var(--space-xs);
+  font-size: 0.85rem;
+}
+
 .identity-name {
   font-family: var(--font-display);
   font-weight: 700;

@@ -36,6 +36,12 @@ pub fn App() -> Element {
 
                 dioxus::logger::tracing::info!("Connected -- registering delegates");
 
+                // If this page was opened from a shared store link, fetch and
+                // subscribe to that store now. It needs only the websocket:
+                // a buyer following a seller's link has no ghostkey and needs
+                // neither delegate to read a store.
+                crate::store_link::open_store_from_url();
+
                 let harvest_wasm = include_bytes!("../../public/contracts/harvest_delegate.wasm");
                 match crate::gateway::register_delegate(harvest_wasm).await {
                     Ok(key) => {

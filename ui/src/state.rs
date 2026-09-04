@@ -29,6 +29,13 @@ pub struct AppState {
     /// Stores we're currently browsing, keyed by store contract ID.
     pub browsing_stores: HashMap<Vec<u8>, BrowsingStore>,
 
+    /// The store the Browse tab shows. `browsing_stores` also holds
+    /// placeholder entries -- one is created the moment a link is opened and
+    /// before any state arrives, and another whenever reputation state turns
+    /// up for a store we haven't loaded -- so "whichever entry the map
+    /// iterates first" is not a safe answer to "which store is on screen".
+    pub active_store_id: Option<Vec<u8>>,
+
     /// Maps reputation contract IDs back to their store contract IDs,
     /// so reputation state can be matched to the right store.
     pub reputation_to_store: HashMap<Vec<u8>, Vec<u8>>,
@@ -128,9 +135,13 @@ fn subscribe_in_background(what: &'static str, contract_id: Vec<u8>) {
 }
 
 impl AppState {
-    /// Start browsing a store: subscribe to it and prepare state.
+    /// Start browsing a store: prepare its state and make it the store the
+    /// Browse tab shows. The caller is responsible for the GET/subscribe.
     pub fn begin_browsing(&mut self, store_contract_id: Vec<u8>) {
-        self.browsing_stores.entry(store_contract_id).or_default();
+        self.browsing_stores
+            .entry(store_contract_id.clone())
+            .or_default();
+        self.active_store_id = Some(store_contract_id);
     }
 
     /// Handle full contract state received from a GET response.
@@ -173,6 +184,13 @@ impl AppState {
                 &contract_id[..8.min(contract_id.len())]
             );
             let reputation_id = store_state.info.info.reputation_contract_id.to_vec();
+
+            // A store the seller just created, or one they own, arrives
+            // without anyone having followed a link. Show it, unless a link
+            // has already named the store this tab is for.
+            if self.active_store_id.is_none() {
+                self.active_store_id = Some(contract_id.clone());
+            }
 
             let store = self.browsing_stores.entry(contract_id.clone()).or_default();
             store.info = Some(store_state.info.info);
