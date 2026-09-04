@@ -42,6 +42,22 @@ jobs:
       - name: cargo test
         run: cargo test --locked --workspace
 
+      # `harvest-common`'s `address-guard` feature is OFF by default, and
+      # deliberately: that crate compiles into all three contracts and the
+      # delegate, and adding this code ungated moved all four code hashes. The
+      # cost is that the two steps above never compile `common/src/address.rs`
+      # or the `harvest-addresses` binary at all, so without this step the
+      # contract-address guard would rot unlinted and untested.
+      #
+      # It is also where a new parameter field becomes a compile error: the
+      # placeholder constructors name every field, so adding one and not
+      # updating them fails HERE, in the same PR that moves the address.
+      - name: clippy and test the contract-address guard
+        run: |
+          set -euo pipefail
+          cargo clippy --locked -p harvest-common --features address-guard --all-targets -- -D warnings
+          cargo test --locked -p harvest-common --features address-guard
+
   wasm:
     name: contracts, delegate and UI build to wasm
     runs-on: ubuntu-latest
@@ -100,6 +116,12 @@ jobs:
       # developers get locally and the check CI enforces cannot drift apart.
       # It reuses the build above rather than building again: these bytes are
       # network addresses and there is exactly one build path for them.
+      # It also prints each artifact's full ADDRESS -- code hash paired with the
+      # CBOR of its live parameter struct -- from the same
+      # `harvest-addresses` binary `contract-drift.yml` uses. The refusal
+      # itself stays a code-hash check because that is what the registries
+      # record; the address is there so a reader can see a parameters-only
+      # move, which no registry entry describes.
       - name: current code hashes are not recorded as superseded
         run: ./scripts/check-code-hashes.sh
 
