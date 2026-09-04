@@ -93,6 +93,19 @@ pub struct AppState {
     /// answer. A queue keeps them in the order they were asked for.
     pub pending_signatures: std::collections::VecDeque<PendingSignature>,
 
+    /// Ghostkey certificates by fingerprint, as the delegate reports them.
+    ///
+    /// A store's details carry the seller's certificate so a buyer can check
+    /// the trust chain, and the certificate has to be inside the record
+    /// *before* it is signed -- the copy `SignResult` returns alongside the
+    /// signature arrives a round-trip too late to be part of what was signed.
+    pub certificates: HashMap<String, String>,
+
+    /// Store details the seller has entered and asked to publish, waiting on
+    /// the certificate that has to travel inside the signed record. See
+    /// `start_store_edit_if_ready`.
+    pub pending_store_edit: Option<PendingStoreEdit>,
+
     /// Signed listings ready to be submitted to the store contract.
     /// The UI should pick these up and send them as contract updates.
     pub signed_listings_ready: Vec<AuthorizedListing>,
@@ -162,6 +175,187 @@ fn spawn_store_creation(pending: PendingStoreCreation) {
                 .push(format!("Store creation failed: {e}"));
         }
     });
+}
+
+/// Ask the ghostkey delegate for an identity's certificate.
+#[cfg(target_arch = "wasm32")]
+fn request_certificate(fingerprint: String) {
+    wasm_bindgen_futures::spawn_local(async move {
+        use dioxus::prelude::ReadableExt;
+
+        let Some(delegate_key) = crate::gateway::APP_STATE
+            .read()
+            .ghostkey_delegate_key
+            .clone()
+        else {
+            dioxus::logger::tracing::error!("Ghostkey delegate not registered");
+            return;
+        };
+        let request = ghostkey_common::GhostkeyRequest::GetCertificate { fingerprint };
+        let payload = match ghostkey_common::to_cbor(&request) {
+            Ok(payload) => payload,
+            Err(e) => {
+                dioxus::logger::tracing::error!("Failed to serialize GetCertificate: {e}");
+                return;
+            }
+        };
+        if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
+            dioxus::logger::tracing::error!("Failed to request certificate: {e}");
+        }
+    });
+}
+
+/// Ask the ghostkey delegate to sign a store's details.
+///
+/// The request is already queued by the time this runs, because the answer
+/// can arrive as soon as the send returns and an answer matching nothing is
+/// dropped. If the send itself fails, withdraw it again: nothing will ever
+/// answer it.
+#[cfg(target_arch = "wasm32")]
+fn spawn_store_info_signature(fingerprint: String, pending: PendingStoreInfo) {
+    wasm_bindgen_futures::spawn_local(async move {
+        use dioxus::prelude::{ReadableExt, WritableExt};
+
+        let queued = PendingSignature::StoreInfo(pending.clone());
+        let withdraw = |reason: String| {
+            dioxus::logger::tracing::error!("{reason}");
+            let mut state = crate::gateway::APP_STATE.write();
+            state.withdraw_pending_signature(&queued);
+            state
+                .notifications
+                .push(format!("Could not publish your store's details: {reason}"));
+        };
+
+        let Some(delegate_key) = crate::gateway::APP_STATE
+            .read()
+            .ghostkey_delegate_key
+            .clone()
+        else {
+            withdraw("ghostkey delegate not registered".to_string());
+            return;
+        };
+        let message = match harvest_common::to_cbor(&pending.info) {
+            Ok(message) => message,
+            Err(e) => {
+                withdraw(format!("serialize store details for signing: {e}"));
+                return;
+            }
+        };
+        let request = ghostkey_common::GhostkeyRequest::SignMessage {
+            fingerprint,
+            message,
+        };
+        let payload = match ghostkey_common::to_cbor(&request) {
+            Ok(payload) => payload,
+            Err(e) => {
+                withdraw(format!("serialize SignMessage: {e}"));
+                return;
+            }
+        };
+        if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
+            withdraw(format!("send store details for signing: {e}"));
+        }
+    });
+}
+
+/// The details a seller types about their own store.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StoreDetails {
+    pub store_name: String,
+    pub description: String,
+    pub payment_instructions: String,
+}
+
+/// Why a store the seller owns needs its details published.
+///
+/// Each of these is a state a store can genuinely be in today, not a
+/// hypothetical: stores created before the details were ever published sit at
+/// version 0, and a creation interrupted between the PUT and the signed
+/// update leaves the same thing behind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StoreDetailsGap {
+    /// Still at version 0, the uninitialized state -- nothing has ever been
+    /// published, so the store has no name, no description, and no link to
+    /// the seller's reputation.
+    NeverPublished,
+    /// Published, but with no name a buyer can read.
+    NoName,
+    /// Published, but naming no reputation contract, so the seller's
+    /// feedback history cannot be reached from the store.
+    NoReputationLink,
+}
+
+impl StoreDetailsGap {
+    /// What to tell the seller is wrong, and what publishing will fix.
+    pub fn message(self) -> &'static str {
+        match self {
+            StoreDetailsGap::NeverPublished => {
+                "This store's details were never published. Buyers who open your link see a \
+                 storefront with no name, no description and no payment instructions, and your \
+                 reputation record cannot be reached from it. Publishing the details below fixes \
+                 all three."
+            }
+            StoreDetailsGap::NoName => {
+                "This store has no name. Buyers who open your link see an unnamed storefront. \
+                 Publishing the details below fixes it."
+            }
+            StoreDetailsGap::NoReputationLink => {
+                "This store does not name your reputation contract, so buyers cannot reach your \
+                 feedback history from it. Publishing the details below restores the link."
+            }
+        }
+    }
+}
+
+/// Whether a store's published details need repairing, and why.
+///
+/// `None` for a store whose state has not arrived yet: absence of information
+/// is not evidence of a gap, and reporting one here would flash a repair
+/// prompt at every seller on every load.
+pub fn store_details_gap(info: Option<&StoreInfoV1>) -> Option<StoreDetailsGap> {
+    let info = info?;
+    if info.version == 0 {
+        // Version 0 is the default state, which `AuthorizedStoreInfoV1::verify`
+        // skips entirely -- nothing in it was ever signed or published.
+        return Some(StoreDetailsGap::NeverPublished);
+    }
+    if info.store_name.trim().is_empty() {
+        return Some(StoreDetailsGap::NoName);
+    }
+    if info.reputation_contract_id == [0u8; 32] {
+        return Some(StoreDetailsGap::NoReputationLink);
+    }
+    None
+}
+
+/// Store details entered by the seller and waiting on the certificate.
+#[derive(Clone, Debug)]
+pub struct PendingStoreEdit {
+    pub ghostkey_fingerprint: String,
+    pub store_contract_id: Vec<u8>,
+    /// Taken from the seller's own `StoreRegistration`, which is the one
+    /// place this survives -- the store's published state does not have it
+    /// whenever there is anything to repair.
+    pub reputation_contract_id: [u8; 32],
+    /// One past whatever the network holds now, so the contract's
+    /// last-writer-wins merge takes this over what is already there.
+    pub next_version: u32,
+    pub details: StoreDetails,
+}
+
+impl PendingStoreEdit {
+    /// The record to sign and publish, once the certificate is known.
+    fn store_info(&self, certificate_pem: String) -> StoreInfoV1 {
+        StoreInfoV1 {
+            version: self.next_version,
+            certificate_pem,
+            seller_fingerprint: self.ghostkey_fingerprint.clone(),
+            reputation_contract_id: self.reputation_contract_id,
+            store_name: self.details.store_name.clone(),
+            description: self.details.description.clone(),
+            payment_instructions: self.details.payment_instructions.clone(),
+        }
+    }
 }
 
 /// Something waiting on the ghostkey delegate's `SignResult`.
@@ -540,6 +734,145 @@ impl AppState {
         );
     }
 
+    /// Drop a queued signature request that nothing will ever answer.
+    ///
+    /// Matched on the bytes it asked to have signed, the same way an incoming
+    /// answer is matched, so this cannot withdraw a different request that
+    /// happens to sit at the same position.
+    fn withdraw_pending_signature(&mut self, withdrawn: &PendingSignature) {
+        let Ok(bytes) = withdrawn.signed_bytes() else {
+            return;
+        };
+        self.pending_signatures
+            .retain(|pending| !pending.signed_bytes().is_ok_and(|queued| queued == bytes));
+    }
+
+    /// Publish new details for a store the seller owns -- the entry point for
+    /// both editing a working store and repairing one whose details never
+    /// reached the network.
+    ///
+    /// Everything except what the seller typed is taken from state rather
+    /// than passed in, which is what makes this safe to call from a form:
+    /// the store has to be one of theirs (`my_stores` is the only source of
+    /// the owning fingerprint), and the reputation contract id comes from
+    /// that registration rather than from the store's published state, which
+    /// is exactly the field that is missing whenever there is anything to
+    /// repair.
+    ///
+    /// Errors are returned rather than swallowed so the form can say why
+    /// nothing happened.
+    pub fn publish_store_details(
+        &mut self,
+        store_contract_id: &[u8],
+        details: StoreDetails,
+    ) -> Result<(), String> {
+        let (ghostkey_fingerprint, registration) = self
+            .my_stores
+            .iter()
+            .find_map(|(fingerprint, stores)| {
+                stores
+                    .iter()
+                    .find(|store| store.store_contract_id == store_contract_id)
+                    .map(|store| (fingerprint.clone(), store))
+            })
+            .ok_or("this store is not one of yours -- nothing to publish details for")?;
+
+        let reputation_contract_id: [u8; 32] = registration
+            .reputation_contract_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                format!(
+                    "this store's reputation contract id is {} bytes, not 32 -- cannot publish \
+                     details that would point buyers at nothing",
+                    registration.reputation_contract_id.len()
+                )
+            })?;
+
+        // One past whatever is published now. A store that has never
+        // published anything is at version 0, so this is 1 -- the first
+        // version the contract actually verifies.
+        let next_version = self
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|store| store.info.as_ref())
+            .map_or(0, |info| info.version)
+            .saturating_add(1);
+
+        self.pending_store_edit = Some(PendingStoreEdit {
+            ghostkey_fingerprint: ghostkey_fingerprint.clone(),
+            store_contract_id: store_contract_id.to_vec(),
+            reputation_contract_id,
+            next_version,
+            details,
+        });
+
+        if !self.start_store_edit_if_ready() {
+            // The certificate has to be inside the record before it is
+            // signed, so ask for it and finish when it lands.
+            info!("Store details are waiting on the certificate for {ghostkey_fingerprint}");
+            #[cfg(target_arch = "wasm32")]
+            request_certificate(ghostkey_fingerprint);
+        }
+        Ok(())
+    }
+
+    /// Sign and publish a pending edit once the certificate it needs is
+    /// known. Returns whether it went ahead.
+    ///
+    /// Called both when the edit is submitted (the certificate is usually
+    /// already cached by then) and whenever a certificate arrives, so
+    /// neither order needs special handling.
+    fn start_store_edit_if_ready(&mut self) -> bool {
+        let Some(edit) = self.pending_store_edit.as_ref() else {
+            return false;
+        };
+        let Some(certificate_pem) = self
+            .certificates
+            .get(&edit.ghostkey_fingerprint)
+            .filter(|pem| !pem.is_empty())
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(edit) = self.pending_store_edit.take() else {
+            return false;
+        };
+
+        let info = edit.store_info(certificate_pem);
+        info!(
+            "Publishing details for store {:?} at version {}",
+            &edit.store_contract_id[..8.min(edit.store_contract_id.len())],
+            info.version
+        );
+        self.queue_store_info_signature(edit.ghostkey_fingerprint, edit.store_contract_id, info);
+        true
+    }
+
+    /// Queue a store-info signature request and ask the delegate for it.
+    ///
+    /// The queueing is deliberately not behind a target gate: it is the part
+    /// that decides what gets published, so it stays testable off-target.
+    /// Only the delegate round-trip needs a browser.
+    fn queue_store_info_signature(
+        &mut self,
+        ghostkey_fingerprint: String,
+        store_contract_id: Vec<u8>,
+        info: StoreInfoV1,
+    ) {
+        let pending = PendingStoreInfo {
+            info,
+            store_contract_id,
+        };
+        self.pending_signatures
+            .push_back(PendingSignature::StoreInfo(pending.clone()));
+
+        #[cfg(target_arch = "wasm32")]
+        spawn_store_info_signature(ghostkey_fingerprint, pending);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = ghostkey_fingerprint;
+    }
+
     /// Publish a new store's contracts, once every input creation needs has
     /// arrived.
     ///
@@ -854,6 +1187,8 @@ impl AppState {
                 // fill in the certificate PEM. The verifying key is extracted
                 // by the store creation code from the certificate at contract
                 // creation time.
+                self.certificates
+                    .insert(fingerprint.clone(), certificate_pem.clone());
                 if let Some(ref mut pending) = self.pending_store_creation {
                     if pending.ghostkey_fingerprint == fingerprint {
                         pending.certificate_pem = certificate_pem;
@@ -861,6 +1196,7 @@ impl AppState {
                     }
                 }
                 self.start_store_creation_if_ready();
+                self.start_store_edit_if_ready();
             }
 
             ghostkey_common::GhostkeyResponse::GhostKeyDetail {
@@ -869,6 +1205,8 @@ impl AppState {
                 ..
             } => {
                 info!("Received ghostkey detail for {}", fingerprint);
+                self.certificates
+                    .insert(fingerprint.clone(), certificate_pem.clone());
                 // Also update pending store creation if applicable
                 if let Some(ref mut pending) = self.pending_store_creation {
                     if pending.ghostkey_fingerprint == fingerprint {
@@ -876,12 +1214,17 @@ impl AppState {
                     }
                 }
                 self.start_store_creation_if_ready();
+                self.start_store_edit_if_ready();
             }
 
             ghostkey_common::GhostkeyResponse::Error { message } => {
                 self.notifications
                     .push(format!("Ghostkey error: {message}"));
                 self.pending_signatures.clear();
+                // A failed `GetCertificate` surfaces here, and an edit
+                // waiting on that certificate would otherwise sit unfinished
+                // and unmentioned.
+                self.pending_store_edit = None;
                 self.request_any_access_in_flight = false;
             }
 
@@ -898,6 +1241,7 @@ impl AppState {
                 self.request_any_access_in_flight = false;
                 self.pending_signatures.clear();
                 self.pending_store_creation = None;
+                self.pending_store_edit = None;
             }
 
             // The vault has no ghostkeys at all. Tell the user where
@@ -909,6 +1253,7 @@ impl AppState {
                 self.request_any_access_in_flight = false;
                 self.pending_signatures.clear();
                 self.pending_store_creation = None;
+                self.pending_store_edit = None;
             }
 
             // Per-fingerprint denial: the user denied a specific-key
@@ -920,6 +1265,7 @@ impl AppState {
                 self.request_any_access_in_flight = false;
                 self.pending_signatures.clear();
                 self.pending_store_creation = None;
+                self.pending_store_edit = None;
             }
 
             // Vault-only responses Harvest doesn't act on. The
@@ -1750,6 +2096,249 @@ mod tests {
             .expect("this creation is still waiting on its own answers");
         assert!(pending.certificate_pem.is_empty());
         assert!(pending.rsa_public_key_der.is_none());
+    }
+
+    const STORE_ID: [u8; 32] = [1u8; 32];
+    /// `registration(1, ..)` files the store's reputation contract under this.
+    const REPUTATION_ID: [u8; 32] = [2u8; 32];
+
+    fn published_info(version: u32, name: &str, reputation_contract_id: [u8; 32]) -> StoreInfoV1 {
+        StoreInfoV1 {
+            version,
+            certificate_pem: String::new(),
+            seller_fingerprint: FINGERPRINT.to_string(),
+            reputation_contract_id,
+            store_name: name.to_string(),
+            description: String::new(),
+            payment_instructions: String::new(),
+        }
+    }
+
+    /// A seller who owns one store, optionally with published details.
+    fn seller_with_store(published: Option<StoreInfoV1>) -> AppState {
+        let mut state = AppState {
+            my_stores: HashMap::from([(FINGERPRINT.to_string(), vec![registration(1, None)])]),
+            ..AppState::default()
+        };
+        if let Some(info) = published {
+            state
+                .browsing_stores
+                .entry(STORE_ID.to_vec())
+                .or_default()
+                .info = Some(info);
+        }
+        state
+    }
+
+    fn typed_details() -> StoreDetails {
+        StoreDetails {
+            store_name: "Bean Shop".to_string(),
+            description: "Coffee".to_string(),
+            payment_instructions: "BTC: bc1q...".to_string(),
+        }
+    }
+
+    /// The store info queued for signing, if any.
+    fn queued_store_info(state: &AppState) -> Option<&StoreInfoV1> {
+        state
+            .pending_signatures
+            .iter()
+            .find_map(|pending| match pending {
+                PendingSignature::StoreInfo(store_info) => Some(&store_info.info),
+                PendingSignature::Listing(_) => None,
+            })
+    }
+
+    /// Version 0 is the uninitialized state: nothing was ever signed or
+    /// published, so the store has no name and no reputation link. This is
+    /// every store created before details were published at all, and every
+    /// store left behind by a creation interrupted before its signed update.
+    #[test]
+    fn a_store_at_version_zero_needs_publishing() {
+        assert_eq!(
+            store_details_gap(Some(&published_info(0, "", [0u8; 32]))),
+            Some(StoreDetailsGap::NeverPublished)
+        );
+    }
+
+    #[test]
+    fn a_published_store_without_a_name_needs_repair() {
+        assert_eq!(
+            store_details_gap(Some(&published_info(1, "   ", REPUTATION_ID))),
+            Some(StoreDetailsGap::NoName)
+        );
+    }
+
+    /// The half nobody would notice. A store can carry a perfectly good name
+    /// and still name no reputation contract, which leaves the seller's
+    /// feedback history unreachable from it.
+    #[test]
+    fn a_published_store_without_a_reputation_link_needs_repair() {
+        assert_eq!(
+            store_details_gap(Some(&published_info(1, "Bean Shop", [0u8; 32]))),
+            Some(StoreDetailsGap::NoReputationLink)
+        );
+    }
+
+    /// Nothing to repair means no prompt, which is what keeps this from
+    /// nagging -- or republishing -- a store that is already fine.
+    #[test]
+    fn a_healthy_store_needs_nothing() {
+        assert_eq!(
+            store_details_gap(Some(&published_info(1, "Bean Shop", REPUTATION_ID))),
+            None
+        );
+    }
+
+    /// A store whose state has not arrived yet is not a store with a gap.
+    /// Reporting one here would flash the repair prompt on every load.
+    #[test]
+    fn a_store_that_has_not_loaded_yet_needs_nothing() {
+        assert_eq!(store_details_gap(None), None);
+    }
+
+    /// The reputation contract id must come from the seller's own
+    /// registration, not from the store's published state -- that field is
+    /// all-zero in exactly the case being repaired, so copying it forward
+    /// would publish a store that still points buyers at nothing.
+    #[test]
+    fn repairing_a_store_restores_the_reputation_link() {
+        let mut state = seller_with_store(Some(published_info(0, "", [0u8; 32])));
+        state
+            .certificates
+            .insert(FINGERPRINT.to_string(), "-----BEGIN CERT-----".to_string());
+
+        state
+            .publish_store_details(&STORE_ID, typed_details())
+            .expect("the seller owns this store");
+
+        let info = queued_store_info(&state).expect("details queued for signing");
+        assert_eq!(
+            info.reputation_contract_id, REPUTATION_ID,
+            "the reputation link must come from the registration, not the empty published state"
+        );
+        assert_ne!(info.reputation_contract_id, [0u8; 32]);
+    }
+
+    /// The rest of the repaired record: the seller's own text, the identity
+    /// fields a buyer needs, and a version past the one the contract skips
+    /// verifying.
+    #[test]
+    fn repairing_a_store_publishes_what_the_seller_typed() {
+        let mut state = seller_with_store(Some(published_info(0, "", [0u8; 32])));
+        state
+            .certificates
+            .insert(FINGERPRINT.to_string(), "-----BEGIN CERT-----".to_string());
+
+        state
+            .publish_store_details(&STORE_ID, typed_details())
+            .expect("the seller owns this store");
+
+        let info = queued_store_info(&state).expect("details queued for signing");
+        assert_eq!(info.version, 1, "version 0 is the unverified state");
+        assert_eq!(info.store_name, "Bean Shop");
+        assert_eq!(info.description, "Coffee");
+        assert_eq!(info.payment_instructions, "BTC: bc1q...");
+        assert_eq!(info.seller_fingerprint, FINGERPRINT);
+        assert_eq!(info.certificate_pem, "-----BEGIN CERT-----");
+    }
+
+    /// Editing a store that is already published has to win the contract's
+    /// last-writer-wins merge, so it lands one past whatever is there.
+    #[test]
+    fn editing_a_published_store_moves_past_its_current_version() {
+        let mut state = seller_with_store(Some(published_info(3, "Old Name", REPUTATION_ID)));
+        state
+            .certificates
+            .insert(FINGERPRINT.to_string(), "cert".to_string());
+
+        state
+            .publish_store_details(&STORE_ID, typed_details())
+            .expect("the seller owns this store");
+
+        let info = queued_store_info(&state).expect("details queued for signing");
+        assert_eq!(info.version, 4);
+        assert_eq!(info.store_name, "Bean Shop");
+    }
+
+    /// A store stranded mid-creation may have no state locally at all. It
+    /// still publishes at version 1 rather than being skipped.
+    #[test]
+    fn a_store_with_no_local_state_still_publishes_at_version_one() {
+        let mut state = seller_with_store(None);
+        state
+            .certificates
+            .insert(FINGERPRINT.to_string(), "cert".to_string());
+
+        state
+            .publish_store_details(&STORE_ID, typed_details())
+            .expect("the seller owns this store");
+
+        assert_eq!(
+            queued_store_info(&state).expect("queued").version,
+            1,
+            "nothing published means the next version is the first one"
+        );
+    }
+
+    /// The certificate travels inside the signed record, so it has to be
+    /// known before signing. Without it the edit waits rather than
+    /// publishing a record with no trust chain -- the same failure the
+    /// creation gate exists to prevent.
+    #[test]
+    fn an_edit_waits_for_the_certificate() {
+        let mut state = seller_with_store(Some(published_info(0, "", [0u8; 32])));
+
+        state
+            .publish_store_details(&STORE_ID, typed_details())
+            .expect("the seller owns this store");
+
+        assert!(
+            state.pending_signatures.is_empty(),
+            "nothing may be signed before the certificate is known"
+        );
+        assert!(state.pending_store_edit.is_some(), "the edit is waiting");
+
+        state.on_ghostkey_response(certificate(FINGERPRINT));
+
+        assert!(state.pending_store_edit.is_none(), "the edit went ahead");
+        let info = queued_store_info(&state).expect("details queued for signing");
+        assert_eq!(info.certificate_pem, "-----BEGIN CERT-----");
+        assert_eq!(info.reputation_contract_id, REPUTATION_ID);
+    }
+
+    /// `my_stores` is the only source of the owning fingerprint and of the
+    /// reputation contract id, so a store that is not in it cannot be
+    /// published to at all -- which is also what stops this firing for a
+    /// store the user is merely browsing.
+    #[test]
+    fn details_cannot_be_published_for_a_store_the_user_does_not_own() {
+        let mut state = seller_with_store(Some(published_info(0, "", [0u8; 32])));
+
+        let err = state
+            .publish_store_details(&[9u8; 32], typed_details())
+            .expect_err("a browsed store is not the seller's to publish");
+
+        assert!(err.contains("not one of yours"), "unhelpful error: {err}");
+        assert!(state.pending_store_edit.is_none());
+        assert!(state.pending_signatures.is_empty());
+    }
+
+    /// An edit waiting on a certificate that will never arrive must not sit
+    /// there unfinished and unmentioned.
+    #[test]
+    fn a_denied_prompt_clears_a_waiting_edit() {
+        let mut state = seller_with_store(Some(published_info(0, "", [0u8; 32])));
+        state
+            .publish_store_details(&STORE_ID, typed_details())
+            .expect("the seller owns this store");
+        assert!(state.pending_store_edit.is_some());
+
+        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::AccessDenied {
+            requestor: harvest_common::expected_harvest_requestor(),
+        });
+
+        assert!(state.pending_store_edit.is_none());
     }
 
     /// A delegate error or a denied prompt invalidates everything queued --

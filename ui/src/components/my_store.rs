@@ -3,6 +3,20 @@ use harvest_common::listing::Listing;
 
 use super::listing_form::ListingForm;
 use crate::gateway::APP_STATE;
+use crate::state::{StoreDetails, StoreDetailsGap};
+
+/// One store a seller owns, as the identity card shows it.
+#[derive(Clone, PartialEq)]
+struct StoreCard {
+    contract_id: Vec<u8>,
+    label: String,
+    /// `None` when the page URL is unavailable, as on a native build.
+    link: Option<String>,
+    /// Set when the store's published details need repairing.
+    gap: Option<StoreDetailsGap>,
+    /// Current values, to fill the form with when editing.
+    details: StoreDetails,
+}
 
 #[component]
 pub fn MyStore() -> Element {
@@ -161,6 +175,9 @@ fn IdentityCard(
 ) -> Element {
     let mut show_listing_form = use_signal(|| false);
     let mut show_store_form = use_signal(|| false);
+    // Which store's details form is open, if any. One signal rather than one
+    // per store: hooks cannot be created inside a loop.
+    let mut editing_store = use_signal(|| Option::<Vec<u8>>::None);
     let fp = identity.fingerprint.clone();
     let has_store = !stores.is_empty();
 
@@ -168,32 +185,45 @@ fn IdentityCard(
     // the seller has to be able to see it. Built here rather than in rsx
     // because it needs the page URL, which native builds don't have.
     //
-    // Each link is labelled: a seller with two stores otherwise gets two
+    // Each store is labelled: a seller with two stores otherwise gets two
     // 44-character links with nothing to tell them apart.
-    let share_links: Vec<(String, String)> = {
+    let store_cards: Vec<StoreCard> = {
         let app_state = APP_STATE.read();
         stores
             .iter()
             .filter_map(|store| {
                 if store.store_contract_id.len() != 32 {
                     // Dropping this silently left the seller a link short
-                    // with no indication which store was missing.
+                    // with no indication which store was missing. Such a
+                    // store cannot be updated either -- its contract key
+                    // cannot be rebuilt -- so there is nothing to offer.
                     dioxus::logger::tracing::warn!(
                         "Store registration has a {}-byte contract id, not 32 -- no share link",
                         store.store_contract_id.len()
                     );
                     return None;
                 }
-                let name = app_state
+                let info = app_state
                     .browsing_stores
                     .get(&store.store_contract_id)
-                    .and_then(|browsing| browsing.info.as_ref())
-                    .map(|info| info.store_name.clone());
-                let link = crate::store_link::share_link(&store.store_contract_id)?;
-                Some((
-                    crate::store_link::store_label(&store.store_contract_id, name.as_deref()),
-                    link,
-                ))
+                    .and_then(|browsing| browsing.info.as_ref());
+                let name = info.map(|info| info.store_name.clone());
+                Some(StoreCard {
+                    label: crate::store_link::store_label(
+                        &store.store_contract_id,
+                        name.as_deref(),
+                    ),
+                    link: crate::store_link::share_link(&store.store_contract_id),
+                    gap: crate::state::store_details_gap(info),
+                    details: StoreDetails {
+                        store_name: info.map(|i| i.store_name.clone()).unwrap_or_default(),
+                        description: info.map(|i| i.description.clone()).unwrap_or_default(),
+                        payment_instructions: info
+                            .map(|i| i.payment_instructions.clone())
+                            .unwrap_or_default(),
+                    },
+                    contract_id: store.store_contract_id.clone(),
+                })
             })
             .collect()
     };
@@ -230,18 +260,64 @@ fn IdentityCard(
             }
         }
 
-        if !share_links.is_empty() {
+        if !store_cards.is_empty() {
             div { class: "store-share",
                 p { class: "text-muted",
                     "Share this link so buyers can open your store:"
                 }
-                for (store_label, link) in &share_links {
+                for card in store_cards.iter().cloned() {
                     div { class: "store-share-row",
-                        span { class: "store-share-label", "{store_label}" }
-                        input {
-                            class: "form-input",
-                            readonly: true,
-                            value: "{link}",
+                        span { class: "store-share-label", "{card.label}" }
+                        if let Some(ref link) = card.link {
+                            input {
+                                class: "form-input",
+                                readonly: true,
+                                value: "{link}",
+                            }
+                        }
+
+                        // The repair prompt. Says what is wrong and what
+                        // publishing fixes, rather than offering a bare form
+                        // and leaving the seller to guess why it is there.
+                        if let Some(gap) = card.gap {
+                            p { class: "text-warning", "{gap.message()}" }
+                        }
+
+                        button {
+                            class: if card.gap.is_some() { "btn btn-sm btn-primary" } else { "btn btn-sm btn-outline" },
+                            onclick: {
+                                let id = card.contract_id.clone();
+                                move |_| {
+                                    let id = id.clone();
+                                    if editing_store() == Some(id.clone()) {
+                                        editing_store.set(None);
+                                    } else {
+                                        editing_store.set(Some(id));
+                                    }
+                                }
+                            },
+                            if editing_store() == Some(card.contract_id.clone()) {
+                                "Cancel"
+                            } else if card.gap.is_some() {
+                                "Publish details"
+                            } else {
+                                "Edit details"
+                            }
+                        }
+
+                        if editing_store() == Some(card.contract_id.clone()) {
+                            StoreDetailsForm {
+                                heading: if card.gap.is_some() { "Publish Store Details" } else { "Edit Store Details" },
+                                submit_label: "Publish",
+                                initial: card.details.clone(),
+                                on_submit: {
+                                    let id = card.contract_id.clone();
+                                    move |details: StoreDetails| {
+                                        editing_store.set(None);
+                                        publish_store_details(id.clone(), details);
+                                    }
+                                },
+                            }
                         }
                     }
                 }
@@ -249,8 +325,10 @@ fn IdentityCard(
         }
 
         if show_store_form() {
-            StoreCreationForm {
-                fingerprint: identity.fingerprint.clone(),
+            StoreDetailsForm {
+                heading: "Create Your Store",
+                submit_label: "Create Store",
+                initial: StoreDetails::default(),
                 on_submit: move |details: StoreDetails| {
                     show_store_form.set(false);
                     initiate_store_creation(identity.fingerprint.clone(), details);
@@ -270,21 +348,23 @@ fn IdentityCard(
     }
 }
 
-struct StoreDetails {
-    store_name: String,
-    description: String,
-    payment_instructions: String,
-}
-
+/// The store-details form, used both to create a store and to change or
+/// repair the details of one that already exists. One component rather than
+/// two: the fields are the same, and a second copy is how the two drift.
 #[component]
-fn StoreCreationForm(fingerprint: String, on_submit: EventHandler<StoreDetails>) -> Element {
-    let mut store_name = use_signal(String::new);
-    let mut description = use_signal(String::new);
-    let mut payment_instructions = use_signal(String::new);
+fn StoreDetailsForm(
+    heading: String,
+    submit_label: String,
+    initial: StoreDetails,
+    on_submit: EventHandler<StoreDetails>,
+) -> Element {
+    let mut store_name = use_signal(|| initial.store_name.clone());
+    let mut description = use_signal(|| initial.description.clone());
+    let mut payment_instructions = use_signal(|| initial.payment_instructions.clone());
 
     rsx! {
         div { class: "card",
-            h3 { "Create Your Store" }
+            h3 { "{heading}" }
 
             div { class: "form-group",
                 label { class: "form-label", "Store Name" }
@@ -327,8 +407,32 @@ fn StoreCreationForm(fingerprint: String, on_submit: EventHandler<StoreDetails>)
                         payment_instructions: payment_instructions().trim().to_string(),
                     });
                 },
-                "Create Store"
+                "{submit_label}"
             }
+        }
+    }
+}
+
+/// Publish new details for a store the seller owns.
+///
+/// Both the ordinary edit and the repair of a store whose details never
+/// reached the network come through here -- they are the same operation, and
+/// the only difference is which version it lands at.
+fn publish_store_details(store_contract_id: Vec<u8>, details: StoreDetails) {
+    let outcome = APP_STATE
+        .write()
+        .publish_store_details(&store_contract_id, details);
+    match outcome {
+        Ok(()) => APP_STATE
+            .write()
+            .notifications
+            .push("Publishing your store's details…".into()),
+        Err(e) => {
+            dioxus::logger::tracing::error!("Could not publish store details: {e}");
+            APP_STATE
+                .write()
+                .notifications
+                .push(format!("Could not publish your store's details: {e}"));
         }
     }
 }
