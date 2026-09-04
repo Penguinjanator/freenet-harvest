@@ -315,7 +315,20 @@ fn handle_delegate_response(
         match value {
             freenet_stdlib::prelude::OutboundDelegateMsg::ApplicationMessage(msg) => {
                 match decode_delegate_message(sender, &msg.payload) {
-                    Ok(response) => apply_delegate_response(&mut APP_STATE.write(), response),
+                    Ok(response) => {
+                        // Offer it to the migration gate FIRST, and outside
+                        // the write guard. A marker answer can release a
+                        // parked probe, and releasing one can run through to
+                        // `finish`, which writes `APP_STATE` -- taking that
+                        // write guard while this one is held panics, because
+                        // `APP_STATE` is a `RefCell` underneath. Same ordering,
+                        // and same reason, as the GET path above.
+                        #[cfg(target_arch = "wasm32")]
+                        if super::migrate_ops::deliver_delegate_response(&response) {
+                            continue;
+                        }
+                        apply_delegate_response(&mut APP_STATE.write(), response)
+                    }
                     Err(e) => error!("Undecodable delegate response from {:?}: {e}", key),
                 }
             }

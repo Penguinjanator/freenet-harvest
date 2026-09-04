@@ -1038,6 +1038,83 @@ fn a_new_generation_gets_a_new_marker() {
     );
 }
 
+/// **The fail-safe direction, which is the whole reason the marker moved.**
+///
+/// The gate used to be a `localStorage` read. In the deployed gateway
+/// `localStorage` throws -- Freenet's webapp iframe has no
+/// `allow-same-origin`, so the frame's origin is opaque -- and the only reason
+/// that was a performance bug rather than a data-loss one is that an
+/// unreadable marker reads as "not migrated". The marker now lives in the
+/// delegate, where the ways to get no usable answer are different (not
+/// registered, send failed, no reply) and the direction has to be the same.
+///
+/// Mutated red by having `probe_gate` skip on `Unavailable`.
+#[test]
+fn an_unavailable_marker_runs_the_probe() {
+    assert_eq!(probe_gate(MarkerLookup::Unavailable), Gate::Run);
+}
+
+/// Only a definite `Present` skips.
+///
+/// Mutated red by having `probe_gate` skip on `Absent`, which is the shape
+/// that would suppress every first-run migration.
+#[test]
+fn only_a_recorded_marker_skips_the_probe() {
+    assert_eq!(probe_gate(MarkerLookup::Present), Gate::Skip);
+    assert_eq!(probe_gate(MarkerLookup::Absent), Gate::Run);
+}
+
+/// A marker id is something the harvest delegate will store.
+///
+/// The delegate refuses an empty or non-ASCII marker id (`markers::
+/// is_valid_marker`), because a key that survives a lossy UTF-8 conversion is
+/// a key that cannot alias with another. A minting side that produced one of
+/// those would have every write silently refused and every walk repeat
+/// forever, with nothing but a log line to say so.
+///
+/// Mutated red by having `marker_key` emit the raw id bytes rather than hex.
+#[test]
+fn a_marker_id_is_one_the_delegate_will_store() {
+    let key = marker_key(
+        Artifact::Mailbox,
+        &ContractInstanceId::new([0xF8u8; 32]),
+        &[0xF9u8; 32],
+    );
+    assert!(!key.is_empty());
+    assert!(key.is_ascii(), "the delegate refuses a non-ASCII marker id");
+}
+
+/// The two delegate requests carry the marker id unchanged.
+///
+/// They are built in `migrate` rather than at the wasm-only call site so this
+/// is assertable at all; a query that named a different marker than the write
+/// would seal one slot and read another forever.
+#[test]
+fn the_delegate_requests_name_the_same_marker() {
+    use harvest_common::HarvestDelegateRequest;
+
+    let id = marker_key(
+        Artifact::Store,
+        &ContractInstanceId::new([3u8; 32]),
+        &[1u8; 32],
+    );
+
+    match (marker_query(&id), marker_write(&id, "note")) {
+        (
+            HarvestDelegateRequest::GetMigrationMarker { marker: queried },
+            HarvestDelegateRequest::SetMigrationMarker {
+                marker: written,
+                note,
+            },
+        ) => {
+            assert_eq!(queried, id);
+            assert_eq!(written, id);
+            assert_eq!(note, "note");
+        }
+        (q, w) => panic!("wrong request variants: {q:?} / {w:?}"),
+    }
+}
+
 /// Two artifacts never share a marker.
 #[test]
 fn artifacts_have_separate_markers() {

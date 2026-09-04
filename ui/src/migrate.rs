@@ -625,7 +625,7 @@ pub fn describe<S>(outcome: &Outcome<S>) -> String {
 
 // --- durable markers ----------------------------------------------------
 
-/// The `localStorage` key under which a completed migration is recorded.
+/// The id under which a completed migration is recorded.
 ///
 /// Keyed by `(artifact, instance, current code hash)`. The code hash is part
 /// of the key because a marker only ever means "this generation has finished
@@ -636,65 +636,100 @@ pub fn describe<S>(outcome: &Outcome<S>) -> String {
 /// a key through a lossy UTF-8 conversion maps every invalid byte to U+FFFD,
 /// so two distinct 32-byte ids collapse onto one marker slot and one of them
 /// gets sealed having never been migrated. River hit exactly that.
+///
+/// The `v1.` prefix versions the id FORMAT. It is the client that mints these,
+/// so a change of shape has to invalidate the old ones from here; the delegate
+/// only prefixes its own namespace and cannot know the format moved.
+///
+/// This is an id, not a storage key: the harvest delegate concatenates it onto
+/// `harvest:migrate:` itself, so nothing chosen here can name another secret.
 pub fn marker_key(
     artifact: Artifact,
     instance: &ContractInstanceId,
     current_code_hash: &[u8; 32],
 ) -> String {
     format!(
-        "harvest.migrate.v1.{}.{}.{}",
+        "v1.{}.{}.{}",
         artifact.as_str(),
         hex::encode(instance.as_bytes()),
         hex::encode(current_code_hash),
     )
 }
 
-/// Whether this `(instance, generation)` has already been migrated.
+/// What the delegate said about a marker -- or failed to say.
 ///
-/// # Why `localStorage` and not the delegate
-///
-/// The delegate is the obvious home for durable client state -- it already
-/// holds the RSA keys and the store registry -- and it is the wrong one here.
-/// A marker kept in the delegate is lost when the DELEGATE re-keys, which
-/// silently resets every contract marker at exactly the moment the contracts
-/// re-keyed too. `localStorage` is scoped to the webapp's origin, which is
-/// derived from the web-container contract id and does not move when a
-/// contract or delegate is rebuilt.
-///
-/// # Unavailable storage is safe
-///
-/// A read that throws (a private window, storage disabled, an embedding that
-/// denies it) is reported as "not migrated", so the probe simply runs again.
-/// That costs one walk per page load and cannot lose data. The failure this
-/// avoids is the opposite one: treating an unreadable marker as "already
-/// done" would skip the migration entirely.
-#[cfg(target_arch = "wasm32")]
-pub fn migration_done(key: &str) -> bool {
-    local_storage()
-        .and_then(|s| s.get_item(key).ok().flatten())
-        .is_some()
+/// The third variant is the one that matters. A marker query can fail to
+/// produce an answer in ways that are not "absent": the delegate may not be
+/// registered yet, the send may fail, the reply may never arrive. Those are
+/// silence, and silence has to be distinguishable from a definite `Absent` at
+/// the type level so neither can be quietly read as the other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MarkerLookup {
+    /// The delegate answered: this migration is already recorded as done.
+    Present,
+    /// The delegate answered: nothing is recorded.
+    Absent,
+    /// No usable answer -- not registered, send failed, or nothing came back.
+    Unavailable,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-pub fn migration_done(_key: &str) -> bool {
-    false
+/// Whether a probe should run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Gate {
+    /// The marker says this generation already finished. Skip.
+    Skip,
+    /// Run the walk.
+    Run,
 }
 
-/// Record a completed migration. Best effort: a failure to write means the
-/// probe repeats, which is wasteful and correct.
-#[cfg(target_arch = "wasm32")]
-pub fn record_migration_done(key: &str, note: &str) {
-    if let Some(storage) = local_storage() {
-        let _ = storage.set_item(key, note);
+/// The repeat gate: **only a definite `Present` skips.**
+///
+/// # Why the direction is the whole design
+///
+/// This gate used to be a `localStorage` read, which in the deployed gateway
+/// is not a gate at all: Freenet serves a webapp inside an iframe with no
+/// `allow-same-origin`, so the frame has an opaque origin and
+/// `window.localStorage` throws. The marker worked under `dx serve` and was a
+/// silent no-op once published -- every seller re-swept every generation of
+/// every artifact on every page load, forever. It cost performance and nothing
+/// else, and the reason it cost nothing else is precisely this direction:
+/// storage that cannot answer reads as "not migrated".
+///
+/// So the marker moved into the harvest delegate's secret store (which is
+/// where River keeps its own, for the same reason), and the direction moved
+/// with it. `Unavailable` runs the walk. A walk that did not need to run
+/// merges what it finds into what is already there and adds nothing; a walk
+/// that was skipped because a storage failure looked like "done" leaves the
+/// seller's listings at an address nothing will ever visit again.
+pub fn probe_gate(lookup: MarkerLookup) -> Gate {
+    match lookup {
+        MarkerLookup::Present => Gate::Skip,
+        MarkerLookup::Absent => Gate::Run,
+        // Never `Skip`. See this function's docs.
+        MarkerLookup::Unavailable => Gate::Run,
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-pub fn record_migration_done(_key: &str, _note: &str) {}
+/// The delegate request that asks whether a marker is recorded.
+///
+/// Built here rather than at the call site so the wire shape is next to the
+/// rules it serves, and so it is exercised by this module's native tests --
+/// the call site is wasm-only.
+pub fn marker_query(marker: &str) -> harvest_common::HarvestDelegateRequest {
+    harvest_common::HarvestDelegateRequest::GetMigrationMarker {
+        marker: marker.to_string(),
+    }
+}
 
-#[cfg(target_arch = "wasm32")]
-fn local_storage() -> Option<web_sys::Storage> {
-    web_sys::window()?.local_storage().ok().flatten()
+/// The delegate request that records a completed migration.
+///
+/// Best effort by design: a write the delegate refuses means the probe
+/// repeats, which is wasteful and correct.
+pub fn marker_write(marker: &str, note: &str) -> harvest_common::HarvestDelegateRequest {
+    harvest_common::HarvestDelegateRequest::SetMigrationMarker {
+        marker: marker.to_string(),
+        note: note.to_string(),
+    }
 }
 
 // --- the probe, as a hand-pumped session -------------------------------

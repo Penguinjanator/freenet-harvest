@@ -23,6 +23,23 @@
 //! display a superseded generation as if it were the live store.
 //! `handle_contract_response` therefore offers every GET response to
 //! [`deliver_state`] first and returns if it is consumed.
+//!
+//! # Why the repeat gate is asynchronous
+//!
+//! The durable marker lives in the harvest delegate's secret store, so reading
+//! it is a round trip and not a function call. It used to be a `localStorage`
+//! read, which is synchronous and, in the deployed gateway, is not a read at
+//! all: Freenet serves a webapp inside an iframe with no `allow-same-origin`,
+//! so the frame has an opaque origin and `window.localStorage` throws. The
+//! gate worked under `dx serve` and silently did nothing once published.
+//!
+//! So a probe is now built first and *held* in [`PENDING`] while the delegate
+//! is asked. Exactly three things can release it, and two of them run it:
+//! the delegate says `present` (dropped), the delegate says absent (run), or
+//! nothing usable comes back within [`MARKER_QUERY_TIMEOUT_MS`] (run). The
+//! send failing runs it immediately, for the same reason. Building the probe
+//! before the answer arrives is what keeps that decision in one place --
+//! `migrate::probe_gate` -- rather than spread across three callbacks.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -99,6 +116,15 @@ thread_local! {
     /// permanent "already done".
     static IN_FLIGHT: RefCell<std::collections::HashSet<String>> =
         RefCell::new(std::collections::HashSet::new());
+
+    /// Probes that are built and waiting on the delegate's answer about their
+    /// durable marker, keyed by that marker.
+    ///
+    /// A probe sits here for one round trip and no longer. Whichever of the
+    /// three releases arrives first takes it; the other two then find nothing
+    /// and do nothing, which is what makes a late answer and a fired timeout
+    /// harmless in either order.
+    static PENDING: RefCell<HashMap<String, Probe>> = RefCell::new(HashMap::new());
 }
 
 /// How long to wait for one candidate before recording it as unresolved.
@@ -108,6 +134,17 @@ thread_local! {
 /// deadline establishes nothing, and typing it as absence is what lets a
 /// migration seal over live data.
 const PROBE_TIMEOUT_MS: u32 = freenet_migrate::RECOMMENDED_PROBE_TIMEOUT_MS as u32;
+
+/// How long to wait for the delegate's answer about a marker before running
+/// the probe anyway.
+///
+/// Shorter than [`PROBE_TIMEOUT_MS`], because it is a different kind of wait:
+/// a delegate call is node-local and answers in milliseconds, where a contract
+/// GET crosses the network. Expiring costs one walk that may not have
+/// been needed; never expiring would leave a migration that has not been
+/// sealed permanently un-run, which is the failure this whole module exists to
+/// prevent.
+const MARKER_QUERY_TIMEOUT_MS: u32 = 8_000;
 
 /// The BLAKE3 code hash of a bundled contract -- the current generation.
 fn code_hash(wasm: &[u8]) -> [u8; 32] {
@@ -261,7 +298,7 @@ fn local_snapshot<S: Default>() -> S {
     S::default()
 }
 
-/// Register a probe and send its first GET.
+/// Build a probe and ask the delegate whether its lineage is already done.
 ///
 /// The durable marker is consulted HERE and nowhere else, and it gates only
 /// the repeat: a first run for this `(instance, current code hash)` is
@@ -269,6 +306,11 @@ fn local_snapshot<S: Default>() -> S {
 /// gate is satisfied by any write to the new key, including this app's own
 /// `create_store_contracts` PUT of a default state, and would then suppress
 /// the migration forever (freenet/river#621).
+///
+/// The probe is built before the answer arrives and parked in [`PENDING`].
+/// That is not eagerness for its own sake: it means the marker's three
+/// possible outcomes all reduce to "release this probe, or drop it", decided
+/// by `migrate::probe_gate` rather than by three separate code paths.
 fn start<F>(
     artifact: Artifact,
     fingerprint: &str,
@@ -282,9 +324,11 @@ fn start<F>(
     let current = migrate::current_id(&current_hash, &params);
     let marker = migrate::marker_key(artifact, &current, &current_hash);
 
-    if migrate::migration_done(&marker) {
-        return;
-    }
+    // The in-memory guard comes first, and covers the marker query as well as
+    // the walk. Without that, a second `GhostKeyList` arriving inside the
+    // query's round trip would park a second probe under the same marker and
+    // silently evict the first from `PENDING` -- a migration that never ran
+    // and never reported anything.
     let fresh = IN_FLIGHT.with(|f| f.borrow_mut().insert(marker.clone()));
     if !fresh {
         return;
@@ -293,18 +337,131 @@ fn start<F>(
     let probe = Probe {
         artifact,
         fingerprint: fingerprint.to_string(),
-        marker,
+        marker: marker.clone(),
         current,
         params: params.clone(),
         session: build(&params),
     };
+    PENDING.with(|p| p.borrow_mut().insert(marker.clone(), probe));
+
+    // The deadline first, so a send that never produces a response cannot
+    // strand the probe. An expiry that finds the probe already gone is a
+    // no-op.
+    {
+        let marker = marker.clone();
+        gloo_timers::callback::Timeout::new(MARKER_QUERY_TIMEOUT_MS, move || {
+            // A `None` here is the normal case: the delegate already answered
+            // and the probe is long gone. Saying so when it is NOT is what
+            // matters -- a timeout firing on every load is the signal that
+            // markers are not reaching the delegate at all.
+            if release_pending(&marker).is_some() {
+                warn!(
+                    "migration: the delegate did not answer about marker {marker}; \
+                     treating it as not migrated and probing"
+                );
+            }
+        })
+        .forget();
+    }
+
+    let query = migrate::marker_query(&marker);
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = send_harvest_request(&query).await {
+            // Unavailable, so the probe runs. `probe_gate` is where that
+            // choice is argued; this is only the path that reaches it.
+            warn!("migration: could not ask the delegate about {marker}: {e}");
+            release_pending(&marker);
+        }
+    });
+}
+
+/// Send one request to the harvest delegate.
+async fn send_harvest_request(
+    request: &harvest_common::HarvestDelegateRequest,
+) -> Result<(), String> {
+    let delegate_key = super::APP_STATE
+        .read()
+        .harvest_delegate_key
+        .clone()
+        .ok_or("harvest delegate not registered")?;
+    let payload =
+        harvest_common::to_cbor(request).map_err(|e| format!("serialize delegate request: {e}"))?;
+    super::send_delegate_message(&delegate_key, payload).await
+}
+
+/// Release a parked probe and run it, returning it if this call is the one
+/// that found it.
+///
+/// Idempotent by construction: the probe is removed from [`PENDING`] under one
+/// borrow, so of a late delegate answer, an expired deadline and a failed send
+/// exactly one does anything and the rest find nothing.
+fn release_pending(marker: &str) -> Option<()> {
+    let probe = PENDING.with(|p| p.borrow_mut().remove(marker))?;
     info!(
         "migration: probing {} predecessor generation(s) of the {} contract for {}",
-        artifact.lineage().len(),
-        artifact.as_str(),
-        fingerprint
+        probe.artifact.lineage().len(),
+        probe.artifact.as_str(),
+        probe.fingerprint
     );
     pump(probe);
+    Some(())
+}
+
+/// Drop a parked probe without running it: the delegate says this lineage was
+/// already carried forward under this exact code hash.
+fn drop_pending(marker: &str) {
+    let dropped = PENDING.with(|p| p.borrow_mut().remove(marker));
+    if let Some(probe) = dropped {
+        info!(
+            "migration: the {} contract for {} is already migrated at this generation",
+            probe.artifact.as_str(),
+            probe.fingerprint
+        );
+    }
+    // The in-flight guard is what stops a later `GhostKeyList` re-asking the
+    // delegate about a marker this session has already settled.
+    IN_FLIGHT.with(|f| {
+        f.borrow_mut().insert(marker.to_string());
+    });
+}
+
+/// A delegate response arrived. Returns `true` if it belonged to the migration
+/// and must not reach `AppState`.
+///
+/// Offered BEFORE the app-state write guard is taken, for the same reason
+/// `deliver_state` is: releasing a probe can run all the way through to
+/// `finish`, which writes `APP_STATE`, and `APP_STATE` is a `RefCell`
+/// underneath -- taking the write guard twice panics.
+pub fn deliver_delegate_response(response: &super::response_handler::DelegateResponse) -> bool {
+    use harvest_common::HarvestDelegateResponse;
+    let super::response_handler::DelegateResponse::Harvest(harvest) = response else {
+        return false;
+    };
+    match harvest {
+        HarvestDelegateResponse::MigrationMarker { marker, present } => {
+            match migrate::probe_gate(if *present {
+                migrate::MarkerLookup::Present
+            } else {
+                migrate::MarkerLookup::Absent
+            }) {
+                migrate::Gate::Skip => drop_pending(marker),
+                migrate::Gate::Run => {
+                    release_pending(marker);
+                }
+            }
+            true
+        }
+        HarvestDelegateResponse::MigrationMarkerRecorded { marker, recorded } => {
+            if !*recorded {
+                warn!(
+                    "migration: the delegate did not record marker {marker}; \
+                     this lineage will be probed again on the next load"
+                );
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Advance one probe: ask for the next candidate, or finish it.
@@ -463,7 +620,7 @@ fn finish(mut probe: Probe) {
     // that decides it. Sealing is recorded AFTER the forward PUT is queued, so
     // a probe that could not even encode its result does not mark itself done.
     match seal {
-        Seal::Seal if recovered => migrate::record_migration_done(&probe.marker, &note),
+        Seal::Seal if recovered => record_marker(&probe.marker, &note),
         // `Seal` without anything to forward cannot happen today (only
         // `Recovered` seals, and `Recovered` always yields state), but if a
         // future outcome made it possible, not sealing is the safe half.
@@ -472,6 +629,22 @@ fn finish(mut probe: Probe) {
 
     IN_FLIGHT.with(|f| {
         f.borrow_mut().remove(&probe.marker);
+    });
+}
+
+/// Ask the delegate to record a completed migration.
+///
+/// Fire-and-forget: the reply is only logged. A write the delegate refuses,
+/// or a send that never arrives, leaves the marker unwritten, and an unwritten
+/// marker means the walk runs again on the next load -- wasteful and correct,
+/// which is the same direction every other uncertainty here resolves in.
+fn record_marker(marker: &str, note: &str) {
+    let request = migrate::marker_write(marker, note);
+    let marker = marker.to_string();
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = send_harvest_request(&request).await {
+            warn!("migration: could not record marker {marker}: {e}");
+        }
     });
 }
 
