@@ -6,6 +6,14 @@
 
 #![deny(unsafe_code)]
 
+// Fixed placeholder parameter values for the contract-address guard, and the
+// binary that prints the addresses. Behind a feature that is OFF by default and
+// enabled only by the guard's own invocations, because this crate is compiled
+// INTO all three contracts and the delegate: adding even unreferenced code here
+// moved all four code hashes when it was first tried, which is to say the guard
+// would have re-keyed the artifacts it exists to watch.
+#[cfg(feature = "address-guard")]
+pub mod address;
 pub mod bitcoin_delegate;
 pub mod delegate;
 pub mod feedback;

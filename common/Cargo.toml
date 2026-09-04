@@ -31,3 +31,18 @@ freenet-bitcoin-common = { workspace = true, features = ["test-support"] }
 [features]
 default = ["ghostkey"]
 ghostkey = ["dep:ghostkey-common"]
+# The contract-address guard: fixed placeholder parameter values and the
+# `harvest-addresses` binary that turns them into addresses. OFF by default and
+# never enabled by a contract build. This crate is compiled into all three
+# contracts and the delegate, and adding this code UNGATED moved all four code
+# hashes -- a guard that re-keys the artifacts it watches. The gate is a
+# guarantee where a measurement was needed.
+address-guard = []
+
+# `required-features` keeps the binary out of every build that does not ask for
+# it, including the contract builds. CI lints and compiles it explicitly (see
+# `.github/workflows/ci.yml`), so gating it does not leave it unchecked.
+[[bin]]
+name = "harvest-addresses"
+path = "src/bin/harvest-addresses.rs"
+required-features = ["address-guard"]
