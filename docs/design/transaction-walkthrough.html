@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Harvest Transaction, Step by Step</title>
+<style>
+:root {
+    --bg: #ffffff; --surface: #f9fafb; --border: #e5e7eb; --primary: #2563eb;
+    --text: #1f2937; --text-dim: #6b7280; --code-bg: #f3f4f6;
+    --success: #059669; --warning: #d97706;
+    --bob: #2563eb; --alice: #b45309; --sys: #6b7280;
+    --bob-bg: #eff6ff; --alice-bg: #fffbeb; --sys-bg: #f3f4f6;
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #111827; --surface: #1f2937; --border: #374151; --primary: #60a5fa;
+        --text: #f3f4f6; --text-dim: #9ca3af; --code-bg: #1f2937;
+        --success: #34d399; --warning: #fbbf24;
+        --bob: #60a5fa; --alice: #fbbf24; --sys: #9ca3af;
+        --bob-bg: #172033; --alice-bg: #241f11; --sys-bg: #1a2130;
+    }
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.6;
+    max-width: 860px; margin: 0 auto; padding: 2rem;
+}
+h1 { font-weight: 600; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; margin-bottom: 0.5rem; }
+h2 { font-weight: 600; margin-top: 2.5rem; margin-bottom: 0.75rem; }
+h3 { font-weight: 500; margin-top: 1.25rem; margin-bottom: 0.5rem; }
+p { margin-bottom: 0.75rem; }
+.subtitle { color: var(--text-dim); margin-bottom: 1.5rem; }
+.card {
+    background: var(--surface); border-radius: 6px; padding: 1rem; margin: 0.75rem 0;
+    border: 1px solid var(--border); border-left: 3px solid var(--primary);
+}
+.card.insight { border-left-color: var(--success); }
+.card.warning { border-left-color: var(--warning); }
+.card h3 { margin-top: 0; margin-bottom: 0.5rem; }
+.card p:last-child, .card ul:last-child { margin-bottom: 0; }
+code {
+    background: var(--code-bg); padding: 0.125rem 0.3rem; border-radius: 3px;
+    font-family: 'SF Mono', 'Menlo', 'Consolas', monospace; font-size: 0.875em;
+}
+
+/* Step blocks */
+.step { margin: 1.75rem 0; }
+.step > h3 {
+    display: flex; align-items: center; gap: 0.6rem; font-weight: 600;
+    margin: 0 0 0.6rem 0; font-size: 1.1rem;
+}
+.num {
+    display: inline-flex; align-items: center; justify-content: center;
+    background: var(--text); color: var(--bg); width: 1.7rem; height: 1.7rem;
+    border-radius: 50%; font-weight: 600; font-size: 0.8em; flex-shrink: 0;
+}
+.num.alt { background: var(--text-dim); }
+
+.actors { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin-bottom: 0.75rem; }
+@media (max-width: 660px) { .actors { grid-template-columns: 1fr; } }
+.actor { border-radius: 6px; padding: 0.75rem 0.9rem; border: 1px solid var(--border); }
+.actor.bob { background: var(--bob-bg); border-left: 3px solid var(--bob); }
+.actor.alice { background: var(--alice-bg); border-left: 3px solid var(--alice); }
+.actor .who {
+    display: block; font-size: 0.72rem; letter-spacing: 0.07em; text-transform: uppercase;
+    font-weight: 700; margin-bottom: 0.35rem;
+}
+.actor.bob .who { color: var(--bob); }
+.actor.alice .who { color: var(--alice); }
+.actor p { margin-bottom: 0.4rem; font-size: 0.95rem; }
+.actor p:last-child { margin-bottom: 0; }
+.screen {
+    display: block; background: var(--bg); border: 1px dashed var(--border);
+    border-radius: 4px; padding: 0.4rem 0.6rem; margin: 0.35rem 0;
+    font-size: 0.875rem; font-style: italic; color: var(--text-dim);
+}
+.none { font-size: 0.9rem; color: var(--text-dim); font-style: italic; }
+
+.under {
+    background: var(--sys-bg); border: 1px solid var(--border); border-left: 3px solid var(--sys);
+    border-radius: 6px; padding: 0.85rem 1rem;
+}
+.under .who {
+    display: block; font-size: 0.72rem; letter-spacing: 0.07em; text-transform: uppercase;
+    font-weight: 700; color: var(--sys); margin-bottom: 0.35rem;
+}
+.under p { margin-bottom: 0.5rem; font-size: 0.95rem; }
+.under p:last-child { margin-bottom: 0; }
+.why {
+    display: block; font-size: 0.7rem; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--text-dim); font-weight: 600; margin-top: 0.6rem; margin-bottom: 0.1rem;
+}
+
+table { width: 100%; border-collapse: collapse; margin: 0.75rem 0; font-size: 0.9375em; }
+th, td { padding: 0.5rem 0.75rem; text-align: left; border: 1px solid var(--border); vertical-align: top; }
+th { background: var(--surface); font-weight: 500; }
+ul, ol { padding-left: 1.5rem; margin: 0.5rem 0; }
+li { margin-bottom: 0.25rem; }
+footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.875em; }
+</style>
+</head>
+<body>
+
+<h1>A Harvest Transaction, Step by Step</h1>
+<p class="subtitle">Alice sells hot sauce. Bob buys a $50 bottle. At each step: what Bob sees, what Alice sees, and what the system is doing underneath — and why.</p>
+
+<div class="card insight">
+<h3>The one idea underneath everything</h3>
+<p>Harvest has no operator, no arbitrator, and no way to reverse a payment. Nothing can ever establish who was telling the truth about a delivery — there is no oracle for "did the parcel arrive".</p>
+<p>So the design gives up on <em>judging</em> disputes and instead makes them <strong>expensive in a way strangers can verify without a judge</strong>. A seller posts collateral by burning money; a complaint spends it. Nobody decides who was right. The money moves anyway, and that is what stops fraud paying.</p>
+</div>
+
+<h2>Before any of this: Alice sets up shop</h2>
+
+<div class="step">
+<h3><span class="num">0</span> Alice builds her bond</h3>
+<div class="actors">
+  <div class="actor bob">
+    <span class="who">Bob</span>
+    <p class="none">Not involved — he has never heard of Alice yet.</p>
+  </div>
+  <div class="actor alice">
+    <span class="who">Alice</span>
+    <p>Donates to Freenet to create an anonymous identity, and donates more later as her shop grows. She sees her position in Harvest:</p>
+    <span class="screen">Your bond: $500 · You can carry up to $250 of orders at once</span>
+    <p>To take bigger orders, she donates more. That is the whole interaction.</p>
+  </div>
+</div>
+<div class="under">
+  <span class="who">Underneath</span>
+  <p>Each donation produces a certificate from the issuer binding the amount to Alice's identity key. The certificates sit in her public reputation record, where anyone can verify them against Freenet's master key. The money is <strong>gone</strong> — donated, not held in escrow.</p>
+  <span class="why">Why burned rather than held</span>
+  <p>Escrow needs somebody to hold the money, and there is nobody. Burning is the only way to make a cost verifiable by strangers with no custodian — and it cannot be quietly withdrawn the night before a scam.</p>
+  <span class="why">Why it grows instead of being a fixed tier</span>
+  <p>With a fixed tier, a brand-new identity and a five-year-old spotless one look identical, so the worst that can happen to a cheat is paying the entry fee again. A growing bond restores the thing that makes reputation work at all: history has value, and walking away costs what it cost to build.</p>
+</div>
+</div>
+
+<h2>The transaction</h2>
+
+<div class="step">
+<h3><span class="num">1</span> Bob decides whether Alice is good for it</h3>
+<div class="actors">
+  <div class="actor bob">
+    <span class="who">Bob</span>
+    <p>Browsing a listing, he sees a line beneath the price:</p>
+    <span class="screen">Seller has $500 staked · $60 of orders in progress · your $50 order is well covered</span>
+    <p>He clicks buy. Nothing else is asked of him.</p>
+  </div>
+  <div class="actor alice">
+    <span class="who">Alice</span>
+    <p class="none">Sees nothing. She does not know Bob is looking.</p>
+  </div>
+</div>
+<div class="under">
+  <span class="who">Underneath</span>
+  <p>Bob's software fetches Alice's reputation record, checks her certificates chain back to Freenet's master key, adds up her donations, then subtracts twice any unrefunded complaints and twice her currently open orders. $500 − $120 = $380 of spare capacity; his $50 order needs $100 of it.</p>
+  <span class="why">What Bob is really asking</span>
+  <p>Not "does this person seem honest" but <strong>"is more money staked here than I am about to risk?"</strong> — a question with an arithmetic answer, which is the point. It requires trusting nobody's judgement, including Bob's own.</p>
+  <span class="why">Why Bob's own software does the sum</span>
+  <p>The figure goes down when complaints land, so it is not stable. A Freenet contract must reach the same verdict on the same data forever or peers permanently disagree, so no contract may depend on a value that moves. Bob's own software has no such obligation, so it can freely count, weigh and expire things. <strong>The network stores facts; the reader forms the verdict.</strong></p>
+</div>
+</div>
+
+<div class="step">
+<h3><span class="num">2</span> Alice publicly declares the order</h3>
+<div class="actors">
+  <div class="actor bob">
+    <span class="who">Bob</span>
+    <span class="screen">Waiting for the seller to confirm…</span>
+  </div>
+  <div class="actor alice">
+    <span class="who">Alice</span>
+    <p>An order appears. She clicks accept.</p>
+    <span class="screen">Bob wants 1 × Ghost Pepper, $50 — Accept? This will use $100 of your $380 spare capacity.</span>
+  </div>
+</div>
+<div class="under">
+  <span class="who">Underneath</span>
+  <p>Accepting writes an <strong>order commitment</strong> into Alice's public record: a scrambled order number, the amount, and a recent Bitcoin block hash. It reveals nothing about who Bob is or what he bought.</p>
+  <span class="why">Why this exists at all — it is the anti-scam mechanism</span>
+  <p>It makes Alice's total exposure <em>countable by strangers</em>. Without it, orders are private, so nobody can see how much she currently owes in undelivered goods.</p>
+  <span class="why">Why it must happen before payment</span>
+  <p>If Alice could take money without declaring it, she could quietly run $5,000 of orders against $500 of collateral and vanish $4,500 ahead. Declaring first caps what she can ever be holding at once: <strong>she cannot take money without first admitting, in public, that she owes goods.</strong></p>
+  <span class="why">Why a Bitcoin block hash</span>
+  <p>Contracts cannot read a clock. Embedding a recent block hash proves the entry is <em>no earlier than</em> that block, and the reader's own clock says how long ago that was. The asymmetry falls the right way: you cannot make a fresh order look old, because looking old requires having published early — which is exactly the behaviour being forced.</p>
+</div>
+</div>
+
+<div class="step">
+<h3><span class="num">3</span> Bob's software checks the declaration is real</h3>
+<div class="actors">
+  <div class="actor bob">
+    <span class="who">Bob</span>
+    <span class="screen">Confirming… ✓ Seller confirmed. Ready to pay.</span>
+    <p>Takes a few seconds. He does nothing.</p>
+  </div>
+  <div class="actor alice">
+    <span class="who">Alice</span>
+    <p class="none">Nothing to do.</p>
+  </div>
+</div>
+<div class="under">
+  <span class="who">Underneath</span>
+  <p>Bob's software reads Alice's record back <em>from the network</em>, confirms his own order is actually in there, and re-checks that her total open orders still fit inside her bond.</p>
+  <span class="why">Two jobs in one rule</span>
+  <p>Requiring Bob to see <em>his own</em> entry is what forces Alice to publish at all — an undeclared order collects no money. Re-checking the total is what stops Bob being the order that tips her past her collateral.</p>
+  <span class="why">Why the buyer enforces this rather than the network</span>
+  <p>Because it is selfish. Bob is not policing the marketplace, he is protecting himself — which is what makes the rule hold without anyone enforcing it. Every buyer follows it for their own sake, and the cap is the collective side effect.</p>
+</div>
+</div>
+
+<div class="step">
+<h3><span class="num">4</span> Alice sends a bill and a pre-signed confession</h3>
+<div class="actors">
+  <div class="actor bob">
+    <span class="who">Bob</span>
+    <span class="screen">Pay $50 [Open wallet] — If this never arrives, you'll be able to claim against the seller's bond.</span>
+  </div>
+  <div class="actor alice">
+    <span class="who">Alice</span>
+    <p>Creates a $50 invoice in her Lightning wallet and pastes it into Harvest. Harvest handles the rest.</p>
+    <span class="screen">Invoice attached ✓ Amount and order matched.</span>
+  </div>
+</div>
+<div class="under">
+  <span class="who">Underneath</span>
+  <p>Harvest reads the invoice locally and pulls out its payment hash and amount, checking they match the order. Alice's software then signs a <strong>claim</strong> — a statement in her own name reading <em>"I failed to deliver order N, amount $50"</em> — and sends it privately to Bob along with the invoice.</p>
+  <span class="why">Why the seller signs a confession in advance</span>
+  <p>There is no oracle for delivery and never will be, so no third party can ever attest that Alice failed. The only unforgeable evidence available is a statement <strong>Alice wrote herself, beforehand</strong>. She cannot dispute it later, because it carries her signature.</p>
+  <span class="why">Why it is tied to the invoice</span>
+  <p>The confession is useless on its own. It only becomes usable together with the secret that Lightning releases when the invoice is paid — so <strong>the ability to damage Alice costs exactly $50</strong>.</p>
+  <span class="why">Without that tie</span>
+  <p>Complaints would be free. Anyone could open a hundred conversations, collect a hundred signed confessions, pay for none, and file them all — destroying any seller at no cost. That was the fatal flaw in the earlier version of this design.</p>
+</div>
+</div>
+
+<h2>An aside: how any of this reaches Lightning</h2>
+
+<p>The obvious objection is that Freenet cannot talk to a payment network. That is correct, and more absolutely than you might expect — but it turns out not to matter. The steps resume afterwards.</p>
+
+<div class="card warning">
+<h3>Nothing inside Freenet can make a network call</h3>
+<p><strong>Contracts and delegates have no network capability whatsoever</strong> — the runtime grants six host functions covering storage, secrets, logging, randomness and time, and nothing else. A delegate could hold a wallet key and sign a transaction, but could never broadcast it.</p>
+<p><strong>The web interface cannot either.</strong> The gateway runs it in a sandbox permitted to contact only its own origin — so no request to a Lightning node, not even one on the same machine.</p>
+</div>
+
+<div class="card insight">
+<h3>But the protocol never needs one</h3>
+<p>The only things that ever cross the boundary are an invoice going out and a short secret coming back. Crucially, <strong>Alice learns she has been paid by looking at her own wallet</strong>, exactly as any merchant with a payment page does. Nothing in the design requires software to detect a settlement.</p>
+<p>And because a Lightning invoice is self-describing, Harvest can read the amount and payment hash straight out of the pasted text — no network call — and check them against the order automatically.</p>
+</div>
+
+<table>
+<tr><th>How the two values move</th><th>Experience</th><th>Status</th></tr>
+<tr><td>A <code>lightning:</code> link plus the clipboard</td><td>Works, slightly manual</td><td>Available today; the gateway explicitly grants the sandbox clipboard access, which reads as the sanctioned pattern</td></tr>
+<tr><td>WebLN — a wallet extension pays and hands back the secret</td><td>Smooth, no manual step</td><td>Not blocked in principle, but whether extensions reach this particular sandbox is untested. Cheap experiment, worth doing early.</td></tr>
+<tr><td>Give delegates controlled network access</td><td>Fully automatic</td><td>A platform change, already an open question in the original design</td></tr>
+</table>
+
+<h2>Back to the transaction</h2>
+
+<div class="step">
+<h3><span class="num">5</span> Bob pays</h3>
+<div class="actors">
+  <div class="actor bob">
+    <span class="who">Bob</span>
+    <p>Taps the pay button, his wallet opens, he confirms. If his wallet is connected, that is the end of it; otherwise he pastes a short code back.</p>
+    <span class="screen">Paid ✓ You can claim against this order if it doesn't arrive.</span>
+  </div>
+  <div class="actor alice">
+    <span class="who">Alice</span>
+    <p>Sees $50 arrive <em>in her wallet</em> — not in Harvest. Harvest does not know yet.</p>
+  </div>
+</div>
+<div class="under">
+  <span class="who">Underneath</span>
+  <p>Settling the payment releases a secret that travels back to Bob's wallet. Harvest checks it matches the invoice and stores it alongside the signed confession. <strong>Nothing is published.</strong> Bob now holds a complete, usable complaint, and could not have obtained it without paying.</p>
+</div>
+</div>
+
+<div class="step">
+<h3><span class="num">6</span> Alice ships</h3>
+<div class="actors">
+  <div class="actor bob">
+    <span class="who">Bob</span>
+    <span class="screen">Marked as shipped by seller</span>
+  </div>
+  <div class="actor alice">
+    <span class="who">Alice</span>
+    <p>Posts the bottle. Optionally marks it shipped.</p>
+  </div>
+</div>
+<div class="under">
+  <span class="who">Underneath</span>
+  <p>Nothing. Shipping is invisible to the system, which is the whole reason the rest of the design is shaped as it is.</p>
+</div>
+</div>
+
+<h2>Then one of three things</h2>
+
+<div class="step">
+<h3><span class="num alt">7a</span> It arrives — and nothing happens at all</h3>
+<div class="actors">
+  <div class="actor bob">
+    <span class="who">Bob</span>
+    <p>Enjoys the hot sauce. Does nothing.</p>
+  </div>
+  <div class="actor alice">
+    <span class="who">Alice</span>
+    <p>After a while her capacity quietly returns.</p>
+    <span class="screen">Spare capacity: $380 → $480</span>
+  </div>
+</div>
+<div class="under">
+  <span class="who">Underneath</span>
+  <p>No writes of any kind. The order commitment ages past the complaint window and readers begin counting it closed.</p>
+  <span class="why">Why this matters</span>
+  <p><strong>Silence is success.</strong> The overwhelmingly common outcome records nothing, which keeps the whole system small — a busy seller's record only grows when things go wrong.</p>
+  <span class="why">Why "closed" is a judgement, not a deletion</span>
+  <p>Contracts cannot expire anything and records are append-only, so nothing is ever removed. "Old enough to ignore" is a conclusion each reader draws for itself from the block anchor — the same principle as step 1.</p>
+</div>
+</div>
+
+<div class="step">
+<h3><span class="num alt">7b</span> It never arrives — Bob complains</h3>
+<div class="actors">
+  <div class="actor bob">
+    <span class="who">Bob</span>
+    <span class="screen">This order is overdue. File a claim? This reduces the seller's bond by $100 and is public — your buyer identity will be attached to it.</span>
+    <p>He clicks file.</p>
+  </div>
+  <div class="actor alice">
+    <span class="who">Alice</span>
+    <span class="screen">A claim was filed against order N. Your bond: $500 → $400. Refund $50 to clear it.</span>
+  </div>
+</div>
+<div class="under">
+  <span class="who">Underneath</span>
+  <p>Bob publishes Alice's own signed confession together with the payment secret. The network checks her signature, checks the secret matches the invoice, and checks the amounts agree — all pure arithmetic, no clock, nothing fetched from elsewhere. Every reader now computes $500 − (2 × $50) = $400.</p>
+  <span class="why">Why a $50 theft costs $100 of bond</span>
+  <p>If a complaint cost exactly what was stolen, the crime would fund itself — steal $50, lose $50, top up with the stolen $50, break even. The multiplier must exceed one, and in fact must exceed one divided by the share of victims who actually bother to complain. If only half do, it needs to be above two.</p>
+  <span class="why">Why this counts as a fine when nobody collects it</span>
+  <p>Nobody takes anything — the money was burned long ago. What makes it bite is simply that <strong>every buyer's software agrees to subtract it</strong>. That is a convention rather than a law, but it holds because each buyer applies it to protect themselves, not out of public spirit.</p>
+</div>
+</div>
+
+<div class="step">
+<h3><span class="num alt">7c</span> Alice made a mistake and fixes it</h3>
+<div class="actors">
+  <div class="actor bob">
+    <span class="who">Bob</span>
+    <p>Gets his $50 back.</p>
+    <span class="screen">Refunded ✓ Claim marked resolved.</span>
+  </div>
+  <div class="actor alice">
+    <span class="who">Alice</span>
+    <p>Pays Bob's refund invoice from her wallet.</p>
+    <span class="screen">Bond restored: $400 → $500</span>
+  </div>
+</div>
+<div class="under">
+  <span class="who">Underneath</span>
+  <p>Alice publishes proof of the refund. Readers treat the complaint as cured and stop subtracting it.</p>
+  <span class="why">Three jobs at once</span>
+  <p><strong>Honest errors stay survivable</strong> — a lost parcel should not permanently cost a seller twice its value. <strong>Complaining becomes worth doing</strong> — Bob files to get his money back, not merely to punish, so more victims complain, which makes the deterrent stronger for everyone. And <strong>it caps extortion</strong>: a dishonest buyer who received his goods and demands a refund anyway can extract the order value, not the penalty, because refunding is Alice's cheaper option.</p>
+  <span class="why">Why even a scammer refunds</span>
+  <p>Refunding costs $50; taking the hit costs $100 of bond. Anyone who intends to keep selling refunds — which usefully means <strong>victims who complain tend to get paid by any seller who is not already leaving.</strong></p>
+</div>
+</div>
+
+<h2>What the arrangement buys</h2>
+
+<table>
+<tr><th>Problem</th><th>How it is addressed</th></tr>
+<tr><td>Seller takes the money and vanishes</td><td>Open orders can never exceed the bond, so the maximum haul is always less than the bond destroyed. Unprofitable at any size.</td></tr>
+<tr><td>Complaints as free ammunition</td><td>A complaint needs the payment secret, so it costs the order value to obtain.</td></tr>
+<tr><td>"Two complaints" — out of how many?</td><td>The question stops mattering. Complaints are withdrawals from a stated balance, not a rate needing a denominator.</td></tr>
+<tr><td>Faking a good reputation</td><td>The only way to raise a bond is to burn real money. The signal <em>is</em> the cost.</td></tr>
+<tr><td>Abandoning a damaged identity</td><td>Pointless — a complained-about identity is not tainted, just poorer, and a fresh one costs what the old one cost.</td></tr>
+<tr><td>Growth making sellers more temptable</td><td>Inverted. Larger orders require more collateral posted first, so capacity and exposure rise together.</td></tr>
+</table>
+
+<h2>Three ideas doing all the work</h2>
+
+<div class="card insight">
+<h3>1. The network stores facts; software forms verdicts</h3>
+<p>Every "a contract cannot do that" obstacle — no clock, cannot count, cannot expire things — applies to what the <em>network</em> validates, not to the software reading it. Keep the record as an append-only pile of self-proving signed facts and move all judgement into the reader, and the obstacles mostly evaporate.</p>
+</div>
+
+<div class="card insight">
+<h3>2. Every write must cost real money</h3>
+<p>Anyone can write to a Freenet contract, so spam prevention cannot rely on permission. Here it does not have to: raising a bond needs a donation, filing a complaint needs a paid order, and a refund proof needs an actual refund. There is no free write anywhere in the design.</p>
+</div>
+
+<div class="card insight">
+<h3>3. Disputes get priced, never judged</h3>
+<p>No mechanism here can work out who was lying — that is a hard limit, not a gap to fill in later. What it can do is ensure every dispute costs both sides real money in proportion to the order, so neither defrauding people nor falsely accusing them works as a business.</p>
+</div>
+
+<div class="card warning">
+<h3>What this honestly does not fix</h3>
+<p>A buyer who receives his goods and demands a refund anyway still gets away with roughly the order value, once. His identity accumulates a visible history of complaints, which limits repetition, but it cannot be driven to zero — that follows from having no way to tell a real victim from a false one.</p>
+<p>And a genuine victim of a seller who is <em>deliberately leaving</em> still loses their money. The complaint they file destroys a bond the seller had already written off.</p>
+</div>
+
+<footer>
+Walkthrough of the claims-as-spends design for Harvest, 29 August 2026. Companion document on what this publishes to the network: <code>harvest-privacy.html</code>. Prepared with AI assistance — Claude.
+</footer>
+
+</body>
+</html>
