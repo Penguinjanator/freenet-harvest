@@ -144,6 +144,13 @@ pub async fn create_store_contracts(
             store_contract_key: store_key_bytes,
         });
 
+    // The mailbox id is known here and nowhere else in this session -- the
+    // store contract's state doesn't carry it -- so record the mapping now,
+    // or every message a buyer leaves in this mailbox is dropped on arrival.
+    super::APP_STATE
+        .write()
+        .register_store_mailbox(store_id.as_bytes(), mailbox_id.as_bytes());
+
     Ok(())
 }
 

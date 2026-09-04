@@ -3,7 +3,7 @@
 //! Centralizes all reactive state so the response handler and UI components
 //! can read/write from a single source of truth.
 
-use dioxus::logger::tracing::info;
+use dioxus::logger::tracing::{info, warn};
 use harvest_common::listing::AuthorizedListing;
 use harvest_common::mailbox::EncryptedMessage;
 use harvest_common::payment::AuthorizedOrder;
@@ -144,6 +144,38 @@ impl AppState {
         self.active_store_id = Some(store_contract_id);
     }
 
+    /// Record which store a mailbox contract belongs to, and subscribe to the
+    /// mailbox so its state actually arrives.
+    ///
+    /// `mailbox_to_store` is the only route from an incoming mailbox state
+    /// back to the store it belongs to. It cannot be recovered from contract
+    /// state: `StoreInfoV1` names the store's reputation contract but not its
+    /// mailbox, so the mapping has to come from the delegate's
+    /// `StoreRegistration` -- which means it only ever exists for our own
+    /// stores, not for a store we are browsing as a buyer.
+    pub fn register_store_mailbox(&mut self, store_contract_id: &[u8], mailbox_contract_id: &[u8]) {
+        if mailbox_contract_id.len() != 32 || mailbox_contract_id.iter().all(|&b| b == 0) {
+            warn!("Store registration has no usable mailbox contract id -- not subscribing");
+            return;
+        }
+
+        self.browsing_stores
+            .entry(store_contract_id.to_vec())
+            .or_default()
+            .mailbox_contract_id = Some(mailbox_contract_id.to_vec());
+
+        // The map doubles as the record of what we have already asked for, so
+        // repeated registrations (every `StoreList` answer re-registers) don't
+        // re-subscribe.
+        if self
+            .mailbox_to_store
+            .insert(mailbox_contract_id.to_vec(), store_contract_id.to_vec())
+            .is_none()
+        {
+            subscribe_in_background("mailbox", mailbox_contract_id.to_vec());
+        }
+    }
+
     /// Handle full contract state received from a GET response.
     pub fn on_contract_state(&mut self, contract_id: Vec<u8>, state_bytes: Vec<u8>) {
         if state_bytes.is_empty() {
@@ -236,10 +268,24 @@ impl AppState {
                 mailbox_state.messages.len()
             );
 
-            if let Some(store_id) = self.mailbox_to_store.get(&contract_id).cloned() {
-                if let Some(store) = self.browsing_stores.get_mut(&store_id) {
-                    store.mailbox_messages = mailbox_state.messages;
-                }
+            match self.mailbox_to_store.get(&contract_id).cloned() {
+                Some(store_id) => match self.browsing_stores.get_mut(&store_id) {
+                    Some(store) => store.mailbox_messages = mailbox_state.messages,
+                    None => warn!(
+                        "Mailbox {:?} maps to a store we have no state for -- dropping messages",
+                        &contract_id[..8.min(contract_id.len())]
+                    ),
+                },
+                // Only a store registered with the harvest delegate has a
+                // known mailbox id, so this is expected for any mailbox we
+                // subscribed to some other way -- but it means the messages
+                // go nowhere, which is worth saying out loud rather than
+                // falling off the end of the function silently.
+                None => warn!(
+                    "Mailbox state for {:?}, which belongs to no store we know -- dropping {} message(s)",
+                    &contract_id[..8.min(contract_id.len())],
+                    mailbox_state.messages.len()
+                ),
             }
             return;
         }
@@ -340,6 +386,10 @@ impl AppState {
                 // who owns the store.
                 for registration in &stores {
                     subscribe_in_background("store", registration.store_contract_id.clone());
+                    self.register_store_mailbox(
+                        &registration.store_contract_id,
+                        &registration.mailbox_contract_id,
+                    );
                 }
                 self.my_stores.insert(ghostkey_fingerprint, stores);
             }
