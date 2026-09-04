@@ -7,6 +7,8 @@
 //! the store state).
 
 use dioxus::logger::tracing::{error, info, warn};
+// `Readable` is what puts `.read()` on `APP_STATE`; see `handle_delegate_response`.
+use dioxus::prelude::ReadableExt;
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
 
 use harvest_common::{from_cbor, HarvestDelegateResponse};
@@ -154,48 +156,127 @@ fn follow_reputation_link(_reputation_id: Vec<u8>) {
     }
 }
 
+/// Which delegate an application message came from.
+///
+/// Decided by the `DelegateKey` the gateway hands us, never by trying
+/// decoders in turn. `HarvestDelegateResponse::Error { message: String }` and
+/// `ghostkey_common::GhostkeyResponse::Error { message: String }` are
+/// byte-identical externally-tagged CBOR -- `{"Error": {"message": "..."}}`
+/// -- so a trial decode that reaches for Harvest first classifies EVERY
+/// ghostkey error as a Harvest one. That silently defeated the certificate
+/// gate: a failed `GetCertificate` raised a notification and cleared nothing,
+/// leaving `pending_store_creation` and `pending_store_edit` waiting on an
+/// answer that was never coming.
+///
+/// The key cannot collide the way the payloads can. It is derived from the
+/// delegate's own WASM and parameters, so it identifies the sender outright.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DelegateSender {
+    Harvest,
+    Ghostkey,
+    /// A key matching neither delegate this app registered. Nothing is
+    /// decoded: guessing is what caused the bug this enum exists to fix.
+    Unknown,
+}
+
+/// One decoded delegate message, already attributed to its sender.
+#[derive(Debug)]
+pub(crate) enum DelegateResponse {
+    Harvest(HarvestDelegateResponse),
+    Bitcoin(harvest_common::BitcoinDelegateResponse),
+    Ghostkey(ghostkey_common::GhostkeyResponse),
+}
+
+pub(crate) fn delegate_sender(
+    key: &freenet_stdlib::prelude::DelegateKey,
+    harvest: Option<&freenet_stdlib::prelude::DelegateKey>,
+    ghostkey: Option<&freenet_stdlib::prelude::DelegateKey>,
+) -> DelegateSender {
+    if harvest == Some(key) {
+        DelegateSender::Harvest
+    } else if ghostkey == Some(key) {
+        DelegateSender::Ghostkey
+    } else {
+        DelegateSender::Unknown
+    }
+}
+
+/// Decode one application message using the protocol of the delegate that
+/// actually sent it.
+///
+/// The harvest delegate speaks two enums over one key -- its own responses
+/// and its Bitcoin surface -- so that one pair is still separated by a trial
+/// decode. That is sound where the cross-delegate version was not: the two
+/// share no variant name, so no payload decodes as both, and either way the
+/// message is genuinely from the harvest delegate. Add a variant to one that
+/// collides with the other and this becomes wrong again.
+pub(crate) fn decode_delegate_message(
+    sender: DelegateSender,
+    payload: &[u8],
+) -> Result<DelegateResponse, String> {
+    match sender {
+        DelegateSender::Harvest => from_cbor::<HarvestDelegateResponse>(payload)
+            .map(DelegateResponse::Harvest)
+            .or_else(|harvest_err| {
+                from_cbor::<harvest_common::BitcoinDelegateResponse>(payload)
+                    .map(DelegateResponse::Bitcoin)
+                    .map_err(|btc_err| {
+                        format!(
+                            "not a harvest delegate response ({harvest_err}) nor a Bitcoin \
+                             one ({btc_err})"
+                        )
+                    })
+            }),
+        DelegateSender::Ghostkey => from_cbor::<ghostkey_common::GhostkeyResponse>(payload)
+            .map(DelegateResponse::Ghostkey)
+            .map_err(|e| format!("not a ghostkey delegate response ({e})")),
+        DelegateSender::Unknown => {
+            Err("message from a delegate this app never registered".to_string())
+        }
+    }
+}
+
+pub(crate) fn apply_delegate_response(
+    app: &mut crate::state::AppState,
+    response: DelegateResponse,
+) {
+    match response {
+        DelegateResponse::Harvest(r) => {
+            info!("Harvest delegate response: {:?}", r);
+            app.on_delegate_response(r);
+        }
+        DelegateResponse::Bitcoin(r) => {
+            info!("Bitcoin delegate response: {:?}", r);
+            app.on_bitcoin_delegate_response(r);
+        }
+        DelegateResponse::Ghostkey(r) => {
+            info!("Ghostkey response: {:?}", r);
+            app.on_ghostkey_response(r);
+        }
+    }
+}
+
 fn handle_delegate_response(
     key: freenet_stdlib::prelude::DelegateKey,
     values: Vec<freenet_stdlib::prelude::OutboundDelegateMsg>,
 ) {
+    // Read the registered keys and drop the guard before any write below --
+    // APP_STATE is a RefCell underneath and holding both at once panics.
+    let sender = {
+        let app = APP_STATE.read();
+        delegate_sender(
+            &key,
+            app.harvest_delegate_key.as_ref(),
+            app.ghostkey_delegate_key.as_ref(),
+        )
+    };
+
     for value in values {
         match value {
             freenet_stdlib::prelude::OutboundDelegateMsg::ApplicationMessage(msg) => {
-                // Try harvest delegate response first
-                match from_cbor::<HarvestDelegateResponse>(&msg.payload) {
-                    Ok(response) => {
-                        info!("Harvest delegate response: {:?}", response);
-                        let mut app = APP_STATE.write();
-                        app.on_delegate_response(response);
-                    }
-                    Err(_) => {
-                        // Try ghostkey delegate response
-                        match from_cbor::<ghostkey_common::GhostkeyResponse>(&msg.payload) {
-                            Ok(gk_response) => {
-                                info!("Ghostkey response: {:?}", gk_response);
-                                let mut app = APP_STATE.write();
-                                app.on_ghostkey_response(gk_response);
-                            }
-                            Err(_) => {
-                                // Try the harvest delegate's Bitcoin surface
-                                match from_cbor::<harvest_common::BitcoinDelegateResponse>(
-                                    &msg.payload,
-                                ) {
-                                    Ok(btc_response) => {
-                                        info!("Bitcoin delegate response: {:?}", btc_response);
-                                        let mut app = APP_STATE.write();
-                                        app.on_bitcoin_delegate_response(btc_response);
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "Unknown delegate response from {:?} (err: {e})",
-                                            key
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
+                match decode_delegate_message(sender, &msg.payload) {
+                    Ok(response) => apply_delegate_response(&mut APP_STATE.write(), response),
+                    Err(e) => error!("Undecodable delegate response from {:?}: {e}", key),
                 }
             }
             freenet_stdlib::prelude::OutboundDelegateMsg::RequestUserInput(req) => {

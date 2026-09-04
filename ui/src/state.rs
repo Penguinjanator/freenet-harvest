@@ -891,11 +891,21 @@ impl AppState {
     /// travelling inside the *signed* `StoreInfoV1`, where correcting it means
     /// a fresh signature rather than an edit.
     ///
-    /// Waiting is the safe direction. Every response that means the
+    /// Waiting is the safe direction only because every response meaning the
     /// certificate will never arrive -- `Error`, `AccessDenied`,
-    /// `NoIdentityAvailable`, `PermissionDenied` -- already clears
-    /// `pending_store_creation` and tells the user, so this cannot leave a
-    /// creation waiting forever on an answer that is not coming.
+    /// `NoIdentityAvailable`, `PermissionDenied`, `KeyNotFound` -- clears
+    /// `pending_store_creation` and tells the user. Otherwise a creation sits
+    /// here forever on an answer that is not coming.
+    ///
+    /// That claim was false in two ways when it was first written, and both
+    /// are worth remembering because neither showed up as a failing test.
+    /// `Error` cleared `pending_store_edit` but not `pending_store_creation`;
+    /// and `KeyNotFound`, which is a flat "there is no such key" for a waiting
+    /// `GetCertificate`, fell into the wildcard arm and cleared nothing at
+    /// all. Underneath both, no ghostkey error reached
+    /// `on_ghostkey_response` in the first place -- the gateway routed every
+    /// one of them to the Harvest handler by trial CBOR decode. See
+    /// `gateway::response_handler::DelegateSender`.
     fn start_store_creation_if_ready(&mut self) {
         let ready = matches!(
             self.pending_store_creation.as_ref(),
@@ -1221,9 +1231,12 @@ impl AppState {
                 self.notifications
                     .push(format!("Ghostkey error: {message}"));
                 self.pending_signatures.clear();
-                // A failed `GetCertificate` surfaces here, and an edit
-                // waiting on that certificate would otherwise sit unfinished
-                // and unmentioned.
+                // A failed `GetCertificate` surfaces here, and a creation or
+                // an edit waiting on that certificate would otherwise sit
+                // unfinished and unmentioned. `start_store_creation_if_ready`
+                // waits for the certificate precisely because it trusts this
+                // to happen.
+                self.pending_store_creation = None;
                 self.pending_store_edit = None;
                 self.request_any_access_in_flight = false;
             }
@@ -1268,12 +1281,27 @@ impl AppState {
                 self.pending_store_edit = None;
             }
 
+            // Terminal for a waiting `GetCertificate`: the vault is telling
+            // us the key does not exist, so no certificate is coming and
+            // nothing is left to wait for. This used to fall into the
+            // wildcard below and clear nothing, which left a seller's store
+            // creation pending forever with no message.
+            ghostkey_common::GhostkeyResponse::KeyNotFound { fingerprint } => {
+                self.notifications.push(format!(
+                    "Ghostkey {fingerprint} was not found in the vault."
+                ));
+                self.request_any_access_in_flight = false;
+                self.pending_signatures.clear();
+                self.pending_store_creation = None;
+                self.pending_store_edit = None;
+            }
+
             // Vault-only responses Harvest doesn't act on. The
             // explicit arms above cover every user-visible failure
             // mode in the current ghostkey-common protocol; this
             // wildcard is just for vault-management responses
             // (PermissionGranted / PermissionRevoked / PermissionList /
-            // KeyNotFound / VerifyResult / Deleted / LabelSet, etc).
+            // VerifyResult / Deleted / LabelSet, etc).
             // A future response variant with a failure semantic
             // would slip through here -- worth re-auditing on every
             // ghostkey-common bump.
@@ -2329,16 +2357,71 @@ mod tests {
     #[test]
     fn a_denied_prompt_clears_a_waiting_edit() {
         let mut state = seller_with_store(Some(published_info(0, "", [0u8; 32])));
+        state.harvest_delegate_key = Some(delegate_key(0xA1));
+        state.ghostkey_delegate_key = Some(delegate_key(0xB2));
         state
             .publish_store_details(&STORE_ID, typed_details())
             .expect("the seller owns this store");
         assert!(state.pending_store_edit.is_some());
 
-        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::AccessDenied {
-            requestor: harvest_common::expected_harvest_requestor(),
-        });
+        from_ghostkey(
+            &mut state,
+            &ghostkey_common::GhostkeyResponse::AccessDenied {
+                requestor: harvest_common::expected_harvest_requestor(),
+            },
+        );
 
         assert!(state.pending_store_edit.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Delegate routing
+    //
+    // These go through `gateway::response_handler`'s real router rather than
+    // calling `on_ghostkey_response` directly. Calling it directly is what
+    // made the original version of `a_denied_prompt_clears_the_whole_queue`
+    // green and vacuous: the handler was correct and unreachable, because the
+    // router classified every ghostkey error as a Harvest one by trial CBOR
+    // decode. A test that skips the router cannot see that.
+    // -----------------------------------------------------------------
+
+    fn delegate_key(seed: u8) -> freenet_stdlib::prelude::DelegateKey {
+        freenet_stdlib::prelude::DelegateKey::new(
+            [seed; 32],
+            freenet_stdlib::prelude::CodeHash::new([seed; 32]),
+        )
+    }
+
+    /// An `AppState` that knows both delegate keys, as it does once the app
+    /// has finished registering them.
+    fn state_with_delegates() -> AppState {
+        AppState {
+            harvest_delegate_key: Some(delegate_key(0xA1)),
+            ghostkey_delegate_key: Some(delegate_key(0xB2)),
+            ..AppState::default()
+        }
+    }
+
+    /// Deliver one CBOR payload as if the gateway had reported it arriving
+    /// from `from`, through the same code path the live app uses.
+    fn deliver(state: &mut AppState, from: &freenet_stdlib::prelude::DelegateKey, payload: &[u8]) {
+        use crate::gateway::response_handler::{
+            apply_delegate_response, decode_delegate_message, delegate_sender,
+        };
+        let sender = delegate_sender(
+            from,
+            state.harvest_delegate_key.as_ref(),
+            state.ghostkey_delegate_key.as_ref(),
+        );
+        match decode_delegate_message(sender, payload) {
+            Ok(response) => apply_delegate_response(state, response),
+            Err(e) => panic!("the router rejected a well-formed payload: {e}"),
+        }
+    }
+
+    fn from_ghostkey(state: &mut AppState, response: &ghostkey_common::GhostkeyResponse) {
+        let payload = harvest_common::to_cbor(response).expect("a response must serialize");
+        deliver(state, &delegate_key(0xB2), &payload);
     }
 
     /// A delegate error or a denied prompt invalidates everything queued --
@@ -2346,14 +2429,148 @@ mod tests {
     /// the next unrelated signature.
     #[test]
     fn a_denied_prompt_clears_the_whole_queue() {
-        let mut state = AppState::default();
+        let mut state = state_with_delegates();
         state.pending_signatures.push_back(pending_store_info());
         state.pending_signatures.push_back(pending_listing());
 
-        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::Error {
-            message: "nope".to_string(),
-        });
+        from_ghostkey(
+            &mut state,
+            &ghostkey_common::GhostkeyResponse::Error {
+                message: "nope".to_string(),
+            },
+        );
         assert!(state.pending_signatures.is_empty());
+    }
+
+    /// The bug this routing exists to prevent, stated as a property.
+    ///
+    /// `HarvestDelegateResponse::Error { message: String }` and
+    /// `GhostkeyResponse::Error { message: String }` are byte-identical CBOR,
+    /// so nothing about the payload can tell them apart. Only the key can.
+    #[test]
+    fn an_error_is_attributed_to_the_delegate_that_sent_it_not_to_its_shape() {
+        use crate::gateway::response_handler::{
+            decode_delegate_message, delegate_sender, DelegateResponse, DelegateSender,
+        };
+
+        let harvest = delegate_key(0xA1);
+        let ghostkey = delegate_key(0xB2);
+        let gk_error = ghostkey_common::GhostkeyResponse::Error {
+            message: "vault said no".to_string(),
+        };
+        let hv_error = HarvestDelegateResponse::Error {
+            message: "vault said no".to_string(),
+        };
+
+        let gk_bytes = harvest_common::to_cbor(&gk_error).unwrap();
+        let hv_bytes = harvest_common::to_cbor(&hv_error).unwrap();
+        assert_eq!(
+            gk_bytes, hv_bytes,
+            "the two error payloads must be indistinguishable -- if they ever \
+             stop being, this test is no longer testing anything"
+        );
+
+        assert_eq!(
+            delegate_sender(&ghostkey, Some(&harvest), Some(&ghostkey)),
+            DelegateSender::Ghostkey
+        );
+        assert!(matches!(
+            decode_delegate_message(DelegateSender::Ghostkey, &gk_bytes),
+            Ok(DelegateResponse::Ghostkey(_))
+        ));
+        assert!(matches!(
+            decode_delegate_message(DelegateSender::Harvest, &hv_bytes),
+            Ok(DelegateResponse::Harvest(_))
+        ));
+    }
+
+    /// A key belonging to neither delegate is not guessed at. Guessing is
+    /// what produced the misrouting in the first place.
+    #[test]
+    fn a_message_from_an_unregistered_delegate_is_not_decoded() {
+        use crate::gateway::response_handler::{
+            decode_delegate_message, delegate_sender, DelegateSender,
+        };
+
+        let harvest = delegate_key(0xA1);
+        let ghostkey = delegate_key(0xB2);
+        let stranger = delegate_key(0xFF);
+        assert_eq!(
+            delegate_sender(&stranger, Some(&harvest), Some(&ghostkey)),
+            DelegateSender::Unknown
+        );
+
+        let payload = harvest_common::to_cbor(&HarvestDelegateResponse::Error {
+            message: "x".to_string(),
+        })
+        .unwrap();
+        assert!(decode_delegate_message(DelegateSender::Unknown, &payload).is_err());
+    }
+
+    /// `start_store_creation_if_ready` waits for the certificate rather than
+    /// publishing a store without one, which is only safe because every
+    /// response meaning "no certificate is coming" clears the pending
+    /// creation. A ghostkey `Error` is one of those, and it has to survive
+    /// the trip through the router to do its job.
+    #[test]
+    fn a_ghostkey_error_clears_a_waiting_store_creation() {
+        let mut state = state_with_delegates();
+        state.pending_store_creation = Some(PendingStoreCreation {
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            seller_verifying_key_bytes: [3u8; 32],
+            certificate_pem: String::new(),
+            store_name: "Bean Shop".to_string(),
+            description: String::new(),
+            payment_instructions: String::new(),
+            rsa_public_key_der: None,
+        });
+
+        from_ghostkey(
+            &mut state,
+            &ghostkey_common::GhostkeyResponse::Error {
+                message: "no access".to_string(),
+            },
+        );
+
+        assert!(
+            state.pending_store_creation.is_none(),
+            "a creation waiting on a certificate that will never arrive must not sit there"
+        );
+        assert!(
+            !state.notifications.is_empty(),
+            "and the seller has to be told"
+        );
+    }
+
+    /// `KeyNotFound` is a flat "there is no such key" -- terminal for a
+    /// waiting `GetCertificate`. It used to fall into the wildcard arm, which
+    /// logs and clears nothing.
+    #[test]
+    fn key_not_found_clears_a_waiting_store_creation() {
+        let mut state = state_with_delegates();
+        state.pending_store_creation = Some(PendingStoreCreation {
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            seller_verifying_key_bytes: [3u8; 32],
+            certificate_pem: String::new(),
+            store_name: "Bean Shop".to_string(),
+            description: String::new(),
+            payment_instructions: String::new(),
+            rsa_public_key_der: None,
+        });
+        state.pending_signatures.push_back(pending_store_info());
+        state.request_any_access_in_flight = true;
+
+        from_ghostkey(
+            &mut state,
+            &ghostkey_common::GhostkeyResponse::KeyNotFound {
+                fingerprint: FINGERPRINT.to_string(),
+            },
+        );
+
+        assert!(state.pending_store_creation.is_none());
+        assert!(state.pending_signatures.is_empty());
+        assert!(!state.request_any_access_in_flight);
+        assert!(!state.notifications.is_empty());
     }
 
     /// A mailbox belongs to one store. Re-pointing the map at a second one
