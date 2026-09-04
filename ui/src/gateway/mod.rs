@@ -8,6 +8,12 @@ pub mod bitcoin_config;
 pub mod bitcoin_ops;
 mod connection;
 mod delegate_api;
+// The migration probe's I/O half. wasm-only: it exists to drive the gateway's
+// shared response handler, which has no native counterpart. Every decision it
+// makes lives in `crate::migrate`, which is target-independent and tested on
+// the host.
+#[cfg(target_arch = "wasm32")]
+pub mod migrate_ops;
 pub mod response_handler;
 pub mod store_ops;
 

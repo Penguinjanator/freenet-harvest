@@ -48,6 +48,16 @@ fn handle_contract_response(response: ContractResponse) {
 
             info!("GET response for contract ({} bytes)", state_bytes.len());
 
+            // Offer it to the migration probe FIRST. A probe GETs a SUPERSEDED
+            // generation's instance, whose state is perfectly decodable
+            // store/reputation/mailbox state -- so letting it fall through to
+            // `on_contract_state` would put an old generation on screen as if
+            // it were the live store, and would follow its reputation link too.
+            #[cfg(target_arch = "wasm32")]
+            if super::migrate_ops::deliver_state(key.id(), &state_bytes) {
+                return;
+            }
+
             // Check if this is a store state -- if so, we need to follow
             // the reputation contract link
             let reputation_to_subscribe = check_for_reputation_link(&state_bytes);
@@ -65,6 +75,29 @@ fn handle_contract_response(response: ContractResponse) {
 
         ContractResponse::PutResponse { key } => {
             info!("PUT response for contract {:?}", key);
+        }
+
+        // The node answering, positively, that nothing is stored under this
+        // key. This is the ONE signal a migration probe may read as absence;
+        // every other way a GET fails to produce state (a timeout, a transport
+        // fault, an error the gateway reports without a key) is silence, and
+        // silence is recorded as unresolved so the walk can never seal over a
+        // predecessor that was merely unreachable.
+        //
+        // Absence is worth less here than it looks even so: it is
+        // unauthenticated, and a contract that exists answers NotFound while it
+        // is momentarily unfindable. That is why an all-absent walk still does
+        // not seal -- see `migrate::seal_decision`.
+        ContractResponse::NotFound { instance_id } => {
+            info!("NotFound for contract {instance_id}");
+            #[cfg(target_arch = "wasm32")]
+            if super::migrate_ops::deliver_absent(&instance_id) {
+                return;
+            }
+            #[cfg(target_arch = "wasm32")]
+            APP_STATE
+                .write()
+                .note_store_state_unavailable(instance_id.as_bytes());
         }
 
         ContractResponse::UpdateResponse { key, summary: _ } => {

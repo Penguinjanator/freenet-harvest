@@ -1082,6 +1082,7 @@ impl AppState {
                 info!("RSA keys initialized for {}", ghostkey_fingerprint);
                 self.rsa_public_keys
                     .insert(ghostkey_fingerprint.clone(), rsa_public_key_der.clone());
+                self.start_reputation_migration(&ghostkey_fingerprint);
 
                 if let Some(pending) = self.pending_store_creation.as_mut() {
                     if pending.ghostkey_fingerprint == ghostkey_fingerprint {
@@ -1096,7 +1097,8 @@ impl AppState {
                 rsa_public_key_der,
             } => {
                 self.rsa_public_keys
-                    .insert(ghostkey_fingerprint, rsa_public_key_der);
+                    .insert(ghostkey_fingerprint.clone(), rsa_public_key_der);
+                self.start_reputation_migration(&ghostkey_fingerprint);
             }
 
             HarvestDelegateResponse::StoreRegistered {
@@ -1149,6 +1151,42 @@ impl AppState {
         }
     }
 
+    /// Start this identity's reputation migration, now that the delegate has
+    /// produced its RSA public key.
+    ///
+    /// **This is the ordering constraint the migration doctrine names.**
+    /// `ReputationParameters::rsa_public_key_der` IS that key, so it is an
+    /// input to the reputation contract's address. Until the key is in hand
+    /// there is no way to derive a predecessor reputation instance -- or the
+    /// current one -- so probing earlier would walk ids belonging to nobody,
+    /// find nothing, and risk sealing that verdict over a recoverable
+    /// instance. The store and mailbox contracts have no such dependency and
+    /// start as soon as the ghostkey is known.
+    ///
+    /// Called from both delegate responses that can carry the key, because
+    /// which one arrives depends on whether the identity already had keys.
+    /// Starting twice is a no-op: `migrate_ops` keys in-flight probes by their
+    /// marker.
+    pub fn start_reputation_migration(&self, _ghostkey_fingerprint: &str) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let Some(vk) = self
+                .ghostkeys
+                .iter()
+                .find(|k| k.fingerprint == _ghostkey_fingerprint)
+                .and_then(|k| k.verifying_key_bytes.clone())
+            else {
+                // The vault has not shared this identity's verifying key, so
+                // the owner half of the parameters is missing too. Nothing to
+                // do until it does; `GhostKeyList` starts the other two
+                // migrations at that point and this one retries on the next
+                // key response.
+                return;
+            };
+            crate::gateway::migrate_ops::start_reputation_migration(_ghostkey_fingerprint, &vk);
+        }
+    }
+
     /// Handle a response from the ghostkey delegate.
     pub fn on_ghostkey_response(&mut self, response: ghostkey_common::GhostkeyResponse) {
         match response {
@@ -1175,6 +1213,26 @@ impl AppState {
                             );
                         }
                     });
+                }
+
+                // Learning the verifying key is also the first moment the
+                // store and mailbox contracts' addresses can be derived --
+                // for the current generation and for every superseded one --
+                // so this is where their migration starts. It deliberately
+                // does NOT wait for `ListStores`: the delegate's registry
+                // names the instance a store was CREATED at, and that
+                // registry is itself lost whenever the delegate re-keys.
+                // Deriving from the ghostkey needs neither.
+                //
+                // Started unconditionally, once per (instance, current code
+                // hash). Nothing here asks whether the current instance is
+                // empty -- see `crate::migrate`'s module docs for why that
+                // gate is the shape that silently disables a migration.
+                #[cfg(target_arch = "wasm32")]
+                for key in &keys {
+                    if let Some(vk) = key.verifying_key_bytes.as_ref() {
+                        crate::gateway::migrate_ops::start_identity_migration(&key.fingerprint, vk);
+                    }
                 }
                 // If any ghostkey has verifying_key_bytes and we have a pending
                 // store creation for it, fill in the key
@@ -1212,6 +1270,30 @@ impl AppState {
                         self.ghostkeys.push(key);
                     }
                 }
+
+                // Retry the reputation migration for every identity we now
+                // know a verifying key for. Both halves of
+                // `ReputationParameters` have to be present at once, and the
+                // two arrive from DIFFERENT delegates in no fixed order: the
+                // RSA key from the harvest delegate, the verifying key from
+                // the ghostkey vault. Whichever lands second has to be the one
+                // that starts the probe, so both call sites try and the one
+                // that is still missing an input returns without starting
+                // anything. Without this the whole reputation migration is
+                // silently skipped whenever the RSA response happens to arrive
+                // first -- and it does, for an identity that already has keys.
+                //
+                // A no-op when a probe for the same lineage is already running
+                // or already sealed.
+                let fingerprints: Vec<String> = self
+                    .ghostkeys
+                    .iter()
+                    .map(|k| k.fingerprint.clone())
+                    .collect();
+                for fingerprint in fingerprints {
+                    self.start_reputation_migration(&fingerprint);
+                }
+
                 self.request_any_access_in_flight = false;
             }
 

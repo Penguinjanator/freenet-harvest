@@ -38,6 +38,10 @@ serde_json = { workspace = true }
 
 # Crypto
 ed25519-dalek = { workspace = true }
+# Hex, for migration marker keys. Raw bytes in a storage key alias under any
+# lossy UTF-8 conversion, which is how two distinct predecessors end up sharing
+# one marker slot -- see migrate::marker_key.
+hex = { workspace = true }
 blake3 = { workspace = true }
 # "check" feature enables Base58Check decoding, needed to turn a legacy
 # P2PKH/P2SH address string into its scriptPubKey (see gateway/bitcoin_address.rs).
@@ -62,6 +66,10 @@ freenet-stdlib = { workspace = true, features = ["net"] }
 # native+wasm profile, which is what a browser app wants -- and it keeps the
 # migration logic testable natively, since none of it is behind a wasm gate.
 freenet-migrate = { workspace = true, features = ["ui"] }
+# For `ComposableState::merge` -- the store contract's own merge, which the
+# migration reuses rather than reimplementing so folding a generation is the
+# same operation the network performs between two peers.
+freenet-scaffold = { workspace = true }
 
 [build-dependencies]
 chrono = "0.4"

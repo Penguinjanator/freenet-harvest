@@ -4,10 +4,26 @@ use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey};
 use harvest_common::listing::AuthorizedListing;
 use harvest_common::StoreRegistration;
 
-/// The store contract this build of the UI bundles. `create_store_contracts`
-/// publishes it; `store_contract_key` hashes it to recover the key of a store
-/// published earlier.
-const STORE_CONTRACT_WASM: &[u8] = include_bytes!("../../public/contracts/store_contract.wasm");
+/// The contract WASM this build of the UI bundles.
+///
+/// These bytes ARE the addresses: a contract lives at
+/// `BLAKE3(BLAKE3(wasm) || parameters)`, so the committed files decide where
+/// every store, reputation contract and mailbox this build creates will live.
+/// `create_store_contracts` publishes them, `store_contract_key` hashes the
+/// store one to recover the key of a store published earlier, and
+/// `crate::gateway::migrate_ops` hashes all three to derive the current
+/// generation's instance ids for the migration probe.
+///
+/// Declared once rather than `include_bytes!`d at each use: three copies of an
+/// `include_bytes!` is three chances for one of them to name a different file,
+/// and the failure would be a contract published at an address nothing else in
+/// the app agrees with.
+pub(crate) const STORE_CONTRACT_WASM: &[u8] =
+    include_bytes!("../../public/contracts/store_contract.wasm");
+pub(crate) const REPUTATION_CONTRACT_WASM: &[u8] =
+    include_bytes!("../../public/contracts/reputation_contract.wasm");
+pub(crate) const MAILBOX_CONTRACT_WASM: &[u8] =
+    include_bytes!("../../public/contracts/mailbox_contract.wasm");
 
 /// Whether a store's `ContractKey` was recovered from local state or rebuilt
 /// from the bundled contract -- see `store_contract_key`.
@@ -145,9 +161,8 @@ pub async fn create_store_contracts(
     let reputation_state_bytes = harvest_common::to_cbor(&reputation_state)
         .map_err(|e| format!("serialize reputation state: {e}"))?;
 
-    let reputation_wasm = include_bytes!("../../public/contracts/reputation_contract.wasm");
     let (reputation_container, reputation_id, _reputation_key) =
-        make_contract(reputation_wasm, reputation_params_bytes);
+        make_contract(REPUTATION_CONTRACT_WASM, reputation_params_bytes);
 
     info!("Creating reputation contract: {:?}", reputation_id);
     super::put_contract(
@@ -175,8 +190,8 @@ pub async fn create_store_contracts(
     let store_state_bytes =
         harvest_common::to_cbor(&store_state).map_err(|e| format!("serialize store state: {e}"))?;
 
-    let store_wasm = include_bytes!("../../public/contracts/store_contract.wasm");
-    let (store_container, store_id, store_key) = make_contract(store_wasm, store_params_bytes);
+    let (store_container, store_id, store_key) =
+        make_contract(STORE_CONTRACT_WASM, store_params_bytes);
 
     info!("Creating store contract: {:?}", store_id);
     super::put_contract(store_container, WrappedState::new(store_state_bytes)).await?;
@@ -192,9 +207,8 @@ pub async fn create_store_contracts(
     let mailbox_state_bytes = harvest_common::to_cbor(&mailbox_state)
         .map_err(|e| format!("serialize mailbox state: {e}"))?;
 
-    let mailbox_wasm = include_bytes!("../../public/contracts/mailbox_contract.wasm");
     let (mailbox_container, mailbox_id, _mailbox_key) =
-        make_contract(mailbox_wasm, mailbox_params_bytes);
+        make_contract(MAILBOX_CONTRACT_WASM, mailbox_params_bytes);
 
     info!("Creating mailbox contract: {:?}", mailbox_id);
     super::put_contract(mailbox_container, WrappedState::new(mailbox_state_bytes)).await?;
