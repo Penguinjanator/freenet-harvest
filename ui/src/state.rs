@@ -1649,6 +1649,87 @@ pub fn friendly_bridge_error(raw: &str) -> String {
     }
 }
 
+/// Whether anything is actually synchronizing a watched script, as the watch
+/// row should report it.
+///
+/// # Why `LocalOnly` is every manual watch today
+///
+/// Watching an address is two separate things: recording it privately (which
+/// works), and asking a bridge to synchronize the script so its transactions
+/// land in a `BitcoinAddressContract` the UI can subscribe to (which nothing
+/// does). The second half has no implementation and cannot get one where it
+/// was assumed to live:
+///
+/// * The delegate cannot make the request. `OutboundDelegateMsg` has no HTTP
+///   variant -- the whole set is application messages, user input, context,
+///   and contract GET/PUT/UPDATE/SUBSCRIBE -- so a delegate has no outbound
+///   HTTP capability at all. `handlers`' `Watch` arm persists the record and
+///   answers `Watched { result: Ok(..) }`, which is the truth about what it
+///   did, not a claim that a bridge was told.
+/// * The page cannot make it either, once published. A webapp is served with
+///   `connect-src` limited to its own gateway, so `fetch` to a bridge URL is
+///   refused by the content-security policy. `gateway::bitcoin_config`'s
+///   module docs record the same refusal for `/v1/status`, which is why the
+///   tip contract id became a build-time constant.
+///
+/// So a manual watch keeps `contract_id: None` and `bridge_synced: false`
+/// forever, `register_watch_contract` returns immediately because there is no
+/// contract id to subscribe to, and no transaction can ever appear. Saying
+/// "Waiting for bridge to sync…" describes a wait that never ends. This
+/// function exists so the row says that instead.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum WatchSyncStatus {
+    /// A bridge reported a failure for this script.
+    Failed(String),
+    /// A bridge is synchronizing it and named the address contract carrying
+    /// the results, so transactions can appear.
+    Live,
+    /// A bridge is synchronizing it but named no address contract, so there
+    /// is nothing for the UI to subscribe to.
+    SyncedWithoutContract,
+    /// Recorded on this device and nowhere else.
+    LocalOnly,
+}
+
+impl WatchSyncStatus {
+    /// What to tell the user, or `None` when there is nothing to say because
+    /// the watch is working.
+    pub fn message(&self) -> Option<String> {
+        match self {
+            WatchSyncStatus::Failed(text) => Some(text.clone()),
+            WatchSyncStatus::Live => None,
+            WatchSyncStatus::SyncedWithoutContract => Some(
+                "A bridge is watching this address but didn't say which Freenet contract \
+                 carries the results, so there is nothing for Harvest to read."
+                    .to_string(),
+            ),
+            WatchSyncStatus::LocalOnly => Some(
+                "Recorded on this device only. No bridge has been asked to watch this \
+                 address, so its transactions will not appear here."
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+/// Classify a watch. See [`WatchSyncStatus`] for why `LocalOnly` is the
+/// answer for every manual watch today.
+pub fn watch_sync_status(watch: &WatchedPayment) -> WatchSyncStatus {
+    if let Some(error) = watch.last_error.as_deref() {
+        return WatchSyncStatus::Failed(friendly_bridge_error(error));
+    }
+    if !watch.bridge_synced {
+        return WatchSyncStatus::LocalOnly;
+    }
+    // A bridge confirmed the script but the address contract is what the UI
+    // actually reads, so a watch without one is not live however the bridge
+    // answered.
+    if watch.contract_id.is_none() {
+        return WatchSyncStatus::SyncedWithoutContract;
+    }
+    WatchSyncStatus::Live
+}
+
 /// Bitcoin/Payments state: bridge config, the user's private watch list, and
 /// live on-chain data mirrored from subscribed Bitcoin contracts.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -2677,5 +2758,93 @@ mod tests {
         state.on_delegate_response(store_list(vec![registration(3, None)]));
         state.on_delegate_response(store_list(vec![registration(3, None)]));
         assert_eq!(state.subscribed_stores.len(), 3);
+    }
+
+    // -----------------------------------------------------------------
+    // What a watch row can honestly say
+    // -----------------------------------------------------------------
+
+    /// A watch exactly as `WatchForm` builds one and the delegate stores it.
+    fn manual_watch() -> WatchedPayment {
+        WatchedPayment {
+            network: BitcoinNetwork::Signet,
+            script_pubkey: vec![0x00, 0x14, 0xde, 0xad],
+            address: "tb1qexample".to_string(),
+            label: None,
+            order_id: None,
+            expected_amount_sats: None,
+            contract_id: None,
+            added_at_ms: 1_700_000_000_000,
+            bridge_synced: false,
+            last_error: None,
+        }
+    }
+
+    /// The bug this replaced: the row said "Waiting for bridge to sync…"
+    /// for a watch that nothing had asked a bridge about, and nothing ever
+    /// would -- neither the delegate (no outbound HTTP in
+    /// `OutboundDelegateMsg`) nor the page (the gateway's CSP limits
+    /// `connect-src` to its own gateway). A wait that never ends must not be
+    /// described as a wait.
+    #[test]
+    fn a_watch_nobody_asked_a_bridge_about_says_so() {
+        let status = watch_sync_status(&manual_watch());
+        assert_eq!(status, WatchSyncStatus::LocalOnly);
+        let message = status.message().expect("a dead watch has to say so");
+        assert!(
+            message.contains("No bridge has been asked"),
+            "the row must name the missing step, got: {message}"
+        );
+        assert!(
+            !message.to_lowercase().contains("waiting"),
+            "nothing is being waited for, got: {message}"
+        );
+    }
+
+    /// A bridge that answered and named the address contract carrying the
+    /// results is the one case with nothing to warn about.
+    #[test]
+    fn a_synced_watch_with_an_address_contract_has_nothing_to_report() {
+        let watch = WatchedPayment {
+            bridge_synced: true,
+            contract_id: Some("11111111111111111111111111111111".to_string()),
+            ..manual_watch()
+        };
+        assert_eq!(watch_sync_status(&watch), WatchSyncStatus::Live);
+        assert_eq!(watch_sync_status(&watch).message(), None);
+    }
+
+    /// `bridge_synced` alone is not enough. The UI reads transactions out of
+    /// the address contract, so a watch without one shows nothing however
+    /// the bridge answered -- and must not be reported as working.
+    #[test]
+    fn a_synced_watch_with_no_address_contract_is_not_live() {
+        let watch = WatchedPayment {
+            bridge_synced: true,
+            ..manual_watch()
+        };
+        assert_eq!(
+            watch_sync_status(&watch),
+            WatchSyncStatus::SyncedWithoutContract
+        );
+        assert!(watch_sync_status(&watch).message().is_some());
+    }
+
+    /// An error the bridge reported outranks everything else, and arrives
+    /// already translated -- the row renders it verbatim.
+    #[test]
+    fn a_bridge_error_is_reported_in_the_users_terms() {
+        let watch = WatchedPayment {
+            last_error: Some("not authorized".to_string()),
+            ..manual_watch()
+        };
+        assert_eq!(
+            watch_sync_status(&watch),
+            WatchSyncStatus::Failed(friendly_bridge_error("not authorized"))
+        );
+        assert!(watch_sync_status(&watch)
+            .message()
+            .expect("a failure has to say so")
+            .contains("Ghost Key"));
     }
 }

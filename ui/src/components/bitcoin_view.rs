@@ -22,7 +22,7 @@ use harvest_common::payment::{AuthorizedOrder, OrderStatus};
 use harvest_common::{BridgeEndpoint, WatchedPayment};
 
 use crate::gateway::{bitcoin_address, bitcoin_config, bitcoin_ops, APP_STATE};
-use crate::state::{friendly_bridge_error, AddressView, BitcoinState, TipView, TxRowStatus};
+use crate::state::{watch_sync_status, AddressView, BitcoinState, TipView, TxRowStatus};
 
 #[component]
 pub fn BitcoinView() -> Element {
@@ -431,10 +431,11 @@ fn WatchRow(watch: WatchedPayment) -> Element {
                     if let Some(label) = &watch.label { "{label}" } else { "{watch.address}" }
                 }
                 p { class: "seller-id", "{watch.address}" }
-                if let Some(err) = &watch.last_error {
-                    p { class: "text-warning", "{friendly_bridge_error(err)}" }
-                } else if !watch.bridge_synced {
-                    p { class: "text-muted text-italic", "Waiting for bridge to sync…" }
+                // What this row can honestly say about the watch. Not
+                // "Waiting for bridge to sync…", which described a wait that
+                // never ends -- see `state::WatchSyncStatus`.
+                if let Some(message) = watch_sync_status(&watch).message() {
+                    p { class: "text-warning", "{message}" }
                 }
                 if let Some(l) = &live {
                     p { class: "text-muted",
@@ -501,6 +502,16 @@ fn WatchForm(network: BitcoinNetwork, has_ghostkey: bool) -> Element {
     rsx! {
         div { class: "card",
             h4 { "Watch a Bitcoin address" }
+            // Said before the click, not after it. A watch is recorded
+            // privately and that is all it is: nothing asks a bridge to
+            // synchronize the script, so no transactions follow. See
+            // `state::WatchSyncStatus` for why that cannot be done from
+            // either the delegate or the page today.
+            p { class: "text-muted",
+                "This records the address privately on this device. Harvest has no route "
+                "to a bridge from inside a published app, so nothing will be synchronized "
+                "and no transactions will appear for it yet."
+            }
             div { class: "form-group",
                 input {
                     class: "form-input",
@@ -586,8 +597,10 @@ fn GhostKeyGate(on_dismiss: EventHandler<()>) -> Element {
     rsx! {
         div { class: "info-box",
             p {
-                "Watching a new address through Freenet.org's bridge is available to Ghost Key holders. "
-                "A Ghost Key just proves you've supported the network -- the bridge never learns anything else about you."
+                "Recording a watch is gated on holding a Ghost Key, which is what a bridge "
+                "would check before agreeing to synchronize an address for you. A Ghost Key "
+                "just proves you've supported the network -- a bridge learns nothing else "
+                "about you. No bridge is asked anything today; see the note above the form."
             }
             div { style: "margin-top: 12px; display: flex; gap: 8px; align-items: center;",
                 button {
