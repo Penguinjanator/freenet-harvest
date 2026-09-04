@@ -767,6 +767,216 @@ mod order_tests {
     }
 
     // -----------------------------------------------------------------
+    // Reversal: what counts as evidence that a payment was undone
+    // -----------------------------------------------------------------
+
+    /// One bridge-signed `ConfirmedOutput` claim paying `value_sats` to the
+    /// order's script, plus the outpoint it is about so a caller can retract
+    /// it afterwards.
+    ///
+    /// `value_sats` is what distinguishes two claims: `payment_proof` mines a
+    /// block whose only transaction pays that value to that script, so the
+    /// txid -- and therefore the outpoint -- is a function of the pair. Two
+    /// claims for the same value would be one outpoint, not two.
+    fn confirmed_claim(
+        order: &Order,
+        bridge: &SigningKey,
+        value_sats: u64,
+        confirm_height: u32,
+    ) -> (SignedClaim, OutPoint) {
+        let addr_params = order.bitcoin_params(vec![]); // only used for script_id()
+        let (spv, txid, block_hash) =
+            payment_proof(&order.payment_script_pubkey, value_sats, 1, [1u8; 32]);
+        let outpoint = OutPoint { txid, vout: 0 };
+        let anchor = BlockAnchor {
+            height: confirm_height,
+            hash: block_hash,
+        };
+        let body = ClaimBody {
+            script_id: addr_params.script_id(),
+            network: order.network,
+            as_of: anchor,
+            claim: Claim::ConfirmedOutput {
+                outpoint,
+                value_sats,
+                anchor,
+                spv,
+            },
+        };
+        (SignedClaim::sign(bridge, &body).unwrap(), outpoint)
+    }
+
+    /// The claim a real reorg produces: as of a HIGHER chain position than
+    /// the confirmation it supersedes, the bridge no longer sees `outpoint`
+    /// on its best chain. It carries no SPV proof because it asserts an
+    /// absence, and there is nothing to prove the inclusion of.
+    fn retraction_claim(
+        order: &Order,
+        bridge: &SigningKey,
+        outpoint: OutPoint,
+        as_of_height: u32,
+    ) -> SignedClaim {
+        let addr_params = order.bitcoin_params(vec![]);
+        let body = ClaimBody {
+            script_id: addr_params.script_id(),
+            network: order.network,
+            as_of: BlockAnchor {
+                height: as_of_height,
+                hash: BlockHash([7u8; 32]),
+            },
+            claim: Claim::Retracted { outpoint },
+        };
+        SignedClaim::sign(bridge, &body).unwrap()
+    }
+
+    fn signed_tip(order: &Order, bridge: &SigningKey, height: u32) -> SignedTipEntry {
+        SignedTipEntry::sign(
+            bridge,
+            &TipEntryBody {
+                network: order.network,
+                anchor: BlockAnchor {
+                    height,
+                    hash: BlockHash([9u8; 32]),
+                },
+                prev_hash: BlockHash([8u8; 32]),
+                block_time: 1_700_000_000,
+                tx_count: 1,
+                median_time: 1_700_000_000,
+            },
+        )
+        .unwrap()
+    }
+
+    /// The poisoning attack. `PaymentReversed` outranks `Paid` and merge is a
+    /// monotonic maximum on rank, so a reversal a peer accepts can never be
+    /// corrected by any later proof of payment. The status is also unsigned by
+    /// design, so anyone who can read the public order can submit one.
+    ///
+    /// An empty `claims` vector costs nothing to build and needs no bridge.
+    /// It must not be evidence of anything.
+    #[test]
+    fn an_empty_claim_set_cannot_declare_an_order_reversed() {
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let p = params(&seller, &bridge);
+        let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+
+        // No claims at all -- the tip is genuine, but it says nothing about
+        // this script.
+        let proof = OrderPaymentProof::on_chain(vec![], signed_tip(&order, &bridge, 101));
+        let record = make_authorized_order(
+            &seller,
+            order.clone(),
+            OrderStatus::PaymentReversed,
+            Some(proof),
+        );
+
+        let state = orders_of([(order.id.clone(), record)]);
+        let err = state
+            .verify(&StoreStateV1::default(), &p)
+            .expect_err("an empty claim set must not establish a reversal");
+        assert!(err.contains("reversal evidence invalid"), "got: {err}");
+    }
+
+    /// The other half of the same rule, and the one that stops the fix being
+    /// "reject every reversal": a genuine reorg -- a signed confirmation, then
+    /// a signed retraction at a higher `as_of` -- must still be accepted.
+    #[test]
+    fn a_genuine_reorg_verifies_as_reversed() {
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let p = params(&seller, &bridge);
+        let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+
+        let (confirmed, outpoint) = confirmed_claim(&order, &bridge, order.amount_sats, 100);
+        let retracted = retraction_claim(&order, &bridge, outpoint, 101);
+        let proof = OrderPaymentProof::on_chain(
+            vec![confirmed, retracted],
+            signed_tip(&order, &bridge, 101),
+        );
+
+        // The proof itself must fail with `Reversed` specifically. That is the
+        // error `AuthorizedOrder::verify` keys on, so nothing else will do.
+        assert_eq!(
+            crate::payment::verify_payment_proof(&order, &proof, &p.trusted_bitcoin_bridges),
+            Err(crate::payment::ProofError::Reversed)
+        );
+
+        let record = make_authorized_order(
+            &seller,
+            order.clone(),
+            OrderStatus::PaymentReversed,
+            Some(proof),
+        );
+        let state = orders_of([(order.id.clone(), record)]);
+        assert!(
+            state.verify(&StoreStateV1::default(), &p).is_ok(),
+            "a bridge-signed retraction at a higher as_of is a real reversal"
+        );
+    }
+
+    /// A partial reversal: the order was paid across two outpoints and only
+    /// one was reorged out. What remains confirmed is non-zero but no longer
+    /// covers the order, which is a reversal in every sense that matters.
+    ///
+    /// This case used to surface as `InsufficientValue`, and accommodating it
+    /// is why `AuthorizedOrder::verify` accepted that error as evidence of a
+    /// reversal -- the same error an empty claim set produces. It must report
+    /// `Reversed` on its own account instead.
+    #[test]
+    fn a_partial_reorg_reports_reversed_not_insufficient_value() {
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let p = params(&seller, &bridge);
+        let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+        assert_eq!(order.amount_sats, 50_000);
+
+        // Two distinct outpoints, 30_000 + 20_000, together covering the order.
+        let (big, _) = confirmed_claim(&order, &bridge, 30_000, 100);
+        let (small, small_outpoint) = confirmed_claim(&order, &bridge, 20_000, 100);
+        let retracted = retraction_claim(&order, &bridge, small_outpoint, 101);
+
+        let proof = OrderPaymentProof::on_chain(
+            vec![big, small, retracted],
+            signed_tip(&order, &bridge, 101),
+        );
+
+        assert_eq!(
+            crate::payment::verify_payment_proof(&order, &proof, &p.trusted_bitcoin_bridges),
+            Err(crate::payment::ProofError::Reversed),
+            "30_000 of 50_000 left, with a signed retraction, is a reversal"
+        );
+    }
+
+    /// Evidence that still proves payment is not evidence of a reversal.
+    ///
+    /// This is what stops the whole `PaymentReversed` arm being replaced by an
+    /// unconditional `Ok(())`: without it, that mutation passes every other
+    /// test in this workspace.
+    #[test]
+    fn a_reversal_backed_by_a_valid_payment_proof_is_rejected() {
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let p = params(&seller, &bridge);
+        let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+
+        // A genuine, fully valid proof of PAYMENT, submitted as a reversal.
+        let proof = make_payment_proof(&order, &bridge, 1);
+        let record = make_authorized_order(
+            &seller,
+            order.clone(),
+            OrderStatus::PaymentReversed,
+            Some(proof),
+        );
+
+        let state = orders_of([(order.id.clone(), record)]);
+        let err = state
+            .verify(&StoreStateV1::default(), &p)
+            .expect_err("evidence of payment is not evidence of reversal");
+        assert!(err.contains("still proves payment"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------
     // Merge properties
     // -----------------------------------------------------------------
 

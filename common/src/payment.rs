@@ -406,7 +406,7 @@ fn verify_on_chain_proof(
     let mut shallowest: Option<u32> = None;
     let mut saw_retraction = false;
 
-    for (_op, claims) in &by_outpoint {
+    for claims in by_outpoint.values() {
         match fold_outpoint_status(claims.iter()) {
             Some(OutpointStatus::Confirmed { value_sats, anchor }) => {
                 let confs = freenet_bitcoin_common::confirmations(&anchor, tip_height);
@@ -419,7 +419,21 @@ fn verify_on_chain_proof(
         }
     }
 
-    if confirmed_total == 0 && saw_retraction {
+    // What makes a reversal a reversal is a bridge-signed `Retracted` claim
+    // PLUS a remaining total that no longer covers what the order is owed.
+    //
+    // Testing only for a total of zero was too narrow. An order paid across
+    // two outpoints, one of which is later reorged out, is genuinely reversed
+    // while the other outpoint's value is still confirmed -- and that case
+    // used to surface as `InsufficientValue`. Which is precisely why
+    // `AuthorizedOrder::verify` accepted `InsufficientValue` as evidence of a
+    // reversal, and why an empty claim set (`InsufficientValue { have: 0 }`,
+    // no bridge involved at all) could poison any order in the store. Report
+    // the reversal here, so that arm can require the reversal error itself.
+    //
+    // The `== 0` limb only covers the degenerate zero-sats order, which
+    // reached `Reversed` before this change and still does.
+    if saw_retraction && (confirmed_total < order.amount_sats || confirmed_total == 0) {
         return Err(ProofError::Reversed);
     }
     if confirmed_total < order.amount_sats {
@@ -490,15 +504,45 @@ impl AuthorizedOrder {
                     .map_err(|e| format!("payment proof rejected: {e}"))
             }
             OrderStatus::PaymentReversed => {
-                // A reversal must also be evidenced, or anyone could declare a
-                // paid order unpaid.
+                // A reversal must be evidenced by a bridge-signed retraction,
+                // and by nothing weaker.
+                //
+                // `PaymentReversed` outranks `Paid` and merge is a monotonic
+                // maximum on rank, so this status is effectively permanent:
+                // once a peer accepts it, no later proof of payment can ever
+                // displace it. It is also, deliberately, unsigned -- evidenced
+                // by Bitcoin rather than by authority -- so anyone who can read
+                // the public order can submit one. Those two facts together
+                // mean the evidence test here is the ONLY thing standing
+                // between a public order and permanent poisoning.
+                //
+                // So it accepts `ProofError::Reversed` and nothing else.
+                // Every other rejection means "this evidence does not
+                // demonstrate payment", which is not the same claim as
+                // "payment was demonstrated and then undone". An empty
+                // `claims` vector fails with `InsufficientValue { have: 0 }`
+                // and costs an attacker nothing to build; accepting that as a
+                // reversal, as this once did, let anyone permanently poison
+                // any order in any store. Absence of proof is not proof of
+                // absence.
+                //
+                // `Reversed` is reachable only via `fold_outpoint_status`
+                // returning `Retracted` for an outpoint, which requires a
+                // claim signed by one of this store's trusted bridges.
+                //
+                // Residual, tracked as the selective-omission gap in the
+                // `OnChainPaymentProof` doc comment: the submitter still picks
+                // which claims to show, so once a bridge has ever published a
+                // retraction for this script, a submitter can exhibit that
+                // claim while withholding a later re-confirmation. Closing
+                // that needs a bridge-signed commitment to the complete claim
+                // set, not a change here.
                 let proof = self
                     .payment_proof
                     .as_ref()
                     .ok_or_else(|| "reversal without evidence".to_string())?;
                 match verify_payment_proof(&self.order, proof, trusted_bridges) {
                     Err(ProofError::Reversed) => Ok(()),
-                    Err(ProofError::InsufficientValue { .. }) => Ok(()),
                     Ok(_) => Err("reversal claimed, but the evidence still proves payment".into()),
                     Err(e) => Err(format!("reversal evidence invalid: {e}")),
                 }
