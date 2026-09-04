@@ -7,27 +7,11 @@ use crate::gateway::APP_STATE;
 pub fn StoreView() -> Element {
     let app_state = APP_STATE.read();
 
-    // Prefer the store a link named; fall back to any store whose state has
-    // actually arrived. `browsing_stores` also holds placeholder entries with
-    // no info yet, so picking the map's first entry can show "no store" while
-    // a perfectly good one is loaded.
+    // `AppState::displayed_store` owns this choice, so the document title
+    // (see `components::App`) cannot answer it differently.
     let store_entry = app_state
-        .active_store_id
-        .as_ref()
-        .and_then(|id| {
-            app_state
-                .browsing_stores
-                .get(id)
-                .map(|s| (id.clone(), s.clone()))
-        })
-        .filter(|(_, store)| store.info.is_some())
-        .or_else(|| {
-            app_state
-                .browsing_stores
-                .iter()
-                .find(|(_, store)| store.info.is_some())
-                .map(|(k, v)| (k.clone(), v.clone()))
-        });
+        .displayed_store()
+        .map(|(id, store)| (id.clone(), store.clone()));
 
     // A link was followed but the store's state hasn't come back yet. Once
     // `store_link_error` is set the wait is over and the message changes --

@@ -240,6 +240,32 @@ impl AppState {
         }
     }
 
+    /// The store the Browse tab is showing.
+    ///
+    /// Prefer the store a link named; fall back to any store whose state has
+    /// actually arrived. `browsing_stores` also holds placeholder entries --
+    /// one is created the moment a link is opened, before any state arrives,
+    /// and another whenever reputation state turns up for a store we haven't
+    /// loaded -- so "whichever entry the map iterates first" picks
+    /// arbitrarily among them and can show "no store" while a perfectly good
+    /// one is loaded.
+    ///
+    /// Both `StoreView` and the document title resolve the shown store, and
+    /// they answered differently until they shared this: the title took the
+    /// map's first loaded entry, so with two stores open the page was titled
+    /// after one the user was not looking at.
+    pub fn displayed_store(&self) -> Option<(&Vec<u8>, &BrowsingStore)> {
+        self.active_store_id
+            .as_ref()
+            .and_then(|id| self.browsing_stores.get_key_value(id))
+            .filter(|(_, store)| store.info.is_some())
+            .or_else(|| {
+                self.browsing_stores
+                    .iter()
+                    .find(|(_, store)| store.info.is_some())
+            })
+    }
+
     /// Record that we have asked the gateway for a store contract. Returns
     /// `true` the first time, so the caller subscribes exactly once.
     pub fn note_store_subscribed(&mut self, store_contract_id: &[u8]) -> bool {
@@ -1219,6 +1245,60 @@ mod tests {
             state.my_stores[FINGERPRINT][0].store_contract_id,
             vec![7u8; 32]
         );
+    }
+
+    fn loaded_store(name: &str) -> BrowsingStore {
+        BrowsingStore {
+            info: Some(StoreInfoV1 {
+                version: 1,
+                certificate_pem: String::new(),
+                seller_fingerprint: FINGERPRINT.to_string(),
+                reputation_contract_id: [0u8; 32],
+                store_name: name.to_string(),
+                description: String::new(),
+                payment_instructions: String::new(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// With several stores loaded, the shown store is the active one -- not
+    /// whichever the HashMap iterates first. Both `StoreView` and the
+    /// document title depend on this answer.
+    #[test]
+    fn the_displayed_store_is_the_active_one() {
+        let mut state = AppState::default();
+        for byte in 1..=8u8 {
+            state
+                .browsing_stores
+                .insert(vec![byte; 32], loaded_store(&format!("store {byte}")));
+        }
+        state.active_store_id = Some(vec![5u8; 32]);
+
+        let (id, store) = state.displayed_store().expect("a store is loaded");
+        assert_eq!(id, &vec![5u8; 32]);
+        assert_eq!(store.info.as_ref().unwrap().store_name, "store 5");
+    }
+
+    /// A placeholder entry -- created the moment a link is opened -- is not a
+    /// loaded store, and must not shadow one that is.
+    #[test]
+    fn a_placeholder_active_store_falls_back_to_a_loaded_one() {
+        let mut state = AppState::default();
+        state
+            .browsing_stores
+            .insert(vec![1u8; 32], loaded_store("loaded"));
+        state.begin_browsing(vec![2u8; 32]);
+
+        let (id, _) = state.displayed_store().expect("the loaded store");
+        assert_eq!(id, &vec![1u8; 32]);
+    }
+
+    #[test]
+    fn no_loaded_store_displays_nothing() {
+        let mut state = AppState::default();
+        state.begin_browsing(vec![2u8; 32]);
+        assert!(state.displayed_store().is_none());
     }
 
     /// A mailbox belongs to one store. Re-pointing the map at a second one

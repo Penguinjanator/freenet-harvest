@@ -115,11 +115,14 @@ pub fn App() -> Element {
     // Update document title based on current view
     {
         let app_state = crate::gateway::APP_STATE.read();
+        // Ask the same question `StoreView` asks, through the same helper.
+        // Reading `browsing_stores` directly here picked the map's first
+        // loaded entry, so once a second store loaded the page was titled
+        // after a store the user was not looking at.
         let store_name = app_state
-            .browsing_stores
-            .values()
-            .find_map(|s| s.info.as_ref())
-            .map(|i| i.store_name.as_str());
+            .displayed_store()
+            .and_then(|(_, store)| store.info.as_ref())
+            .map(|info| info.store_name.as_str());
 
         match (&current_route(), store_name) {
             (Route::Browse, Some(name)) => crate::document_title::set_store_title(name),
