@@ -6,6 +6,18 @@ use crate::listing::{AuthorizedListing, Listing};
 
 pub type RequestId = u64;
 
+/// The parameters the harvest delegate is registered under.
+///
+/// A delegate lives at `BLAKE3(BLAKE3(wasm) || parameters)` exactly as a
+/// contract does, so this value is half of its address. It is empty because the
+/// delegate needs no per-instance configuration -- but "empty" is a decision,
+/// not an absence, and it belongs in one place rather than being spelled
+/// `Parameters::from(Vec::<u8>::new())` at each registration site. Changing it
+/// re-keys the delegate and strands every secret it holds; the address guard
+/// (`common/src/bin/harvest-addresses.rs`) reads this constant, so such a
+/// change shows up as a moved address rather than as nothing at all.
+pub const DELEGATE_PARAMETERS: &[u8] = &[];
+
 /// Requests from the UI to the Harvest delegate.
 #[non_exhaustive]
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]

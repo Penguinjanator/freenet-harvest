@@ -20,7 +20,7 @@ pub async fn send_delegate_message(
     {
         let request = ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
             key: delegate_key.clone(),
-            params: Parameters::from(Vec::<u8>::new()),
+            params: Parameters::from(harvest_common::delegate::DELEGATE_PARAMETERS),
             inbound: vec![InboundDelegateMsg::ApplicationMessage(
                 ApplicationMessage::new(payload),
             )],
@@ -143,7 +143,12 @@ pub async fn register_delegate(delegate_wasm: &[u8]) -> Result<DelegateKey, Stri
     #[cfg(target_arch = "wasm32")]
     {
         let delegate_code = DelegateCode::from(delegate_wasm.to_vec());
-        let params = Parameters::from(Vec::<u8>::new());
+        // Half of the delegate's address, so it is named once
+        // (`harvest_common::delegate::DELEGATE_PARAMETERS`) rather than spelled
+        // out here and again at every other registration site. The address
+        // guard reads the same constant, so a change to it shows up as a moved
+        // delegate key instead of as nothing at all.
+        let params = Parameters::from(harvest_common::delegate::DELEGATE_PARAMETERS);
         let delegate = Delegate::from((&delegate_code, &params));
         let container = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate));
         let key = container.key().clone();

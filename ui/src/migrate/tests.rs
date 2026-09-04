@@ -303,11 +303,12 @@ fn delegate_keys_derive_from_their_code_hashes() {
         );
         let mut hasher = blake3::Hasher::new();
         hasher.update(&entry.code_hash);
-        // Harvest registers its delegate with `Parameters::from(Vec::new())`,
-        // so there is nothing to append. Spelled out rather than omitted,
-        // because the derivation is `blake3(code_hash || params)` and reading
-        // it as `blake3(code_hash)` is only accidentally right.
-        hasher.update(&[]);
+        // The derivation is `blake3(code_hash || params)`, and reading it as
+        // `blake3(code_hash)` is only accidentally right. Read the parameters
+        // from the constant the app registers with rather than writing `&[]`
+        // here: a hardcoded empty slice would keep this test passing after a
+        // change that re-keyed the real delegate.
+        hasher.update(harvest_common::delegate::DELEGATE_PARAMETERS);
         assert_eq!(
             *hasher.finalize().as_bytes(),
             entry.delegate_key,
