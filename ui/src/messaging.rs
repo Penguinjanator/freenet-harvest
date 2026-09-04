@@ -3,6 +3,15 @@
 //! Uses X25519 key exchange + AES-256-GCM for end-to-end encryption.
 //! Messages are padded to size buckets before encryption to reduce
 //! traffic analysis (see harvest_common::mailbox::pad_to_bucket).
+//!
+//! # Nothing calls this yet
+//!
+//! `encrypt_message` and `decrypt_message` have no callers outside this
+//! module's own tests. The missing half is the seller's X25519 public key:
+//! `StoreInfoV1` publishes a certificate and a reputation contract id and no
+//! encryption key, so a buyer has nothing to derive a conversation key
+//! against. `components::message_view` says so on screen rather than
+//! offering a compose box that silently discards what is typed into it.
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
