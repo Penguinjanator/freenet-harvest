@@ -90,14 +90,21 @@ fn handle_contract_response(response: ContractResponse) {
         // not seal -- see `migrate::seal_decision`.
         ContractResponse::NotFound { instance_id } => {
             info!("NotFound for contract {instance_id}");
+            // Offered to the migration probe, which is the only thing that
+            // acts on it. `deliver_absent` is the ONE path a `NotFound` may
+            // take into a probe: every other way a GET fails to produce state
+            // (a timeout, a transport fault, an error the gateway reports
+            // without a key) is silence, recorded as unresolved so the walk
+            // can never seal over a predecessor that was merely unreachable.
             #[cfg(target_arch = "wasm32")]
-            if super::migrate_ops::deliver_absent(&instance_id) {
-                return;
-            }
-            #[cfg(target_arch = "wasm32")]
-            APP_STATE
-                .write()
-                .note_store_state_unavailable(instance_id.as_bytes());
+            let _consumed = super::migrate_ops::deliver_absent(&instance_id);
+
+            // Nothing else acts on it. `AppState` already has a
+            // `store_state_unavailable` set that this could feed, and feeding
+            // it here is deliberately left alone: this arm sees NotFound for
+            // every contract kind, and marking a mailbox or reputation id as
+            // an unpublished STORE would be wrong in the set and misleading in
+            // the log. Routing it properly is its own change.
         }
 
         ContractResponse::UpdateResponse { key, summary: _ } => {
