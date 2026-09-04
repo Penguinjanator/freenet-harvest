@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
 use ed25519_dalek::VerifyingKey;
-use freenet_bitcoin_common::BridgeId;
 use freenet_scaffold_macro::composable;
 use serde::{Deserialize, Serialize};
 
@@ -9,36 +8,26 @@ use crate::listing::{verify_scoped_signature, AuthorizedListing, ListingId};
 use crate::payment::{AuthorizedOrder, OrderId, OrderStatus};
 
 /// Immutable parameters for a store contract, set at creation time.
+///
+/// # Why there is only one field
+///
+/// Parameters are hashed into the contract's address, so anything here is
+/// frozen for the store's entire life. The seller's key genuinely is the
+/// store's identity, so freezing it is correct.
+///
+/// The Bitcoin trust configuration used to live here too --
+/// `trusted_bitcoin_bridges` and `bitcoin_address_code_hash` -- and being
+/// frozen was fatal to it: every store the UI creates was published with an
+/// empty bridge list, which made it permanently incapable of accepting an
+/// on-chain payment, and a bridge that went away could never be replaced.
+/// Both fields now live on [`crate::payment::Order`], where the seller's
+/// signature on the invoice authenticates them and each new order may name a
+/// new set. See that struct's `trusted_bridges` for the full argument,
+/// including why moving them to mutable *state* would have been worse.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct StoreParameters {
     /// The seller's Ed25519 verifying key (from their ghostkey certificate).
     pub seller_verifying_key: VerifyingKey,
-    /// Bitcoin bridges this store trusts to attest order payments.
-    ///
-    /// Empty means no order can ever be proven `Paid` --
-    /// `verify_payment_proof` rejects `NoTrustedBridges` outright -- so a
-    /// store that hasn't been configured with a bridge yet fails closed
-    /// rather than accepting an unattested payment claim.
-    ///
-    /// `#[serde(default)]` so stores serialized before orders existed still
-    /// decode: they simply come back with no trusted bridges, i.e. no order
-    /// on them can ever validate as `Paid`, which is the safe default.
-    #[serde(default)]
-    pub trusted_bitcoin_bridges: Vec<BridgeId>,
-    /// BLAKE3 hash of the `BitcoinAddressContract` WASM whose instances this
-    /// store's orders reference for the related-contract cross-check in the
-    /// store contract's `validate_state` (see that file's doc comment for
-    /// why the cross-check is additive-only).
-    ///
-    /// The store contract cannot know the Bitcoin contract's code hash on
-    /// its own -- it never sees that WASM -- so it has to be told. `None`
-    /// (the `#[serde(default)]` value, and also correct for stores created
-    /// before this field existed) simply skips the related-contract request:
-    /// the embedded [`crate::payment::OrderPaymentProof`] remains fully
-    /// authoritative either way, so omitting this forfeits an optional
-    /// cross-check and nothing else.
-    #[serde(default)]
-    pub bitcoin_address_code_hash: Option<[u8; 32]>,
 }
 
 /// Information about the store owner. Single-value, version-bumped on update.
@@ -407,10 +396,7 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
                 return Err("order filed under a key that is not its own id".to_string());
             }
             record
-                .verify(
-                    &parameters.seller_verifying_key,
-                    &parameters.trusted_bitcoin_bridges,
-                )
+                .verify(&parameters.seller_verifying_key)
                 .map_err(|e| format!("order {id} invalid: {e}"))?;
         }
         Ok(())
@@ -488,10 +474,7 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
         };
         for record in incoming {
             record
-                .verify(
-                    &parameters.seller_verifying_key,
-                    &parameters.trusted_bitcoin_bridges,
-                )
+                .verify(&parameters.seller_verifying_key)
                 .map_err(|e| format!("order {} delta invalid: {e}", record.order.id))?;
             merge_order(&mut self.orders, record.clone());
         }
@@ -515,8 +498,8 @@ mod order_tests {
     use chrono::{DateTime, Utc};
     use ed25519_dalek::{Signer, SigningKey};
     use freenet_bitcoin_common::{
-        spv::testing::payment_proof, BitcoinNetwork, BlockAnchor, BlockHash, Claim, ClaimBody,
-        OutPoint, SignedClaim, SignedTipEntry, TipEntryBody,
+        spv::testing::payment_proof, BitcoinNetwork, BlockAnchor, BlockHash, BridgeId, Claim,
+        ClaimBody, OutPoint, SignedClaim, SignedTipEntry, TipEntryBody,
     };
 
     use crate::payment::{Order, OrderPaymentProof};
@@ -529,12 +512,22 @@ mod order_tests {
         SigningKey::from_bytes(&[22u8; 32])
     }
 
-    fn params(seller: &SigningKey, bridge: &SigningKey) -> StoreParameters {
+    /// A second, unrelated bridge -- for the tests about one store holding
+    /// orders that trust different bridges.
+    fn other_bridge_key() -> SigningKey {
+        SigningKey::from_bytes(&[33u8; 32])
+    }
+
+    fn params(seller: &SigningKey) -> StoreParameters {
         StoreParameters {
             seller_verifying_key: seller.verifying_key(),
-            trusted_bitcoin_bridges: vec![BridgeId(bridge.verifying_key().to_bytes())],
-            bitcoin_address_code_hash: None,
         }
+    }
+
+    /// The bridge set an order names. Per-order now, so every test order has
+    /// to say whose observations settle it.
+    fn bridges(bridge: &SigningKey) -> Vec<BridgeId> {
+        vec![BridgeId(bridge.verifying_key().to_bytes())]
     }
 
     fn timestamp(secs: i64) -> DateTime<Utc> {
@@ -556,6 +549,10 @@ mod order_tests {
             payment_hash: None,
             payment_address: "tb1qtest".into(),
             required_confirmations: 1,
+            // The bridge set now travels in the order itself, under the
+            // seller's signature, rather than in the store's address.
+            trusted_bridges: bridges(&bridge_key()),
+            bitcoin_address_code_hash: None,
             created_at: ts,
         }
     }
@@ -633,7 +630,7 @@ mod order_tests {
         bridge: &SigningKey,
         prev_block_seed: u8,
     ) -> OrderPaymentProof {
-        let addr_params = order.bitcoin_params(vec![]); // only used for script_id() here
+        let addr_params = order.bitcoin_params();
         let (spv, txid, block_hash) = payment_proof(
             &order.payment_script_pubkey,
             order.amount_sats,
@@ -700,7 +697,7 @@ mod order_tests {
     fn genuinely_paid_order_verifies() {
         let seller = seller_key();
         let bridge = bridge_key();
-        let p = params(&seller, &bridge);
+        let p = params(&seller);
         let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
         let proof = make_payment_proof(&order, &bridge, 1);
         let record = make_authorized_order(&seller, order.clone(), OrderStatus::Paid, Some(proof));
@@ -712,11 +709,117 @@ mod order_tests {
         );
     }
 
+    /// The whole point of moving the bridge list off the store's address:
+    /// one store, two orders, two DIFFERENT bridges, both valid.
+    ///
+    /// While the list was `StoreParameters::trusted_bitcoin_bridges` it was
+    /// hashed into the contract id, so every order in a store was checked
+    /// against one frozen list and this state was unrepresentable -- a store
+    /// created with an empty list (which is every store the UI creates) could
+    /// never accept a payment at all, and a dead bridge could never be
+    /// replaced. Per-order, the second order simply names the new bridge.
+    #[test]
+    fn two_orders_in_one_store_may_trust_different_bridges() {
+        let seller = seller_key();
+        let p = params(&seller);
+
+        let mut first = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+        first.trusted_bridges = bridges(&bridge_key());
+        let first_proof = make_payment_proof(&first, &bridge_key(), 1);
+
+        // A second invoice, issued later, naming a different bridge -- the
+        // rotation the old shape made impossible.
+        let mut second = make_order("buyer-2", 1_700_000_100, &[0x00, 0x14, 0xcc, 0xdd]);
+        second.trusted_bridges = bridges(&other_bridge_key());
+        let second_proof = make_payment_proof(&second, &other_bridge_key(), 2);
+
+        let state = orders_of([
+            (
+                first.id.clone(),
+                make_authorized_order(&seller, first, OrderStatus::Paid, Some(first_proof)),
+            ),
+            (
+                second.id.clone(),
+                make_authorized_order(&seller, second, OrderStatus::Paid, Some(second_proof)),
+            ),
+        ]);
+        assert!(
+            state.verify(&StoreStateV1::default(), &p).is_ok(),
+            "each order must be judged against the bridge set IT names, not a store-wide one"
+        );
+    }
+
+    /// The other half of the same property: naming a bridge does not make
+    /// somebody else's signature acceptable.
+    #[test]
+    fn a_proof_signed_by_a_bridge_the_order_does_not_name_is_rejected() {
+        let seller = seller_key();
+        let p = params(&seller);
+        let mut order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+        order.trusted_bridges = bridges(&bridge_key());
+        // Genuinely signed -- by a bridge this order never named.
+        let proof = make_payment_proof(&order, &other_bridge_key(), 1);
+        let record = make_authorized_order(&seller, order.clone(), OrderStatus::Paid, Some(proof));
+
+        let state = orders_of([(order.id.clone(), record)]);
+        let err = state
+            .verify(&StoreStateV1::default(), &p)
+            .expect_err("an untrusted bridge's signature must not settle this order");
+        assert!(err.contains("payment proof rejected"), "got: {err}");
+    }
+
+    /// An order naming no bridge fails closed rather than accepting an
+    /// unattested claim.
+    #[test]
+    fn an_order_naming_no_bridge_can_never_be_paid() {
+        let seller = seller_key();
+        let p = params(&seller);
+        let mut order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+        let proof = make_payment_proof(&order, &bridge_key(), 1);
+        order.trusted_bridges = Vec::new();
+        let record = make_authorized_order(&seller, order.clone(), OrderStatus::Paid, Some(proof));
+
+        let state = orders_of([(order.id.clone(), record)]);
+        let err = state
+            .verify(&StoreStateV1::default(), &p)
+            .expect_err("an order that names no bridge must not be provable as paid");
+        assert!(err.contains("trusts no Bitcoin bridge"), "got: {err}");
+    }
+
+    /// The bridge set is only safe per-order because the seller's signature
+    /// covers it. If it were carried outside the signed `Order` -- or the
+    /// signature were over a subset of the fields -- anyone holding a valid
+    /// order could append their own bridge and mint a payment proof.
+    #[test]
+    fn adding_a_bridge_to_a_signed_order_breaks_the_seller_signature() {
+        let seller = seller_key();
+        let p = params(&seller);
+        let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+        let proof = make_payment_proof(&order, &bridge_key(), 1);
+        let mut record =
+            make_authorized_order(&seller, order.clone(), OrderStatus::Paid, Some(proof));
+
+        // The attacker's own key, appended to a set the seller signed.
+        record
+            .order
+            .trusted_bridges
+            .push(BridgeId(other_bridge_key().verifying_key().to_bytes()));
+
+        let state = orders_of([(order.id.clone(), record)]);
+        let err = state
+            .verify(&StoreStateV1::default(), &p)
+            .expect_err("the bridge set must be inside what the seller signed");
+        assert!(
+            err.contains("does not match expected data"),
+            "the failure must be the SIGNATURE, not a downstream payment check: {err}"
+        );
+    }
+
     #[test]
     fn forged_proof_is_rejected() {
         let seller = seller_key();
         let bridge = bridge_key();
-        let p = params(&seller, &bridge);
+        let p = params(&seller);
         let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
         let mut proof = make_payment_proof(&order, &bridge, 1);
         // Flip a byte in the bridge's claim signature: same claim body,
@@ -736,8 +839,7 @@ mod order_tests {
     #[test]
     fn order_marked_paid_without_evidence_is_rejected() {
         let seller = seller_key();
-        let bridge = bridge_key();
-        let p = params(&seller, &bridge);
+        let p = params(&seller);
         let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
         let record = make_authorized_order(&seller, order.clone(), OrderStatus::Paid, None);
 
@@ -752,7 +854,7 @@ mod order_tests {
     fn order_proof_for_a_different_script_is_rejected() {
         let seller = seller_key();
         let bridge = bridge_key();
-        let p = params(&seller, &bridge);
+        let p = params(&seller);
         let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
         // Genuine proof, but for a DIFFERENT script than the order's own.
         let wrong_script_order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0x99, 0x88]);
@@ -784,7 +886,7 @@ mod order_tests {
         value_sats: u64,
         confirm_height: u32,
     ) -> (SignedClaim, OutPoint) {
-        let addr_params = order.bitcoin_params(vec![]); // only used for script_id()
+        let addr_params = order.bitcoin_params();
         let (spv, txid, block_hash) =
             payment_proof(&order.payment_script_pubkey, value_sats, 1, [1u8; 32]);
         let outpoint = OutPoint { txid, vout: 0 };
@@ -816,7 +918,7 @@ mod order_tests {
         outpoint: OutPoint,
         as_of_height: u32,
     ) -> SignedClaim {
-        let addr_params = order.bitcoin_params(vec![]);
+        let addr_params = order.bitcoin_params();
         let body = ClaimBody {
             script_id: addr_params.script_id(),
             network: order.network,
@@ -858,7 +960,7 @@ mod order_tests {
     fn an_empty_claim_set_cannot_declare_an_order_reversed() {
         let seller = seller_key();
         let bridge = bridge_key();
-        let p = params(&seller, &bridge);
+        let p = params(&seller);
         let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
 
         // No claims at all -- the tip is genuine, but it says nothing about
@@ -885,7 +987,7 @@ mod order_tests {
     fn a_genuine_reorg_verifies_as_reversed() {
         let seller = seller_key();
         let bridge = bridge_key();
-        let p = params(&seller, &bridge);
+        let p = params(&seller);
         let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
 
         let (confirmed, outpoint) = confirmed_claim(&order, &bridge, order.amount_sats, 100);
@@ -898,7 +1000,7 @@ mod order_tests {
         // The proof itself must fail with `Reversed` specifically. That is the
         // error `AuthorizedOrder::verify` keys on, so nothing else will do.
         assert_eq!(
-            crate::payment::verify_payment_proof(&order, &proof, &p.trusted_bitcoin_bridges),
+            crate::payment::verify_payment_proof(&order, &proof),
             Err(crate::payment::ProofError::Reversed)
         );
 
@@ -925,9 +1027,7 @@ mod order_tests {
     /// `Reversed` on its own account instead.
     #[test]
     fn a_partial_reorg_reports_reversed_not_insufficient_value() {
-        let seller = seller_key();
         let bridge = bridge_key();
-        let p = params(&seller, &bridge);
         let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
         assert_eq!(order.amount_sats, 50_000);
 
@@ -942,7 +1042,7 @@ mod order_tests {
         );
 
         assert_eq!(
-            crate::payment::verify_payment_proof(&order, &proof, &p.trusted_bitcoin_bridges),
+            crate::payment::verify_payment_proof(&order, &proof),
             Err(crate::payment::ProofError::Reversed),
             "30_000 of 50_000 left, with a signed retraction, is a reversal"
         );
@@ -957,7 +1057,7 @@ mod order_tests {
     fn a_reversal_backed_by_a_valid_payment_proof_is_rejected() {
         let seller = seller_key();
         let bridge = bridge_key();
-        let p = params(&seller, &bridge);
+        let p = params(&seller);
         let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
 
         // A genuine, fully valid proof of PAYMENT, submitted as a reversal.
@@ -995,7 +1095,7 @@ mod order_tests {
     fn a_withheld_retraction_is_not_currently_detected() {
         let seller = seller_key();
         let bridge = bridge_key();
-        let p = params(&seller, &bridge);
+        let p = params(&seller);
         let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
 
         let (confirmed, outpoint) = confirmed_claim(&order, &bridge, order.amount_sats, 100);
@@ -1007,7 +1107,6 @@ mod order_tests {
             crate::payment::verify_payment_proof(
                 &order,
                 &OrderPaymentProof::on_chain(vec![confirmed.clone(), retracted], tip.clone()),
-                &p.trusted_bitcoin_bridges,
             ),
             Err(crate::payment::ProofError::Reversed),
         );
@@ -1017,7 +1116,7 @@ mod order_tests {
         // completed payment.
         let curated = OrderPaymentProof::on_chain(vec![confirmed], tip);
         assert_eq!(
-            crate::payment::verify_payment_proof(&order, &curated, &p.trusted_bitcoin_bridges),
+            crate::payment::verify_payment_proof(&order, &curated),
             Ok(order.amount_sats),
             "KNOWN GAP: omitting the retraction still validates as paid",
         );
@@ -1039,7 +1138,7 @@ mod order_tests {
     fn status_is_monotonic_under_merge() {
         let seller = seller_key();
         let bridge = bridge_key();
-        let p = params(&seller, &bridge);
+        let p = params(&seller);
         let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
 
         let awaiting =
@@ -1071,7 +1170,7 @@ mod order_tests {
     fn merge_is_commutative_associative_and_idempotent() {
         let seller = seller_key();
         let bridge = bridge_key();
-        let p = params(&seller, &bridge);
+        let p = params(&seller);
 
         let order_x = make_order("buyer-x", 1_700_000_000, &[0x00, 0x14, 0x01, 0x01]);
         let order_y = make_order("buyer-y", 1_700_000_100, &[0x00, 0x14, 0x02, 0x02]);
@@ -1166,7 +1265,7 @@ mod order_tests {
     fn equal_rank_ties_are_broken_deterministically_and_commutatively() {
         let seller = seller_key();
         let bridge = bridge_key();
-        let p = params(&seller, &bridge);
+        let p = params(&seller);
         let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
 
         // Two independently-assembled, EACH INDIVIDUALLY VALID proofs for
@@ -1227,7 +1326,7 @@ mod order_tests {
     fn delta_returns_none_when_summary_already_matches() {
         let seller = seller_key();
         let bridge = bridge_key();
-        let p = params(&seller, &bridge);
+        let p = params(&seller);
         let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
         let proof = make_payment_proof(&order, &bridge, 1);
         let record = make_authorized_order(&seller, order.clone(), OrderStatus::Paid, Some(proof));
@@ -1269,6 +1368,8 @@ mod order_tests {
             payment_address: "tb1qtest".into(),
             payment_hash: None,
             required_confirmations: 1,
+            trusted_bridges: Vec::new(),
+            bitcoin_address_code_hash: None,
             created_at: ts,
         };
         (

@@ -180,17 +180,71 @@ pub struct Order {
     /// decode.
     #[serde(default)]
     pub payment_hash: Option<[u8; 32]>,
+    /// The Bitcoin bridges whose observations settle *this* invoice.
+    ///
+    /// # Why this is per-order and not a store parameter
+    ///
+    /// It used to be `StoreParameters::trusted_bitcoin_bridges`. A contract's
+    /// parameters are hashed into its address, so that list was immutable for
+    /// the store's whole life: a store created with an empty list could never
+    /// accept an on-chain payment, ever, and a bridge that went away could
+    /// never be replaced. Every store the UI creates was in exactly that
+    /// state.
+    ///
+    /// Moving it to *mutable state* would have been worse. `OrdersV1::verify`
+    /// re-checks every order against the list on every state validation, so
+    /// rotating a mutable list would retroactively invalidate the entire
+    /// historical order book — a peer's verdict changing under it, which is
+    /// precisely what stops replicas converging.
+    ///
+    /// Per-order, both problems go away at once. An order is verified forever
+    /// against the bridge set that was in force when the seller signed it, and
+    /// a new order can name a new set. A bridge going dark costs the orders
+    /// already open against it, not the store.
+    ///
+    /// # What authenticates it
+    ///
+    /// Nothing new. `AuthorizedOrder::verify_terms` checks a ghostkey-scoped
+    /// seller signature over the CBOR of this whole struct, so the bridge set
+    /// is signed by the same signature as the amount and the payment address.
+    /// A buyer who accepts an invoice is accepting its bridges along with its
+    /// price, which is why the UI shows them (see `OrderCard`).
+    ///
+    /// Empty means no payment can ever be proven — `verify_payment_proof`
+    /// returns `NoTrustedBridges` outright — so an order that names no bridge
+    /// fails closed rather than accepting an unattested claim.
+    ///
+    /// `#[serde(default)]` so orders written before this field existed still
+    /// decode; they come back with no bridges, i.e. unpayable, which is the
+    /// safe direction.
+    #[serde(default)]
+    pub trusted_bridges: Vec<BridgeId>,
+    /// BLAKE3 hash of the `BitcoinAddressContract` WASM whose instance
+    /// observes this order's payment address.
+    ///
+    /// Used only for the store contract's related-contract cross-check, which
+    /// is additive-only (see that file's `validate_state`). The store contract
+    /// never holds the Bitcoin contract's WASM, so it has to be told the hash;
+    /// `None` simply skips the cross-check for this order and forfeits nothing
+    /// else, since the embedded [`OrderPaymentProof`] stays authoritative
+    /// either way.
+    ///
+    /// Per-order for the same reason as `trusted_bridges`: as a store
+    /// parameter it was frozen at the store's address, so a rebuild of the
+    /// Bitcoin contract could never be reflected.
+    #[serde(default)]
+    pub bitcoin_address_code_hash: Option<[u8; 32]>,
     pub created_at: DateTime<Utc>,
 }
 
 impl Order {
     /// Parameters of the `BitcoinAddressContract` that observes this order's
     /// payment destination.
-    pub fn bitcoin_params(&self, trusted_bridges: Vec<BridgeId>) -> BitcoinAddressParameters {
+    pub fn bitcoin_params(&self) -> BitcoinAddressParameters {
         BitcoinAddressParameters {
             network: self.network,
             script_pubkey: self.payment_script_pubkey.clone(),
-            trusted_bridges,
+            trusted_bridges: self.trusted_bridges.clone(),
             // Derived from the network rather than carried in the order, so a
             // seller cannot weaken the work floor for their own invoices.
             pow_floor: self.network.default_pow_floor(),
@@ -404,14 +458,11 @@ impl std::fmt::Display for ProofError {
 ///
 /// This is the function the store contract runs, so it must be a pure function
 /// of its arguments: no clock, no network, no ambient state. Everything it
-/// needs is either in the order, in the proof, or in the store's parameters.
-pub fn verify_payment_proof(
-    order: &Order,
-    proof: &OrderPaymentProof,
-    trusted_bridges: &[BridgeId],
-) -> Result<u64, ProofError> {
+/// needs is either in the order or in the proof — including which bridges to
+/// believe, which the seller fixed when they signed the order.
+pub fn verify_payment_proof(order: &Order, proof: &OrderPaymentProof) -> Result<u64, ProofError> {
     match proof {
-        OrderPaymentProof::OnChain(p) => verify_on_chain_proof(order, p, trusted_bridges),
+        OrderPaymentProof::OnChain(p) => verify_on_chain_proof(order, p),
         OrderPaymentProof::Lightning(p) => verify_lightning_proof(order, p),
     }
 }
@@ -440,21 +491,17 @@ pub fn verify_lightning_proof(
     Ok(order.amount_sats)
 }
 
-fn verify_on_chain_proof(
-    order: &Order,
-    proof: &OnChainPaymentProof,
-    trusted_bridges: &[BridgeId],
-) -> Result<u64, ProofError> {
+fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u64, ProofError> {
     if order.payment_script_pubkey.is_empty() {
         return Err(ProofError::WrongRail);
     }
-    if trusted_bridges.is_empty() {
+    if order.trusted_bridges.is_empty() {
         return Err(ProofError::NoTrustedBridges);
     }
 
     let tip_params = freenet_bitcoin_common::BitcoinTipParameters {
         network: order.network,
-        trusted_bridges: trusted_bridges.to_vec(),
+        trusted_bridges: order.trusted_bridges.clone(),
     };
     let tip = proof.tip.verify(&tip_params).map_err(ProofError::BadTip)?;
     if tip.network != order.network {
@@ -462,7 +509,7 @@ fn verify_on_chain_proof(
     }
     let tip_height = tip.anchor.height;
 
-    let addr_params = order.bitcoin_params(trusted_bridges.to_vec());
+    let addr_params = order.bitcoin_params();
     let expected_script = addr_params.script_id();
 
     // Verify every claim's signature and that it is about THIS script. A claim
@@ -573,11 +620,12 @@ impl AuthorizedOrder {
     }
 
     /// Verify the whole record: terms, and whatever authorizes the status.
-    pub fn verify(
-        &self,
-        seller_key: &VerifyingKey,
-        trusted_bridges: &[BridgeId],
-    ) -> Result<(), String> {
+    ///
+    /// The bridges the payment evidence is judged against come from
+    /// `self.order.trusted_bridges`, which `verify_terms` has just established
+    /// is genuinely the seller's — so this needs no bridge argument and cannot
+    /// be called with a set the seller did not sign for.
+    pub fn verify(&self, seller_key: &VerifyingKey) -> Result<(), String> {
         self.verify_terms(seller_key)?;
         match self.status {
             OrderStatus::AwaitingPayment => Ok(()),
@@ -586,7 +634,7 @@ impl AuthorizedOrder {
                     .payment_proof
                     .as_ref()
                     .ok_or_else(|| "order marked Paid without payment evidence".to_string())?;
-                verify_payment_proof(&self.order, proof, trusted_bridges)
+                verify_payment_proof(&self.order, proof)
                     .map(|_| ())
                     .map_err(|e| format!("payment proof rejected: {e}"))
             }
@@ -628,7 +676,7 @@ impl AuthorizedOrder {
                     .payment_proof
                     .as_ref()
                     .ok_or_else(|| "reversal without evidence".to_string())?;
-                match verify_payment_proof(&self.order, proof, trusted_bridges) {
+                match verify_payment_proof(&self.order, proof) {
                     Err(ProofError::Reversed) => Ok(()),
                     Ok(_) => Err("reversal claimed, but the evidence still proves payment".into()),
                     Err(e) => Err(format!("reversal evidence invalid: {e}")),
@@ -789,6 +837,11 @@ mod lightning_tests {
             payment_address: String::new(),
             payment_hash,
             required_confirmations: 0,
+            // Lightning needs no observer at all, which is exactly why these
+            // tests pass an empty bridge set: a preimage settles the invoice
+            // with no bridge in the picture.
+            trusted_bridges: Vec::new(),
+            bitcoin_address_code_hash: None,
             created_at: ts,
         }
     }
@@ -800,7 +853,7 @@ mod lightning_tests {
         let proof = OrderPaymentProof::Lightning(LightningPaymentProof { preimage });
         // No bridge is consulted: the trusted-bridge list is irrelevant here,
         // which is the point -- a Lightning payment needs no observer.
-        assert_eq!(verify_payment_proof(&order, &proof, &[]).unwrap(), 50_000);
+        assert_eq!(verify_payment_proof(&order, &proof).unwrap(), 50_000);
     }
 
     #[test]
@@ -810,7 +863,7 @@ mod lightning_tests {
             preimage: [7u8; 32],
         });
         assert_eq!(
-            verify_payment_proof(&order, &proof, &[]),
+            verify_payment_proof(&order, &proof),
             Err(ProofError::PreimageMismatch)
         );
     }
@@ -826,7 +879,7 @@ mod lightning_tests {
             preimage: [42u8; 32],
         });
         assert_eq!(
-            verify_payment_proof(&order, &proof, &[]),
+            verify_payment_proof(&order, &proof),
             Err(ProofError::WrongRail)
         );
     }
@@ -836,7 +889,7 @@ mod lightning_tests {
         let order = lightning_order(Some(sha256(&[1u8; 32])));
         let proof = OrderPaymentProof::on_chain(vec![], dummy_tip());
         assert_eq!(
-            verify_payment_proof(&order, &proof, &[]),
+            verify_payment_proof(&order, &proof),
             Err(ProofError::WrongRail)
         );
     }

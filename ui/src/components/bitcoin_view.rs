@@ -351,9 +351,63 @@ fn live_address_for_order(
     bitcoin.addresses.get(&bytes).cloned()
 }
 
+/// The bridges named by this invoice that this build does not recognise.
+///
+/// # Why a buyer has to look at this, per invoice
+///
+/// The trusted-bridge set used to be a store *parameter*, hashed into the
+/// store's contract address. That was fatal in one direction (frozen for the
+/// store's life, so a store created with no bridge could never take a payment)
+/// but convenient in another: checking the store's address once told you the
+/// bridges for every order it would ever issue.
+///
+/// It is now per-order, under the seller's signature. That is what makes
+/// rotation possible, and it moves one check onto the buyer: two invoices from
+/// the same store may name different observers, so the bridge set has to be
+/// read per invoice rather than once per store. This function is that check,
+/// and `OrderCard` surfaces its answer — an invoice whose "Paid" verdict would
+/// rest on a signature from a stranger says so on its face, before the buyer
+/// sends any coin.
+///
+/// `bitcoin_config::TRUSTED_BRIDGE_ID_BS58` is the compiled-in trust policy:
+/// whose signature on a Bitcoin fact this build believes.
+fn unrecognised_bridges(order: &harvest_common::payment::Order) -> Vec<String> {
+    order
+        .trusted_bridges
+        .iter()
+        .map(|b| b.to_bs58())
+        .filter(|id| id != bitcoin_config::TRUSTED_BRIDGE_ID_BS58)
+        .collect()
+}
+
+/// Short, quotable form of a bridge id, for a line that has to fit on a card.
+fn short_bridge(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
 #[component]
 fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> Element {
     let o = &order.order;
+    let unrecognised = unrecognised_bridges(o);
+    let bridge_note = if o.trusted_bridges.is_empty() {
+        BridgeNote::None
+    } else if unrecognised.is_empty() {
+        BridgeNote::Recognised(
+            o.trusted_bridges
+                .iter()
+                .map(|b| short_bridge(&b.to_bs58()))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    } else {
+        BridgeNote::Unrecognised(
+            unrecognised
+                .iter()
+                .map(|id| short_bridge(id))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    };
     let (status_class, status_text) = match order.status {
         OrderStatus::AwaitingPayment => match &live {
             Some(l) if l.confirmed_sats > 0 => {
@@ -377,7 +431,100 @@ fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> Element {
             }
             p { class: "text-muted", "Order {o.id.short()} · {o.network.as_str()}" }
             p { class: "seller-id", "{o.payment_address}" }
+            match bridge_note {
+                BridgeNote::None => rsx! {
+                    p { class: "text-warning",
+                        "This invoice names no Bitcoin bridge, so no payment to it can ever \
+                         be proven. Ask the seller to reissue it."
+                    }
+                },
+                BridgeNote::Unrecognised(ids) => rsx! {
+                    p { class: "text-warning",
+                        "This invoice will be settled by a bridge this app does not \
+                         recognise ({ids}). Its payment status would rest on a signature \
+                         you have no reason to trust — check with the seller before paying."
+                    }
+                },
+                BridgeNote::Recognised(ids) => rsx! {
+                    p { class: "text-muted", "Settled by bridge {ids}" }
+                },
+            }
         }
+    }
+}
+
+/// What `OrderCard` has to say about an invoice's bridge set.
+enum BridgeNote {
+    /// No bridge named: the invoice can never be proven paid.
+    None,
+    /// Every named bridge is one this build trusts.
+    Recognised(String),
+    /// At least one named bridge is a stranger.
+    Unrecognised(String),
+}
+
+#[cfg(test)]
+mod bridge_check_tests {
+    use freenet_bitcoin_common::BridgeId;
+    use harvest_common::listing::ListingId;
+    use harvest_common::payment::{Order, OrderId};
+
+    use super::{bitcoin_config, unrecognised_bridges};
+
+    fn order_trusting(bridges: Vec<BridgeId>) -> Order {
+        let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let listing_id = ListingId::new("seller", &ts, "Widget");
+        Order {
+            id: OrderId::new("seller", &listing_id, &ts, "buyer"),
+            listing_id,
+            buyer_fingerprint: "buyer".into(),
+            seller_fingerprint: "seller".into(),
+            amount_sats: 50_000,
+            network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+            payment_script_pubkey: vec![0x00, 0x14, 0xaa, 0xbb],
+            payment_address: "tb1qtest".into(),
+            required_confirmations: 1,
+            payment_hash: None,
+            trusted_bridges: bridges,
+            bitcoin_address_code_hash: None,
+            created_at: ts,
+        }
+    }
+
+    fn known_bridge() -> BridgeId {
+        let bytes = bs58::decode(bitcoin_config::TRUSTED_BRIDGE_ID_BS58)
+            .into_vec()
+            .expect("the compiled-in bridge id must be valid base58");
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&bytes);
+        BridgeId(a)
+    }
+
+    #[test]
+    fn a_bridge_this_build_trusts_raises_nothing() {
+        assert!(unrecognised_bridges(&order_trusting(vec![known_bridge()])).is_empty());
+    }
+
+    /// The regression this whole check exists for. Moving the bridge set into
+    /// the order made rotation possible and made a buyer's one-time check of
+    /// the store address insufficient: a second invoice from the same store
+    /// may name an observer the buyer has never heard of. If that goes
+    /// unflagged, the buyer pays against a "Paid" verdict resting on a
+    /// stranger's signature.
+    #[test]
+    fn a_bridge_this_build_has_never_heard_of_is_flagged() {
+        let stranger = BridgeId([7u8; 32]);
+        let flagged = unrecognised_bridges(&order_trusting(vec![stranger]));
+        assert_eq!(flagged, vec![stranger.to_bs58()]);
+    }
+
+    /// A known bridge alongside a stranger must still flag the stranger --
+    /// mixing one trusted observer in does not launder the other.
+    #[test]
+    fn a_stranger_mixed_in_with_a_known_bridge_is_still_flagged() {
+        let stranger = BridgeId([7u8; 32]);
+        let flagged = unrecognised_bridges(&order_trusting(vec![known_bridge(), stranger]));
+        assert_eq!(flagged, vec![stranger.to_bs58()]);
     }
 }
 

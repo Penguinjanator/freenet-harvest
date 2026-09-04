@@ -170,15 +170,13 @@ impl Artifact {
 /// The store parameters a seller's store is published under.
 ///
 /// These must match `create_store_contracts` exactly, or every id derived here
-/// names a contract that does not exist. The Bitcoin fields are the documented
-/// safe defaults that function publishes with; they are part of the address,
-/// so a future change to them re-keys every store independently of the WASM
-/// and would need its own lineage story.
+/// names a contract that does not exist. The seller's key is the only
+/// parameter, which is what makes every generation's store instance derivable
+/// from the seller's ghostkey alone -- the Bitcoin trust configuration used to
+/// sit here too and is now per-order, so it can no longer re-key a store.
 pub fn store_params(seller_verifying_key: &ed25519_dalek::VerifyingKey) -> StoreParameters {
     StoreParameters {
         seller_verifying_key: *seller_verifying_key,
-        trusted_bitcoin_bridges: Vec::new(),
-        bitcoin_address_code_hash: None,
     }
 }
 

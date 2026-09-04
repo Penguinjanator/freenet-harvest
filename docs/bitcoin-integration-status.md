@@ -29,26 +29,37 @@ Bitcoin.
 
 ## Blocking gaps for the full end-to-end scenario
 
-### 1. Every store the UI creates refuses every payment, permanently
+### 1. A store's bridge choice is no longer permanent — but nothing issues orders yet
 
-`gateway::store_ops::create_store_contracts` builds `StoreParameters` with
-`trusted_bitcoin_bridges: Vec::new()`. An empty list means
-`verify_payment_proof` rejects with `NoTrustedBridges`, so **no order on that
-store can ever validate as `Paid`** — which is the right fail-closed default,
-and is fatal as a permanent one.
+**The permanence is fixed.** The trusted-bridge list used to be
+`StoreParameters::trusted_bitcoin_bridges`, and a contract's key is
+`BLAKE3(BLAKE3(wasm) || parameters)`, so it was frozen at the store's address
+for the store's whole life. `create_store_contracts` supplied an empty list
+every time, which meant `verify_payment_proof` rejected with
+`NoTrustedBridges` and **no order on any store this app created could ever
+validate as `Paid`** — fail-closed, which is right, and permanent, which was
+fatal. A bridge that went away could not be replaced either.
 
-It is permanent because `trusted_bitcoin_bridges` is a *parameter*, and a
-contract's key is `BLAKE3(BLAKE3(wasm) || parameters)`. Changing the trusted
-bridge list changes the address, so it is not a setting a seller can edit
-later — it is chosen once, at creation, and the UI chooses "none" every time.
-There is no path in the UI that ever supplies a bridge id here, and the
-Payments section's bridge configuration is delegate-side state that never
-reaches store creation.
+The list (and the paired `bitcoin_address_code_hash`) now live on
+`payment::Order`, inside what the seller signs. So each invoice names the
+bridges that settle it, a later invoice may name different ones, and
+`StoreParameters` is back to holding only the seller's key — which genuinely
+is the store's identity, and is correctly immutable. Moving the list to
+mutable *state* instead would have been worse: `OrdersV1::verify` re-checks
+every order on every state validation, so rotating a shared mutable list would
+retroactively invalidate the whole historical order book.
 
-So the Bitcoin payment path is complete and verified in the contract, and
-unreachable from any store this app creates. Closing it means deciding which
-bridge a new store trusts at the moment it is created (and accepting that
-changing that decision later means a new store).
+**What remains open is a different gap:** no path in the UI issues an order at
+all, so nothing yet chooses a bridge set at invoice time. When that path is
+built it has to supply one; an order that names none is unpayable, exactly as
+before, but now that is a per-invoice mistake rather than a permanent property
+of the store.
+
+The buyer side of the same move is already in place. Because the bridge set is
+per-invoice, checking a store's address once no longer tells a buyer who will
+observe their payment, so `OrderCard` reads it per order and warns when an
+invoice names a bridge this build does not recognise
+(`components::bitcoin_view::unrecognised_bridges`).
 
 ### 2. A watch is recorded and nothing is ever asked to synchronize it
 

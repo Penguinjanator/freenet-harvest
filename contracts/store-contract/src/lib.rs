@@ -31,19 +31,24 @@ const MAX_RELATED_CONTRACTS_PER_REQUEST: usize = 10;
 /// bytes so it can call `.hash()` on them -- it has no entry point that
 /// accepts a hash directly -- but the store contract never holds the
 /// Bitcoin contract's WASM; it only knows its hash, supplied out-of-band as
-/// `StoreParameters::bitcoin_address_code_hash`. So this replicates the same
-/// two-hash construction by hand instead of going through `ContractCode`.
+/// `Order::bitcoin_address_code_hash`. So this replicates the same two-hash
+/// construction by hand instead of going through `ContractCode`.
 ///
 /// This assumes the real `BitcoinAddressContract` was published with its
 /// `BitcoinAddressParameters` encoded via `ciborium` (as
 /// `bitcoin-address-contract`'s own `decode_params` expects) -- the hash is
 /// over the exact on-wire parameter bytes, not a semantic re-encoding, so a
-/// different encoder would silently compute the wrong id. It also assumes
-/// `params.trusted_bridges`' ORDER matches whatever the address contract was
-/// actually deployed with, for the same reason. Both hold today because
-/// `order.bitcoin_params` builds `params` directly from this store's own
-/// `trusted_bitcoin_bridges`, which is the same list the store's operator
-/// used to deploy the paired address contracts.
+/// different encoder would silently compute the wrong id.
+///
+/// It used to have to assume something further and shakier: that the bridge
+/// list's ORDER matched whatever the address contract was actually deployed
+/// with, since the list came from the *store's* frozen parameters and had no
+/// necessary relationship to any particular order. Now that both the bridge
+/// list and the code hash travel in the order itself
+/// (`harvest_common::payment::Order`), the seller states them per invoice and
+/// signs them, so the address contract this names is the one the seller meant
+/// for this payment. A mismatch costs the cross-check for that order and
+/// nothing more -- see `validate_state` on why it is additive-only.
 fn bitcoin_address_instance_id(
     code_hash: &[u8; 32],
     params: &BitcoinAddressParameters,
@@ -115,13 +120,6 @@ impl ContractInterface for Contract {
         // fetch corroborating evidence for operators (surfaced via a log
         // line), never to gate it.
         // ---------------------------------------------------------------
-        let Some(code_hash) = parameters.bitcoin_address_code_hash else {
-            // Nothing to compute a related instance id with -- skip the
-            // cross-check entirely rather than guessing at one. See the
-            // field's doc comment on `StoreParameters`.
-            return Ok(ValidateResult::Valid);
-        };
-
         let mut wanted_ids: Vec<ContractInstanceId> = Vec::new();
         for record in store_state.orders.orders.values() {
             if !matches!(
@@ -130,9 +128,13 @@ impl ContractInterface for Contract {
             ) {
                 continue;
             }
-            let addr_params = record
-                .order
-                .bitcoin_params(parameters.trusted_bitcoin_bridges.clone());
+            // No code hash on this order means nothing to compute a related
+            // instance id with -- skip that order's cross-check rather than
+            // guessing at one. See the field's doc comment on `Order`.
+            let Some(code_hash) = record.order.bitcoin_address_code_hash else {
+                continue;
+            };
+            let addr_params = record.order.bitcoin_params();
             let instance_id = bitcoin_address_instance_id(&code_hash, &addr_params)?;
             if !wanted_ids.contains(&instance_id) {
                 wanted_ids.push(instance_id);
@@ -170,9 +172,10 @@ impl ContractInterface for Contract {
             ) {
                 continue;
             }
-            let addr_params = record
-                .order
-                .bitcoin_params(parameters.trusted_bitcoin_bridges.clone());
+            let Some(code_hash) = record.order.bitcoin_address_code_hash else {
+                continue;
+            };
+            let addr_params = record.order.bitcoin_params();
             let Ok(instance_id) = bitcoin_address_instance_id(&code_hash, &addr_params) else {
                 continue;
             };
@@ -348,7 +351,7 @@ mod tests {
         (scoped_bytes, signature)
     }
 
-    fn make_order(script: &[u8]) -> Order {
+    fn make_order(script: &[u8], code_hash: Option<[u8; 32]>) -> Order {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let listing_id = ListingId::new("seller-fp", &ts, "Widget");
         Order {
@@ -362,12 +365,16 @@ mod tests {
             payment_hash: None,
             payment_address: "tb1qtest".into(),
             required_confirmations: 1,
+            trusted_bridges: vec![freenet_bitcoin_common::BridgeId(
+                bridge_key().verifying_key().to_bytes(),
+            )],
+            bitcoin_address_code_hash: code_hash,
             created_at: ts,
         }
     }
 
     fn make_paid_order(seller: &SigningKey, bridge: &SigningKey, order: Order) -> AuthorizedOrder {
-        let addr_params = order.bitcoin_params(vec![]);
+        let addr_params = order.bitcoin_params();
         let (spv, txid, block_hash) = payment_proof(
             &order.payment_script_pubkey,
             order.amount_sats,
@@ -438,17 +445,9 @@ mod tests {
         (bytes, id)
     }
 
-    fn params_bytes(
-        seller: &SigningKey,
-        bridge: &SigningKey,
-        code_hash: Option<[u8; 32]>,
-    ) -> Vec<u8> {
+    fn params_bytes(seller: &SigningKey) -> Vec<u8> {
         let params = StoreParameters {
             seller_verifying_key: seller.verifying_key(),
-            trusted_bitcoin_bridges: vec![freenet_bitcoin_common::BridgeId(
-                bridge.verifying_key().to_bytes(),
-            )],
-            bitcoin_address_code_hash: code_hash,
         };
         let mut bytes = vec![];
         into_writer(&params, &mut bytes).unwrap();
@@ -459,9 +458,9 @@ mod tests {
     fn skips_related_request_when_code_hash_absent() {
         let seller = seller_key();
         let bridge = bridge_key();
-        let order = make_order(&[0x00, 0x14, 0xaa, 0xbb]);
+        let order = make_order(&[0x00, 0x14, 0xaa, 0xbb], None);
         let (state_bytes, _id) = paid_store_state_bytes(&seller, &bridge, order);
-        let params = params_bytes(&seller, &bridge, None);
+        let params = params_bytes(&seller);
 
         let result = Contract::validate_state(
             Parameters::from(params),
@@ -481,15 +480,13 @@ mod tests {
     fn requests_related_contract_for_a_paid_order_when_code_hash_known() {
         let seller = seller_key();
         let bridge = bridge_key();
-        let order = make_order(&[0x00, 0x14, 0xaa, 0xbb]);
-        let addr_params = order.bitcoin_params(vec![freenet_bitcoin_common::BridgeId(
-            bridge.verifying_key().to_bytes(),
-        )]);
         let code_hash = [42u8; 32];
+        let order = make_order(&[0x00, 0x14, 0xaa, 0xbb], Some(code_hash));
+        let addr_params = order.bitcoin_params();
         let expected_id = bitcoin_address_instance_id(&code_hash, &addr_params).unwrap();
 
         let (state_bytes, _id) = paid_store_state_bytes(&seller, &bridge, order);
-        let params = params_bytes(&seller, &bridge, Some(code_hash));
+        let params = params_bytes(&seller);
 
         let result = Contract::validate_state(
             Parameters::from(params),
@@ -509,15 +506,13 @@ mod tests {
     fn validates_once_related_state_resolves_even_if_it_came_back_empty() {
         let seller = seller_key();
         let bridge = bridge_key();
-        let order = make_order(&[0x00, 0x14, 0xaa, 0xbb]);
-        let addr_params = order.bitcoin_params(vec![freenet_bitcoin_common::BridgeId(
-            bridge.verifying_key().to_bytes(),
-        )]);
         let code_hash = [42u8; 32];
+        let order = make_order(&[0x00, 0x14, 0xaa, 0xbb], Some(code_hash));
+        let addr_params = order.bitcoin_params();
         let expected_id = bitcoin_address_instance_id(&code_hash, &addr_params).unwrap();
 
         let (state_bytes, _id) = paid_store_state_bytes(&seller, &bridge, order);
-        let params = params_bytes(&seller, &bridge, Some(code_hash));
+        let params = params_bytes(&seller);
 
         // Simulate Freenet's second invocation: the id we would have asked
         // for is already a key in `related`, with no state behind it (the
