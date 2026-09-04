@@ -171,6 +171,37 @@ pub enum PendingSignature {
     StoreInfo(PendingStoreInfo),
 }
 
+impl PendingSignature {
+    /// The exact bytes this request handed the delegate as
+    /// `SignMessage::message`, which is what comes back inside the
+    /// `ScopedPayload`. See `signed_message_bytes`.
+    fn signed_bytes(&self) -> Result<Vec<u8>, String> {
+        match self {
+            PendingSignature::Listing(pending) => harvest_common::to_cbor(&pending.listing),
+            PendingSignature::StoreInfo(pending) => harvest_common::to_cbor(&pending.info),
+        }
+    }
+}
+
+/// The message a `SignResult`'s scoped payload was built around, i.e. the
+/// bytes the caller originally asked to have signed.
+///
+/// The delegate wraps the request's `message` verbatim as
+/// `ScopedPayload::payload` and signs the wrapper, and every verifier -- the
+/// store contract included, via `verify_scoped_signature` -- checks that
+/// inner payload against a byte-for-byte re-encoding of the object it is
+/// verifying. So these bytes identify which request an answer belongs to,
+/// exactly and independently of arrival order.
+///
+/// `None` if the payload will not deserialize, which means the answer is
+/// unusable rather than merely unmatched: a signature the contract cannot
+/// verify is not worth applying to anything.
+fn signed_message_bytes(scoped_payload: &[u8]) -> Option<Vec<u8>> {
+    harvest_common::from_cbor::<ghostkey_common::ScopedPayload>(scoped_payload)
+        .ok()
+        .map(|scoped| scoped.payload)
+}
+
 /// A store's own details, awaiting signature so they can be published.
 ///
 /// `AuthorizedStoreInfoV1::verify` skips verification only at version 0, so
@@ -706,7 +737,31 @@ impl AppState {
                 certificate_pem,
             } => {
                 info!("Received signature from ghostkey delegate");
-                match self.pending_signatures.pop_front() {
+                // Match the answer to its request by the bytes that were
+                // signed, not by queue position. `SignResult` carries no
+                // correlation id, so position is the obvious choice -- but it
+                // is only correct while answers come back in the order they
+                // were asked for, and it fails silently when they do not: the
+                // signature is grafted onto the wrong object, and what lands
+                // on the network is a record whose signature does not cover
+                // it. The contract then rejects it with nothing to say about
+                // why, which is indistinguishable from never having sent it.
+                //
+                // The scoped payload names its own request (see
+                // `signed_message_bytes`), so use that instead. An answer
+                // matching nothing outstanding is dropped rather than applied
+                // to whatever happens to be at the head of the queue: those
+                // bytes could not verify against any object we hold, so
+                // there is nothing useful to do with them.
+                let matched = signed_message_bytes(&scoped_payload).and_then(|message| {
+                    self.pending_signatures
+                        .iter()
+                        .position(|pending| {
+                            pending.signed_bytes().is_ok_and(|bytes| bytes == message)
+                        })
+                        .and_then(|at| self.pending_signatures.remove(at))
+                });
+                match matched {
                     Some(PendingSignature::Listing(pending)) => {
                         let authorized = AuthorizedListing {
                             listing: pending.listing,
@@ -781,7 +836,11 @@ impl AppState {
                         let _ = authorized;
                     }
                     None => {
-                        warn!("SignResult received with nothing waiting for a signature");
+                        warn!(
+                            "SignResult matches none of the {} outstanding signature request(s) \
+                             -- dropping it",
+                            self.pending_signatures.len()
+                        );
                     }
                 }
             }
@@ -1443,9 +1502,25 @@ mod tests {
         assert!(state.displayed_store().is_none());
     }
 
+    /// A `SignResult` carrying a scoped payload that names no request we
+    /// made -- the bytes will not even deserialize.
     fn sign_result() -> ghostkey_common::GhostkeyResponse {
         ghostkey_common::GhostkeyResponse::SignResult {
             scoped_payload: vec![1, 2, 3],
+            signature: vec![4, 5, 6],
+            certificate_pem: String::new(),
+        }
+    }
+
+    /// A `SignResult` shaped the way the ghostkey delegate answers: the
+    /// request's own message, wrapped verbatim as `ScopedPayload::payload`.
+    fn sign_result_for(pending: &PendingSignature) -> ghostkey_common::GhostkeyResponse {
+        let scoped = ghostkey_common::ScopedPayload {
+            requestor: harvest_common::expected_harvest_requestor(),
+            payload: pending.signed_bytes().expect("serialize signed message"),
+        };
+        ghostkey_common::GhostkeyResponse::SignResult {
+            scoped_payload: harvest_common::to_cbor(&scoped).expect("serialize scoped payload"),
             signature: vec![4, 5, 6],
             certificate_pem: String::new(),
         }
@@ -1473,31 +1548,67 @@ mod tests {
         })
     }
 
-    /// `SignResult` carries no correlation id, so the queue's order is the
-    /// only thing matching an answer to its request. A store's info and a
-    /// listing can be outstanding at the same time -- publishing a store
-    /// signs its info, and the seller can start a listing right after -- and
-    /// answering them out of order would attach the store's signature to the
-    /// listing.
+    /// `SignResult` carries no correlation id, so an answer has to be matched
+    /// to its request by the bytes it was signed over. Queue position cannot
+    /// do it: a store's info and a listing can be outstanding at once --
+    /// publishing a store signs its info, and the seller can start a listing
+    /// right after -- and nothing guarantees the two delegate round-trips
+    /// finish in the order they began.
+    ///
+    /// Answer the *second* request first. Under position-matching the store
+    /// info would swallow the listing's signature and both records would go
+    /// out carrying a signature that does not cover them.
     #[test]
-    fn signatures_are_answered_in_the_order_they_were_asked_for() {
+    fn an_answer_goes_to_the_request_whose_bytes_it_carries() {
         let mut state = AppState::default();
+        let listing = pending_listing();
         state.pending_signatures.push_back(pending_store_info());
-        state.pending_signatures.push_back(pending_listing());
+        state.pending_signatures.push_back(listing.clone());
 
-        // First answer belongs to the store info, not the listing.
-        state.on_ghostkey_response(sign_result());
-        assert!(
-            state.signed_listings_ready.is_empty(),
-            "the listing must not have consumed the store info's signature"
+        state.on_ghostkey_response(sign_result_for(&listing));
+
+        assert_eq!(
+            state.signed_listings_ready.len(),
+            1,
+            "the listing's own answer must reach the listing"
         );
-        assert_eq!(state.pending_signatures.len(), 1);
-
-        // Second answer is the listing's.
-        state.on_ghostkey_response(sign_result());
-        assert_eq!(state.signed_listings_ready.len(), 1);
         assert_eq!(state.signed_listings_ready[0].listing.title, "Beans");
-        assert!(state.pending_signatures.is_empty());
+        assert_eq!(
+            state.pending_signatures.len(),
+            1,
+            "the store info is still waiting for its own answer"
+        );
+        assert!(matches!(
+            state.pending_signatures.front(),
+            Some(PendingSignature::StoreInfo(_))
+        ));
+    }
+
+    /// And the signature it carries has to be the one attached: the scoped
+    /// payload is what the store contract re-encodes and compares against, so
+    /// pairing it with the wrong record produces something no verifier
+    /// accepts.
+    #[test]
+    fn the_signature_attached_is_the_one_that_was_answered() {
+        let mut state = AppState::default();
+        let listing = pending_listing();
+        state.pending_signatures.push_back(listing.clone());
+
+        state.on_ghostkey_response(sign_result_for(&listing));
+
+        let signed = state
+            .signed_listings_ready
+            .first()
+            .expect("a signed listing");
+        assert_eq!(
+            signed.scoped_payload,
+            harvest_common::to_cbor(&ghostkey_common::ScopedPayload {
+                requestor: harvest_common::expected_harvest_requestor(),
+                payload: listing.signed_bytes().expect("signed bytes"),
+            })
+            .expect("serialize"),
+            "the scoped payload must wrap this listing's own bytes"
+        );
     }
 
     /// An answer with nothing queued must be dropped, not applied to
@@ -1507,6 +1618,29 @@ mod tests {
         let mut state = AppState::default();
         state.on_ghostkey_response(sign_result());
         assert!(state.signed_listings_ready.is_empty());
+    }
+
+    /// An answer that matches nothing outstanding is dropped rather than
+    /// spent on whatever happens to be queued. Those bytes cannot verify
+    /// against any record we hold, so applying them would publish something
+    /// the contract rejects -- and would consume a request that is still
+    /// legitimately waiting for its own answer.
+    #[test]
+    fn an_unrecognised_signature_does_not_consume_a_queued_request() {
+        let mut state = AppState::default();
+        state.pending_signatures.push_back(pending_listing());
+
+        state.on_ghostkey_response(sign_result());
+
+        assert!(
+            state.signed_listings_ready.is_empty(),
+            "nothing should have been signed"
+        );
+        assert_eq!(
+            state.pending_signatures.len(),
+            1,
+            "the queued listing must still be waiting for its own answer"
+        );
     }
 
     fn pending_creation() -> PendingStoreCreation {
