@@ -1,6 +1,72 @@
 //! Store operations: creating stores, submitting listings, subscribing.
 
+use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey};
 use harvest_common::listing::AuthorizedListing;
+use harvest_common::StoreRegistration;
+
+/// The store contract this build of the UI bundles. `create_store_contracts`
+/// publishes it; `store_contract_key` hashes it to recover the key of a store
+/// published earlier.
+const STORE_CONTRACT_WASM: &[u8] = include_bytes!("../../public/contracts/store_contract.wasm");
+
+/// Whether a store's `ContractKey` was recovered from local state or rebuilt
+/// from the bundled contract -- see `store_contract_key`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeyOrigin {
+    /// Recorded locally when the store was created. Always correct.
+    Recorded,
+    /// Rebuilt from the store contract this build bundles. Correct only if
+    /// the store was published with the same contract build.
+    Reconstructed,
+}
+
+/// The `ContractKey` for a store, which is what sending it an update needs.
+///
+/// The key is written down exactly once, locally, when the store is created.
+/// The delegate cannot keep it: `HarvestDelegateRequest::RegisterStore` has no
+/// field for it, so every registration `ListStores` returns is keyless. After
+/// a page reload there is therefore no local copy to fall back on either --
+/// `my_stores` starts empty and is refilled entirely from the delegate -- and
+/// preserving a known key across a merge, while necessary, does nothing for
+/// the reload case. So rebuild it.
+///
+/// A `ContractKey` is an instance id plus a code hash, and both are available
+/// without the delegate: the instance id *is* `store_contract_id`, and the
+/// code hash is the hash of the store contract this build bundles. The
+/// parameters -- which we do not have after a reload -- are not needed,
+/// because they are already folded into the instance id.
+///
+/// The one case this does not fix: a store published with an *older* store
+/// contract has a different code hash, so the rebuilt key names a contract
+/// that does not exist and the update will fail. That store is already broken
+/// today, with no key at all, so this is never a regression -- but it is not
+/// a fix for every store either, which is why the caller is told which of the
+/// two it got and can say so.
+pub fn store_contract_key(
+    registration: &StoreRegistration,
+) -> Result<(ContractKey, KeyOrigin), String> {
+    if let Some(bytes) = registration.store_contract_key.as_ref() {
+        return harvest_common::from_cbor(bytes)
+            .map(|key| (key, KeyOrigin::Recorded))
+            .map_err(|e| format!("deserialize stored contract key: {e}"));
+    }
+
+    let instance_id: [u8; 32] = registration
+        .store_contract_id
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            format!(
+                "store contract id is {} bytes, not 32",
+                registration.store_contract_id.len()
+            )
+        })?;
+    let code_hash = *ContractCode::from(STORE_CONTRACT_WASM.to_vec()).hash();
+    Ok((
+        ContractKey::from_id_and_code(ContractInstanceId::new(instance_id), code_hash),
+        KeyOrigin::Reconstructed,
+    ))
+}
 
 /// Create the three contracts for a new store and register them with the
 /// harvest delegate.
@@ -156,31 +222,30 @@ pub async fn create_store_contracts(
 
 /// Submit a signed listing to a store contract.
 ///
-/// Looks up the store's `ContractKey` from the stored registration data
-/// and sends the listing as a delta update.
+/// Resolves the store's `ContractKey` (see `store_contract_key`) and sends
+/// the listing as a delta update.
 #[cfg(target_arch = "wasm32")]
 pub async fn submit_listing_by_id(
     store_contract_id: &[u8],
     listing: AuthorizedListing,
 ) -> Result<(), String> {
-    use dioxus::logger::tracing::info;
+    use dioxus::logger::tracing::{info, warn};
     use dioxus::prelude::ReadableExt;
     use freenet_stdlib::prelude::*;
 
-    // Find the stored ContractKey for this store
-    let contract_key: ContractKey = {
+    let (contract_key, origin) = {
         let state = super::APP_STATE.read();
-        let key_bytes = state
+        let registration = state
             .my_stores
             .values()
             .flat_map(|stores| stores.iter())
             .find(|s| s.store_contract_id == store_contract_id)
-            .and_then(|s| s.store_contract_key.as_ref())
-            .ok_or("store contract key not found -- store may not be fully created yet")?
-            .clone();
-        harvest_common::from_cbor(&key_bytes)
-            .map_err(|e| format!("deserialize contract key: {e}"))?
+            .ok_or("this store is not one of yours -- nothing to add a listing to")?;
+        store_contract_key(registration)?
     };
+    if origin == KeyOrigin::Reconstructed {
+        warn!("Store contract key rebuilt from the bundled store contract");
+    }
 
     let title = listing.listing.title.clone();
     let delta = vec![listing];
@@ -191,7 +256,20 @@ pub async fn submit_listing_by_id(
         &contract_key,
         UpdateData::Delta(StateDelta::from(delta_bytes)),
     )
-    .await?;
+    .await
+    .map_err(|e| match origin {
+        // A rebuilt key is wrong if the store predates the store contract
+        // this build bundles, and the failure that produces says nothing
+        // about why. Say it here rather than leaving the seller with a bare
+        // gateway error.
+        KeyOrigin::Reconstructed => format!(
+            "{e} -- this store's contract key was rebuilt from the store \
+             contract this version of Harvest bundles. If the store was \
+             created with an older version, that key is wrong and the \
+             listing cannot be submitted."
+        ),
+        KeyOrigin::Recorded => e,
+    })?;
 
     info!("Submitted listing '{}' to store contract", title);
     Ok(())
@@ -228,4 +306,67 @@ pub async fn list_stores(ghostkey_fingerprint: String) -> Result<(), String> {
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn list_stores(_ghostkey_fingerprint: String) -> Result<(), String> {
     Err("delegate messaging requires WASM".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registration(store_contract_key: Option<Vec<u8>>) -> StoreRegistration {
+        StoreRegistration {
+            store_contract_id: vec![3u8; 32],
+            reputation_contract_id: vec![4u8; 32],
+            mailbox_contract_id: vec![5u8; 32],
+            store_contract_key,
+        }
+    }
+
+    /// The reload path: after a refresh there is no local state at all, and
+    /// every registration the delegate returns is keyless. Preserving a known
+    /// key across a merge does nothing here -- there is nothing to preserve
+    /// from -- so the key has to be rebuilt or "Add Listing" stays broken.
+    #[test]
+    fn a_keyless_registration_still_yields_a_usable_key() {
+        let (key, origin) = store_contract_key(&registration(None)).expect("should rebuild");
+
+        assert_eq!(origin, KeyOrigin::Reconstructed);
+        assert_eq!(key.id().as_bytes(), &[3u8; 32]);
+        assert_eq!(
+            key.code_hash(),
+            ContractCode::from(STORE_CONTRACT_WASM.to_vec()).hash(),
+            "the code hash must come from the bundled store contract"
+        );
+    }
+
+    /// A key recorded at creation time is authoritative -- it is right even
+    /// for a store published under an older contract build, which is exactly
+    /// the case reconstruction gets wrong.
+    #[test]
+    fn a_recorded_key_wins_over_reconstruction() {
+        let recorded = ContractKey::from_id_and_code(
+            ContractInstanceId::new([3u8; 32]),
+            *ContractCode::from(vec![0xFEu8; 16]).hash(),
+        );
+        let bytes = harvest_common::to_cbor(&recorded).expect("serialize");
+
+        let (key, origin) = store_contract_key(&registration(Some(bytes))).expect("should decode");
+
+        assert_eq!(origin, KeyOrigin::Recorded);
+        assert_eq!(key.code_hash(), recorded.code_hash());
+        assert_ne!(
+            key.code_hash(),
+            ContractCode::from(STORE_CONTRACT_WASM.to_vec()).hash()
+        );
+    }
+
+    /// A malformed id is reported, not silently turned into some other
+    /// contract -- the same reasoning as `store_link::parse_store_id`.
+    #[test]
+    fn a_store_id_of_the_wrong_length_is_an_error() {
+        let mut reg = registration(None);
+        reg.store_contract_id = vec![3u8; 31];
+
+        let err = store_contract_key(&reg).expect_err("should refuse");
+        assert!(err.contains("31 bytes"), "unhelpful error: {err}");
+    }
 }
