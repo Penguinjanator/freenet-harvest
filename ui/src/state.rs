@@ -46,6 +46,13 @@ pub struct AppState {
     /// Our own stores (ghostkey fingerprint -> list of registrations).
     pub my_stores: HashMap<String, Vec<StoreRegistration>>,
 
+    /// Store contracts we have already asked the gateway for. Every
+    /// `StoreList` answer names every store the ghostkey owns, and a
+    /// ghostkey re-connecting in the same session produces another answer,
+    /// so without this each repeat costs a fresh GET+subscribe per store --
+    /// and each of those re-triggers the reputation follow-on GET too.
+    pub subscribed_stores: HashSet<Vec<u8>>,
+
     /// Ghostkey identities available to us. Each successful
     /// `RequestAnyAccess` response merges (deduped by fingerprint) into
     /// this list rather than replacing it, so users can connect a
@@ -142,6 +149,59 @@ impl AppState {
             .entry(store_contract_id.clone())
             .or_default();
         self.active_store_id = Some(store_contract_id);
+    }
+
+    /// Fold the delegate's answer to `ListStores` into what we already know,
+    /// rather than replacing it.
+    ///
+    /// The delegate's registry cannot round-trip everything a registration
+    /// holds. `HarvestDelegateRequest::RegisterStore` has no field for the
+    /// store's `ContractKey`, so the delegate stores `None` and every
+    /// registration it hands back has `store_contract_key: None`. The key is
+    /// recorded exactly once, locally, when the store is created
+    /// (`gateway::store_ops::create_store`) -- and it is what
+    /// `submit_listing_by_id` needs. Replacing wholesale therefore left the
+    /// seller with a rendered "Add Listing" button that always failed with
+    /// "store may not be fully created yet", for a store created weeks ago.
+    ///
+    /// The answer can also be missing a store outright: `RegisterStore` and
+    /// `ListStores` can be in flight at the same time, so a store created
+    /// moments ago may not be in the registry yet.
+    ///
+    /// Nothing in Harvest deletes a store, so a registration we already hold
+    /// is never stale. The invariant is "never lose a locally-known
+    /// registration"; the delegate's answer only adds, and only fills in
+    /// fields we don't already have.
+    pub fn merge_store_registrations(
+        &mut self,
+        ghostkey_fingerprint: &str,
+        stores: Vec<StoreRegistration>,
+    ) {
+        let known = self
+            .my_stores
+            .entry(ghostkey_fingerprint.to_string())
+            .or_default();
+
+        for mut registration in stores {
+            match known
+                .iter_mut()
+                .find(|s| s.store_contract_id == registration.store_contract_id)
+            {
+                Some(existing) => {
+                    if registration.store_contract_key.is_none() {
+                        registration.store_contract_key = existing.store_contract_key.take();
+                    }
+                    *existing = registration;
+                }
+                None => known.push(registration),
+            }
+        }
+    }
+
+    /// Record that we have asked the gateway for a store contract. Returns
+    /// `true` the first time, so the caller subscribes exactly once.
+    pub fn note_store_subscribed(&mut self, store_contract_id: &[u8]) -> bool {
+        self.subscribed_stores.insert(store_contract_id.to_vec())
     }
 
     /// Record which store a mailbox contract belongs to, and subscribe to the
@@ -358,40 +418,38 @@ impl AppState {
                 ghostkey_fingerprint,
                 stores,
             } => {
-                // A store created in this session is already in `my_stores`
-                // but is not necessarily in the delegate's registry yet --
-                // `RegisterStore` and `ListStores` can be in flight at the
-                // same time. Letting an empty answer replace a non-empty
-                // entry would make a brand new store disappear from the UI
-                // moments after it was created, so only an answer that
-                // actually names stores replaces what we already have.
-                if stores.is_empty() {
-                    if let Some(known) = self.my_stores.get(&ghostkey_fingerprint) {
-                        info!(
-                            "Delegate reports no stores for {} -- keeping {} already known",
-                            ghostkey_fingerprint,
-                            known.len()
-                        );
-                        return;
-                    }
-                }
                 info!(
                     "Delegate reports {} store(s) for {}",
                     stores.len(),
                     ghostkey_fingerprint
                 );
+                self.merge_store_registrations(&ghostkey_fingerprint, stores);
+
                 // Nothing else re-fetches these after a reload: the seller's
                 // own store is subscribed at creation time and never again,
                 // so without this the Browse tab is empty for the very seller
                 // who owns the store.
-                for registration in &stores {
-                    subscribe_in_background("store", registration.store_contract_id.clone());
-                    self.register_store_mailbox(
-                        &registration.store_contract_id,
-                        &registration.mailbox_contract_id,
-                    );
+                let registrations: Vec<(Vec<u8>, Vec<u8>)> = self
+                    .my_stores
+                    .get(&ghostkey_fingerprint)
+                    .map(|stores| {
+                        stores
+                            .iter()
+                            .map(|s| {
+                                (
+                                    s.store_contract_id.clone(),
+                                    s.mailbox_contract_id.clone(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (store_contract_id, mailbox_contract_id) in registrations {
+                    if self.note_store_subscribed(&store_contract_id) {
+                        subscribe_in_background("store", store_contract_id.clone());
+                    }
+                    self.register_store_mailbox(&store_contract_id, &mailbox_contract_id);
                 }
-                self.my_stores.insert(ghostkey_fingerprint, stores);
             }
 
             HarvestDelegateResponse::Error { message } => {
@@ -1028,4 +1086,93 @@ pub enum TxRowStatus {
     Unconfirmed,
     Confirmed { anchor_height: u32 },
     Retracted,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FINGERPRINT: &str = "fp-1";
+
+    fn registration(id: u8, key: Option<Vec<u8>>) -> StoreRegistration {
+        StoreRegistration {
+            store_contract_id: vec![id; 32],
+            reputation_contract_id: vec![id.wrapping_add(1); 32],
+            mailbox_contract_id: vec![id.wrapping_add(2); 32],
+            store_contract_key: key,
+        }
+    }
+
+    fn store_list(stores: Vec<StoreRegistration>) -> HarvestDelegateResponse {
+        HarvestDelegateResponse::StoreList {
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            stores,
+        }
+    }
+
+    /// The delegate cannot store a store's `ContractKey` -- `RegisterStore`
+    /// has no field for it -- so every registration it hands back is keyless.
+    /// Losing the key breaks "Add Listing" for a store that exists, which is
+    /// what a wholesale replace did. See `merge_store_registrations`.
+    #[test]
+    fn a_store_list_answer_keeps_a_locally_known_contract_key() {
+        let key = vec![0xAB; 40];
+        let mut state = AppState::default();
+        state.merge_store_registrations(FINGERPRINT, vec![registration(1, Some(key.clone()))]);
+
+        state.on_delegate_response(store_list(vec![registration(1, None)]));
+
+        let stores = &state.my_stores[FINGERPRINT];
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].store_contract_key, Some(key));
+    }
+
+    /// `RegisterStore` and `ListStores` can be in flight at once, so a store
+    /// created moments ago need not be in the answer at all.
+    #[test]
+    fn a_store_list_answer_never_drops_a_store_it_does_not_name() {
+        let key = vec![0xCD; 40];
+        let mut state = AppState::default();
+        state.merge_store_registrations(FINGERPRINT, vec![registration(1, Some(key.clone()))]);
+
+        state.on_delegate_response(store_list(vec![]));
+        state.on_delegate_response(store_list(vec![registration(2, None)]));
+
+        let stores = &state.my_stores[FINGERPRINT];
+        assert_eq!(stores.len(), 2);
+        let kept = stores
+            .iter()
+            .find(|s| s.store_contract_id == vec![1u8; 32])
+            .expect("the locally-known store should survive");
+        assert_eq!(kept.store_contract_key, Some(key));
+    }
+
+    /// A registration the delegate knows about but we don't is added, key and
+    /// all -- the merge is not "ignore the delegate".
+    #[test]
+    fn a_store_list_answer_adds_stores_we_did_not_know_about() {
+        let mut state = AppState::default();
+        state.on_delegate_response(store_list(vec![registration(7, None)]));
+
+        assert_eq!(state.my_stores[FINGERPRINT].len(), 1);
+        assert_eq!(
+            state.my_stores[FINGERPRINT][0].store_contract_id,
+            vec![7u8; 32]
+        );
+    }
+
+    /// Every `StoreList` answer names every store, and a ghostkey
+    /// reconnecting produces another answer, so the GET+subscribe has to be
+    /// deduped the way `register_store_mailbox` already dedupes its own.
+    #[test]
+    fn a_store_is_only_subscribed_once() {
+        let mut state = AppState::default();
+        assert!(state.note_store_subscribed(&[1u8; 32]));
+        assert!(!state.note_store_subscribed(&[1u8; 32]));
+        assert!(state.note_store_subscribed(&[2u8; 32]));
+
+        state.on_delegate_response(store_list(vec![registration(3, None)]));
+        state.on_delegate_response(store_list(vec![registration(3, None)]));
+        assert_eq!(state.subscribed_stores.len(), 3);
+    }
 }
