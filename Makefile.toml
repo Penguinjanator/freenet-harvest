@@ -82,13 +82,28 @@ script = '''
 # inside the same minute -- routine when a publish fails and is retried.
 #
 # Seconds cut the window 60x; the counter file closes it entirely on one machine
-# by forcing the next version past the last one we actually published. It is
-# committed so a publish from a different machine continues the sequence rather
-# than restarting it.
+# by forcing the next version past the last one we actually published.
+#
+# The file is TRACKED, which is the only reason the same holds across machines:
+# a publish from a fresh checkout starts from the committed value rather than
+# from whatever its own clock says. That property is worth nothing unless the
+# updated file is committed AFTER a publish, so this task says so out loud when
+# it changes it. An uncommitted counter is a single-machine counter with a
+# misleading name.
 LAST_FILE=published-contract/last-version
 VERSION=$(date +%s)
 if [ -f "$LAST_FILE" ]; then
   LAST=$(cat "$LAST_FILE")
+  # A corrupt or hand-edited counter must stop the publish, not silently fall
+  # back to the clock: falling back is exactly how a version goes BACKWARDS,
+  # and a rejected update is the one failure this whole mechanism exists to
+  # prevent.
+  case "$LAST" in
+    ""|*[!0-9]*)
+      echo "error: $LAST_FILE does not hold a plain number (got '$LAST')" >&2
+      echo "       Fix it to the last published version before publishing." >&2
+      exit 1 ;;
+  esac
   if [ "$VERSION" -le "$LAST" ]; then
     VERSION=$((LAST + 1))
     echo "Clock version collided with last published ($LAST); using $VERSION"
@@ -96,6 +111,8 @@ if [ -f "$LAST_FILE" ]; then
 fi
 echo "$VERSION" > "$LAST_FILE"
 echo "Signing with version: $VERSION"
+echo "REMEMBER: commit $LAST_FILE once the publish succeeds, or the next"
+echo "          publish from another checkout restarts the sequence."
 ${WEB_CONTAINER_TOOL} sign \
   --input target/webapp/webapp.tar.xz \
   --output target/webapp/webapp.metadata \
