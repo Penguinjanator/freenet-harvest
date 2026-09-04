@@ -75,7 +75,26 @@ echo "Compressed webapp to target/webapp/webapp.tar.xz"
 description = "Sign the webapp archive with the web-container-tool"
 dependencies = ["compress-webapp"]
 script = '''
-VERSION=$(( $(date +%s) / 60 ))
+# Web-container versions must be STRICTLY increasing. The generic web-container
+# contract rejects new_version <= current_version, so two archives signed at the
+# same version reject each other in both directions and the site forks with no
+# way back. This was minutes-since-epoch, which collides for any two publishes
+# inside the same minute -- routine when a publish fails and is retried.
+#
+# Seconds cut the window 60x; the counter file closes it entirely on one machine
+# by forcing the next version past the last one we actually published. It is
+# committed so a publish from a different machine continues the sequence rather
+# than restarting it.
+LAST_FILE=published-contract/last-version
+VERSION=$(date +%s)
+if [ -f "$LAST_FILE" ]; then
+  LAST=$(cat "$LAST_FILE")
+  if [ "$VERSION" -le "$LAST" ]; then
+    VERSION=$((LAST + 1))
+    echo "Clock version collided with last published ($LAST); using $VERSION"
+  fi
+fi
+echo "$VERSION" > "$LAST_FILE"
 echo "Signing with version: $VERSION"
 ${WEB_CONTAINER_TOOL} sign \
   --input target/webapp/webapp.tar.xz \
