@@ -211,6 +211,14 @@ impl AppState {
         ghostkey_fingerprint: &str,
         stores: Vec<StoreRegistration>,
     ) {
+        // Don't create the entry for an answer that carries nothing. A
+        // storeless seller would otherwise get an empty vec that says
+        // "asked, owns none" and reads identically to "owns some" at every
+        // `contains_key`, and the log would report keeping 0 stores.
+        if stores.is_empty() {
+            return;
+        }
+
         let known = self
             .my_stores
             .entry(ghostkey_fingerprint.to_string())
@@ -247,9 +255,29 @@ impl AppState {
     /// mailbox, so the mapping has to come from the delegate's
     /// `StoreRegistration` -- which means it only ever exists for our own
     /// stores, not for a store we are browsing as a buyer.
+    ///
+    /// A mailbox belongs to exactly one store, so a second store claiming one
+    /// that is already mapped is a bug somewhere upstream. The first mapping
+    /// is kept: re-pointing it would silently strand the first store's
+    /// messages, since it would still show a `mailbox_contract_id` that
+    /// nothing routes back to it any more.
     pub fn register_store_mailbox(&mut self, store_contract_id: &[u8], mailbox_contract_id: &[u8]) {
         if mailbox_contract_id.len() != 32 || mailbox_contract_id.iter().all(|&b| b == 0) {
             warn!("Store registration has no usable mailbox contract id -- not subscribing");
+            return;
+        }
+
+        if let Some(owner) = self.mailbox_to_store.get(mailbox_contract_id) {
+            if owner != store_contract_id {
+                warn!(
+                    "Mailbox {} is already registered to a different store -- keeping the \
+                     first mapping and ignoring the second",
+                    bs58::encode(mailbox_contract_id).into_string()
+                );
+                return;
+            }
+            // Already ours: every `StoreList` answer re-registers, and the
+            // map doubles as the record of what we have already asked for.
             return;
         }
 
@@ -257,17 +285,9 @@ impl AppState {
             .entry(store_contract_id.to_vec())
             .or_default()
             .mailbox_contract_id = Some(mailbox_contract_id.to_vec());
-
-        // The map doubles as the record of what we have already asked for, so
-        // repeated registrations (every `StoreList` answer re-registers) don't
-        // re-subscribe.
-        if self
-            .mailbox_to_store
-            .insert(mailbox_contract_id.to_vec(), store_contract_id.to_vec())
-            .is_none()
-        {
-            subscribe_in_background("mailbox", mailbox_contract_id.to_vec());
-        }
+        self.mailbox_to_store
+            .insert(mailbox_contract_id.to_vec(), store_contract_id.to_vec());
+        subscribe_in_background("mailbox", mailbox_contract_id.to_vec());
     }
 
     /// Handle full contract state received from a GET response.
@@ -1176,6 +1196,17 @@ mod tests {
         assert_eq!(kept.store_contract_key, Some(key));
     }
 
+    /// An answer with nothing in it must not leave an empty vec behind: a
+    /// seller who owns no store would otherwise be recorded as having an
+    /// entry, which reads the same as owning one at every `contains_key`.
+    #[test]
+    fn an_empty_answer_records_nothing_for_a_storeless_seller() {
+        let mut state = AppState::default();
+        state.on_delegate_response(store_list(vec![]));
+
+        assert!(!state.my_stores.contains_key(FINGERPRINT));
+    }
+
     /// A registration the delegate knows about but we don't is added, key and
     /// all -- the merge is not "ignore the delegate".
     #[test]
@@ -1188,6 +1219,38 @@ mod tests {
             state.my_stores[FINGERPRINT][0].store_contract_id,
             vec![7u8; 32]
         );
+    }
+
+    /// A mailbox belongs to one store. Re-pointing the map at a second one
+    /// would leave the first store showing a `mailbox_contract_id` that
+    /// nothing routes back to it, so its messages would vanish on arrival.
+    #[test]
+    fn a_mailbox_stays_with_the_first_store_that_claimed_it() {
+        let mut state = AppState::default();
+        state.register_store_mailbox(&[1u8; 32], &[9u8; 32]);
+        state.register_store_mailbox(&[2u8; 32], &[9u8; 32]);
+
+        assert_eq!(state.mailbox_to_store[&vec![9u8; 32]], vec![1u8; 32]);
+        assert_eq!(
+            state.browsing_stores[&vec![1u8; 32]].mailbox_contract_id,
+            Some(vec![9u8; 32])
+        );
+        assert!(
+            !state.browsing_stores.contains_key(&vec![2u8; 32]),
+            "the losing store must not be left pointing at a mailbox it does not own"
+        );
+    }
+
+    /// Re-registering the same pair is the normal case -- every `StoreList`
+    /// answer does it -- and must not be reported as a collision.
+    #[test]
+    fn re_registering_the_same_mailbox_is_not_a_collision() {
+        let mut state = AppState::default();
+        state.register_store_mailbox(&[1u8; 32], &[9u8; 32]);
+        state.register_store_mailbox(&[1u8; 32], &[9u8; 32]);
+
+        assert_eq!(state.mailbox_to_store[&vec![9u8; 32]], vec![1u8; 32]);
+        assert_eq!(state.mailbox_to_store.len(), 1);
     }
 
     /// A link whose store never arrives has to end in a message, not in
