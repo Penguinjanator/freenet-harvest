@@ -45,6 +45,7 @@ pub(crate) fn all_secret_key_shapes(fp: &str, tx_id: &str) -> Vec<Vec<u8>> {
         TX_INDEX_KEY.to_vec(),
         crate::bitcoin::BITCOIN_WATCHES_KEY.to_vec(),
         crate::bitcoin::BITCOIN_BRIDGE_KEY.to_vec(),
+        crate::markers::marker_secret_key("v1.store.aa.bb"),
     ]
 }
 
@@ -123,6 +124,16 @@ pub fn handle(ctx: &mut DelegateCtx, request: HarvestDelegateRequest) -> Harvest
         HarvestDelegateRequest::ListStores {
             ghostkey_fingerprint,
         } => handle_list_stores(ctx, &ghostkey_fingerprint),
+
+        // The migration repeat-gate. `markers` owns both the namespace and the
+        // fail-safe direction; this is only the routing.
+        HarvestDelegateRequest::GetMigrationMarker { marker } => {
+            crate::markers::get_marker(&crate::markers::CtxMarkers(ctx), &marker)
+        }
+
+        HarvestDelegateRequest::SetMigrationMarker { marker, note } => {
+            crate::markers::set_marker(&mut crate::markers::CtxMarkers(ctx), &marker, &note)
+        }
 
         _ => HarvestDelegateResponse::Error {
             message: "unsupported request variant for this delegate version".into(),

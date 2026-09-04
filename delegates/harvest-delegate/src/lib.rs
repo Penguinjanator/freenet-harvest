@@ -2,6 +2,7 @@
 
 mod bitcoin;
 mod handlers;
+mod markers;
 mod migration;
 
 use freenet_stdlib::prelude::{

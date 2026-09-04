@@ -303,12 +303,26 @@ mod tests {
         })
         .expect("cbor");
         let harvest_unit = to_cbor(&HarvestDelegateRequest::ListTransactions).expect("cbor");
+        // The migration-marker pair. They live on `HarvestDelegateRequest`
+        // rather than on the migration enum, so they are ordinary requests --
+        // but they are the newest names in the file, and a name that collided
+        // with `ExportSecrets` would route a marker query to the branch that
+        // hands out private keys.
+        let marker_get = to_cbor(&HarvestDelegateRequest::GetMigrationMarker {
+            marker: "v1.store.aa.bb".into(),
+        })
+        .expect("cbor");
+        let marker_set = to_cbor(&HarvestDelegateRequest::SetMigrationMarker {
+            marker: "v1.store.aa.bb".into(),
+            note: "recovered".into(),
+        })
+        .expect("cbor");
         let bitcoin = to_cbor(&BitcoinDelegateRequest::ListWatched).expect("cbor");
 
         assert!(from_cbor::<HarvestDelegateRequest>(&migration).is_err());
         assert!(from_cbor::<BitcoinDelegateRequest>(&migration).is_err());
 
-        for other in [&harvest, &harvest_unit, &bitcoin] {
+        for other in [&harvest, &harvest_unit, &marker_get, &marker_set, &bitcoin] {
             assert!(
                 from_cbor::<HarvestMigrationRequest>(other).is_err(),
                 "a non-migration payload decoded as a migration request, which \
