@@ -228,6 +228,7 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 "0227238dccae77ef9f49d06b685fa3fed95fe63b292d7d7a4fa9d6ad3f42caa8",
                 "ccc61113e758c463ab03a55612ac28a480c4733e9a82eb961566cf6496205233",
                 "df0e8dfbc12071b1ab80d1b5c05aa6a9265b9b4141669a740f04f96363118d4a",
+                "186f7784628f0f773dd711c91a35d822e2f1111fe052328227f924977df2d2c0",
             ],
         ),
         (
@@ -237,6 +238,7 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 "2d274a944701a37166b09c2a41d987738cd7b29a5f5b8b0179e400dace9ce1f5",
                 "7f345c69a800288fe2eb649319cf9b34587953f8161976cc412ab4d308ad35da",
                 "c9a939f9a93648f1571193228ccd2fd8331a9970f7c3d934b5b0d646f8cae2ca",
+                "5c4d0eec19bf023c32c1723fc6676e43ecc1638922e952ab06c572b407350750",
             ],
         ),
         (
@@ -246,6 +248,7 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 "a2819d2967e92510d0e1b7a5ece5c2261fbd04f4ec8b4fbdabd6f58d2ff0ea9d",
                 "99fc27fab5a87d274fb32a5772a4f670cad6821700a7e4c54eaec783c6aa1358",
                 "61154e38ca91b5dbf0e4c1c3fa5ad36b4ed56f058dbc8418d20781213e613f4e",
+                "a00fd23796d2d87c6652749ac2365a94bf060f27f5fbe5e70929cc6635c19433",
             ],
         ),
     ];
@@ -274,6 +277,7 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             "2f805880b45c83ab25271e0da1e9528ab6a3f7e96dae730e4b5465227654877d".to_string(),
             "ddcecc5b3f1abd49194f103fec424ce6ad38f0ac8359a4bad92d9125ae43085e".to_string(),
             "57b467532105613f28829c0fac8a4d72d0a146593d6d64430892f5ce7009027a".to_string(),
+            "230c2b581c4fa44de16cd9705413d099dfc5bff0634130907c1b81e0cee05c42".to_string(),
         ],
     );
 }
@@ -462,6 +466,91 @@ fn the_rsa_key_changes_the_reputation_instance_id() {
         id_a, id_b,
         "the RSA public key must be part of the reputation contract's address"
     );
+}
+
+// --- the store's parameter-encoding split -------------------------------
+
+/// The bytes generations V1..=5 were published under, reconstructed here
+/// independently of `migrate.rs` so the two have to agree.
+fn legacy_store_param_bytes(vk: &VerifyingKey) -> Vec<u8> {
+    #[derive(serde::Serialize)]
+    struct Old {
+        seller_verifying_key: VerifyingKey,
+        trusted_bitcoin_bridges: Vec<[u8; 32]>,
+        bitcoin_address_code_hash: Option<[u8; 32]>,
+    }
+    harvest_common::to_cbor(&Old {
+        seller_verifying_key: *vk,
+        trusted_bitcoin_bridges: Vec::new(),
+        bitcoin_address_code_hash: None,
+    })
+    .expect("encode legacy store parameters")
+}
+
+/// The premise: the two encodings really are different, so probing an old
+/// generation with today's parameters is a search of the wrong address rather
+/// than a harmless re-encoding.
+///
+/// Without this the test below could pass vacuously.
+#[test]
+fn the_store_parameter_encoding_actually_changed() {
+    let current = encode_params(&store_params(&seller_vk())).expect("encode");
+    assert_ne!(
+        current.as_ref(),
+        legacy_store_param_bytes(&seller_vk()).as_slice(),
+        "if these matched there would be nothing to split on and \
+         `store_candidates` would be dead weight"
+    );
+}
+
+/// Every already-published store generation must be probed at the address it
+/// actually has.
+///
+/// `freenet_migrate::ContractLineageEntry` carries only a code hash, so the
+/// crate derives every predecessor id from the CURRENT parameters. That is
+/// right until the parameter encoding changes, and then it fails silently:
+/// the probe walks addresses that never existed, every one comes back
+/// `NotFound`, and the sweep reports a clean "nothing to migrate" over a
+/// seller's whole store.
+///
+/// Mutated red by deriving the lineage with `NewestFirst::from_lineage` and
+/// today's parameters -- i.e. by not making the split at all, which is what
+/// the code did before `store_candidates` existed.
+#[test]
+fn superseded_store_generations_are_probed_under_their_own_parameter_encoding() {
+    let vk = seller_vk();
+    let legacy = Parameters::from(legacy_store_param_bytes(&vk));
+    let current = encode_params(&store_params(&vk)).expect("encode");
+
+    let candidates = store_candidate_ids(&vk).expect("candidates");
+    assert_eq!(
+        candidates.len(),
+        store_lineage().len(),
+        "every recorded generation must be probed"
+    );
+
+    // Newest-first, and every recorded generation predates the split, so each
+    // id must be the LEGACY derivation and none may be the current one.
+    let mut newest_first: Vec<_> = store_lineage().iter().collect();
+    newest_first.sort_by_key(|e| std::cmp::Reverse(e.generation));
+
+    for (entry, got) in newest_first.iter().zip(&candidates) {
+        assert!(
+            entry.generation <= LAST_LEGACY_STORE_PARAM_GENERATION,
+            "generation {} postdates the split; this test needs updating to expect \
+             the current encoding for it",
+            entry.generation
+        );
+        let expected = current_id(&entry.code_hash, &legacy);
+        let wrong = current_id(&entry.code_hash, &current);
+        assert_ne!(expected, wrong);
+        assert_eq!(
+            *got, expected,
+            "generation {} must be probed at its real address, not at one derived \
+             from today's parameters -- which it was never published under",
+            entry.generation
+        );
+    }
 }
 
 // --- sealing ------------------------------------------------------------

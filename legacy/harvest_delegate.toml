@@ -57,3 +57,10 @@ description = "Superseded by the freenet-stdlib 0.6 -> 0.8.5 bump taken to adopt
 date = "2026-09-04"
 code_hash = "57b467532105613f28829c0fac8a4d72d0a146593d6d64430892f5ce7009027a"
 delegate_key = "325bcfe3545934d812a613772e06878a3902f09d5c25d2dc32f7f1e111d506d8"
+
+[[entry]]
+version = "V5"
+description = "Superseded by the per-order Bitcoin bridge list and the payment-proof claim bounds. Both changes are in `harvest-common`, which is compiled into every artifact here, so the bytes moved. Nothing the delegate itself does changed. The FIRST generation carrying the export handler, so unlike V1-V4 its secrets are recoverable by a successor"
+date = "2026-09-04"
+code_hash = "230c2b581c4fa44de16cd9705413d099dfc5bff0634130907c1b81e0cee05c42"
+delegate_key = "ad56614dde8916d635462fe1504f2e2de98f954891f015abdbada28c30754eb6"

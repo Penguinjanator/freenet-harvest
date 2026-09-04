@@ -18,20 +18,32 @@
 //!
 //! A predecessor's instance id is `BLAKE3(old_code_hash || cbor(params))`, so
 //! recovering an old generation needs the OLD hash (from the registry) and the
-//! CURRENT parameters -- never the old WASM, which is why the artifacts being
-//! stale and irreproducible (harvest#18) does not block any of this.
+//! parameter bytes that generation was published under -- never the old WASM,
+//! which is why the artifacts being stale and irreproducible (harvest#18) does
+//! not block any of this.
 //!
 //! Harvest's parameters happen to be derivable from things the client already
 //! knows:
 //!
-//! * **Store** -- the seller's ghostkey verifying key, plus the empty/`None`
-//!   Bitcoin defaults `create_store_contracts` publishes with.
+//! * **Store** -- the seller's ghostkey verifying key.
 //! * **Mailbox** -- the owner's ghostkey verifying key.
 //! * **Reputation** -- the seller's RSA public key AND their verifying key.
 //!
 //! The first two need nothing but the ghostkey, which is why a store is
 //! recoverable even for a seller whose delegate secrets are gone. The third
 //! does not, and that asymmetry is the ordering constraint below.
+//!
+//! ## When the PARAMETERS change, not just the code
+//!
+//! `freenet_migrate` derives every predecessor id from one set of parameter
+//! bytes, which is right only while the parameter encoding is stable. The
+//! store's is not: `StoreParameters` shed two fields when the Bitcoin bridge
+//! list moved onto `Order`, so generations V1-V5 live at addresses no
+//! encoding this build produces can reproduce. [`store_candidates`] derives
+//! each generation under the encoding it was actually published with, and
+//! [`LAST_LEGACY_STORE_PARAM_GENERATION`] is the boundary. Any future change
+//! to a contract's parameters needs the same treatment, and its absence is
+//! silent: the probe finds nothing at every address and reports success.
 //!
 //! # The ordering constraint
 //!
@@ -178,6 +190,99 @@ pub fn store_params(seller_verifying_key: &ed25519_dalek::VerifyingKey) -> Store
     StoreParameters {
         seller_verifying_key: *seller_verifying_key,
     }
+}
+
+/// The last store generation published under the OLD `StoreParameters` shape.
+///
+/// # Why a generation split exists at all
+///
+/// A contract's address is `BLAKE3(code_hash || parameter_bytes)`, and
+/// `freenet_migrate::ContractLineageEntry` carries only the code hash: the
+/// crate derives every predecessor's id using the parameters the CURRENT build
+/// encodes. That is right as long as the parameter *encoding* never changes,
+/// and it silently stops being right the moment it does -- the probe walks a
+/// list of addresses that never existed, finds nothing at every one, and
+/// reports a clean "nothing to migrate".
+///
+/// `StoreParameters` used to carry `trusted_bitcoin_bridges` and
+/// `bitcoin_address_code_hash` alongside the seller's key. Moving them onto
+/// `Order` cut its CBOR from 109 bytes to 56, so every store ever published --
+/// generations V1 through V5 -- lives at an address derived from the longer
+/// encoding, and nothing this build encodes will ever reproduce it.
+///
+/// So this constant is the boundary: at or below it, derive with
+/// [`legacy_store_params_cbor`]; above it, with today's encoding. It is a
+/// fixed historical fact, not a thing to bump on the next re-key -- a
+/// generation added later is published under the current shape.
+pub const LAST_LEGACY_STORE_PARAM_GENERATION: u32 = 5;
+
+/// The parameter bytes generations V1..=[`LAST_LEGACY_STORE_PARAM_GENERATION`]
+/// were actually published under.
+///
+/// Mirrors the old `StoreParameters` exactly, including the values
+/// `create_store_contracts` supplied for the two Bitcoin fields: an empty
+/// bridge list and no code hash. This is a frozen record of bytes that already
+/// exist on the network, so it is written out here rather than derived from
+/// the live struct -- deriving it from a type that is still being edited is
+/// how it would go quietly wrong again.
+fn legacy_store_params_cbor(
+    seller_verifying_key: &ed25519_dalek::VerifyingKey,
+) -> Result<Parameters<'static>, String> {
+    #[derive(serde::Serialize)]
+    struct LegacyStoreParameters {
+        seller_verifying_key: ed25519_dalek::VerifyingKey,
+        trusted_bitcoin_bridges: Vec<[u8; 32]>,
+        bitcoin_address_code_hash: Option<[u8; 32]>,
+    }
+    encode_params(&LegacyStoreParameters {
+        seller_verifying_key: *seller_verifying_key,
+        trusted_bitcoin_bridges: Vec::new(),
+        bitcoin_address_code_hash: None,
+    })
+}
+
+/// Every superseded store instance to probe, newest generation first, each id
+/// derived under the parameter encoding ITS generation was published with.
+///
+/// This is what `freenet_migrate::NewestFirst::from_lineage` would do if the
+/// encoding had never changed; it exists only because it did. See
+/// [`LAST_LEGACY_STORE_PARAM_GENERATION`].
+pub fn store_candidate_ids(
+    seller_verifying_key: &ed25519_dalek::VerifyingKey,
+) -> Result<Vec<ContractInstanceId>, String> {
+    let current = encode_params(&store_params(seller_verifying_key))?;
+    let legacy = legacy_store_params_cbor(seller_verifying_key)?;
+
+    let mut by_generation: Vec<(u32, ContractInstanceId)> = store_lineage()
+        .iter()
+        .map(|e| {
+            let params = if e.generation <= LAST_LEGACY_STORE_PARAM_GENERATION {
+                &legacy
+            } else {
+                &current
+            };
+            (
+                e.generation,
+                contract_id_from_code_hash(&e.code_hash, params),
+            )
+        })
+        .collect();
+    // Same ordering rule as `NewestFirst::from_lineage`: by the registry's
+    // declared generation, never by slice order.
+    by_generation.sort_by_key(|(generation, _)| core::cmp::Reverse(*generation));
+    Ok(by_generation.into_iter().map(|(_, id)| id).collect())
+}
+
+/// [`store_candidate_ids`] as the ordering-proof type `ProbeSession` wants.
+///
+/// `assume_ordered` is safe here for the reason it asks for: the list is sorted
+/// by the registry's declared `generation`, descending, immediately above.
+pub fn store_candidates(
+    seller_verifying_key: &ed25519_dalek::VerifyingKey,
+) -> Result<freenet_migrate::NewestFirst, String> {
+    Ok(freenet_migrate::NewestFirst::assume_ordered(
+        store_candidate_ids(seller_verifying_key)?,
+    ))
 }
 
 pub fn mailbox_params(owner_verifying_key: &ed25519_dalek::VerifyingKey) -> MailboxParameters {
@@ -634,7 +739,26 @@ impl<O: ProbeStateOps> ProbeSession<O> {
         lineage: &[ContractLineageEntry],
         policy: SelectionPolicy,
     ) -> Self {
-        let candidates = freenet_migrate::NewestFirst::from_lineage(params, lineage);
+        Self::start_with_candidates(
+            ops,
+            local_snapshot,
+            freenet_migrate::NewestFirst::from_lineage(params, lineage),
+            policy,
+        )
+    }
+
+    /// Start a probe over candidates the caller derived itself.
+    ///
+    /// Only for an artifact whose PARAMETER ENCODING changed at some point in
+    /// its lineage, so one set of parameter bytes cannot address every
+    /// generation -- see [`store_candidates`]. Everything else should use
+    /// [`start`](Self::start), which cannot be handed a wrong order.
+    pub fn start_with_candidates(
+        ops: O,
+        local_snapshot: O::State,
+        candidates: freenet_migrate::NewestFirst,
+        policy: SelectionPolicy,
+    ) -> Self {
         Self {
             driver: freenet_migrate::ProbeDriver::new(ops, local_snapshot, candidates, policy),
             outstanding: None,

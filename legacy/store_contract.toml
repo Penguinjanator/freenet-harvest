@@ -4,11 +4,20 @@
 # generation is derived from the WASM this build ships and is never listed
 # here.
 #
-# Instance ids are derived per seller: `BLAKE3(code_hash || cbor(StoreParameters))`, where the
-# parameters are the seller's ghostkey verifying key plus the (empty / None)
-# Bitcoin defaults `create_store_contracts` publishes with. That makes every
-# generation's store instance derivable from the seller's ghostkey ALONE --
-# the probe does not need the delegate to have survived to find an old store.
+# Instance ids are derived per seller: `BLAKE3(code_hash || cbor(StoreParameters))`.
+# That makes every generation's store instance derivable from the seller's
+# ghostkey ALONE -- the probe does not need the delegate to have survived to
+# find an old store.
+#
+# CAREFUL: `cbor(StoreParameters)` is NOT the same bytes for every row here.
+# V1-V5 were published when `StoreParameters` still carried
+# `trusted_bitcoin_bridges` and `bitcoin_address_code_hash` (as `[]` and
+# `null`); today it holds only the seller's key, which is 56 bytes rather than
+# 109. `ui/src/migrate.rs::store_candidates` derives each generation under the
+# encoding it was published with, keyed on
+# `LAST_LEGACY_STORE_PARAM_GENERATION`. A row added from here on is published
+# under the current shape. Getting this wrong is silent -- the probe walks
+# addresses that never existed and reports a clean migration.
 #
 # The state is a `#[composable]` CRDT merged by the contract's own
 # `update_state`, so folding an old generation forward is the same operation
@@ -39,3 +48,8 @@ description = "Superseded by the freenet-stdlib 0.6 -> 0.8.5 bump, taken so free
 date = "2026-09-04"
 code_hash = "df0e8dfbc12071b1ab80d1b5c05aa6a9265b9b4141669a740f04f96363118d4a"
 
+[[entry]]
+version = "V5"
+description = "Superseded by the per-order Bitcoin bridge list and the payment-proof claim bounds. Both changes are in `harvest-common`, which is compiled into every artifact here, so the bytes moved -- for this contract substantively: `StoreParameters` lost `trusted_bitcoin_bridges` and `bitcoin_address_code_hash` to `Order`, so its parameter encoding changed as well as its code"
+date = "2026-09-04"
+code_hash = "186f7784628f0f773dd711c91a35d822e2f1111fe052328227f924977df2d2c0"

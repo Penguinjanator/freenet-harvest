@@ -132,27 +132,36 @@ pub fn start_identity_migration(fingerprint: &str, verifying_key_bytes: &[u8]) {
     };
 
     let store_params = migrate::store_params(&vk);
-    match migrate::encode_params(&store_params) {
-        Ok(params) => {
+    // The store's predecessors are NOT addressed by these parameter bytes.
+    // `StoreParameters` shed two fields when the Bitcoin bridge list moved
+    // onto `Order`, so every already-published generation lives at an address
+    // derived from the older, longer encoding, and `store_candidates` is what
+    // derives each generation under the encoding it was published with. These
+    // parameters still address the CURRENT instance, which is what `start`
+    // needs them for.
+    match (
+        migrate::encode_params(&store_params),
+        migrate::store_candidates(&vk),
+    ) {
+        (Ok(params), Ok(candidates)) => {
             start(
                 Artifact::Store,
                 fingerprint,
                 params.clone(),
                 STORE_CONTRACT_WASM,
-                |p| {
-                    Session::Store(Box::new(ProbeSession::start(
+                move |_p| {
+                    Session::Store(Box::new(ProbeSession::start_with_candidates(
                         StoreOps {
                             params: store_params.clone(),
                         },
                         local_snapshot(),
-                        p,
-                        migrate::store_lineage(),
+                        candidates.clone(),
                         migrate::fold_all_policy(),
                     )))
                 },
             );
         }
-        Err(e) => warn!("cannot migrate store for {fingerprint}: {e}"),
+        (Err(e), _) | (_, Err(e)) => warn!("cannot migrate store for {fingerprint}: {e}"),
     }
 
     let mailbox_params = migrate::mailbox_params(&vk);

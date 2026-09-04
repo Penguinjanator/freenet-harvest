@@ -39,3 +39,9 @@ version = "V4"
 description = "Superseded by the freenet-stdlib 0.6 -> 0.8.5 bump taken to adopt freenet-migrate"
 date = "2026-09-04"
 code_hash = "61154e38ca91b5dbf0e4c1c3fa5ad36b4ed56f058dbc8418d20781213e613f4e"
+
+[[entry]]
+version = "V5"
+description = "Superseded by the per-order Bitcoin bridge list and the payment-proof claim bounds. Both changes are in `harvest-common`, which is compiled into every artifact here, so the bytes moved. Nothing this contract itself does changed"
+date = "2026-09-04"
+code_hash = "a00fd23796d2d87c6652749ac2365a94bf060f27f5fbe5e70929cc6635c19433"

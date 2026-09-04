@@ -9,8 +9,19 @@ data sits at the old one.
 
 Each file here lists the **superseded** code hashes of one artifact, oldest
 first. `ui/src/migrate.rs` walks them, derives each predecessor's instance id
-from `(code_hash, current parameters)`, probes it, and folds what it finds into
-the current generation.
+from `(code_hash, parameters)`, probes it, and folds what it finds into the
+current generation.
+
+Note "parameters", not "current parameters". A contract's address is
+`BLAKE3(code_hash || parameter_bytes)`, so changing a parameter STRUCT re-keys
+every generation's derivation as surely as changing the WASM does -- and
+`freenet_migrate` derives every predecessor from a single set of parameter
+bytes, so it cannot notice on its own. `StoreParameters` has already changed
+once (the Bitcoin bridge list moved onto `Order`); `store_candidates` handles
+that split, and `store_contract.toml`'s header records where the boundary
+falls. **If you edit a parameter struct, that split is part of the change**,
+and skipping it fails silently: every probe comes back `NotFound` and the
+sweep reports a clean migration having looked at addresses that never existed.
 
 ## Rules
 
