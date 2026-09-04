@@ -82,9 +82,16 @@ pub struct AppState {
     /// arrives, the response handler picks this up and creates the contracts.
     pub pending_store_creation: Option<PendingStoreCreation>,
 
-    /// A listing that's been submitted for signing and is waiting for
-    /// the ghostkey delegate's SignResult response.
-    pub pending_listing: Option<PendingListing>,
+    /// Signature requests sent to the ghostkey delegate and not yet
+    /// answered, oldest first.
+    ///
+    /// `SignResult` carries no correlation id, so arrival order is the only
+    /// thing tying an answer to its request. A single field could not stay
+    /// correct once two kinds of signature existed: publishing a store signs
+    /// its info, and the seller can start a listing immediately afterwards,
+    /// so both can be outstanding at once and the wrong one would consume the
+    /// answer. A queue keeps them in the order they were asked for.
+    pub pending_signatures: std::collections::VecDeque<PendingSignature>,
 
     /// Signed listings ready to be submitted to the store contract.
     /// The UI should pick these up and send them as contract updates.
@@ -107,6 +114,24 @@ pub struct PendingStoreCreation {
     pub store_name: String,
     pub description: String,
     pub payment_instructions: String,
+}
+
+/// Something waiting on the ghostkey delegate's `SignResult`.
+#[derive(Clone, Debug)]
+pub enum PendingSignature {
+    Listing(PendingListing),
+    StoreInfo(PendingStoreInfo),
+}
+
+/// A store's own details, awaiting signature so they can be published.
+///
+/// `AuthorizedStoreInfoV1::verify` skips verification only at version 0, so
+/// anything a buyer can actually read has to carry a real signature over the
+/// ghostkey delegate's `ScopedPayload` -- the same round-trip a listing makes.
+#[derive(Clone, Debug)]
+pub struct PendingStoreInfo {
+    pub info: StoreInfoV1,
+    pub store_contract_id: Vec<u8>,
 }
 
 /// A listing awaiting signature from the ghostkey delegate.
@@ -610,39 +635,83 @@ impl AppState {
                 certificate_pem,
             } => {
                 info!("Received signature from ghostkey delegate");
-                if let Some(pending) = self.pending_listing.take() {
-                    let authorized = AuthorizedListing {
-                        listing: pending.listing,
-                        scoped_payload,
-                        signature,
-                        certificate_pem,
-                    };
-                    info!(
-                        "Constructed AuthorizedListing: {}",
-                        authorized.listing.title
-                    );
+                match self.pending_signatures.pop_front() {
+                    Some(PendingSignature::Listing(pending)) => {
+                        let authorized = AuthorizedListing {
+                            listing: pending.listing,
+                            scoped_payload,
+                            signature,
+                            certificate_pem,
+                        };
+                        info!(
+                            "Constructed AuthorizedListing: {}",
+                            authorized.listing.title
+                        );
 
-                    // Submit to the store contract if we know which one
-                    #[cfg(target_arch = "wasm32")]
-                    if let Some(store_id) = pending.store_contract_id {
-                        let listing = authorized.clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            if let Err(e) =
-                                crate::gateway::store_ops::submit_listing_by_id(&store_id, listing)
-                                    .await
-                            {
-                                dioxus::logger::tracing::error!("Failed to submit listing: {}", e);
-                                crate::gateway::APP_STATE
-                                    .write()
-                                    .notifications
-                                    .push(format!("Failed to submit listing: {e}"));
-                            }
-                        });
+                        // Submit to the store contract if we know which one
+                        #[cfg(target_arch = "wasm32")]
+                        if let Some(store_id) = pending.store_contract_id {
+                            let listing = authorized.clone();
+                            wasm_bindgen_futures::spawn_local(async move {
+                                if let Err(e) = crate::gateway::store_ops::submit_listing_by_id(
+                                    &store_id, listing,
+                                )
+                                .await
+                                {
+                                    dioxus::logger::tracing::error!(
+                                        "Failed to submit listing: {}",
+                                        e
+                                    );
+                                    crate::gateway::APP_STATE
+                                        .write()
+                                        .notifications
+                                        .push(format!("Failed to submit listing: {e}"));
+                                }
+                            });
+                        }
+
+                        self.signed_listings_ready.push(authorized);
                     }
+                    Some(PendingSignature::StoreInfo(pending)) => {
+                        let authorized = harvest_common::store::AuthorizedStoreInfoV1 {
+                            info: pending.info,
+                            scoped_payload,
+                            signature,
+                        };
+                        info!(
+                            "Constructed AuthorizedStoreInfoV1: {}",
+                            authorized.info.store_name
+                        );
 
-                    self.signed_listings_ready.push(authorized);
-                } else {
-                    info!("SignResult received but no pending listing");
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            let store_id = pending.store_contract_id;
+                            wasm_bindgen_futures::spawn_local(async move {
+                                if let Err(e) = crate::gateway::store_ops::submit_store_info_by_id(
+                                    &store_id, authorized,
+                                )
+                                .await
+                                {
+                                    dioxus::logger::tracing::error!(
+                                        "Failed to publish store details: {}",
+                                        e
+                                    );
+                                    crate::gateway::APP_STATE
+                                        .write()
+                                        .notifications
+                                        .push(format!(
+                                        "Store created, but its name and description could not \
+                                         be published: {e}"
+                                    ));
+                                }
+                            });
+                        }
+                        #[cfg(not(target_arch = "wasm32"))]
+                        let _ = authorized;
+                    }
+                    None => {
+                        warn!("SignResult received with nothing waiting for a signature");
+                    }
                 }
             }
 
@@ -680,7 +749,7 @@ impl AppState {
             ghostkey_common::GhostkeyResponse::Error { message } => {
                 self.notifications
                     .push(format!("Ghostkey error: {message}"));
-                self.pending_listing = None;
+                self.pending_signatures.clear();
                 self.request_any_access_in_flight = false;
             }
 
@@ -695,7 +764,7 @@ impl AppState {
                     "Ghostkey access was denied. Click 'Connect a ghostkey' again to retry.".into(),
                 );
                 self.request_any_access_in_flight = false;
-                self.pending_listing = None;
+                self.pending_signatures.clear();
                 self.pending_store_creation = None;
             }
 
@@ -706,7 +775,7 @@ impl AppState {
                     "No ghostkey identities found. Open the Ghostkey Vault to create one, then come back and click 'Connect a ghostkey'.".into(),
                 );
                 self.request_any_access_in_flight = false;
-                self.pending_listing = None;
+                self.pending_signatures.clear();
                 self.pending_store_creation = None;
             }
 
@@ -717,7 +786,7 @@ impl AppState {
                 self.notifications
                     .push(format!("Ghostkey access denied for {fingerprint}."));
                 self.request_any_access_in_flight = false;
-                self.pending_listing = None;
+                self.pending_signatures.clear();
                 self.pending_store_creation = None;
             }
 
@@ -1299,6 +1368,87 @@ mod tests {
         let mut state = AppState::default();
         state.begin_browsing(vec![2u8; 32]);
         assert!(state.displayed_store().is_none());
+    }
+
+    fn sign_result() -> ghostkey_common::GhostkeyResponse {
+        ghostkey_common::GhostkeyResponse::SignResult {
+            scoped_payload: vec![1, 2, 3],
+            signature: vec![4, 5, 6],
+            certificate_pem: String::new(),
+        }
+    }
+
+    fn pending_listing() -> PendingSignature {
+        PendingSignature::Listing(PendingListing {
+            fingerprint: FINGERPRINT.to_string(),
+            listing: harvest_common::listing::Listing {
+                id: harvest_common::listing::ListingId([1u8; 16]),
+                title: "Beans".to_string(),
+                description: String::new(),
+                kind: harvest_common::listing::ListingKind::Sale,
+                price: None,
+                created_at: chrono::Utc::now(),
+            },
+            store_contract_id: None,
+        })
+    }
+
+    fn pending_store_info() -> PendingSignature {
+        PendingSignature::StoreInfo(PendingStoreInfo {
+            info: loaded_store("Bean Shop").info.expect("info"),
+            store_contract_id: vec![1u8; 32],
+        })
+    }
+
+    /// `SignResult` carries no correlation id, so the queue's order is the
+    /// only thing matching an answer to its request. A store's info and a
+    /// listing can be outstanding at the same time -- publishing a store
+    /// signs its info, and the seller can start a listing right after -- and
+    /// answering them out of order would attach the store's signature to the
+    /// listing.
+    #[test]
+    fn signatures_are_answered_in_the_order_they_were_asked_for() {
+        let mut state = AppState::default();
+        state.pending_signatures.push_back(pending_store_info());
+        state.pending_signatures.push_back(pending_listing());
+
+        // First answer belongs to the store info, not the listing.
+        state.on_ghostkey_response(sign_result());
+        assert!(
+            state.signed_listings_ready.is_empty(),
+            "the listing must not have consumed the store info's signature"
+        );
+        assert_eq!(state.pending_signatures.len(), 1);
+
+        // Second answer is the listing's.
+        state.on_ghostkey_response(sign_result());
+        assert_eq!(state.signed_listings_ready.len(), 1);
+        assert_eq!(state.signed_listings_ready[0].listing.title, "Beans");
+        assert!(state.pending_signatures.is_empty());
+    }
+
+    /// An answer with nothing queued must be dropped, not applied to
+    /// whatever is queued next.
+    #[test]
+    fn a_signature_with_nothing_waiting_is_dropped() {
+        let mut state = AppState::default();
+        state.on_ghostkey_response(sign_result());
+        assert!(state.signed_listings_ready.is_empty());
+    }
+
+    /// A delegate error or a denied prompt invalidates everything queued --
+    /// none of it will ever be answered, and a leftover entry would consume
+    /// the next unrelated signature.
+    #[test]
+    fn a_denied_prompt_clears_the_whole_queue() {
+        let mut state = AppState::default();
+        state.pending_signatures.push_back(pending_store_info());
+        state.pending_signatures.push_back(pending_listing());
+
+        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::Error {
+            message: "nope".to_string(),
+        });
+        assert!(state.pending_signatures.is_empty());
     }
 
     /// A mailbox belongs to one store. Re-pointing the map at a second one

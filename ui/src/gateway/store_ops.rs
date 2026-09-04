@@ -36,6 +36,18 @@ fn listings_delta_bytes(listings: Vec<AuthorizedListing>) -> Result<Vec<u8>, Str
     .map_err(|e| format!("serialize listing delta: {e}"))
 }
 
+/// Bytes of a store-contract delta carrying only the store's own details.
+fn store_info_delta_bytes(
+    info: harvest_common::store::AuthorizedStoreInfoV1,
+) -> Result<Vec<u8>, String> {
+    harvest_common::to_cbor(&harvest_common::store::StoreStateV1Delta {
+        info: Some(info),
+        listings: None,
+        orders: None,
+    })
+    .map_err(|e| format!("serialize store info delta: {e}"))
+}
+
 /// The `ContractKey` for a store, which is what sending it an update needs.
 ///
 /// The key is written down exactly once, locally, when the store is created.
@@ -217,7 +229,7 @@ pub async fn create_store_contracts(
     super::APP_STATE
         .write()
         .my_stores
-        .entry(seller_fingerprint)
+        .entry(seller_fingerprint.clone())
         .or_default()
         .push(harvest_common::StoreRegistration {
             store_contract_id: store_id.as_bytes().to_vec(),
@@ -233,6 +245,79 @@ pub async fn create_store_contracts(
         .write()
         .register_store_mailbox(store_id.as_bytes(), mailbox_id.as_bytes());
 
+    // 5. Publish the store's own details.
+    //
+    // The contract was PUT with `StoreStateV1::default()`, whose info is at
+    // version 0 -- the uninitialized state. Until this lands, every store on
+    // the network has an empty name and description, so a buyer following the
+    // seller's share link arrives at a blank storefront.
+    //
+    // This cannot be done in the PUT above: `AuthorizedStoreInfoV1::verify`
+    // skips verification only at version 0, so anything a buyer can read has
+    // to carry a real Ed25519 signature over the ghostkey delegate's
+    // `ScopedPayload`. That is a round-trip -- `SignMessage` now, the update
+    // when `SignResult` comes back (see `AppState::on_ghostkey_response`) --
+    // the same one a listing makes.
+    let info = harvest_common::store::StoreInfoV1 {
+        version: 1,
+        certificate_pem,
+        seller_fingerprint: seller_fingerprint.clone(),
+        reputation_contract_id: *reputation_id
+            .as_bytes()
+            .first_chunk::<32>()
+            .ok_or("reputation contract id is not 32 bytes -- cannot publish store details")?,
+        store_name,
+        description,
+        payment_instructions,
+    };
+    request_store_info_signature(seller_fingerprint, store_id.as_bytes().to_vec(), info).await?;
+
+    Ok(())
+}
+
+/// Ask the ghostkey delegate to sign a store's details, and queue them for
+/// publication when the signature comes back.
+#[cfg(target_arch = "wasm32")]
+async fn request_store_info_signature(
+    seller_fingerprint: String,
+    store_contract_id: Vec<u8>,
+    info: harvest_common::store::StoreInfoV1,
+) -> Result<(), String> {
+    use dioxus::prelude::{ReadableExt, WritableExt};
+
+    let gk_delegate_key = super::APP_STATE
+        .read()
+        .ghostkey_delegate_key
+        .clone()
+        .ok_or("ghostkey delegate not registered -- cannot sign store details")?;
+
+    // What the delegate signs is the CBOR of the info itself; `verify` checks
+    // the scoped payload wraps exactly these bytes.
+    let message = harvest_common::to_cbor(&info)
+        .map_err(|e| format!("serialize store info for signing: {e}"))?;
+
+    // Queue before sending: the response can arrive as soon as the send
+    // returns, and an answer with nothing queued is dropped.
+    super::APP_STATE.write().pending_signatures.push_back(
+        crate::state::PendingSignature::StoreInfo(crate::state::PendingStoreInfo {
+            info,
+            store_contract_id,
+        }),
+    );
+
+    let request = ghostkey_common::GhostkeyRequest::SignMessage {
+        fingerprint: seller_fingerprint,
+        message,
+    };
+    let payload =
+        ghostkey_common::to_cbor(&request).map_err(|e| format!("serialize SignMessage: {e}"))?;
+
+    if let Err(e) = super::send_delegate_message(&gk_delegate_key, payload).await {
+        // Nothing will answer, so don't leave an entry that would consume
+        // the next unrelated signature.
+        super::APP_STATE.write().pending_signatures.pop_back();
+        return Err(format!("send store info for signing: {e}"));
+    }
     Ok(())
 }
 
@@ -286,6 +371,43 @@ pub async fn submit_listing_by_id(
     })?;
 
     info!("Submitted listing '{}' to store contract", title);
+    Ok(())
+}
+
+/// Publish a store's signed details to its contract.
+///
+/// Separate from creation because it cannot happen during it: the details
+/// have to be signed by the ghostkey delegate first, and that is a round-trip
+/// through `SignMessage`/`SignResult`.
+#[cfg(target_arch = "wasm32")]
+pub async fn submit_store_info_by_id(
+    store_contract_id: &[u8],
+    info: harvest_common::store::AuthorizedStoreInfoV1,
+) -> Result<(), String> {
+    use dioxus::logger::tracing::info;
+    use dioxus::prelude::ReadableExt;
+    use freenet_stdlib::prelude::*;
+
+    let (contract_key, _origin) = {
+        let state = super::APP_STATE.read();
+        let registration = state
+            .my_stores
+            .values()
+            .flat_map(|stores| stores.iter())
+            .find(|s| s.store_contract_id == store_contract_id)
+            .ok_or("this store is not one of yours -- cannot publish its details")?;
+        store_contract_key(registration)?
+    };
+
+    let name = info.info.store_name.clone();
+    let delta_bytes = store_info_delta_bytes(info)?;
+    super::update_contract(
+        &contract_key,
+        UpdateData::Delta(StateDelta::from(delta_bytes)),
+    )
+    .await?;
+
+    info!("Published store details for '{}'", name);
     Ok(())
 }
 
@@ -390,6 +512,76 @@ mod tests {
             harvest_common::from_cbor::<harvest_common::store::StoreStateV1Delta>(&bare).is_err(),
             "a bare Vec is not a store delta"
         );
+    }
+
+    /// The whole point of the round-trip: the bytes we hand `SignMessage`
+    /// have to be exactly the bytes `AuthorizedStoreInfoV1::verify` checks
+    /// the scoped payload against. Get that wrong and the contract rejects
+    /// the store's details with no clue why, which is indistinguishable from
+    /// them never having been sent.
+    #[test]
+    fn signing_the_bytes_we_send_produces_info_the_contract_accepts() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use freenet_stdlib::prelude::ContractInstanceId;
+        use harvest_common::listing::verify_scoped_signature;
+        use harvest_common::store::{AuthorizedStoreInfoV1, StoreInfoV1};
+
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let info = StoreInfoV1 {
+            version: 1,
+            certificate_pem: "-----BEGIN CERT-----".to_string(),
+            seller_fingerprint: "fp-1".to_string(),
+            reputation_contract_id: [2u8; 32],
+            store_name: "Bean Shop".to_string(),
+            description: "Coffee".to_string(),
+            payment_instructions: "BTC: bc1q...".to_string(),
+        };
+
+        // Exactly what `request_store_info_signature` sends as `message`.
+        let message = harvest_common::to_cbor(&info).expect("serialize info");
+
+        // What the ghostkey delegate wraps it in before signing.
+        let scoped = ghostkey_common::ScopedPayload {
+            requestor: ghostkey_common::SignatureRequestor::WebApp(
+                harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                    .parse::<ContractInstanceId>()
+                    .expect("canonical webapp id"),
+            ),
+            payload: message,
+        };
+        let scoped_payload = harvest_common::to_cbor(&scoped).expect("serialize scoped");
+        let signature = signing_key.sign(&scoped_payload).to_bytes().to_vec();
+
+        let authorized = AuthorizedStoreInfoV1 {
+            info,
+            scoped_payload,
+            signature,
+        };
+        // The check `AuthorizedStoreInfoV1::verify` runs for any version past
+        // 0, called directly so the test needs nothing from contract state.
+        verify_scoped_signature(
+            &authorized.scoped_payload,
+            &authorized.signature,
+            &signing_key.verifying_key(),
+            &authorized.info,
+        )
+        .expect("the store contract must accept its own signed info");
+
+        // And it must go on the wire in the shape the contract reads.
+        let bytes = store_info_delta_bytes(authorized).expect("serialize delta");
+        let delta = harvest_common::from_cbor::<harvest_common::store::StoreStateV1Delta>(&bytes)
+            .expect("the contract must be able to read its own delta");
+        assert!(delta.info.is_some());
+    }
+
+    /// Version 0 is the uninitialized state, which `verify` skips entirely --
+    /// so publishing details at version 0 would publish something no buyer
+    /// can trust. The details we build must be past it.
+    #[test]
+    fn published_store_details_are_past_the_unverified_version() {
+        let unpublished = harvest_common::store::AuthorizedStoreInfoV1::default();
+        assert_eq!(unpublished.info.version, 0);
+        assert!(unpublished.info.store_name.is_empty());
     }
 
     /// A malformed id is reported, not silently turned into some other

@@ -494,17 +494,6 @@ fn sign_and_submit_listing(_fingerprint: String, _listing: Listing) {
                 }
             };
 
-            if let Err(e) = crate::gateway::send_delegate_message(&gk_delegate_key, payload).await {
-                dioxus::logger::tracing::error!("Failed to send SignMessage: {}", e);
-                return;
-            }
-
-            dioxus::logger::tracing::info!(
-                "Sent listing for signing (fingerprint: {}, title: {})",
-                fingerprint,
-                listing.title
-            );
-
             // Find the store contract ID for this fingerprint
             let store_contract_id = {
                 let state = APP_STATE.read();
@@ -515,11 +504,31 @@ fn sign_and_submit_listing(_fingerprint: String, _listing: Listing) {
                     .map(|s| s.store_contract_id.clone())
             };
 
-            APP_STATE.write().pending_listing = Some(crate::state::PendingListing {
+            let title = listing.title.clone();
+            // Queue before sending. This used to be recorded afterwards, so
+            // a `SignResult` that arrived before the send returned found
+            // nothing waiting and the signed listing was dropped.
+            APP_STATE.write().pending_signatures.push_back(
+                crate::state::PendingSignature::Listing(crate::state::PendingListing {
+                    fingerprint: fingerprint.clone(),
+                    listing,
+                    store_contract_id,
+                }),
+            );
+
+            if let Err(e) = crate::gateway::send_delegate_message(&gk_delegate_key, payload).await {
+                dioxus::logger::tracing::error!("Failed to send SignMessage: {}", e);
+                // Nothing will answer this one, and leaving it queued would
+                // make it consume the next signature that arrives.
+                APP_STATE.write().pending_signatures.pop_back();
+                return;
+            }
+
+            dioxus::logger::tracing::info!(
+                "Sent listing for signing (fingerprint: {}, title: {})",
                 fingerprint,
-                listing,
-                store_contract_id,
-            });
+                title
+            );
         });
     }
 }
