@@ -293,6 +293,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // Superseded by the per-order Bitcoin payment address, which added
             // the BIP-84 derivation module and the payment-xpub secret.
             "f6d6543524d359f54379bd9b0d79f5106a72d1d205b44b04f6375db74fde7e91".to_string(),
+            // V8, from `git show d9cddad:ui/public/contracts/harvest_delegate.wasm`.
+            // The first build of the payment-address work, superseded by its
+            // own review fixes before it left the branch.
+            "f563abc42391938ad99ea47202177acbeddd1e41d517a1b92a49a6aa03a3a6eb".to_string(),
         ],
     );
 }

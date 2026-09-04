@@ -173,9 +173,10 @@ pub async fn set_payment_xpub(
 /// Fetch the configured payment xpub, if any.
 ///
 /// Unlike the request helpers above this allocates no request id: like
-/// `GetBridge` and `ListWatched` it is a read the UI issues on load rather
-/// than an action a button is waiting on, so there is nothing to show as
-/// in-flight.
+/// `GetBridge` and `ListWatched` it is a read rather than an action a button
+/// is waiting on, so there is nothing to show as in-flight. It is issued on
+/// load AND after every `OrderAddress`, whose answer advances the counter this
+/// reports.
 #[cfg(target_arch = "wasm32")]
 pub async fn get_payment_xpub() -> Result<(), String> {
     let delegate_key = APP_STATE

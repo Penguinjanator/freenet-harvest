@@ -72,9 +72,16 @@ pub(crate) const BITCOIN_BRIDGE_KEY: &[u8] = b"harvest:bitcoin:bridge:v1";
 /// matches -- which finds the highest index ever USED, not the highest ever
 /// HANDED OUT. Those differ every time an invoice is abandoned after its
 /// address was shown to a buyer, and the difference is exactly an address
-/// reuse. So the counter is authoritative state, and losing it (a delegate
-/// re-key with no export handshake, say) means the seller should set a fresh
-/// xpub rather than resume.
+/// reuse.
+///
+/// So the counter is authoritative state. It does NOT survive a delegate
+/// re-key today: this generation can answer an export request, but nothing in
+/// the UI drives the handshake yet, and a successor imports through these same
+/// request handlers -- none of which can restore a counter, since
+/// [`apply_set_payment_xpub`] only preserves one it already holds. A seller
+/// crossing a re-key should therefore point Harvest at a FRESH account in
+/// their wallet rather than re-entering the same key, whose low indices may
+/// already carry live invoices.
 pub(crate) const BITCOIN_PAYMENT_XPUB_KEY: &[u8] = b"harvest:bitcoin:payment-xpub:v1";
 
 fn load_watches(ctx: &DelegateCtx) -> Vec<WatchedPayment> {
@@ -107,25 +114,30 @@ fn load_payment_xpub(ctx: &DelegateCtx) -> Option<PaymentXpubStatus> {
         .flatten()
 }
 
-/// Persist the xpub record.
+/// Persist the xpub record, refusing if the host did not take the write.
 ///
-/// The encoding failure is propagated rather than swallowed the way the other
-/// savers swallow theirs, and the difference matters: a dropped watch-list
-/// write costs a watch the user can re-add, but a dropped counter write means
-/// the next derivation hands out the SAME index again -- two invoices on one
-/// address, which is the failure this whole path exists to prevent. So it
-/// turns into a failed derivation rather than an address the caller believes
-/// is fresh.
+/// Both failures are propagated rather than swallowed the way the other savers
+/// swallow theirs, and the difference matters: a dropped watch-list write costs
+/// a watch the user can re-add, but a dropped counter write means the next
+/// derivation hands out the SAME index again -- two invoices on one address,
+/// which is the failure this whole path exists to prevent. So either failure
+/// turns into a failed derivation rather than an address the caller believes is
+/// fresh.
 ///
-/// `DelegateCtx::set_secret` itself returns nothing, so a host that refused
-/// the write is indistinguishable from one that took it. That is a real
-/// residual: it would show up as the same index being handed out twice. There
-/// is no way to detect it from here, and inventing one would mean reading the
-/// secret back, which the same host controls.
+/// `DelegateCtx::set_secret` reports whether the host accepted the write; this
+/// crate already depends on that in `markers::set_marker`. Off-target it always
+/// answers `false` (the `#[cfg(not(target_family = "wasm"))]` stub), which is
+/// why the tests below drive the pure `apply_*` functions rather than `handle`.
 fn save_payment_xpub(ctx: &mut DelegateCtx, status: &PaymentXpubStatus) -> Result<(), String> {
     let bytes = to_cbor(&Some(status.clone()))
         .map_err(|e| format!("could not encode the payment key record: {e}"))?;
-    ctx.set_secret(BITCOIN_PAYMENT_XPUB_KEY, &bytes);
+    if !ctx.set_secret(BITCOIN_PAYMENT_XPUB_KEY, &bytes) {
+        return Err(
+            "the node refused to store the payment key record, so no address was issued -- \
+             issuing one anyway would hand out an index the delegate still believes is unused"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -192,13 +204,34 @@ fn apply_associate_order(
 
 /// Validate an account xpub and build the record to store for it.
 ///
-/// Resets the counter to 0, deliberately: an index only means anything
-/// relative to the key it derives from, so carrying the old count forward
-/// would skip addresses in the new wallet for no reason. Invoices already
-/// issued are unaffected -- an `Order` names a script, not a key.
+/// # The counter is kept when the key is the same one
+///
+/// A fresh key starts at 0, because an index only means anything relative to
+/// the key it derives from. **Re-setting the key already in use does NOT
+/// restart the count**, and that distinction is the whole of this function's
+/// risk: restarting would re-issue addresses that already have live invoices
+/// against them, which is precisely the reuse this feature exists to prevent.
+///
+/// It is not a corner case. The seller reaches it through an ordinary button:
+/// the only visible reason to touch the payment key is to correct the NETWORK,
+/// signet and testnet4 being indistinguishable from the key itself (see
+/// [`crate::bip32::AccountXpub::accepts_network`]), and correcting it means
+/// re-pasting the same key. The form cannot show them what is already set --
+/// it holds a public key, but showing it back would be a privacy leak into the
+/// page -- so they cannot even tell they are re-entering it.
+///
+/// Sameness is decided on the PARSED key, not the string: the same account key
+/// re-exported by a wallet can differ in whitespace or case and still be the
+/// same 78 bytes.
+///
+/// The comparison deliberately ignores the network. A key filed under the
+/// wrong test network derives byte-identical addresses (all of `tb1…`), so the
+/// indices already handed out are real addresses in that wallet whatever the
+/// record says the network was -- re-filing it must not hand them out twice.
 fn apply_set_payment_xpub(
     xpub: &str,
     network: BitcoinNetwork,
+    existing: Option<&PaymentXpubStatus>,
 ) -> Result<PaymentXpubStatus, String> {
     let account = AccountXpub::parse(xpub)?;
     if !account.accepts_network(network) {
@@ -213,10 +246,14 @@ fn apply_set_payment_xpub(
     // halfway through issuing an invoice to a waiting buyer.
     account.order_address(0, network)?;
 
+    let next_index = existing
+        .filter(|held| AccountXpub::parse(&held.xpub).is_ok_and(|held| held == account))
+        .map_or(0, |held| held.next_index);
+
     Ok(PaymentXpubStatus {
         xpub: xpub.trim().to_string(),
         network,
-        next_index: 0,
+        next_index,
     })
 }
 
@@ -366,10 +403,12 @@ pub fn handle(
             xpub,
             network,
         } => {
-            let result = apply_set_payment_xpub(&xpub, network).and_then(|status| {
-                save_payment_xpub(ctx, &status)?;
-                Ok(status)
-            });
+            let existing = load_payment_xpub(ctx);
+            let result =
+                apply_set_payment_xpub(&xpub, network, existing.as_ref()).and_then(|status| {
+                    save_payment_xpub(ctx, &status)?;
+                    Ok(status)
+                });
             BitcoinDelegateResponse::PaymentXpubSet { request_id, result }
         }
 
@@ -543,6 +582,18 @@ mod tests {
     /// re-encoded under the test-network version so it can stand in for a
     /// seller's signet wallet export.
     fn signet_vpub() -> String {
+        vpub_with_chain_code(0)
+    }
+
+    /// A DIFFERENT account key: same public point, a different chain code, so
+    /// it parses and derives an entirely different set of addresses. Standing
+    /// in for "the seller moved to another wallet", which is the only case
+    /// where restarting the index count is correct.
+    fn another_signet_vpub() -> String {
+        vpub_with_chain_code(0xAA)
+    }
+
+    fn vpub_with_chain_code(xor: u8) -> String {
         let mut bytes = bs58::decode(
             "zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs",
         )
@@ -550,12 +601,13 @@ mod tests {
         .into_vec()
         .expect("the BIP-84 vector must decode");
         bytes[..4].copy_from_slice(&0x045f_1cf6u32.to_be_bytes());
+        bytes[13] ^= xor;
         bs58::encode(bytes).with_check().into_string()
     }
 
     #[test]
     fn a_valid_account_key_starts_the_counter_at_zero() {
-        let status = apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet)
+        let status = apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet, None)
             .expect("a BIP-84 test-network key must be accepted");
         assert_eq!(status.next_index, 0);
         assert_eq!(status.network, BitcoinNetwork::Signet);
@@ -566,7 +618,7 @@ mod tests {
     /// for real bitcoin.
     #[test]
     fn a_key_for_the_wrong_network_is_refused() {
-        let err = apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Bitcoin)
+        let err = apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Bitcoin, None)
             .expect_err("must refuse");
         assert!(err.contains("bitcoin"), "unhelpful error: {err}");
     }
@@ -577,7 +629,7 @@ mod tests {
     #[test]
     fn each_derivation_consumes_its_index_and_yields_a_new_script() {
         let mut status =
-            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet).expect("accepted");
+            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet, None).expect("accepted");
 
         let mut seen = std::collections::HashSet::new();
         for expected_index in 0..8u32 {
@@ -592,20 +644,82 @@ mod tests {
         }
     }
 
-    /// Replacing the key restarts the count: indices only mean anything
-    /// relative to the key they derive from, so carrying the old one forward
-    /// would skip addresses in the new wallet for nothing.
+    /// Moving to a DIFFERENT wallet restarts the count: indices only mean
+    /// anything relative to the key they derive from, so carrying the old one
+    /// forward would skip addresses in the new wallet for nothing.
     #[test]
-    fn setting_a_new_key_restarts_the_counter() {
-        let mut status =
-            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet).expect("accepted");
-        apply_derive_order_address(&mut status).expect("derive");
-        apply_derive_order_address(&mut status).expect("derive");
-        assert_eq!(status.next_index, 2);
+    fn setting_a_genuinely_new_key_restarts_the_counter() {
+        let mut held =
+            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet, None).expect("accepted");
+        apply_derive_order_address(&mut held).expect("derive");
+        apply_derive_order_address(&mut held).expect("derive");
+        assert_eq!(held.next_index, 2);
 
         let replaced =
-            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet).expect("accepted");
+            apply_set_payment_xpub(&another_signet_vpub(), BitcoinNetwork::Signet, Some(&held))
+                .expect("accepted");
         assert_eq!(replaced.next_index, 0);
+    }
+
+    /// Re-setting the key ALREADY IN USE must not restart the count, or every
+    /// address already on a live invoice is handed out a second time -- the
+    /// exact reuse this feature exists to prevent.
+    ///
+    /// The seller reaches this through an ordinary button. The one visible
+    /// reason to touch the payment key is to correct the network (signet and
+    /// testnet4 are indistinguishable from the key itself), and correcting it
+    /// means re-pasting the same key.
+    #[test]
+    fn re_setting_the_same_key_keeps_the_counter() {
+        let mut held =
+            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet, None).expect("accepted");
+        let first = apply_derive_order_address(&mut held).expect("derive");
+        apply_derive_order_address(&mut held).expect("derive");
+        assert_eq!(held.next_index, 2);
+
+        let mut again = apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet, Some(&held))
+            .expect("accepted");
+        assert_eq!(
+            again.next_index, 2,
+            "re-setting the same key must not re-issue addresses that already have invoices"
+        );
+        let next = apply_derive_order_address(&mut again).expect("derive");
+        assert_ne!(
+            next.script_pubkey, first.script_pubkey,
+            "the address after a re-set must not be one already handed out"
+        );
+    }
+
+    /// Sameness is decided on the parsed key, not the string. A wallet
+    /// re-exporting the same account key can differ in surrounding whitespace,
+    /// and treating that as a new key would restart the count.
+    #[test]
+    fn a_re_pasted_key_is_recognised_despite_whitespace() {
+        let mut held =
+            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet, None).expect("accepted");
+        apply_derive_order_address(&mut held).expect("derive");
+
+        let padded = format!("  {}\n", signet_vpub());
+        let again =
+            apply_set_payment_xpub(&padded, BitcoinNetwork::Signet, Some(&held)).expect("accepted");
+        assert_eq!(again.next_index, 1);
+    }
+
+    /// Re-filing the same key under a different test network must not restart
+    /// either. Signet, testnet4 and regtest derive byte-identical addresses,
+    /// so the indices already handed out are live addresses in that wallet
+    /// whatever the record says the network was.
+    #[test]
+    fn re_filing_the_same_key_under_another_test_network_keeps_the_counter() {
+        let mut held =
+            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet, None).expect("accepted");
+        apply_derive_order_address(&mut held).expect("derive");
+        apply_derive_order_address(&mut held).expect("derive");
+
+        let refiled = apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Testnet4, Some(&held))
+            .expect("accepted");
+        assert_eq!(refiled.network, BitcoinNetwork::Testnet4);
+        assert_eq!(refiled.next_index, 2);
     }
 
     /// Running off the end of public derivation must refuse rather than wrap,
@@ -613,7 +727,7 @@ mod tests {
     #[test]
     fn exhausting_the_key_refuses_rather_than_wrapping() {
         let mut status =
-            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet).expect("accepted");
+            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet, None).expect("accepted");
         status.next_index = crate::bip32::MAX_ORDER_INDEX + 1;
 
         let err = apply_derive_order_address(&mut status).expect_err("must refuse");

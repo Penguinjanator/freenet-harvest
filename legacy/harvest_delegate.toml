@@ -26,12 +26,22 @@
 # adopts nothing and, correctly, seals nothing, so it retries forever at no
 # cost but recovers nothing. Secrets held under V1-V4 are lost.
 #
-# From V5 on a re-key IS survivable, which is why adopting the export handler
-# was worth doing rather than deferring: every generation recorded since is one
-# whose secrets a successor can ask for. Keep it that way -- a release that
-# ships without it adds another unrecoverable generation, and from V7 the cost
-# of losing one includes the Bitcoin derivation counter, whose loss means an
-# address handed out twice (see that row).
+# From V5 on the export handler is PRESENT, which is the half that had to land
+# early: it cannot be added to a generation retroactively, so every release
+# without it adds another permanently unrecoverable one. Keep it that way.
+#
+# Be precise about what that buys today, because it is easy to read as more.
+# The handler answers an export request; NOTHING ASKS. `delegate_lineage()` in
+# `ui/src/migrate.rs` has no caller outside tests, so no re-key has actually
+# carried a secret forward yet -- V5 to V6 and V6 to V7 both lost everything,
+# exactly as V1-V4 did. The rows say a successor COULD recover from these
+# generations, not that one has.
+#
+# From V7 the cost of that gap includes the Bitcoin derivation counter, and
+# that one is worse than the others: the RSA keypair and the watch list are
+# things a seller can recreate, while a reset counter re-issues addresses that
+# already have live invoices against them. Until the driver exists, a seller
+# crossing a delegate re-key should point Harvest at a fresh wallet account.
 
 [[entry]]
 version = "V1"
@@ -77,7 +87,14 @@ delegate_key = "da8d30151f66c8ac6f012cb65460a3b40982a1dac8f6795fe14dc93d1a655d7c
 
 [[entry]]
 version = "V7"
-description = "Superseded by the per-order Bitcoin payment address: the successor gained the BIP-84 public-derivation module and a new secret, `harvest:bitcoin:payment-xpub:v1`, holding the seller's account key AND its derivation counter. Carries the export handler, which matters more here than usual: that counter cannot be recovered from anywhere else. The orders a store has issued are public but they name SCRIPTS, not indices, so re-deriving forward finds the highest index ever USED rather than the highest ever HANDED OUT -- and the gap between those is exactly an address issued twice"
+description = "Superseded by the per-order Bitcoin payment address: the successor gained the BIP-84 public-derivation module and a new secret, `harvest:bitcoin:payment-xpub:v1`, holding the seller's account key AND its derivation counter. NOTE the counter does NOT survive this re-key, despite the export handler: nothing in the UI drives the delegate export handshake yet (`ui/src/migrate.rs::delegate_lineage` has no caller outside tests), and even if it did, a successor imports through this delegate's own request handlers and no request can restore a counter. So a seller carried across this boundary starts at index 0 against a key whose earlier addresses may still have live invoices -- they should point Harvest at a FRESH account in their wallet rather than the same one"
 date = "2026-09-04"
 code_hash = "f6d6543524d359f54379bd9b0d79f5106a72d1d205b44b04f6375db74fde7e91"
 delegate_key = "50c46d944bf7acb8ca4a947da6583bff3870bbf584ef0146869678e089c1dfc8"
+
+[[entry]]
+version = "V8"
+description = "The first build of the payment-address work, superseded by its own review fixes before it left this branch. Recorded on the same footing as V6: the bytes were committed and could have been run, not because they were ever published. The fixes it lacks are the ones that matter here -- it restarted the derivation counter whenever the payment key was re-entered, even with the same key, and ignored whether the node accepted the counter write at all. Both hand out an address twice"
+date = "2026-09-04"
+code_hash = "f563abc42391938ad99ea47202177acbeddd1e41d517a1b92a49a6aa03a3a6eb"
+delegate_key = "00db1a23517217b598b03af5e35fc418d15c8d00b09fe2f42c20a2bc935d7fe3"

@@ -65,6 +65,19 @@ pub fn App() -> Element {
                         // rather than prompting for a key that is already set.
                         if let Err(e) = crate::gateway::bitcoin_ops::get_payment_xpub().await {
                             dioxus::logger::tracing::error!("Failed to fetch payment key: {e}");
+                            // Nothing will answer, so mark it answered. Left
+                            // false, `PaymentKeyPanel` sits on "Checking your
+                            // payment key…" for the rest of the session and
+                            // the seller can never reach the form to set one.
+                            // Showing the form when we do not know is the safe
+                            // direction: setting the key again is harmless
+                            // (the counter is preserved -- see the delegate's
+                            // `apply_set_payment_xpub`), being unable to set
+                            // it at all is not.
+                            crate::gateway::APP_STATE
+                                .write()
+                                .bitcoin
+                                .payment_xpub_loaded = true;
                         }
                         // No bridge may be configured for the active/default
                         // network yet, in which case there's nothing to

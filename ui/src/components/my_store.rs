@@ -325,10 +325,15 @@ fn IdentityCard(
                                 }
                             }
 
-                            // Payments sit under the store they belong to,
-                            // not under the identity: an invoice is issued on
-                            // one store's contract, and a seller with two
-                            // stores has to be able to tell which.
+                            // The invoice FORM sits under the store it
+                            // issues on -- an invoice goes to one store's
+                            // contract, and a seller with two stores has to be
+                            // able to tell which. The payment KEY inside this
+                            // panel is not per-store: it is one key and one
+                            // derivation counter for the whole app, shown here
+                            // because this is where it is needed. The panel
+                            // says so rather than letting the placement imply
+                            // otherwise.
                             super::invoice_form::StorePayments {
                                 store_contract_id: card.contract_id.clone(),
                                 seller_fingerprint: fp.clone(),

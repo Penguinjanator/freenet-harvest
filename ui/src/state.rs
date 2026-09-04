@@ -540,8 +540,13 @@ pub struct PendingInvoice {
     pub listing_id: harvest_common::listing::ListingId,
     /// Only for the notification the seller sees; nothing signed depends on it.
     pub listing_title: String,
-    /// Ghostkey fingerprint of the buyer this invoice is for. May be empty --
-    /// see [`AppState::issue_invoice`].
+    /// Ghostkey fingerprint of the buyer this invoice is for.
+    ///
+    /// May be empty, and often is: an invoice with no buyer named is one
+    /// anyone holding the link may pay. Naming one records who it was issued
+    /// to and restricts nothing, since Bitcoin cannot say who sent a payment
+    /// -- the form says so where the seller types it
+    /// (`components::invoice_form::InvoiceForm`).
     pub buyer_fingerprint: String,
     pub amount_sats: u64,
     pub required_confirmations: u32,
@@ -577,7 +582,7 @@ pub fn order_for_invoice(
 ) -> Result<harvest_common::payment::Order, String> {
     use harvest_common::payment::{Order, OrderId};
 
-    let trusted_bridges = crate::gateway::bitcoin_config::default_trusted_bridges()?;
+    let trusted_bridges = crate::gateway::bitcoin_config::default_trusted_bridges(derived.network)?;
     Ok(Order {
         id: OrderId::new(
             &pending.seller_fingerprint,
@@ -1299,7 +1304,8 @@ impl AppState {
             return;
         };
 
-        let order = match order_for_invoice(&invoice, &derived, chrono::Utc::now()) {
+        let created_at = self.unused_invoice_timestamp(&invoice, chrono::Utc::now());
+        let order = match order_for_invoice(&invoice, &derived, created_at) {
             Ok(order) => order,
             Err(e) => {
                 self.notifications
@@ -1325,6 +1331,78 @@ impl AppState {
 
         #[cfg(target_arch = "wasm32")]
         spawn_order_signature(pending);
+    }
+
+    /// A creation time whose resulting [`OrderId`] is not one we already hold.
+    ///
+    /// # Why this is needed at all
+    ///
+    /// `OrderId::new` hashes `(seller, listing, created_at_ms, buyer)` -- and
+    /// nothing else. Not the amount, not the script, not the derivation index.
+    /// So two invoices for the same listing, with the same buyer field, whose
+    /// timestamps land in the same MILLISECOND are the same order as far as
+    /// the contract is concerned, and `merge_order` keeps whichever has the
+    /// greater CBOR bytes at equal rank. The loser disappears with no error
+    /// anywhere, taking a derivation index and a payment address that has
+    /// already been shown to somebody.
+    ///
+    /// It is not far-fetched. The buyer field is explicitly optional -- the
+    /// form offers leaving it blank as the normal way to write an invoice
+    /// anyone may pay -- and the timestamp is stamped when the delegate's
+    /// answer is HANDLED, so two invoices issued minutes apart collide if
+    /// their two `OrderAddress` responses arrive in one batch.
+    ///
+    /// Advancing by a millisecond is the cheap fix, and it is a fix rather
+    /// than a mitigation because the id then genuinely differs. The structural
+    /// answer is to fold the derivation index into `OrderId::new`, which the
+    /// delegate guarantees unique -- but that is in `harvest-common`, so it
+    /// re-keys all four artifacts and belongs in a generation of its own.
+    ///
+    /// It only sees invoices THIS client knows about: ones it has queued for
+    /// signing, and ones already in the store state it has loaded. A collision
+    /// with an order issued by another client of the same store is not
+    /// reachable here -- only the same seller can issue on a store, so it
+    /// would take one seller running two clients within a millisecond.
+    fn unused_invoice_timestamp(
+        &self,
+        invoice: &PendingInvoice,
+        from: chrono::DateTime<chrono::Utc>,
+    ) -> chrono::DateTime<chrono::Utc> {
+        use harvest_common::payment::OrderId;
+
+        let known: std::collections::HashSet<OrderId> = self
+            .pending_signatures
+            .iter()
+            .filter_map(|pending| match pending {
+                PendingSignature::Order(order) => Some(order.order.id.clone()),
+                _ => None,
+            })
+            .chain(
+                self.browsing_stores
+                    .get(&invoice.store_contract_id)
+                    .into_iter()
+                    .flat_map(|store| store.orders.iter().map(|o| o.order.id.clone())),
+            )
+            .collect();
+
+        let mut at = from;
+        // Bounded rather than `loop`: a full second of consecutive collisions
+        // is not a state this can reach, and spinning forever in a response
+        // handler would be a worse failure than the one being prevented.
+        for _ in 0..1_000 {
+            let id = OrderId::new(
+                &invoice.seller_fingerprint,
+                &invoice.listing_id,
+                &at,
+                &invoice.buyer_fingerprint,
+            );
+            if !known.contains(&id) {
+                return at;
+            }
+            at += chrono::Duration::milliseconds(1);
+        }
+        warn!("Could not find a free invoice timestamp within a second of {from}");
+        at
     }
 
     /// Publish a new store's contracts, once every input creation needs has
@@ -3992,6 +4070,107 @@ mod invoice_tests {
             state.bitcoin.payment_xpub.as_ref().map(|s| s.next_index),
             Some(4)
         );
+    }
+
+    /// Two invoices for the same listing, both with the buyer field blank --
+    /// which the form offers as the normal way to write an invoice anyone may
+    /// pay -- collide on `OrderId` if their addresses are handled in the same
+    /// millisecond, because the id hashes only
+    /// `(seller, listing, created_at_ms, buyer)`.
+    ///
+    /// The contract's merge then keeps whichever record has the greater CBOR
+    /// bytes at equal rank, so the loser disappears with no error anywhere,
+    /// taking a derivation index and an address that has already been shown to
+    /// somebody.
+    #[test]
+    fn two_invoices_handled_in_one_millisecond_get_distinct_ids() {
+        let mut state = seller_with_a_store();
+
+        let mut anonymous = invoice();
+        anonymous.buyer_fingerprint = String::new();
+        state.issue_invoice(anonymous.clone()).expect("accepted");
+        let first_id = *state.pending_invoices.keys().next().expect("one entry");
+        anonymous.amount_sats = 99_000;
+        state.issue_invoice(anonymous).expect("accepted");
+        let second_id = *state
+            .pending_invoices
+            .keys()
+            .find(|id| **id != first_id)
+            .expect("two entries");
+
+        state.on_bitcoin_delegate_response(address_answer(first_id, 0));
+        state.on_bitcoin_delegate_response(address_answer(second_id, 1));
+
+        let ids: Vec<_> = state
+            .pending_signatures
+            .iter()
+            .filter_map(|pending| match pending {
+                PendingSignature::Order(o) => Some(o.order.id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(
+            ids[0], ids[1],
+            "two invoices sharing an id means one of them silently vanishes on merge"
+        );
+    }
+
+    /// The same guard has to see orders already published to the store, not
+    /// just ones queued locally -- a page that has loaded the store's state
+    /// knows about invoices from earlier sessions, and re-issuing one of their
+    /// ids would replace a live invoice rather than adding one.
+    #[test]
+    fn an_id_already_on_the_store_is_avoided() {
+        let mut state = seller_with_a_store();
+        let mut anonymous = invoice();
+        anonymous.buyer_fingerprint = String::new();
+
+        // An order already on the store, carrying exactly the id a new
+        // invoice stamped at `now` would take.
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let published = order_for_invoice(&anonymous, &derived(0), now).expect("build");
+        let collides = published.id.clone();
+        state
+            .browsing_stores
+            .entry(anonymous.store_contract_id.clone())
+            .or_default()
+            .orders
+            .push(authorize_new_order(published, Vec::new(), Vec::new()));
+
+        let at = state.unused_invoice_timestamp(&anonymous, now);
+
+        assert_ne!(at, now, "the guard must move off a timestamp already taken");
+        assert_ne!(
+            harvest_common::payment::OrderId::new(
+                &anonymous.seller_fingerprint,
+                &anonymous.listing_id,
+                &at,
+                &anonymous.buyer_fingerprint,
+            ),
+            collides
+        );
+    }
+
+    /// A store we have never loaded, or an unrelated one, must not constrain
+    /// the timestamp -- otherwise the guard would be scanning the wrong set
+    /// and would look like it worked while checking nothing.
+    #[test]
+    fn an_unrelated_stores_orders_do_not_move_the_timestamp() {
+        let mut state = seller_with_a_store();
+        let mut anonymous = invoice();
+        anonymous.buyer_fingerprint = String::new();
+
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let published = order_for_invoice(&anonymous, &derived(0), now).expect("build");
+        state
+            .browsing_stores
+            .entry(vec![77u8; 32])
+            .or_default()
+            .orders
+            .push(authorize_new_order(published, Vec::new(), Vec::new()));
+
+        assert_eq!(state.unused_invoice_timestamp(&anonymous, now), now);
     }
 
     /// A rejected key is reported verbatim: every rejection the delegate can

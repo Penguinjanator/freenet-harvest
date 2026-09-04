@@ -386,6 +386,88 @@ fn short_bridge(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
+/// Whether the address an invoice DISPLAYS is the script that would SETTLE it.
+///
+/// # Why a card has to check this
+///
+/// An `Order` carries both forms, and the seller's signature covers both --
+/// so a signature proves the seller wrote them, not that they agree. Every
+/// verification path uses `payment_script_pubkey`
+/// (`harvest_common::payment::verify_payment_proof`); the human reads
+/// `payment_address`. Nothing else in the system compares them.
+///
+/// That was tolerable while orders appeared only in the user's own payments
+/// panel, where both fields came from their own delegate. It is not now: a
+/// store's invoices render to any buyer who opens the link, so a seller could
+/// publish an invoice displaying an address they control while the script that
+/// settles it is unrelated. The buyer pays, the coin arrives where they were
+/// told to send it, the order never reaches `Paid`, and the public record says
+/// the buyer never paid.
+///
+/// `None` means the address could not be parsed at all -- unreadable rather
+/// than proven wrong, which the card reports differently.
+fn address_matches_script(order: &harvest_common::payment::Order) -> Option<bool> {
+    bitcoin_address::address_to_script_pubkey(&order.payment_address, order.network)
+        .ok()
+        .map(|script| script == order.payment_script_pubkey)
+}
+
+/// Order builders for the destination-check test. Not `#[cfg(test)]` on the
+/// module itself, because the test lives in a sibling module and needs to see
+/// it.
+#[cfg(test)]
+pub(super) mod __address_check_test_support {
+    use harvest_common::listing::ListingId;
+    use harvest_common::payment::{Order, OrderId};
+
+    pub fn order_paying(address: &str, script_pubkey: Vec<u8>) -> Order {
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let listing_id = ListingId::new("seller", &created_at, "Widget");
+        Order {
+            id: OrderId::new("seller", &listing_id, &created_at, "buyer"),
+            listing_id,
+            buyer_fingerprint: "buyer".to_string(),
+            seller_fingerprint: "seller".to_string(),
+            amount_sats: 50_000,
+            network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+            payment_script_pubkey: script_pubkey,
+            payment_address: address.to_string(),
+            required_confirmations: 1,
+            payment_hash: None,
+            trusted_bridges: Vec::new(),
+            bitcoin_address_code_hash: None,
+            created_at,
+        }
+    }
+}
+
+/// What an invoice's card has to say about its own payment destination.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DestinationNote {
+    /// The address denotes exactly the script that settles this order.
+    Agrees,
+    /// The address is well-formed and denotes a DIFFERENT script.
+    Contradicts,
+    /// The address cannot be parsed for this network, so nothing can be said
+    /// about it -- which is itself a reason not to pay it.
+    Unreadable,
+}
+
+impl DestinationNote {
+    fn of(order: &harvest_common::payment::Order) -> Self {
+        match address_matches_script(order) {
+            Some(true) => DestinationNote::Agrees,
+            Some(false) => DestinationNote::Contradicts,
+            None => DestinationNote::Unreadable,
+        }
+    }
+
+    /// Whether the address is safe to put in front of somebody to pay.
+    fn payable(self) -> bool {
+        self == DestinationNote::Agrees
+    }
+}
+
 /// One invoice, as both the seller's payments panel and a buyer looking at
 /// the store see it. Shared rather than duplicated: the bridge warning below
 /// is the check a buyer has to make before parting with coin, and a second
@@ -393,6 +475,7 @@ fn short_bridge(id: &str) -> String {
 #[component]
 pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> Element {
     let o = &order.order;
+    let destination = DestinationNote::of(o);
     let unrecognised = unrecognised_bridges(o);
     let bridge_note = if o.trusted_bridges.is_empty() {
         BridgeNote::None
@@ -435,17 +518,37 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                 span { class: "{status_class}", "{status_text}" }
             }
             p { class: "text-muted", "Order {o.id.short()} · {o.network.as_str()}" }
-            // A readonly input rather than a paragraph, so the address can be
-            // selected and copied without hand-transcribing 42 characters --
-            // the same thing the store share link does, and for the same
-            // reason. A clipboard button is not the alternative it looks like:
-            // the app runs in the gateway's sandboxed iframe, where the
-            // clipboard API is not reliably available, and a copy button that
-            // silently does nothing is worse than a field that visibly works.
-            input {
-                class: "form-input",
-                readonly: true,
-                value: "{o.payment_address}",
+            // The address is only offered when it is the script that settles
+            // this order. Showing one that is not would be handing somebody a
+            // destination whose payment the order can never recognise -- see
+            // `address_matches_script`.
+            if destination.payable() {
+                // A readonly input rather than a paragraph, so the address can
+                // be selected and copied without hand-transcribing 42
+                // characters -- the same thing the store share link does, and
+                // for the same reason. A clipboard button is not the
+                // alternative it looks like: the app runs in the gateway's
+                // sandboxed iframe, where the clipboard API is not reliably
+                // available, and a copy button that silently does nothing is
+                // worse than a field that visibly works.
+                input {
+                    class: "form-input",
+                    readonly: true,
+                    value: "{o.payment_address}",
+                }
+            } else {
+                p { class: "text-warning",
+                    match destination {
+                        DestinationNote::Contradicts => "This invoice's payment address is not \
+                             the destination that would settle it. Paying the address shown \
+                             would send coin somewhere this order cannot recognise, so it is \
+                             withheld. Ask the seller to reissue the invoice.",
+                        _ => "This invoice's payment address cannot be read for its network, so \
+                             it cannot be checked against the destination that would settle the \
+                             order. It is withheld rather than shown. Ask the seller to reissue \
+                             the invoice.",
+                    }
+                }
             }
             match bridge_note {
                 BridgeNote::None => rsx! {
@@ -514,6 +617,49 @@ mod bridge_check_tests {
         let mut a = [0u8; 32];
         a.copy_from_slice(&bytes);
         BridgeId(a)
+    }
+
+    /// The buyer's side of the same coin as the bridge check: an `Order`
+    /// carries the address a human reads AND the script that settles it, the
+    /// seller's signature covers both, and nothing else in the system compares
+    /// them. A store's invoices now render to any buyer who opens the link, so
+    /// a seller could display an address they control while the settling
+    /// script is unrelated -- the buyer pays where they were told, and the
+    /// public record says they never paid.
+    #[test]
+    fn an_address_that_is_not_the_settling_script_is_not_offered() {
+        use super::{DestinationNote, __address_check_test_support::order_paying};
+
+        let honest = order_paying(
+            "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+            crate::gateway::bitcoin_address::address_to_script_pubkey(
+                "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+                freenet_bitcoin_common::BitcoinNetwork::Signet,
+            )
+            .expect("a valid signet address"),
+        );
+        assert_eq!(DestinationNote::of(&honest), DestinationNote::Agrees);
+        assert!(DestinationNote::of(&honest).payable());
+
+        // Same displayed address, a script that pays somewhere else.
+        let lying = order_paying(
+            "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+            vec![0x00, 0x14, 0xde, 0xad, 0xbe, 0xef],
+        );
+        assert_eq!(DestinationNote::of(&lying), DestinationNote::Contradicts);
+        assert!(
+            !DestinationNote::of(&lying).payable(),
+            "an address that is not the settling script must not be offered to pay"
+        );
+
+        // An address that cannot be read at all says so separately: unchecked
+        // is not the same claim as proven wrong, and neither is payable.
+        let unreadable = order_paying("not-an-address", vec![0x00, 0x14, 0xaa]);
+        assert_eq!(
+            DestinationNote::of(&unreadable),
+            DestinationNote::Unreadable
+        );
+        assert!(!DestinationNote::of(&unreadable).payable());
     }
 
     #[test]

@@ -30,15 +30,21 @@ use harvest_common::listing::{AuthorizedListing, ListingId};
 use crate::gateway::{bitcoin_config, bitcoin_ops, APP_STATE};
 use crate::state::PendingInvoice;
 
-/// Every network a payment key can be filed under, in the order the picker
-/// offers them. Signet first because it is where the demo deployment lives
-/// and where a seller should be trying this before real money is involved.
-const NETWORKS: [BitcoinNetwork; 4] = [
-    BitcoinNetwork::Signet,
-    BitcoinNetwork::Testnet4,
-    BitcoinNetwork::Regtest,
-    BitcoinNetwork::Bitcoin,
-];
+/// The networks the picker offers.
+///
+/// Exactly the ones this build can settle a payment on
+/// ([`bitcoin_config::settleable_networks`]), not every network Bitcoin has.
+/// Offering the others would let a seller file a mainnet key and issue
+/// real-money invoices naming a bridge that watches signet: they would look
+/// entirely normal and could never be shown to have been paid, which is the
+/// failure mode `bitcoin_config`'s own header exists to prevent.
+///
+/// `order_for_invoice` refuses such a network too, so this is the second of
+/// two gates rather than the only one -- but a choice that always fails at
+/// submit is a worse way to learn than one that is not offered.
+fn offered_networks() -> &'static [BitcoinNetwork] {
+    bitcoin_config::settleable_networks()
+}
 
 /// The seller-side payments panel for one store: the payment key, the form
 /// that issues an invoice against a listing, and the invoices already issued.
@@ -46,17 +52,26 @@ const NETWORKS: [BitcoinNetwork; 4] = [
 pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> Element {
     let mut show_form = use_signal(|| false);
 
-    let (xpub, xpub_loaded, listings, orders) = {
+    let (xpub, xpub_loaded, store_loaded, listings, orders, live) = {
         let state = APP_STATE.read();
         let store = state.browsing_stores.get(&store_contract_id);
         (
             state.bitcoin.payment_xpub.clone(),
             state.bitcoin.payment_xpub_loaded,
+            // "No listings" and "this store's state has not arrived" look
+            // identical through an `unwrap_or_default`, and telling a seller to
+            // add a listing they already have -- while hiding the button that
+            // would let them invoice it -- is the same trap `publish_store_details`
+            // documents at length for the store's version number.
+            state.store_details_are_resolved(&store_contract_id),
             store.map(|s| s.listings.clone()).unwrap_or_default(),
             invoices_issued_by(
                 store.map(|s| s.orders.as_slice()).unwrap_or_default(),
                 &seller_fingerprint,
             ),
+            // Cloned once outside the render loop below; taking a fresh read
+            // guard per order would be a borrow per row for no gain.
+            state.bitcoin.clone(),
         )
     };
 
@@ -67,7 +82,11 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
             PaymentKeyPanel { xpub: xpub.clone(), xpub_loaded }
 
             if xpub.is_some() {
-                if listings.is_empty() {
+                if !store_loaded {
+                    p { class: "text-muted text-italic",
+                        "Loading this store's listings\u{2026}"
+                    }
+                } else if listings.is_empty() {
                     p { class: "text-muted text-italic",
                         "Add a listing first \u{2014} an invoice is issued against one, so a \
                          buyer can see what they are paying for."
@@ -92,14 +111,11 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
             if !orders.is_empty() {
                 p { class: "section-count", "{orders.len()} invoice(s) issued" }
                 PaymentWatchNote {}
-                for order in orders.iter().cloned() {
+                for order in orders.iter() {
                     super::bitcoin_view::OrderCard {
                         key: "{order.order.id}",
                         order: order.clone(),
-                        live: crate::components::bitcoin_view::live_address_for_order(
-                            &APP_STATE.read().bitcoin,
-                            &order.order,
-                        ),
+                        live: super::bitcoin_view::live_address_for_order(&live, &order.order),
                     }
                 }
             }
@@ -162,7 +178,8 @@ fn PaymentKeyPanel(xpub: Option<harvest_common::PaymentXpubStatus>, xpub_loaded:
                     "Paying into your "
                     strong { "{status.network.as_str()}" }
                     " wallet. "
-                    "{status.next_index} invoice(s) have taken an address so far."
+                    "{status.next_index} invoice(s) have taken an address so far. "
+                    "This key is shared by every store and every Ghost Key in this app."
                 }
                 button {
                     class: "btn btn-sm btn-outline",
@@ -208,8 +225,12 @@ fn PaymentKeyForm(replacing: bool, on_done: EventHandler<()>) -> Element {
             }
             if replacing {
                 p { class: "text-warning",
-                    "Replacing the key restarts the address count from zero. Invoices you "
-                    "have already issued are unaffected \u{2014} they name an address, not a key."
+                    "Entering a DIFFERENT key restarts the address count from zero, which is "
+                    "correct \u{2014} addresses only mean anything relative to the key they "
+                    "come from. Re-entering the key you already use keeps the count, so "
+                    "correcting the network below will not re-issue addresses that already "
+                    "have invoices against them. Either way, invoices you have already issued "
+                    "are unaffected: they name an address, not a key."
                 }
             }
 
@@ -227,11 +248,13 @@ fn PaymentKeyForm(replacing: bool, on_done: EventHandler<()>) -> Element {
                 class: "form-input",
                 value: "{network().as_str()}",
                 onchange: move |e| {
-                    if let Some(picked) = NETWORKS.iter().find(|n| n.as_str() == e.value()) {
+                    if let Some(picked) =
+                        offered_networks().iter().find(|n| n.as_str() == e.value())
+                    {
                         network.set(*picked);
                     }
                 },
-                for option in NETWORKS {
+                for option in offered_networks() {
                     option { value: "{option.as_str()}", "{option.as_str()}" }
                 }
             }

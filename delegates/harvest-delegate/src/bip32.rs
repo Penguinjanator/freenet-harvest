@@ -154,11 +154,16 @@ impl AccountXpub {
         // Reject anything that is not a point on the curve here, once, rather
         // than at each derivation: an unparseable key would otherwise fail
         // only when the seller tried to issue their first invoice.
-        if decode_point(&public_key).is_none() {
-            return Err("that key's public point is not a valid secp256k1 point".to_string());
-        }
+        //
+        // The compressed-form check comes FIRST so it can give its own
+        // message. After `decode_point` it would be unreachable: a 33-byte
+        // buffer only decodes at all with an 0x02/0x03 tag, so any other tag
+        // would already have been reported as "not a valid point".
         if public_key[0] != 0x02 && public_key[0] != 0x03 {
             return Err("that key's public point is not in compressed form".to_string());
+        }
+        if decode_point(&public_key).is_none() {
+            return Err("that key's public point is not a valid secp256k1 point".to_string());
         }
 
         Ok(Self {
@@ -221,6 +226,10 @@ impl AccountXpub {
 ///
 /// In practice a wallet's gap limit (typically 20 unused addresses) bites
 /// unimaginably sooner; this bound is about the arithmetic, not the wallet.
+///
+/// One below `0x7fff_ffff` rather than equal to it, so that `index + 1` in
+/// `apply_derive_order_address` cannot reach the hardened range even at the
+/// last valid index. The cost is forfeiting one address out of two billion.
 pub const MAX_ORDER_INDEX: u32 = 0x7fff_ffff - 1;
 
 /// BIP-32 CKDpub: derive the public child at non-hardened `index`.

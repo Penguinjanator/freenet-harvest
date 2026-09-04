@@ -112,6 +112,24 @@ pub const TRUSTED_BRIDGE_ID_BS58: &str = "4MZnDAQWccEWXBUb1wt4iTEkDi6Z2MCcZ9WQN1
 pub const ADDRESS_CONTRACT_CODE_HASH_HEX: &str =
     "3b5f1df28497b1cfb365798cb86fc87a7e45480d47c79e22f09b9f801e95463f";
 
+/// Which networks this build can actually settle a payment on.
+///
+/// [`TRUSTED_BRIDGE_ID_BS58`] is one bridge observing ONE network. Naming it
+/// on an invoice for any other network produces an order that can never be
+/// proven paid: `verify_payment_proof` measures depth against a signed tip for
+/// the order's own network, and no signature from a signet observer will ever
+/// satisfy a mainnet order. The invoice would look entirely normal.
+///
+/// Returned as a list rather than a single value because a build could ship
+/// more than one bridge; today it ships one.
+pub fn settleable_networks() -> &'static [BitcoinNetwork] {
+    // The nova deployment observes signet, and it is the only bridge this
+    // build trusts. Add a network here only alongside a bridge that watches
+    // it -- an entry with no observer is an unpayable invoice waiting to be
+    // issued.
+    &[BitcoinNetwork::Signet]
+}
+
 /// The bridge set a freshly-issued invoice names, as an `Order` carries it.
 ///
 /// An `Order::trusted_bridges` that is empty can never be proven paid --
@@ -123,8 +141,25 @@ pub const ADDRESS_CONTRACT_CODE_HASH_HEX: &str =
 ///
 /// Returning a `Result` rather than defaulting to an empty list is the point:
 /// a malformed constant must stop an invoice being issued, not quietly issue
-/// one that cannot be settled.
-pub fn default_trusted_bridges() -> Result<Vec<freenet_bitcoin_common::BridgeId>, String> {
+/// one that cannot be settled. **A network with no bridge is the same failure
+/// wearing a different hat** -- a non-empty list of observers that watch some
+/// other chain is no better than an empty one, and worse to diagnose, so it is
+/// refused here rather than stamped onto the order.
+pub fn default_trusted_bridges(
+    network: BitcoinNetwork,
+) -> Result<Vec<freenet_bitcoin_common::BridgeId>, String> {
+    if !settleable_networks().contains(&network) {
+        return Err(format!(
+            "this build knows no Bitcoin bridge that watches {}, so an invoice for it \
+             could never be shown to have been paid. It settles payments on: {}.",
+            network.as_str(),
+            settleable_networks()
+                .iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     freenet_bitcoin_common::BridgeId::from_bs58(TRUSTED_BRIDGE_ID_BS58)
         .map(|id| vec![id])
         .map_err(|e| format!("the build's trusted bridge id is unusable: {e}"))
@@ -151,9 +186,17 @@ mod tests {
     /// cannot be discovered at runtime), so a typo in either is a real
     /// possibility -- and the consequence of a bad bridge id is an invoice
     /// that can never be proven paid.
+    ///
+    /// Note what this does NOT check: that
+    /// `ADDRESS_CONTRACT_CODE_HASH_HEX` is the hash of the address contract
+    /// actually deployed. That is the way it really goes wrong -- silently, on
+    /// a rebuild of a contract this workspace does not build -- and it cannot
+    /// be checked here, because the artifact is not bundled. Only well-formedness
+    /// is asserted.
     #[test]
     fn the_builds_bitcoin_constants_parse() {
-        let bridges = default_trusted_bridges().expect("the trusted bridge id must parse");
+        let bridges = default_trusted_bridges(default_network())
+            .expect("the trusted bridge id must parse for the default network");
         assert_eq!(bridges.len(), 1);
         assert_eq!(bridges[0].to_bs58(), TRUSTED_BRIDGE_ID_BS58);
 
@@ -161,5 +204,46 @@ mod tests {
             address_contract_code_hash().is_some(),
             "the address contract code hash must be 32 hex-encoded bytes"
         );
+    }
+
+    /// An invoice for a network no bridge watches can never be shown to have
+    /// been paid, and looks entirely normal. Refusing to build one is the only
+    /// point at which that is visible.
+    #[test]
+    fn a_network_with_no_bridge_cannot_be_invoiced_for() {
+        for network in [
+            BitcoinNetwork::Bitcoin,
+            BitcoinNetwork::Testnet4,
+            BitcoinNetwork::Regtest,
+        ] {
+            let err = default_trusted_bridges(network)
+                .expect_err("a network with no bridge must be refused");
+            assert!(
+                err.contains(network.as_str()),
+                "the error must name the network: {err}"
+            );
+        }
+    }
+
+    /// The default network has to be one the build can settle on, or the form
+    /// opens pre-set to a choice that cannot produce a payable invoice.
+    #[test]
+    fn the_default_network_is_one_this_build_can_settle() {
+        assert!(settleable_networks().contains(&default_network()));
+    }
+
+    /// A network we can settle on must also have a tip contract to measure
+    /// confirmations against; without one the bridge's observations cannot be
+    /// dated. The two lists are maintained separately, so this is the check
+    /// that they agree.
+    #[test]
+    fn every_settleable_network_has_a_tip_contract() {
+        for network in settleable_networks() {
+            assert!(
+                well_known_tip_contract_id(*network).is_some(),
+                "{} is offered for settlement but has no tip contract",
+                network.as_str()
+            );
+        }
     }
 }
