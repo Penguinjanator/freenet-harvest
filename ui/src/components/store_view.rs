@@ -29,8 +29,12 @@ pub fn StoreView() -> Element {
                 .map(|(k, v)| (k.clone(), v.clone()))
         });
 
-    // A link was followed but the store's state hasn't come back yet.
-    let awaiting_link = store_entry.is_none() && app_state.active_store_id.is_some();
+    // A link was followed but the store's state hasn't come back yet. Once
+    // `store_link_error` is set the wait is over and the message changes --
+    // otherwise this reads "Loading store..." for the rest of the session.
+    let link_error = app_state.store_link_error.clone();
+    let awaiting_link =
+        store_entry.is_none() && app_state.active_store_id.is_some() && link_error.is_none();
 
     rsx! {
         div {
@@ -43,6 +47,12 @@ pub fn StoreView() -> Element {
                 None if awaiting_link => {
                     rsx! {
                         p { class: "text-muted text-italic", "Loading store..." }
+                    }
+                }
+                None if link_error.is_some() => {
+                    let message = link_error.clone().unwrap_or_default();
+                    rsx! {
+                        p { class: "text-warning", "{message}" }
                     }
                 }
                 None => {

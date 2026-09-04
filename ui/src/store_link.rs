@@ -28,6 +28,14 @@ use freenet_stdlib::prelude::ContractInstanceId;
 /// The parameter naming the store to open.
 const STORE_PARAM: &str = "store";
 
+/// How long a linked store has to arrive before the user is told it could not
+/// be opened. `get_contract` reports only failures to *send* the GET; one that
+/// errors in the network, or that names a contract nobody holds, produces no
+/// response at all, so a timeout is the only thing that ever ends the Browse
+/// tab's "Loading store..." message.
+#[cfg(target_arch = "wasm32")]
+const LINK_LOAD_TIMEOUT_MS: u32 = 30_000;
+
 /// Look up `name` in an `a=1&b=2` parameter string, tolerating the leading
 /// `#` or `?` that `location.hash()` / `location.search()` include.
 fn param<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
@@ -115,13 +123,24 @@ pub fn open_store_from_url() {
         .begin_browsing(store_id.as_bytes().to_vec());
 
     wasm_bindgen_futures::spawn_local(async move {
+        let contract_id = store_id.as_bytes().to_vec();
         if let Err(e) = crate::gateway::get_contract(&store_id, true).await {
-            dioxus::logger::tracing::error!("Failed to open store from link: {e}");
-            crate::gateway::APP_STATE
-                .write()
-                .notifications
-                .push(format!("Couldn't open that store link: {e}"));
+            crate::gateway::APP_STATE.write().note_store_link_failed(
+                &contract_id,
+                &format!("Couldn't open that store link: {e}"),
+            );
+            return;
         }
+
+        // The GET is out. Nothing will report back if it dead-ends -- a
+        // contract nobody holds simply never answers -- so give it a
+        // deadline and say so if it passes.
+        gloo_timers::future::TimeoutFuture::new(LINK_LOAD_TIMEOUT_MS).await;
+        crate::gateway::APP_STATE.write().note_store_link_failed(
+            &contract_id,
+            "That store didn't load. The link may be wrong, or the store may \
+             not be reachable right now.",
+        );
     });
 }
 

@@ -36,6 +36,15 @@ pub struct AppState {
     /// iterates first" is not a safe answer to "which store is on screen".
     pub active_store_id: Option<Vec<u8>>,
 
+    /// Why the store named by a link could not be opened, if it couldn't.
+    /// Without this the Browse tab sits on "Loading store..." forever: a GET
+    /// that fails after it left the client is only logged, and nothing in the
+    /// response path can attribute the failure back to the link that caused
+    /// it. bs58 has no checksum either, so a one-character typo in a store id
+    /// usually still decodes to 32 valid-looking bytes and is dispatched as a
+    /// GET for a contract that does not exist.
+    pub store_link_error: Option<String>,
+
     /// Maps reputation contract IDs back to their store contract IDs,
     /// so reputation state can be matched to the right store.
     pub reputation_to_store: HashMap<Vec<u8>, Vec<u8>>,
@@ -149,6 +158,31 @@ impl AppState {
             .entry(store_contract_id.clone())
             .or_default();
         self.active_store_id = Some(store_contract_id);
+        self.store_link_error = None;
+    }
+
+    /// Record that a store opened from a link could not be loaded, so the
+    /// Browse tab can say so instead of showing "Loading store..." forever.
+    ///
+    /// Returns whether an error was recorded. Two things that look like
+    /// failures aren't: a state that arrived while the timeout was still
+    /// running, and a store the user has since navigated away from -- the
+    /// message is shown for whichever store is active, so reporting a stale
+    /// one would blame the wrong link.
+    pub fn note_store_link_failed(&mut self, store_contract_id: &[u8], reason: &str) -> bool {
+        if self.active_store_id.as_deref() != Some(store_contract_id) {
+            return false;
+        }
+        if self
+            .browsing_stores
+            .get(store_contract_id)
+            .is_some_and(|store| store.info.is_some())
+        {
+            return false;
+        }
+        warn!("Store link could not be opened: {reason}");
+        self.store_link_error = Some(reason.to_string());
+        true
     }
 
     /// Fold the delegate's answer to `ListStores` into what we already know,
@@ -435,12 +469,7 @@ impl AppState {
                     .map(|stores| {
                         stores
                             .iter()
-                            .map(|s| {
-                                (
-                                    s.store_contract_id.clone(),
-                                    s.mailbox_contract_id.clone(),
-                                )
-                            })
+                            .map(|s| (s.store_contract_id.clone(), s.mailbox_contract_id.clone()))
                             .collect()
                     })
                     .unwrap_or_default();
@@ -1159,6 +1188,65 @@ mod tests {
             state.my_stores[FINGERPRINT][0].store_contract_id,
             vec![7u8; 32]
         );
+    }
+
+    /// A link whose store never arrives has to end in a message, not in
+    /// "Loading store..." forever. See `note_store_link_failed`.
+    #[test]
+    fn a_store_that_never_arrives_becomes_an_error() {
+        let mut state = AppState::default();
+        state.begin_browsing(vec![9u8; 32]);
+        assert_eq!(state.store_link_error, None);
+
+        assert!(state.note_store_link_failed(&[9u8; 32], "didn't load"));
+        assert_eq!(state.store_link_error.as_deref(), Some("didn't load"));
+    }
+
+    /// A store whose state arrived while the timeout was still running is not
+    /// a failure, and must not be reported as one.
+    #[test]
+    fn a_store_that_did_arrive_is_not_reported_as_failed() {
+        let mut state = AppState::default();
+        state.begin_browsing(vec![9u8; 32]);
+        state
+            .browsing_stores
+            .get_mut(&vec![9u8; 32])
+            .expect("begin_browsing creates the entry")
+            .info = Some(StoreInfoV1 {
+            version: 1,
+            certificate_pem: String::new(),
+            seller_fingerprint: FINGERPRINT.to_string(),
+            reputation_contract_id: [0u8; 32],
+            store_name: "Loaded".to_string(),
+            description: String::new(),
+            payment_instructions: String::new(),
+        });
+
+        assert!(!state.note_store_link_failed(&[9u8; 32], "didn't load"));
+        assert_eq!(state.store_link_error, None);
+    }
+
+    /// Opening another link clears the previous failure, or the error from a
+    /// dead link outlives it.
+    #[test]
+    fn opening_another_link_clears_a_previous_error() {
+        let mut state = AppState::default();
+        state.begin_browsing(vec![9u8; 32]);
+        state.note_store_link_failed(&[9u8; 32], "didn't load");
+        state.begin_browsing(vec![10u8; 32]);
+        assert_eq!(state.store_link_error, None);
+    }
+
+    /// A timeout that fires for a store the user has already navigated away
+    /// from must not blame the link they are looking at now.
+    #[test]
+    fn a_timeout_for_an_abandoned_store_is_ignored() {
+        let mut state = AppState::default();
+        state.begin_browsing(vec![9u8; 32]);
+        state.begin_browsing(vec![10u8; 32]);
+
+        assert!(!state.note_store_link_failed(&[9u8; 32], "didn't load"));
+        assert_eq!(state.store_link_error, None);
     }
 
     /// Every `StoreList` answer names every store, and a ghostkey
