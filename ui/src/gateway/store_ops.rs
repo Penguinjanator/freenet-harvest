@@ -20,6 +20,22 @@ pub enum KeyOrigin {
     Reconstructed,
 }
 
+/// Bytes of a store-contract delta carrying only listings.
+///
+/// The store contract's delta is the `StoreStateV1Delta` the `#[composable]`
+/// macro generates -- a struct of one `Option` per field -- not the inner
+/// field's own delta. Sending the bare `Vec<AuthorizedListing>` produces CBOR
+/// the contract rejects outright with "invalid type: sequence, expected map",
+/// so the listing never lands and the failure says nothing about why.
+fn listings_delta_bytes(listings: Vec<AuthorizedListing>) -> Result<Vec<u8>, String> {
+    harvest_common::to_cbor(&harvest_common::store::StoreStateV1Delta {
+        info: None,
+        listings: Some(listings),
+        orders: None,
+    })
+    .map_err(|e| format!("serialize listing delta: {e}"))
+}
+
 /// The `ContractKey` for a store, which is what sending it an update needs.
 ///
 /// The key is written down exactly once, locally, when the store is created.
@@ -248,9 +264,7 @@ pub async fn submit_listing_by_id(
     }
 
     let title = listing.listing.title.clone();
-    let delta = vec![listing];
-    let delta_bytes =
-        harvest_common::to_cbor(&delta).map_err(|e| format!("serialize listing delta: {e}"))?;
+    let delta_bytes = listings_delta_bytes(vec![listing])?;
 
     super::update_contract(
         &contract_key,
@@ -356,6 +370,25 @@ mod tests {
         assert_ne!(
             key.code_hash(),
             ContractCode::from(STORE_CONTRACT_WASM.to_vec()).hash()
+        );
+    }
+
+    /// The store contract's delta is `StoreStateV1Delta`, a struct of
+    /// `Option`s -- not the listings field's own delta. Sending the bare
+    /// `Vec` was CBOR the contract could not read, so no listing ever landed.
+    #[test]
+    fn a_listing_delta_is_shaped_like_the_contracts_delta() {
+        let bytes = listings_delta_bytes(Vec::new()).expect("serialize");
+        let delta = harvest_common::from_cbor::<harvest_common::store::StoreStateV1Delta>(&bytes)
+            .expect("the contract must be able to read its own delta");
+        assert!(delta.listings.is_some());
+        assert!(delta.info.is_none() && delta.orders.is_none());
+
+        // The shape that was being sent, pinned so it cannot come back.
+        let bare = harvest_common::to_cbor(&Vec::<AuthorizedListing>::new()).expect("serialize");
+        assert!(
+            harvest_common::from_cbor::<harvest_common::store::StoreStateV1Delta>(&bare).is_err(),
+            "a bare Vec is not a store delta"
         );
     }
 
