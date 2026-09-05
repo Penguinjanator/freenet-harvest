@@ -3,6 +3,34 @@ use harvest_common::listing::Listing;
 
 use super::listing_form::ListingForm;
 use crate::gateway::APP_STATE;
+use crate::state::{StoreDetails, StoreDetailsGap};
+
+/// One store a seller owns, as the identity card shows it.
+#[derive(Clone, PartialEq)]
+struct StoreCard {
+    contract_id: Vec<u8>,
+    label: String,
+    /// `None` when the page URL is unavailable, as on a native build.
+    link: Option<String>,
+    /// Set when the store's published details need repairing.
+    gap: Option<StoreDetailsGap>,
+    /// Current values, to fill the form with when editing.
+    details: StoreDetails,
+    /// Whether we actually know what this store has published: its state has
+    /// arrived, or the GET for it gave up. False means the form below would
+    /// be filled with empty strings that look like lost details, and an edit
+    /// submitted from it could not be given a version the contract accepts.
+    /// See `state::AppState::store_details_are_resolved`.
+    details_resolved: bool,
+    /// The verdict a BUYER reaches about this store's ghostkey certificate.
+    ///
+    /// Shown to the seller because it is the one thing about their own store
+    /// they cannot otherwise see. Nothing in the publishing path fails when
+    /// the certificate is unusable -- the store publishes, the listings
+    /// publish, and only the buyer's storefront says the identity is
+    /// unbacked. Reading the same verdict here is what closes that gap.
+    certificate: crate::ghostkey_cert::CertificateStatus,
+}
 
 #[component]
 pub fn MyStore() -> Element {
@@ -76,7 +104,7 @@ fn ConnectAnother(in_flight: bool) -> Element {
 /// one-element `GhostKeyList` for the chosen key, which the response
 /// handler folds into APP_STATE.ghostkeys -- our `IdentityList`
 /// renders as soon as it appears.
-fn connect_ghostkey() {
+pub(crate) fn connect_ghostkey() {
     use ghostkey_common::GhostkeyRequest;
 
     // Snapshot delegate key + check the in-flight flag in a single
@@ -143,7 +171,7 @@ fn IdentityList(
             for gk in &ghostkeys {
                 IdentityCard {
                     identity: gk.clone(),
-                    has_store: my_stores.contains_key(&gk.fingerprint),
+                    stores: my_stores.get(&gk.fingerprint).cloned().unwrap_or_default(),
                     has_rsa_key: rsa_keys.contains_key(&gk.fingerprint),
                     has_harvest_delegate: has_harvest_delegate,
                 }
@@ -155,13 +183,67 @@ fn IdentityList(
 #[component]
 fn IdentityCard(
     identity: ghostkey_common::GhostKeyInfo,
-    has_store: bool,
+    stores: Vec<harvest_common::StoreRegistration>,
     has_rsa_key: bool,
     has_harvest_delegate: bool,
 ) -> Element {
     let mut show_listing_form = use_signal(|| false);
     let mut show_store_form = use_signal(|| false);
+    // Which store's details form is open, if any. One signal rather than one
+    // per store: hooks cannot be created inside a loop.
+    let mut editing_store = use_signal(|| Option::<Vec<u8>>::None);
     let fp = identity.fingerprint.clone();
+    let has_store = !stores.is_empty();
+
+    // Buyers can only reach a store through a link the seller sends them, so
+    // the seller has to be able to see it. Built here rather than in rsx
+    // because it needs the page URL, which native builds don't have.
+    //
+    // Each store is labelled: a seller with two stores otherwise gets two
+    // 44-character links with nothing to tell them apart.
+    let store_cards: Vec<StoreCard> = {
+        let app_state = APP_STATE.read();
+        stores
+            .iter()
+            .filter_map(|store| {
+                if store.store_contract_id.len() != 32 {
+                    // Dropping this silently left the seller a link short
+                    // with no indication which store was missing. Such a
+                    // store cannot be updated either -- its contract key
+                    // cannot be rebuilt -- so there is nothing to offer.
+                    dioxus::logger::tracing::warn!(
+                        "Store registration has a {}-byte contract id, not 32 -- no share link",
+                        store.store_contract_id.len()
+                    );
+                    return None;
+                }
+                let browsing = app_state.browsing_stores.get(&store.store_contract_id);
+                let info = browsing.and_then(|browsing| browsing.info.as_ref());
+                let name = info.map(|info| info.store_name.clone());
+                Some(StoreCard {
+                    label: crate::store_link::store_label(
+                        &store.store_contract_id,
+                        name.as_deref(),
+                    ),
+                    link: crate::store_link::share_link(&store.store_contract_id),
+                    gap: crate::state::store_details_gap(info),
+                    details: StoreDetails {
+                        store_name: info.map(|i| i.store_name.clone()).unwrap_or_default(),
+                        description: info.map(|i| i.description.clone()).unwrap_or_default(),
+                        payment_instructions: info
+                            .map(|i| i.payment_instructions.clone())
+                            .unwrap_or_default(),
+                    },
+                    details_resolved: app_state
+                        .store_details_are_resolved(&store.store_contract_id),
+                    certificate: browsing
+                        .map(|browsing| browsing.certificate_status.clone())
+                        .unwrap_or_default(),
+                    contract_id: store.store_contract_id.clone(),
+                })
+            })
+            .collect()
+    };
 
     rsx! {
         div { class: "identity-card",
@@ -195,9 +277,117 @@ fn IdentityCard(
             }
         }
 
+        if !store_cards.is_empty() {
+            div { class: "store-share",
+                p { class: "text-muted",
+                    "Share this link so buyers can open your store:"
+                }
+                for card in store_cards.iter().cloned() {
+                    div { class: "store-share-row",
+                        span { class: "store-share-label", "{card.label}" }
+                        if let Some(ref link) = card.link {
+                            input {
+                                class: "form-input",
+                                readonly: true,
+                                value: "{link}",
+                            }
+                        }
+
+                        // Nothing is offered until we know what the store
+                        // has published. Before this, the button said "Edit
+                        // details" and the form opened filled with empty
+                        // strings -- which reads as details that have been
+                        // lost, so the seller retypes them, and the edit is
+                        // then published at a version the store contract
+                        // discards as stale.
+                        if !card.details_resolved {
+                            p { class: "text-muted text-italic",
+                                "Loading this store's published details…"
+                            }
+                        } else {
+                            // The repair prompt. Says what is wrong and what
+                            // publishing fixes, rather than offering a bare form
+                            // and leaving the seller to guess why it is there.
+                            if let Some(gap) = card.gap {
+                                p { class: "text-warning", "{gap.message()}" }
+                            }
+
+                            // Editing the details will not fix this, so it is
+                            // deliberately not phrased as a repair prompt: a
+                            // certificate that does not verify is either an
+                            // identity this build cannot read or one that is
+                            // not the seller's, and both need looking at
+                            // rather than republishing.
+                            if !card.certificate.is_verified() {
+                                p { class: "text-warning",
+                                    "Buyers see this store as unbacked: {card.certificate.label()}."
+                                    if let Some(why) = card.certificate.detail() {
+                                        " ({why})"
+                                    }
+                                }
+                            }
+
+                            button {
+                                class: if card.gap.is_some() { "btn btn-sm btn-primary" } else { "btn btn-sm btn-outline" },
+                                onclick: {
+                                    let id = card.contract_id.clone();
+                                    move |_| {
+                                        let id = id.clone();
+                                        if editing_store() == Some(id.clone()) {
+                                            editing_store.set(None);
+                                        } else {
+                                            editing_store.set(Some(id));
+                                        }
+                                    }
+                                },
+                                if editing_store() == Some(card.contract_id.clone()) {
+                                    "Cancel"
+                                } else if card.gap.is_some() {
+                                    "Publish details"
+                                } else {
+                                    "Edit details"
+                                }
+                            }
+
+                            // The invoice FORM sits under the store it
+                            // issues on -- an invoice goes to one store's
+                            // contract, and a seller with two stores has to be
+                            // able to tell which. The payment KEY inside this
+                            // panel is not per-store: it is one key and one
+                            // derivation counter for the whole app, shown here
+                            // because this is where it is needed. The panel
+                            // says so rather than letting the placement imply
+                            // otherwise.
+                            super::invoice_form::StorePayments {
+                                store_contract_id: card.contract_id.clone(),
+                                seller_fingerprint: fp.clone(),
+                            }
+
+                            if editing_store() == Some(card.contract_id.clone()) {
+                                StoreDetailsForm {
+                                    heading: if card.gap.is_some() { "Publish Store Details" } else { "Edit Store Details" },
+                                    submit_label: "Publish",
+                                    initial: card.details.clone(),
+                                    on_submit: {
+                                        let id = card.contract_id.clone();
+                                        move |details: StoreDetails| {
+                                            editing_store.set(None);
+                                            publish_store_details(id.clone(), details);
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if show_store_form() {
-            StoreCreationForm {
-                fingerprint: identity.fingerprint.clone(),
+            StoreDetailsForm {
+                heading: "Create Your Store",
+                submit_label: "Create Store",
+                initial: StoreDetails::default(),
                 on_submit: move |details: StoreDetails| {
                     show_store_form.set(false);
                     initiate_store_creation(identity.fingerprint.clone(), details);
@@ -217,21 +407,23 @@ fn IdentityCard(
     }
 }
 
-struct StoreDetails {
-    store_name: String,
-    description: String,
-    payment_instructions: String,
-}
-
+/// The store-details form, used both to create a store and to change or
+/// repair the details of one that already exists. One component rather than
+/// two: the fields are the same, and a second copy is how the two drift.
 #[component]
-fn StoreCreationForm(fingerprint: String, on_submit: EventHandler<StoreDetails>) -> Element {
-    let mut store_name = use_signal(String::new);
-    let mut description = use_signal(String::new);
-    let mut payment_instructions = use_signal(String::new);
+fn StoreDetailsForm(
+    heading: String,
+    submit_label: String,
+    initial: StoreDetails,
+    on_submit: EventHandler<StoreDetails>,
+) -> Element {
+    let mut store_name = use_signal(|| initial.store_name.clone());
+    let mut description = use_signal(|| initial.description.clone());
+    let mut payment_instructions = use_signal(|| initial.payment_instructions.clone());
 
     rsx! {
         div { class: "card",
-            h3 { "Create Your Store" }
+            h3 { "{heading}" }
 
             div { class: "form-group",
                 label { class: "form-label", "Store Name" }
@@ -274,8 +466,32 @@ fn StoreCreationForm(fingerprint: String, on_submit: EventHandler<StoreDetails>)
                         payment_instructions: payment_instructions().trim().to_string(),
                     });
                 },
-                "Create Store"
+                "{submit_label}"
             }
+        }
+    }
+}
+
+/// Publish new details for a store the seller owns.
+///
+/// Both the ordinary edit and the repair of a store whose details never
+/// reached the network come through here -- they are the same operation, and
+/// the only difference is which version it lands at.
+fn publish_store_details(store_contract_id: Vec<u8>, details: StoreDetails) {
+    let outcome = APP_STATE
+        .write()
+        .publish_store_details(&store_contract_id, details);
+    match outcome {
+        Ok(()) => APP_STATE
+            .write()
+            .notifications
+            .push("Publishing your store's details…".into()),
+        Err(e) => {
+            dioxus::logger::tracing::error!("Could not publish store details: {e}");
+            APP_STATE
+                .write()
+                .notifications
+                .push(format!("Could not publish your store's details: {e}"));
         }
     }
 }
@@ -341,6 +557,7 @@ fn initiate_store_creation(_fingerprint: String, _details: StoreDetails) {
                 store_name: details.store_name,
                 description: details.description,
                 payment_instructions: details.payment_instructions,
+                rsa_public_key_der: None,
             });
 
             // Step 1: Request the ghostkey certificate to get the verifying key
@@ -441,17 +658,6 @@ fn sign_and_submit_listing(_fingerprint: String, _listing: Listing) {
                 }
             };
 
-            if let Err(e) = crate::gateway::send_delegate_message(&gk_delegate_key, payload).await {
-                dioxus::logger::tracing::error!("Failed to send SignMessage: {}", e);
-                return;
-            }
-
-            dioxus::logger::tracing::info!(
-                "Sent listing for signing (fingerprint: {}, title: {})",
-                fingerprint,
-                listing.title
-            );
-
             // Find the store contract ID for this fingerprint
             let store_contract_id = {
                 let state = APP_STATE.read();
@@ -462,11 +668,31 @@ fn sign_and_submit_listing(_fingerprint: String, _listing: Listing) {
                     .map(|s| s.store_contract_id.clone())
             };
 
-            APP_STATE.write().pending_listing = Some(crate::state::PendingListing {
+            let title = listing.title.clone();
+            // Queue before sending. This used to be recorded afterwards, so
+            // a `SignResult` that arrived before the send returned found
+            // nothing waiting and the signed listing was dropped.
+            APP_STATE.write().pending_signatures.push_back(
+                crate::state::PendingSignature::Listing(crate::state::PendingListing {
+                    fingerprint: fingerprint.clone(),
+                    listing,
+                    store_contract_id,
+                }),
+            );
+
+            if let Err(e) = crate::gateway::send_delegate_message(&gk_delegate_key, payload).await {
+                dioxus::logger::tracing::error!("Failed to send SignMessage: {}", e);
+                // Nothing will answer this one, and leaving it queued would
+                // make it consume the next signature that arrives.
+                APP_STATE.write().pending_signatures.pop_back();
+                return;
+            }
+
+            dioxus::logger::tracing::info!(
+                "Sent listing for signing (fingerprint: {}, title: {})",
                 fingerprint,
-                listing,
-                store_contract_id,
-            });
+                title
+            );
         });
     }
 }

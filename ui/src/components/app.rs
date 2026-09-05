@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 
+use super::bitcoin_view::BitcoinView;
 use super::my_store::MyStore;
 use super::reputation_view::ReputationView;
 use super::store_view::StoreView;
@@ -10,6 +11,7 @@ enum Route {
     Browse,
     MyStore,
     Reputation,
+    Payments,
 }
 
 #[component]
@@ -34,11 +36,58 @@ pub fn App() -> Element {
 
                 dioxus::logger::tracing::info!("Connected -- registering delegates");
 
+                // If this page was opened from a shared store link, fetch and
+                // subscribe to that store now. It needs only the websocket:
+                // a buyer following a seller's link has no ghostkey and needs
+                // neither delegate to read a store.
+                crate::store_link::open_store_from_url();
+
                 let harvest_wasm = include_bytes!("../../public/contracts/harvest_delegate.wasm");
                 match crate::gateway::register_delegate(harvest_wasm).await {
                     Ok(key) => {
                         dioxus::logger::tracing::info!("Harvest delegate registered: {:?}", key);
                         crate::gateway::APP_STATE.write().harvest_delegate_key = Some(key);
+
+                        // Kick off the Bitcoin surface: bridge config (needed
+                        // for the first-run status panel, no credential
+                        // required) and the private watch list. Each of
+                        // these subscribes to whatever Bitcoin contracts it
+                        // learns about as its response arrives -- see
+                        // `AppState::on_bitcoin_delegate_response`.
+                        if let Err(e) = crate::gateway::bitcoin_ops::get_bridge().await {
+                            dioxus::logger::tracing::error!("Failed to fetch bridge config: {e}");
+                        }
+                        if let Err(e) = crate::gateway::bitcoin_ops::list_watched().await {
+                            dioxus::logger::tracing::error!("Failed to fetch watch list: {e}");
+                        }
+                        // And the seller's payment key, so "My Store" knows
+                        // whether it can offer to issue an invoice at all
+                        // rather than prompting for a key that is already set.
+                        if let Err(e) = crate::gateway::bitcoin_ops::get_payment_xpub().await {
+                            dioxus::logger::tracing::error!("Failed to fetch payment key: {e}");
+                            // Nothing will answer, so mark it answered. Left
+                            // false, `PaymentKeyPanel` sits on "Checking your
+                            // payment key…" for the rest of the session and
+                            // the seller can never reach the form to set one.
+                            // Showing the form when we do not know is the safe
+                            // direction: setting the key again is harmless
+                            // (the counter is preserved -- see the delegate's
+                            // `apply_set_payment_xpub`), being unable to set
+                            // it at all is not.
+                            crate::gateway::APP_STATE
+                                .write()
+                                .bitcoin
+                                .payment_xpub_loaded = true;
+                        }
+                        // No bridge may be configured for the active/default
+                        // network yet, in which case there's nothing to
+                        // subscribe to until one is. Try the default network
+                        // directly too, so the first-run panel gets live
+                        // data even before any watch or bridge config exists.
+                        let default_network = crate::gateway::bitcoin_config::default_network();
+                        crate::gateway::APP_STATE
+                            .write()
+                            .register_tip_contract(default_network);
                     }
                     Err(e) => {
                         dioxus::logger::tracing::error!(
@@ -85,11 +134,14 @@ pub fn App() -> Element {
     // Update document title based on current view
     {
         let app_state = crate::gateway::APP_STATE.read();
+        // Ask the same question `StoreView` asks, through the same helper.
+        // Reading `browsing_stores` directly here picked the map's first
+        // loaded entry, so once a second store loaded the page was titled
+        // after a store the user was not looking at.
         let store_name = app_state
-            .browsing_stores
-            .values()
-            .find_map(|s| s.info.as_ref())
-            .map(|i| i.store_name.as_str());
+            .displayed_store()
+            .and_then(|(_, store)| store.info.as_ref())
+            .map(|info| info.store_name.as_str());
 
         match (&current_route(), store_name) {
             (Route::Browse, Some(name)) => crate::document_title::set_store_title(name),
@@ -132,6 +184,11 @@ pub fn App() -> Element {
                         onclick: move |_| current_route.set(Route::Reputation),
                         "Reputation"
                     }
+                    button {
+                        class: if current_route() == Route::Payments { "nav-btn active" } else { "nav-btn" },
+                        onclick: move |_| current_route.set(Route::Payments),
+                        "Payments"
+                    }
                 }
             }
 
@@ -141,6 +198,7 @@ pub fn App() -> Element {
                 Route::Browse => rsx! { StoreView {} },
                 Route::MyStore => rsx! { MyStore {} },
                 Route::Reputation => rsx! { ReputationView {} },
+                Route::Payments => rsx! { BitcoinView {} },
             }
 
             // Footer with build timestamp

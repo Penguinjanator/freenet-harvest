@@ -20,7 +20,7 @@ pub async fn send_delegate_message(
     {
         let request = ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
             key: delegate_key.clone(),
-            params: Parameters::from(Vec::<u8>::new()),
+            params: Parameters::from(harvest_common::delegate::DELEGATE_PARAMETERS),
             inbound: vec![InboundDelegateMsg::ApplicationMessage(
                 ApplicationMessage::new(payload),
             )],
@@ -51,7 +51,7 @@ pub async fn get_contract(
         info!("GET contract (subscribe={subscribe}): {:?}", contract_key);
 
         let request = ClientRequest::ContractOp(ContractRequest::Get {
-            key: contract_key.clone(),
+            key: *contract_key,
             return_contract_code: false,
             subscribe,
             blocking_subscribe: false,
@@ -72,6 +72,18 @@ pub async fn get_contract(
     }
 }
 
+/// GET-and-subscribe a contract by its raw 32-byte instance id.
+///
+/// Contract ids reach the UI as `Vec<u8>` -- from delegate registrations and
+/// from other contracts' state -- so this is the one place that checks the
+/// length before turning them into a `ContractInstanceId`.
+pub async fn get_contract_by_id(contract_id: &[u8]) -> Result<(), String> {
+    let id_bytes: [u8; 32] = contract_id
+        .try_into()
+        .map_err(|_| "contract id must be 32 bytes".to_string())?;
+    get_contract(&ContractInstanceId::new(id_bytes), true).await
+}
+
 /// Send a contract update (delta or full state).
 pub async fn update_contract(
     contract_key: &ContractKey,
@@ -80,7 +92,7 @@ pub async fn update_contract(
     #[cfg(target_arch = "wasm32")]
     {
         let request = ClientRequest::ContractOp(ContractRequest::Update {
-            key: contract_key.clone(),
+            key: *contract_key,
             data,
         });
 
@@ -131,15 +143,27 @@ pub async fn register_delegate(delegate_wasm: &[u8]) -> Result<DelegateKey, Stri
     #[cfg(target_arch = "wasm32")]
     {
         let delegate_code = DelegateCode::from(delegate_wasm.to_vec());
-        let params = Parameters::from(Vec::<u8>::new());
+        // Half of the delegate's address, so it is named once
+        // (`harvest_common::delegate::DELEGATE_PARAMETERS`) rather than spelled
+        // out here and again at every other registration site. The address
+        // guard reads the same constant, so a change to it shows up as a moved
+        // delegate key instead of as nothing at all.
+        let params = Parameters::from(harvest_common::delegate::DELEGATE_PARAMETERS);
         let delegate = Delegate::from((&delegate_code, &params));
         let container = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate));
         let key = container.key().clone();
 
+        // `DelegateRequest::DEFAULT_CIPHER` / `DEFAULT_NONCE` existed in
+        // freenet-stdlib 0.6 and are gone in 0.8. Zeroes are the correct
+        // replacement rather than a placeholder: since freenet-core#4140 the
+        // node IGNORES the client-supplied cipher and nonce entirely and
+        // derives a per-delegate key from its own KEK, so these bytes never
+        // reach any cryptographic operation. ghostkeys does the same thing for
+        // the same reason (`ui/src/api/delegate.rs`).
         let request = ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate {
             delegate: container,
-            cipher: DelegateRequest::DEFAULT_CIPHER,
-            nonce: DelegateRequest::DEFAULT_NONCE,
+            cipher: [0u8; 32],
+            nonce: [0u8; 24],
         });
 
         let mut api = super::WEB_API.write();

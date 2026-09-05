@@ -37,6 +37,7 @@ The contract and delegate WASMs are built by one script, and only by it:
 
 ```bash
 ./scripts/build-contract-wasm.sh          # build, print BLAKE3 code hashes
+cargo make code-hashes                   # print full ADDRESSES (code hash + parameters)
 ./scripts/build-contract-wasm.sh --sync   # also refresh ui/public/contracts/
 ```
 

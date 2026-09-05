@@ -1,0 +1,107 @@
+# Superseded generations of the Harvest delegate.
+#
+# See README.md in this directory for the rules. Oldest first; the CURRENT
+# generation is derived from the WASM this build ships and is never listed
+# here.
+#
+# A delegate's secrets live at `secrets_dir/<delegate-key>/` on the node, so a
+# re-key strands EVERY secret this delegate holds: the RSA reputation keypair,
+# the transaction records, the per-identity store registry, and the Bitcoin
+# watch list and bridge config. None of it is on the network, so nothing else
+# can recover it.
+#
+# `delegate_key` is `BLAKE3(code_hash || params)` and Harvest's delegate params
+# are EMPTY (`register_delegate` passes `Parameters::from(Vec::new())`), so the
+# key is `BLAKE3(code_hash)`. It is recorded explicitly rather than derived at
+# runtime because it is the address the old delegate actually had; the build
+# re-derives it and FAILS if a row disagrees, so a typo here is a build error
+# rather than a probe that quietly targets nothing.
+#
+# WHAT THESE ROWS CAN AND CANNOT RECOVER. The export/import handshake needs the
+# PREDECESSOR delegate to answer an export request, and no generation before V5
+# has an export handler -- `handle_request` in V1-V4 rejects any payload that is
+# neither a `HarvestDelegateRequest` nor a `BitcoinDelegateRequest`. So the
+# V1-V4 rows are recorded for completeness and for the record of what was
+# deployed, and the sweep will classify every one of them `Unresponsive`: it
+# adopts nothing and, correctly, seals nothing, so it retries forever at no
+# cost but recovers nothing. Secrets held under V1-V4 are lost.
+#
+# From V5 on the export handler is PRESENT, which is the half that had to land
+# early: it cannot be added to a generation retroactively, so every release
+# without it adds another permanently unrecoverable one. Keep it that way.
+#
+# Be precise about what that buys today, because it is easy to read as more.
+# The handler answers an export request; NOTHING ASKS. `delegate_lineage()` in
+# `ui/src/migrate.rs` has no caller outside tests, so no re-key has actually
+# carried a secret forward yet -- V5 to V6 and V6 to V7 both lost everything,
+# exactly as V1-V4 did. The rows say a successor COULD recover from these
+# generations, not that one has.
+#
+# From V7 the cost of that gap includes the Bitcoin derivation counter, and
+# that one is worse than the others: the RSA keypair and the watch list are
+# things a seller can recreate, while a reset counter re-issues addresses that
+# already have live invoices against them. Until the driver exists, a seller
+# crossing a delegate re-key should point Harvest at a fresh wallet account.
+
+[[entry]]
+version = "V1"
+description = "First delegate; RSA blind signing, listing management and transaction state. Also the WASM at ded0e3a -- 4feb95b built it and ded0e3a embedded the same bytes. No export handler, so its secrets are not recoverable"
+date = "2026-04-16"
+code_hash = "1fa5776b332464a22a99ca80d0079cf82120cfc57b195023af8bd6ec8dfd0bfd"
+delegate_key = "832c75e1fd092b41d3d85567307660e15a095e5c29b466fe9657b205ee95eadb"
+
+[[entry]]
+version = "V2"
+description = "Superseded by the Bitcoin payments work: the BitcoinDelegateRequest surface, the watch list and the bridge config. No export handler"
+date = "2026-09-02"
+code_hash = "2f805880b45c83ab25271e0da1e9528ab6a3f7e96dae730e4b5465227654877d"
+delegate_key = "3c0ea2c4e22fa0201c821387afc3f7dcce798775e242f41e77a79b180c4988f3"
+
+[[entry]]
+version = "V3"
+description = "Superseded by the chrono wasmbind fix and the getrandom custom-source registration (harvest#7, harvest#8) -- before those the module did not link or did not instantiate. No export handler"
+date = "2026-09-03"
+code_hash = "ddcecc5b3f1abd49194f103fec424ce6ad38f0ac8359a4bad92d9125ae43085e"
+delegate_key = "b7732bb753f7b2b7a99c175cd548d9c7d75f53091095379f4f7a7d6caa816379"
+
+[[entry]]
+version = "V4"
+description = "Superseded by the freenet-stdlib 0.6 -> 0.8.5 bump taken to adopt freenet-migrate. The last generation with no export handler"
+date = "2026-09-04"
+code_hash = "57b467532105613f28829c0fac8a4d72d0a146593d6d64430892f5ce7009027a"
+delegate_key = "325bcfe3545934d812a613772e06878a3902f09d5c25d2dc32f7f1e111d506d8"
+
+[[entry]]
+version = "V5"
+description = "Superseded by the per-order Bitcoin bridge list and the payment-proof claim bounds. Both changes are in `harvest-common`, which is compiled into every artifact here, so the bytes moved. Nothing the delegate itself does changed. The FIRST generation carrying the export handler, so unlike V1-V4 its secrets are recoverable by a successor"
+date = "2026-09-04"
+code_hash = "230c2b581c4fa44de16cd9705413d099dfc5bff0634130907c1b81e0cee05c42"
+delegate_key = "ad56614dde8916d635462fe1504f2e2de98f954891f015abdbada28c30754eb6"
+
+[[entry]]
+version = "V6"
+description = "Superseded by moving the migration repeat-gate marker out of the browser's localStorage and into this delegate's own secret store, under `harvest:migrate:` (GetMigrationMarker / SetMigrationMarker). Recorded because the bytes were committed and could have been run, not because they were ever published. Carries the export handler, so its secrets -- markers included -- are recoverable by a successor"
+date = "2026-09-04"
+code_hash = "d6a387917599b8ae3746dd41f7ad45d2cc008adb7f4f98b26156ed66032e4aec"
+delegate_key = "da8d30151f66c8ac6f012cb65460a3b40982a1dac8f6795fe14dc93d1a655d7c"
+
+[[entry]]
+version = "V7"
+description = "Superseded by the per-order Bitcoin payment address: the successor gained the BIP-84 public-derivation module and a new secret, `harvest:bitcoin:payment-xpub:v1`, holding the seller's account key AND its derivation counter. NOTE the counter does NOT survive this re-key, despite the export handler: nothing in the UI drives the delegate export handshake yet (`ui/src/migrate.rs::delegate_lineage` has no caller outside tests), and even if it did, a successor imports through this delegate's own request handlers and no request can restore a counter. So a seller carried across this boundary starts at index 0 against a key whose earlier addresses may still have live invoices -- they should point Harvest at a FRESH account in their wallet rather than the same one"
+date = "2026-09-04"
+code_hash = "f6d6543524d359f54379bd9b0d79f5106a72d1d205b44b04f6375db74fde7e91"
+delegate_key = "50c46d944bf7acb8ca4a947da6583bff3870bbf584ef0146869678e089c1dfc8"
+
+[[entry]]
+version = "V8"
+description = "The first build of the payment-address work, superseded by its own review fixes before it left this branch. Recorded on the same footing as V6: the bytes were committed and could have been run, not because they were ever published. The fixes it lacks are the ones that matter here -- it restarted the derivation counter whenever the payment key was re-entered, even with the same key, and ignored whether the node accepted the counter write at all. Both hand out an address twice"
+date = "2026-09-04"
+code_hash = "f563abc42391938ad99ea47202177acbeddd1e41d517a1b92a49a6aa03a3a6eb"
+delegate_key = "00db1a23517217b598b03af5e35fc418d15c8d00b09fe2f42c20a2bc935d7fe3"
+
+[[entry]]
+version = "V9"
+description = "Superseded by the 2026-09-05 correctness review. Its own changes are the ones that matter here: every request is now gated on the caller, because the delegate's secret store is per-USER rather than per-app, so any web app the user had ever opened on this node could address it and reach the seller's payment key; and a migration seal is written only once the recovery is durably written and reachable. `harvest-common` is compiled into every artifact here, so its changes move these bytes whether or not this artifact's own behaviour changed. This generation carries the 2026-09-05 correctness review: `StoreStateV1::orders` gained `#[serde(default)]`, without which no V1 state decoded at all; `apply_delta` became all-or-nothing in orders, listings and feedback; the equal-rank order tie-break now keeps the SMALLER encoding and `AuthorizedOrder::verify` refuses any field the status does not consult, which together close a permanent third-party displacement of a paid order; a reversal now requires evidence the order was once covered; and confirmation depth is capped at what the bridge attested. The parameter structs also became `pub(crate)` with constructors so a second derivation no longer compiles -- a visibility change ONLY, not a field change: `cbor(StoreParameters)` is still 56 bytes and the V2..=V5 legacy parameter band is unaffected. `freenet-bitcoin-common` moved bbeed1e -> 0e5b9d9 for the attested-depth cap, and it links into all four artifacts as well. `scripts/build-contract-wasm.sh` is NOT among the causes: its reproducible-build fix landed in 47b67aa and was already in effect for the generation this supersedes"
+date = "2026-09-05"
+code_hash = "c11c732fce7c00344739cf94ec0934c45fd2fbb152d24fe7de1d353b9ee207a4"
+delegate_key = "9def598ae700df7f914eb16f2d5399121783bd432cbc9f2a0a417540cfff58da"

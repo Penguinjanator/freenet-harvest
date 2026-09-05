@@ -1,0 +1,64 @@
+# Superseded generations of the Harvest reputation contract.
+#
+# See README.md in this directory for the rules. Oldest first; the CURRENT
+# generation is derived from the WASM this build ships and is never listed
+# here.
+#
+# Instance ids are derived per seller: `BLAKE3(code_hash || cbor(
+# ReputationParameters))`, whose fields are the seller's RSA public key (DER)
+# and their ghostkey verifying key.
+#
+# THE RSA KEY IS THE ORDERING CONSTRAINT. `ReputationParameters
+# .rsa_public_key_der` is exactly the value the harvest delegate holds under
+# `harvest:rsa_pk:{fingerprint}` (see common/src/reputation.rs and
+# delegates/harvest-delegate/src/handlers.rs). So a reputation instance id --
+# for ANY generation, including the current one -- cannot be derived until the
+# delegate's secrets have been carried forward. Probing reputation first does
+# not merely fail to find anything: it would probe the WRONG ids and could seal
+# a "nothing there" marker over a recoverable instance. `ui/src/migrate.rs`
+# enforces the order in code.
+#
+# The state is an append-only (grow-only) set of feedback entries deduplicated
+# by nonce, so folding generations is idempotent and cannot lose an entry.
+
+[[entry]]
+version = "V1"
+description = "First reputation contract; store creation flow and contract WASM embedding"
+date = "2026-04-16"
+code_hash = "b8577fa15470f4721ede1dfb677d03e263d6f59e6b2661d922aa5eb8d66ce3f9"
+
+[[entry]]
+version = "V2"
+description = "Superseded by the Bitcoin payments work (shared harvest-common is compiled into every contract, so a change anywhere in it re-keys all three)"
+date = "2026-09-02"
+code_hash = "2d274a944701a37166b09c2a41d987738cd7b29a5f5b8b0179e400dace9ce1f5"
+
+[[entry]]
+version = "V3"
+description = "Superseded by the chrono wasmbind fix (harvest#8) -- the module built before it could not be instantiated at all"
+date = "2026-09-03"
+code_hash = "7f345c69a800288fe2eb649319cf9b34587953f8161976cc412ab4d308ad35da"
+
+[[entry]]
+version = "V4"
+description = "Superseded by the freenet-stdlib 0.6 -> 0.8.5 bump taken to adopt freenet-migrate"
+date = "2026-09-04"
+code_hash = "c9a939f9a93648f1571193228ccd2fd8331a9970f7c3d934b5b0d646f8cae2ca"
+
+[[entry]]
+version = "V5"
+description = "Superseded by the per-order Bitcoin bridge list and the payment-proof claim bounds. Both changes are in `harvest-common`, which is compiled into every artifact here, so the bytes moved. Nothing this contract itself does changed"
+date = "2026-09-04"
+code_hash = "5c4d0eec19bf023c32c1723fc6676e43ecc1638922e952ab06c572b407350750"
+
+[[entry]]
+version = "V6"
+description = "Superseded by the per-order Bitcoin payment address: `harvest-common` gained the payment-xpub and order-address surface on `BitcoinDelegateRequest`, and it is compiled into every artifact here, so the bytes moved. Nothing this contract itself does changed"
+date = "2026-09-04"
+code_hash = "fd91d10d8100cec85ce5719290b57b2c56908352c31f5038fe0e78168eca9f35"
+
+[[entry]]
+version = "V7"
+description = "Superseded by the 2026-09-05 correctness review. Its own change is that `apply_delta` is now all-or-nothing: it used to commit a verified entry AND ITS NONCE before rejecting a later invalid one in the same delta, and a burnt nonce makes genuine feedback permanently undeliverable, because `used_nonces` is what suppresses a replay. `harvest-common` is compiled into every artifact here, so its changes move these bytes whether or not this artifact's own behaviour changed. This generation carries the 2026-09-05 correctness review: `StoreStateV1::orders` gained `#[serde(default)]`, without which no V1 state decoded at all; `apply_delta` became all-or-nothing in orders, listings and feedback; the equal-rank order tie-break now keeps the SMALLER encoding and `AuthorizedOrder::verify` refuses any field the status does not consult, which together close a permanent third-party displacement of a paid order; a reversal now requires evidence the order was once covered; and confirmation depth is capped at what the bridge attested. The parameter structs also became `pub(crate)` with constructors so a second derivation no longer compiles -- a visibility change ONLY, not a field change: `cbor(StoreParameters)` is still 56 bytes and the V2..=V5 legacy parameter band is unaffected. `freenet-bitcoin-common` moved bbeed1e -> 0e5b9d9 for the attested-depth cap, and it links into all four artifacts as well. `scripts/build-contract-wasm.sh` is NOT among the causes: its reproducible-build fix landed in 47b67aa and was already in effect for the generation this supersedes"
+date = "2026-09-05"
+code_hash = "7163be62207ae9f77ee2ccb8e0249fe2d824cb52788732eb6fe60cca52b0f801"

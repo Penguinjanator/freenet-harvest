@@ -1,0 +1,59 @@
+# Superseded generations of the Harvest mailbox contract.
+#
+# See README.md in this directory for the rules. Oldest first; the CURRENT
+# generation is derived from the WASM this build ships and is never listed
+# here.
+#
+# Instance ids are derived per owner: `BLAKE3(code_hash || cbor(
+# MailboxParameters))`, whose single field is the owner's ghostkey verifying
+# key. Like the store contract and unlike the reputation contract, that makes
+# every generation derivable from the ghostkey alone, with no dependency on
+# the delegate's secrets.
+#
+# The state is a set of encrypted messages deduplicated by nonce, with pruning
+# by a TTL measured against the newest message the mailbox holds. Folding an
+# old generation forward can therefore re-admit a message the successor had
+# already pruned; that is harmless and self-correcting, because `apply_delta`
+# re-runs the same deterministic prune on the folded result.
+
+[[entry]]
+version = "V1"
+description = "First mailbox contract; store creation flow and contract WASM embedding"
+date = "2026-04-16"
+code_hash = "db0b1c286442209e76eb7f507d945803ae9ebf6582e9f1b2714d57d7b03703cc"
+
+[[entry]]
+version = "V2"
+description = "Superseded by the Bitcoin payments work (shared harvest-common is compiled into every contract)"
+date = "2026-09-02"
+code_hash = "a2819d2967e92510d0e1b7a5ece5c2261fbd04f4ec8b4fbdabd6f58d2ff0ea9d"
+
+[[entry]]
+version = "V3"
+description = "Superseded by the chrono wasmbind fix (harvest#8) -- the module built before it could not be instantiated at all"
+date = "2026-09-03"
+code_hash = "99fc27fab5a87d274fb32a5772a4f670cad6821700a7e4c54eaec783c6aa1358"
+
+[[entry]]
+version = "V4"
+description = "Superseded by the freenet-stdlib 0.6 -> 0.8.5 bump taken to adopt freenet-migrate"
+date = "2026-09-04"
+code_hash = "61154e38ca91b5dbf0e4c1c3fa5ad36b4ed56f058dbc8418d20781213e613f4e"
+
+[[entry]]
+version = "V5"
+description = "Superseded by the per-order Bitcoin bridge list and the payment-proof claim bounds. Both changes are in `harvest-common`, which is compiled into every artifact here, so the bytes moved. Nothing this contract itself does changed"
+date = "2026-09-04"
+code_hash = "a00fd23796d2d87c6652749ac2365a94bf060f27f5fbe5e70929cc6635c19433"
+
+[[entry]]
+version = "V6"
+description = "Superseded by the per-order Bitcoin payment address: `harvest-common` gained the payment-xpub and order-address surface on `BitcoinDelegateRequest`, and it is compiled into every artifact here, so the bytes moved. Nothing this contract itself does changed"
+date = "2026-09-04"
+code_hash = "e49cb3038b321a895850adcf594e09b6a5a698b7ba469a991a529910493628dc"
+
+[[entry]]
+version = "V7"
+description = "Superseded by the 2026-09-05 correctness review, and for this contract the substantive change is its own: retention stopped being governed by unauthenticated content. A 30-day TTL measured against the newest message present let one message dated far in the future evict every legitimate one, and made a mailbox permanently invalid the moment any message aged out; a `MAX_MESSAGES` count cap with a total, content-derived ranking replaces it. `harvest-common` is compiled into every artifact here, so its changes move these bytes whether or not this artifact's own behaviour changed. This generation carries the 2026-09-05 correctness review: `StoreStateV1::orders` gained `#[serde(default)]`, without which no V1 state decoded at all; `apply_delta` became all-or-nothing in orders, listings and feedback; the equal-rank order tie-break now keeps the SMALLER encoding and `AuthorizedOrder::verify` refuses any field the status does not consult, which together close a permanent third-party displacement of a paid order; a reversal now requires evidence the order was once covered; and confirmation depth is capped at what the bridge attested. The parameter structs also became `pub(crate)` with constructors so a second derivation no longer compiles -- a visibility change ONLY, not a field change: `cbor(StoreParameters)` is still 56 bytes and the V2..=V5 legacy parameter band is unaffected. `freenet-bitcoin-common` moved bbeed1e -> 0e5b9d9 for the attested-depth cap, and it links into all four artifacts as well. `scripts/build-contract-wasm.sh` is NOT among the causes: its reproducible-build fix landed in 47b67aa and was already in effect for the generation this supersedes"
+date = "2026-09-05"
+code_hash = "2eb1403aa35b94b8c6a0cbf252c7858e07b704740b0b76d4412871a643a78afa"

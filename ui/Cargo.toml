@@ -14,12 +14,17 @@ no-sync = []
 [dependencies]
 harvest-common = { workspace = true }
 ghostkey-common = { workspace = true }
+freenet-bitcoin-common = { workspace = true }
 
 # UI Framework
 dioxus = { workspace = true }
 
 # Web
-web-sys = { workspace = true }
+# "Response" added for the bridge's public /v1/status HTTP endpoint (see
+# gateway/bitcoin_bridge_http.rs) -- a plain browser `fetch`, not a Freenet
+# gateway call, since that's the one piece of bridge discovery the delegate
+# cannot do for us (delegates have no outbound-HTTP capability at all).
+web-sys = { workspace = true, features = ["Response"] }
 wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 js-sys = { workspace = true }
@@ -33,17 +38,64 @@ serde_json = { workspace = true }
 
 # Crypto
 ed25519-dalek = { workspace = true }
+# Hex, for migration marker keys. Raw bytes in a storage key alias under any
+# lossy UTF-8 conversion, which is how two distinct predecessors end up sharing
+# one marker slot -- see migrate::marker_key.
+hex = { workspace = true }
 blake3 = { workspace = true }
-bs58 = { workspace = true }
+# "check" feature enables Base58Check decoding, needed to turn a legacy
+# P2PKH/P2SH address string into its scriptPubKey (see gateway/bitcoin_address.rs).
+bs58 = { workspace = true, features = ["check"] }
 x25519-dalek = { workspace = true }
 aes-gcm = { workspace = true }
+# Ghost Key certificate parsing and chain verification.
+#
+# Declared here rather than in `[workspace.dependencies]` on purpose: only the
+# reader needs it. `harvest-common` is compiled into all three contracts and
+# the delegate, so a dependency added there -- even an optional one -- is a
+# dependency four published artifacts have to be rebuilt to be sure of, and
+# rebuilding re-keys them. See `common/src/address.rs`.
+#
+# `ghostkey_lib`, not `ghostkey-common`: the certificate type lives here.
+# `ghostkey-common` is the delegate's wire protocol and carries no certificate
+# type at all -- `GhostkeyRequest`/`GhostkeyResponse` pass certificates around
+# as opaque PEM strings, which is exactly why nothing was verifying them.
+ghostkey_lib = "0.2"
+
+# Bech32/Bech32m decoding for SegWit address parsing (P2WPKH/P2WSH/P2TR).
+# Not a workspace dependency -- only the UI needs to parse user-typed
+# addresses into scriptPubKey bytes; every other crate in this workspace
+# only ever handles scriptPubKey bytes directly.
+bech32 = "0.11"
 
 # Utilities
-chrono = { workspace = true }
+# Browser wasm, not a contract, so `wasmbind` is correct here -- the workspace
+# default disables it because it makes CONTRACT modules unloadable.
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "wasmbind"] }
 getrandom = { version = "0.2", features = ["js", "wasm-bindgen", "js-sys"], default-features = false }
 
 # Freenet
 freenet-stdlib = { workspace = true, features = ["net"] }
+# The probe driver and the delegate export/import entry points. "ui" is the
+# native+wasm profile, which is what a browser app wants -- and it keeps the
+# migration logic testable natively, since none of it is behind a wasm gate.
+freenet-migrate = { workspace = true, features = ["ui"] }
+# For `ComposableState::merge` -- the store contract's own merge, which the
+# migration reuses rather than reimplementing so folding a generation is the
+# same operation the network performs between two peers.
+freenet-scaffold = { workspace = true }
+
+[dev-dependencies]
+# Naming the notary's RSA signing key, so the certificate tests can mint a
+# chain of their own rather than needing one Freenet issued. Pinned to what
+# `ghostkey_lib` itself depends on -- a second version would be a second,
+# incompatible `SecretKey` type.
+blind-rsa-signatures = "=0.15.1"
 
 [build-dependencies]
 chrono = "0.4"
+# Turns legacy/*.toml into the lineage consts src/migrate.rs walks. Also
+# re-derives each delegate row's key from its code hash and fails the build on
+# a mismatch, so a mistyped registry is a build error rather than a probe that
+# silently targets nothing.
+freenet-migrate-build = "0.2"

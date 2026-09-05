@@ -12,13 +12,38 @@ freenet-main-delegate = []
 
 [dependencies]
 harvest-common = { workspace = true }
+freenet-bitcoin-common = { workspace = true }
 freenet-stdlib = { workspace = true }
+# The delegate half: `handle_export_request` plus the origin policy that gates
+# it. Answering a successor's export request is the ONLY way this generation's
+# secrets can ever leave the node, so shipping without it makes this generation
+# permanently unrecoverable -- see src/migration.rs.
+freenet-migrate = { workspace = true, features = ["delegate"] }
 serde = { workspace = true }
 ciborium = { workspace = true }
 chrono = { workspace = true }
 rsa = { workspace = true }
 sha2 = { workspace = true }
 getrandom = { workspace = true }
+
+# Per-order Bitcoin address derivation (src/bip32.rs). Public BIP-32
+# derivation only -- no private key is held or produced anywhere in this
+# crate, so none of this is a signing surface.
+#
+# `default-features = false` drops ecdsa/signing/std, which this crate has no
+# use for and which would only add wasm the delegate never executes.
+# `precomputed-tables` is deliberately NOT enabled: it trades ~200KB of static
+# tables for speed on an operation that runs twice per invoice, and the
+# compiled bytes of this module are the delegate's on-network address.
+k256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
+hmac = { version = "0.12", default-features = false }
+ripemd = { version = "0.1", default-features = false }
+# "check" for the Base58Check envelope every extended key is wrapped in.
+bs58 = { workspace = true, features = ["check"] }
+# Bech32 encoding for the P2WPKH addresses derivation produces. The address
+# string and the scriptPubKey are derived together here, in one place, because
+# an Order carries both and they must denote the same output.
+bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
 
 [lib]
 crate-type = ["cdylib", "rlib"]

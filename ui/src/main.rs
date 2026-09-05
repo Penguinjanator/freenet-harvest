@@ -5,8 +5,11 @@
 mod components;
 mod document_title;
 mod gateway;
+mod ghostkey_cert;
 mod messaging;
+mod migrate;
 mod state;
+mod store_link;
 
 fn main() {
     dioxus::logger::initialize_default();

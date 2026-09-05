@@ -1,6 +1,5 @@
 #![allow(unexpected_cfgs)]
 
-use chrono::Utc;
 use ciborium::{de::from_reader, ser::into_writer};
 use freenet_stdlib::prelude::*;
 
@@ -27,7 +26,7 @@ impl ContractInterface for Contract {
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
         mailbox_state
-            .verify(Utc::now())
+            .verify()
             .map(|_| ValidateResult::Valid)
             .map_err(|e| ContractError::InvalidUpdateWithInfo {
                 reason: format!("State verification failed: {e}"),
@@ -49,8 +48,6 @@ impl ContractInterface for Contract {
                 .map_err(|e| ContractError::Deser(e.to_string()))?
         };
 
-        let now = Utc::now();
-
         for update in data {
             match update {
                 UpdateData::State(new_state) => {
@@ -68,7 +65,7 @@ impl ContractInterface for Contract {
                         })
                         .collect();
                     if !delta.is_empty() {
-                        mailbox_state.apply_delta(&Some(delta), now).map_err(|e| {
+                        mailbox_state.apply_delta(&Some(delta)).map_err(|e| {
                             ContractError::InvalidUpdateWithInfo {
                                 reason: e.to_string(),
                             }
@@ -81,7 +78,7 @@ impl ContractInterface for Contract {
                     }
                     let delta = from_reader::<MailboxDelta, &[u8]>(d.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
-                    mailbox_state.apply_delta(&Some(delta), now).map_err(|e| {
+                    mailbox_state.apply_delta(&Some(delta)).map_err(|e| {
                         ContractError::InvalidUpdateWithInfo {
                             reason: e.to_string(),
                         }

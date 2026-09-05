@@ -6,6 +6,18 @@ use crate::listing::{AuthorizedListing, Listing};
 
 pub type RequestId = u64;
 
+/// The parameters the harvest delegate is registered under.
+///
+/// A delegate lives at `BLAKE3(BLAKE3(wasm) || parameters)` exactly as a
+/// contract does, so this value is half of its address. It is empty because the
+/// delegate needs no per-instance configuration -- but "empty" is a decision,
+/// not an absence, and it belongs in one place rather than being spelled
+/// `Parameters::from(Vec::<u8>::new())` at each registration site. Changing it
+/// re-keys the delegate and strands every secret it holds; the address guard
+/// (`common/src/bin/harvest-addresses.rs`) reads this constant, so such a
+/// change shows up as a moved address rather than as nothing at all.
+pub const DELEGATE_PARAMETERS: &[u8] = &[];
+
 /// Requests from the UI to the Harvest delegate.
 #[non_exhaustive]
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -67,6 +79,30 @@ pub enum HarvestDelegateRequest {
 
     /// List all stores registered for a ghostkey identity.
     ListStores { ghostkey_fingerprint: String },
+
+    // === Migration markers ===
+    /// Has the contract migration named by `marker` already completed?
+    ///
+    /// `marker` is an opaque, ASCII-only id minted by
+    /// `harvest-ui`'s `migrate::marker_key` -- artifact, contract instance and
+    /// current code hash, hex-encoded. The delegate stores it under its own
+    /// `harvest:migrate:` prefix rather than treating it as a raw secret key,
+    /// so a caller cannot address anything else in the delegate's namespace
+    /// with it.
+    ///
+    /// The answer is a plain `present: bool`, and every failure -- an
+    /// unreadable store, a malformed marker, no answer at all -- has to be
+    /// read as **not** present. An unreadable marker treated as "done" skips
+    /// the migration; treated as "not done" it repeats a walk that only ever
+    /// adds. See `harvest-ui`'s `migrate` module docs.
+    GetMigrationMarker { marker: String },
+
+    /// Record that the migration named by `marker` finished.
+    ///
+    /// `note` is the human-readable outcome line, stored as the marker's
+    /// value so a later reader can see what sealed it. Only the presence of
+    /// the key is load-bearing.
+    SetMigrationMarker { marker: String, note: String },
 }
 
 /// Responses from the Harvest delegate to the UI.
@@ -126,6 +162,26 @@ pub enum HarvestDelegateResponse {
     StoreList {
         ghostkey_fingerprint: String,
         stores: Vec<StoreRegistration>,
+    },
+
+    /// Whether the migration named by `marker` is already recorded as done.
+    ///
+    /// `present: false` is the answer to every uncertainty as well as to a
+    /// genuine absence -- see `HarvestDelegateRequest::GetMigrationMarker`.
+    MigrationMarker {
+        marker: String,
+        present: bool,
+    },
+
+    /// The outcome of a `SetMigrationMarker`.
+    ///
+    /// `recorded: false` means the host refused the write. It is reported
+    /// rather than swallowed so the log says why the same walk runs again next
+    /// load, but nothing has to act on it: an unwritten marker repeats a walk
+    /// that only ever adds.
+    MigrationMarkerRecorded {
+        marker: String,
+        recorded: bool,
     },
 
     Error {

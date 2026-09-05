@@ -6,21 +6,37 @@
 
 #![deny(unsafe_code)]
 
+// Fixed placeholder parameter values for the contract-address guard, and the
+// binary that prints the addresses. Behind a feature that is OFF by default and
+// enabled only by the guard's own invocations, because this crate is compiled
+// INTO all three contracts and the delegate: adding even unreferenced code here
+// moved all four code hashes when it was first tried, which is to say the guard
+// would have re-keyed the artifacts it exists to watch.
+#[cfg(feature = "address-guard")]
+pub mod address;
+pub mod bitcoin_delegate;
 pub mod delegate;
 pub mod feedback;
 pub mod listing;
 pub mod mailbox;
+pub mod migration;
+pub mod payment;
 pub mod reputation;
 pub mod store;
 pub mod util;
 
 // Re-exports for convenience
+pub use bitcoin_delegate::{
+    BitcoinDelegateRequest, BitcoinDelegateResponse, BridgeAuthMode, BridgeEndpoint,
+    DerivedAddress, PaymentXpubStatus, WatchedPayment,
+};
 pub use delegate::{
     HarvestDelegateRequest, HarvestDelegateResponse, StoreRegistration, TransactionRecord,
 };
 pub use feedback::{FeedbackCategory, FeedbackToken, FeedbackTokenMsg};
 pub use listing::{AuthorizedListing, Listing, ListingId, ListingKind, PriceInfo};
 pub use mailbox::{ConversationId, EncryptedMessage, MailboxParameters, MailboxStateV1};
+pub use payment::{AuthorizedOrder, Order, OrderId, OrderPaymentProof, OrderStatus, ProofError};
 pub use reputation::{FeedbackEntry, ReputationParameters, ReputationStateV1};
 pub use store::{StoreParameters, StoreStateV1};
 
@@ -67,7 +83,10 @@ pub const LEGACY_HARVEST_WEBAPP_CONTRACT_IDS: &[&str] = &[];
 static EXPECTED_HARVEST_REQUESTOR: std::sync::LazyLock<ghostkey_common::SignatureRequestor> =
     std::sync::LazyLock::new(|| {
         use freenet_stdlib::prelude::ContractInstanceId;
-        let id = ContractInstanceId::from_bytes(HARVEST_WEBAPP_CONTRACT_ID)
+        // `from_bytes` under freenet-stdlib 0.6; renamed to `from_base58` in
+        // 0.8 because the old name read as "raw 32 bytes" when it always
+        // parsed base58 TEXT. Same function, and the constant is base58.
+        let id = ContractInstanceId::from_base58(HARVEST_WEBAPP_CONTRACT_ID)
             .expect("HARVEST_WEBAPP_CONTRACT_ID must parse as a valid ContractInstanceId");
         ghostkey_common::SignatureRequestor::WebApp(id)
     });

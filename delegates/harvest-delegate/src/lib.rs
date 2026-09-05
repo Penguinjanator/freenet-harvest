@@ -1,13 +1,49 @@
 #![allow(unexpected_cfgs)]
 
+mod bip32;
+mod bitcoin;
 mod handlers;
+mod markers;
+mod migration;
+mod origin;
+mod secrets;
 
 use freenet_stdlib::prelude::{
     delegate, ApplicationMessage, DelegateCtx, DelegateError, DelegateInterface,
     InboundDelegateMsg, MessageOrigin, OutboundDelegateMsg, Parameters,
 };
 
-use harvest_common::{from_cbor, to_cbor, HarvestDelegateRequest, HarvestDelegateResponse};
+use crate::secrets::CtxSecrets;
+use harvest_common::migration::HarvestMigrationRequest;
+use harvest_common::{
+    from_cbor, to_cbor, BitcoinDelegateRequest, HarvestDelegateRequest, HarvestDelegateResponse,
+};
+
+// RSA key generation (`InitReputationKeys`) and blind signing
+// (`BlindSignFeedbackToken`) need real randomness, via `rsa::rand_core::OsRng`.
+// `getrandom` (which `OsRng` sits on) has no OS backend on
+// `wasm32-unknown-unknown`, so the workspace enables its "custom" feature --
+// but that feature only *allows* registering a source, it doesn't provide
+// one. Without this registration the crate fails to LINK (missing
+// `__getrandom_custom` symbol), not merely to produce bad randomness at
+// runtime, so this was a pre-existing latent build break, independent of
+// anything Bitcoin-related, that just hadn't been exercised by a fresh
+// `cargo build --target wasm32-unknown-unknown` in this checkout.
+//
+// The entropy source is the delegate host's own RNG
+// (`freenet_stdlib::rand::rand_bytes`, backed by `__frnt__rand__rand_bytes`),
+// never a JS/browser API -- a delegate does not run in a browser. Per
+// `getrandom::register_custom_getrandom!`'s docs, registration must happen in
+// the root binary crate; this delegate IS that root (compiled directly to a
+// `cdylib`, no separate `main.rs`), so registering here is correct. The
+// registration is a no-op on every other target (native `cargo test` keeps
+// using the OS RNG), so this cannot change test behavior.
+fn harvest_delegate_getrandom(buf: &mut [u8]) -> Result<(), getrandom::Error> {
+    let bytes = freenet_stdlib::rand::rand_bytes(buf.len() as u32);
+    buf.copy_from_slice(&bytes);
+    Ok(())
+}
+getrandom::register_custom_getrandom!(harvest_delegate_getrandom);
 
 pub struct HarvestDelegate;
 
@@ -44,7 +80,7 @@ impl DelegateInterface for HarvestDelegate {
                         "cannot process an already processed message".into(),
                     ));
                 }
-                handle_request(ctx, &app_msg.payload)
+                handle_request(ctx, origin.as_ref(), &app_msg.payload)
             }
 
             // Contract notifications are delivered when a subscribed contract's
@@ -83,19 +119,89 @@ impl DelegateInterface for HarvestDelegate {
 
 fn handle_request(
     ctx: &mut DelegateCtx,
+    origin: Option<&MessageOrigin>,
     payload: &[u8],
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-    let request: HarvestDelegateRequest = from_cbor(payload)
-        .map_err(|e| DelegateError::Other(format!("deserialize request: {e}")))?;
+    // NOTHING is dispatched before the caller is checked.
+    //
+    // This line replaces a comment that said the migration export "is the only
+    // request whose answer is this delegate's private keys, so it is the only
+    // one whose authorization matters". That was true when it was written, and
+    // the Bitcoin work made it false without touching it: `SetPaymentXpub`
+    // decides which wallet every future invoice pays into, so an unchecked
+    // caller redirects the seller's income rather than merely reading
+    // something. It reached the handler because `migration::handle` was the
+    // only one of the three families that even took an `origin` -- the other
+    // two could not have checked if they had wanted to.
+    //
+    // Hence the gate here, at the one point every family passes through,
+    // rather than three gates that a fourth family would silently not have.
+    // `handlers::handle` and `bitcoin::handle` each re-apply the SAME
+    // `origin::authorize`, so a future caller reaching them by another route is
+    // still checked, and the two checks cannot disagree about who is allowed.
+    //
+    // A refused caller is turned away before any trial decode, so it also
+    // learns nothing about which request shapes this build understands.
+    crate::origin::authorize(origin)?;
 
-    let response = handlers::handle(ctx, request);
+    // A migration export is tried FIRST, and it is the one branch that must
+    // not fall through to the others: it is the request whose answer is this
+    // delegate's private keys, and `migration::handle` re-checks the same
+    // policy on the way in. Trying it after a failed decode of something else
+    // would still be correct, but putting it first keeps the
+    // highest-consequence path at the top rather than reached by exhaustion.
+    //
+    // The trial decode is sound for the same reason the two below are: all
+    // three enums are externally-tagged, so the variant name is part of the
+    // encoding, and `ExportSecrets` appears in none of the others. A payload
+    // for one fails to decode as another with "unknown variant" rather than
+    // misparsing into the wrong shape. Add a colliding variant name and this
+    // stops being true.
+    if let Ok(request) = from_cbor::<HarvestMigrationRequest>(payload) {
+        return migration::handle(ctx, origin, request);
+    }
 
-    let response_bytes =
-        to_cbor(&response).map_err(|e| DelegateError::Other(format!("serialize response: {e}")))?;
+    // The Bitcoin payment surface (`harvest_common::bitcoin_delegate`) is
+    // deliberately NOT folded into `HarvestDelegateRequest`/`Response` as new
+    // variants -- that enum is owned by a different, concurrently-edited
+    // workstream, and adding variants there would mean editing a file this
+    // change doesn't need to touch. Instead we dispatch on which request
+    // enum the payload actually decodes as. Both enums use externally-tagged
+    // CBOR (the variant name is part of the encoding), so a
+    // `BitcoinDelegateRequest` payload fails to decode as a
+    // `HarvestDelegateRequest` with an "unknown variant" error rather than
+    // silently misparsing into the wrong shape, which is what makes this
+    // fallback safe rather than ambiguous.
+    match from_cbor::<HarvestDelegateRequest>(payload) {
+        Ok(request) => {
+            let response = handlers::handle(&mut CtxSecrets(ctx), origin, request);
 
-    Ok(vec![OutboundDelegateMsg::ApplicationMessage(
-        ApplicationMessage::new(response_bytes),
-    )])
+            let response_bytes = to_cbor(&response)
+                .map_err(|e| DelegateError::Other(format!("serialize response: {e}")))?;
+
+            Ok(vec![OutboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(response_bytes),
+            )])
+        }
+        Err(harvest_decode_err) => {
+            let request: BitcoinDelegateRequest =
+                from_cbor(payload).map_err(|bitcoin_decode_err| {
+                    DelegateError::Other(format!(
+                        "payload is neither a HarvestDelegateRequest ({harvest_decode_err}) nor a \
+                     BitcoinDelegateRequest ({bitcoin_decode_err})"
+                    ))
+                })?;
+
+            let response = bitcoin::handle(&mut CtxSecrets(ctx), origin, request)?;
+
+            let response_bytes = to_cbor(&response)
+                .map_err(|e| DelegateError::Other(format!("serialize bitcoin response: {e}")))?;
+
+            Ok(vec![OutboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(response_bytes),
+            )])
+        }
+    }
 }
 
 /// Handle a contract state change notification.
@@ -150,4 +256,122 @@ fn handle_get_contract_response(
     Ok(vec![OutboundDelegateMsg::ApplicationMessage(
         ApplicationMessage::new(response_bytes),
     )])
+}
+
+/// The gate at the crate's own entry point.
+///
+/// The per-family tests in `bitcoin` and `handlers` drive their handlers
+/// against a real store; these drive the DISPATCHER, because the defect being
+/// fixed was one of routing -- a request family reached a handler that had no
+/// way to check who sent it. What matters here is that no payload gets as far
+/// as being classified before the caller is.
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use crate::origin::test_origins::{a_different_web_app, harvest};
+    use freenet_bitcoin_common::BitcoinNetwork;
+    use harvest_common::bitcoin_delegate::BitcoinDelegateRequest as BtcReq;
+    use harvest_common::bitcoin_delegate::BitcoinDelegateResponse as BtcResp;
+    use harvest_common::migration::HarvestMigrationRequest as MigReq;
+
+    const A_VALID_ZPUB: &str = "zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs";
+
+    /// The host's context. Its secret methods are inert off the `wasm32`
+    /// target, which is exactly why the handlers take a store instead (see
+    /// [`crate::secrets`]) -- but nothing below reaches a secret, because
+    /// everything below is refused before dispatch.
+    fn ctx() -> DelegateCtx {
+        unsafe { DelegateCtx::__new() }
+    }
+
+    fn refusal(payload: &[u8], origin: Option<&MessageOrigin>) -> String {
+        match handle_request(&mut ctx(), origin, payload).expect_err("must be refused") {
+            DelegateError::Other(message) => message,
+            other => panic!("expected a refusal message, got {other:?}"),
+        }
+    }
+
+    /// The reported defect, at the dispatcher: a `SetPaymentXpub` from a web
+    /// app that is not Harvest must not reach the handler that decides where
+    /// the seller's invoices are paid.
+    ///
+    /// Mutated red by removing the `authorize` call from `handle_request`.
+    #[test]
+    fn a_foreign_web_app_cannot_set_the_payment_xpub() {
+        let payload = to_cbor(&BtcReq::SetPaymentXpub {
+            request_id: 1,
+            xpub: A_VALID_ZPUB.to_string(),
+            network: BitcoinNetwork::Bitcoin,
+        })
+        .expect("cbor");
+
+        let message = refusal(&payload, Some(&a_different_web_app()));
+        assert!(
+            message.contains("Harvest web app"),
+            "the refusal must say why: {message}"
+        );
+    }
+
+    /// Every family is refused at the same point, including the migration
+    /// export, which is the one that was already checked.
+    #[test]
+    fn every_request_family_is_refused_for_a_foreign_web_app() {
+        let payloads = [
+            to_cbor(&MigReq::ExportSecrets {
+                source_generation: 4,
+            })
+            .expect("cbor"),
+            to_cbor(&HarvestDelegateRequest::ListTransactions).expect("cbor"),
+            to_cbor(&BtcReq::ListWatched).expect("cbor"),
+        ];
+        for payload in payloads {
+            assert!(refusal(&payload, Some(&a_different_web_app())).contains("Harvest web app"));
+            assert!(refusal(&payload, None).contains("could not attest"));
+        }
+    }
+
+    /// The refusal happens BEFORE the payload is classified, so a caller that
+    /// is not allowed to be here learns nothing about which request shapes this
+    /// build understands.
+    ///
+    /// Mutated red by removing the boundary gate and relying on the handlers'
+    /// own checks: an undecodable payload then never reaches a handler at all,
+    /// so the caller gets the decode error naming both request enums.
+    #[test]
+    fn a_refused_caller_is_turned_away_before_the_payload_is_decoded() {
+        let nonsense = b"not a request of any kind";
+        let message = refusal(nonsense, Some(&a_different_web_app()));
+        assert!(
+            message.contains("Harvest web app"),
+            "expected an authorization refusal, got: {message}"
+        );
+        assert!(
+            !message.contains("HarvestDelegateRequest"),
+            "the refusal disclosed which request shapes exist: {message}"
+        );
+
+        // The genuine caller DOES get the decode error, which is what makes the
+        // assertion above meaningful rather than a property of the payload.
+        let message = refusal(nonsense, Some(&harvest()));
+        assert!(
+            message.contains("HarvestDelegateRequest"),
+            "the Harvest web app should have been told its payload was undecodable: {message}"
+        );
+    }
+
+    /// And the genuine caller is dispatched normally, so the tests above are
+    /// not passing on a delegate that refuses everybody.
+    #[test]
+    fn the_harvest_web_app_is_dispatched() {
+        let payload = to_cbor(&BtcReq::ListWatched).expect("cbor");
+        let msgs = handle_request(&mut ctx(), Some(&harvest()), &payload)
+            .expect("the Harvest web app must reach the handler");
+        let OutboundDelegateMsg::ApplicationMessage(msg) = &msgs[0] else {
+            panic!("expected an application message");
+        };
+        match from_cbor::<BtcResp>(&msg.payload) {
+            Ok(BtcResp::WatchList { .. }) => {}
+            other => panic!("expected a WatchList, got {other:?}"),
+        }
+    }
 }

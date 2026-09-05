@@ -42,6 +42,9 @@ cd ui && dx build --${BUILD_PROFILE}
 # manually. Path is relative to `ui/` because we cd'd above and the
 # script runs as one shell so the cwd persists.
 cp assets/harvest.css ../target/dx/harvest-ui/${BUILD_PROFILE}/web/public/harvest.css
+# The logo is referenced by harvest.css but dx does not copy it either, so the
+# published app 404s on it. Same class of gap as the CSS.
+cp assets/harvest-logo.svg ../target/dx/harvest-ui/${BUILD_PROFILE}/web/public/harvest-logo.svg
 echo "CSS copied to build output"
 '''
 
@@ -72,8 +75,44 @@ echo "Compressed webapp to target/webapp/webapp.tar.xz"
 description = "Sign the webapp archive with the web-container-tool"
 dependencies = ["compress-webapp"]
 script = '''
-VERSION=$(( $(date +%s) / 60 ))
+# Web-container versions must be STRICTLY increasing. The generic web-container
+# contract rejects new_version <= current_version, so two archives signed at the
+# same version reject each other in both directions and the site forks with no
+# way back. This was minutes-since-epoch, which collides for any two publishes
+# inside the same minute -- routine when a publish fails and is retried.
+#
+# Seconds cut the window 60x; the counter file closes it entirely on one machine
+# by forcing the next version past the last one we actually published.
+#
+# The file is TRACKED, which is the only reason the same holds across machines:
+# a publish from a fresh checkout starts from the committed value rather than
+# from whatever its own clock says. That property is worth nothing unless the
+# updated file is committed AFTER a publish, so this task says so out loud when
+# it changes it. An uncommitted counter is a single-machine counter with a
+# misleading name.
+LAST_FILE=published-contract/last-version
+VERSION=$(date +%s)
+if [ -f "$LAST_FILE" ]; then
+  LAST=$(cat "$LAST_FILE")
+  # A corrupt or hand-edited counter must stop the publish, not silently fall
+  # back to the clock: falling back is exactly how a version goes BACKWARDS,
+  # and a rejected update is the one failure this whole mechanism exists to
+  # prevent.
+  case "$LAST" in
+    ""|*[!0-9]*)
+      echo "error: $LAST_FILE does not hold a plain number (got '$LAST')" >&2
+      echo "       Fix it to the last published version before publishing." >&2
+      exit 1 ;;
+  esac
+  if [ "$VERSION" -le "$LAST" ]; then
+    VERSION=$((LAST + 1))
+    echo "Clock version collided with last published ($LAST); using $VERSION"
+  fi
+fi
+echo "$VERSION" > "$LAST_FILE"
 echo "Signing with version: $VERSION"
+echo "REMEMBER: commit $LAST_FILE once the publish succeeds, or the next"
+echo "          publish from another checkout restarts the sequence."
 ${WEB_CONTAINER_TOOL} sign \
   --input target/webapp/webapp.tar.xz \
   --output target/webapp/webapp.metadata \
@@ -108,3 +147,13 @@ args = ["test", "--workspace"]
 description = "Run clippy on all targets"
 command = "cargo"
 args = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+
+# --- Migration ---
+
+[tasks.code-hashes]
+description = "Print the current ADDRESSES (code hash + parameters) and refuse if a code hash is already recorded as superseded"
+dependencies = ["build-contract-wasm"]
+# The logic lives in a script rather than inline here so CI can run the SAME
+# check without needing cargo-make on the runner. Two copies of a guard drift,
+# and the copy that drifts is the one nobody is watching.
+script = "./scripts/check-code-hashes.sh"

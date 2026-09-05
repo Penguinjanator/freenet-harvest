@@ -2,14 +2,31 @@
 //!
 //! Handles WebSocket connection, delegate registration, and contract operations.
 
+pub mod bitcoin_address;
+pub mod bitcoin_bridge_http;
+pub mod bitcoin_config;
+pub mod bitcoin_ops;
 mod connection;
 mod delegate_api;
+// The migration probe's I/O half. wasm-only: it exists to drive the gateway's
+// shared response handler, which has no native counterpart. Every decision it
+// makes lives in `crate::migrate`, which is target-independent and tested on
+// the host.
+#[cfg(target_arch = "wasm32")]
+pub mod migrate_ops;
+// The one decision `migrate_ops` makes that loses data when it is wrong: when
+// a migration may declare itself done. NOT wasm-gated, deliberately -- it is
+// pure, and keeping it here is what makes it reachable from `cargo test`,
+// which nothing inside `migrate_ops` is.
+pub mod migrate_gate;
+pub mod migrate_seal;
 pub mod response_handler;
 pub mod store_ops;
 
 pub use connection::{connect, ConnectionStatus};
 pub use delegate_api::{
-    get_contract, put_contract, register_delegate, send_delegate_message, update_contract,
+    get_contract, get_contract_by_id, put_contract, register_delegate, send_delegate_message,
+    update_contract,
 };
 
 use dioxus::prelude::*;

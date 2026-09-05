@@ -2,6 +2,14 @@
 
 *Design document -- April 2026*
 
+> **The accountability mechanism described here is superseded.** This document's
+> account of stores, listings, messaging and the overall shape of the application
+> is still accurate. Its **blind-signature feedback tokens are not** — see
+> [design/incentive-mechanism.md](design/incentive-mechanism.md), whose Part 3
+> shows that design fails in three independent ways, and which replaces it with
+> seller standing and complaints-as-withdrawals. GitHub issue #8 records the
+> superseded design too.
+
 Harvest is a decentralized marketplace application for [Freenet](https://freenet.org), joining the family of Freenet apps alongside **River** (group chat) and **Delta** (wiki/CMS). It enables peer-to-peer commerce with anonymous, donation-backed identities and a novel accountability mechanism based on blind-signature feedback tokens.
 
 ## Overview

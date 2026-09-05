@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What Harvest Would Publish</title>
+<style>
+:root {
+    --bg: #ffffff;
+    --surface: #f9fafb;
+    --border: #e5e7eb;
+    --primary: #2563eb;
+    --text: #1f2937;
+    --text-dim: #6b7280;
+    --code-bg: #f3f4f6;
+    --success: #059669;
+    --warning: #d97706;
+    --danger: #dc2626;
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #111827;
+        --surface: #1f2937;
+        --border: #374151;
+        --primary: #60a5fa;
+        --text: #f3f4f6;
+        --text-dim: #9ca3af;
+        --code-bg: #1f2937;
+        --success: #34d399;
+        --warning: #fbbf24;
+        --danger: #f87171;
+    }
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.6;
+    max-width: 820px; margin: 0 auto; padding: 2rem;
+}
+h1 { font-weight: 600; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; margin-bottom: 0.5rem; }
+h2 { font-weight: 600; margin-top: 2.25rem; margin-bottom: 0.75rem; }
+h3 { font-weight: 500; margin-top: 1.25rem; margin-bottom: 0.5rem; }
+p { margin-bottom: 0.75rem; }
+.subtitle { color: var(--text-dim); margin-bottom: 1.5rem; }
+.card {
+    background: var(--surface); border-radius: 6px; padding: 1rem;
+    margin: 0.75rem 0; border: 1px solid var(--border); border-left: 3px solid var(--primary);
+}
+.card.insight { border-left-color: var(--success); }
+.card.warning { border-left-color: var(--warning); }
+.card.danger { border-left-color: var(--danger); }
+.card h3 { margin-top: 0; margin-bottom: 0.5rem; }
+.card p:last-child, .card ul:last-child { margin-bottom: 0; }
+code {
+    background: var(--code-bg); padding: 0.125rem 0.3rem; border-radius: 3px;
+    font-family: 'SF Mono', 'Menlo', 'Consolas', monospace; font-size: 0.875em;
+}
+table { width: 100%; border-collapse: collapse; margin: 0.75rem 0; font-size: 0.9375em; }
+th, td { padding: 0.5rem 0.75rem; text-align: left; border: 1px solid var(--border); vertical-align: top; }
+th { background: var(--surface); font-weight: 500; }
+ul, ol { padding-left: 1.5rem; margin: 0.5rem 0; }
+li { margin-bottom: 0.25rem; }
+.tag {
+    display: inline-block; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 3px; padding: 0.0625rem 0.375rem; font-size: 0.75em; color: var(--text-dim);
+    font-family: 'SF Mono', 'Menlo', monospace;
+}
+.diagram-svg {
+    width: 100%; max-width: 780px; height: auto; display: block;
+    margin: 1rem auto; font-family: inherit; font-size: 13px;
+}
+.pub { color: var(--danger); font-weight: 600; }
+.priv { color: var(--success); font-weight: 600; }
+footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.875em; }
+</style>
+</head>
+<body>
+
+<h1>What Harvest Would Publish</h1>
+<p class="subtitle">Information leakage under the claims-as-spends design, and what it means in practice for the people using it. 29 August 2026.</p>
+
+<div class="card danger">
+<h3>The short version</h3>
+<p>The current design publishes <strong>almost nothing</strong>. A seller who never fails has an essentially empty public record.</p>
+<p>The proposed design publishes <strong>a live, itemised, timestamped business ledger for every seller</strong> — every order's value and time, every capital injection, every dispute, forever, to anyone who asks. And the transparency is not incidental: it is the thing that makes the exit-scam protection work, so it cannot be optimised away without giving up the protection.</p>
+<p>There is a bitter irony here. The "no denominator" problem — that you could see a seller's failures but never how many successes they had — existed <em>because</em> success was silent. This design fixes the denominator by removing the privacy that created it.</p>
+</div>
+
+<h2>1. What is written to the network</h2>
+
+<p>Everything below lives in the seller's reputation contract as ordinary contract state. On Freenet, contract state is public by construction — there is no read permission, no authentication, and no rate limit.</p>
+
+<table>
+<tr><th>Record</th><th>Contents</th><th>Written when</th></tr>
+<tr><td>Ghostkey certificate</td><td>Donation tier, issuer attestation</td><td>Once, at identity creation</td></tr>
+<tr><td>Top-up certificate</td><td>Donation amount, bound to this pseudonym</td><td>Each time the seller adds capital</td></tr>
+<tr><td><strong>Order commitment</strong></td><td>Hashed order nonce, <strong>order amount</strong>, recent Bitcoin block hash</td><td><strong>Every single order</strong>, before payment</td></tr>
+<tr><td>Filed claim</td><td>Amount, payment hash, payment preimage, seller signature, <strong>buyer's ghostkey signature</strong></td><td>When a buyer reports non-delivery</td></tr>
+<tr><td>Refund receipt</td><td>Claim nonce, <strong>buyer's Lightning invoice</strong>, refund preimage</td><td>When a seller cures a claim</td></tr>
+</table>
+
+<h3>Who can actually see it, and how easily</h3>
+
+<div class="card warning">
+<p>This is worse than "public" in the way a website is public. On Freenet, <strong>any peer that hosts the contract holds the state locally and receives every update pushed to it in real time</strong>. A monitor does not scrape; it subscribes. That means surveillance is:</p>
+<ul>
+<li><strong>Free</strong> — hosting costs the observer nothing beyond disk</li>
+<li><strong>Undetectable</strong> — the seller cannot see who is watching</li>
+<li><strong>Unblockable</strong> — the seller cannot refuse a reader, throttle one, or take the data down</li>
+<li><strong>Real-time</strong> — updates arrive within seconds, not on a scrape interval</li>
+<li><strong>Permanent</strong> — state is append-only; nothing can be deleted or amended later</li>
+</ul>
+<p>Enumerating every Harvest seller and subscribing to all of them is a weekend project, not an intelligence operation.</p>
+</div>
+
+<h2>2. A transaction, showing what escapes</h2>
+
+<svg viewBox="0 0 780 300" class="diagram-svg" role="img" aria-label="Transaction timeline showing which steps write to public state">
+  <defs>
+    <marker id="ah" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="currentColor"/>
+    </marker>
+  </defs>
+
+  <text x="0" y="14" fill="currentColor" font-weight="600" font-size="12">PRIVATE — between buyer and seller</text>
+  <line x1="0" y1="24" x2="780" y2="24" stroke="currentColor" stroke-opacity="0.25"/>
+
+  <!-- private lane boxes -->
+  <g stroke="currentColor" fill="none" stroke-opacity="0.55">
+    <rect x="0"   y="36" width="104" height="34" rx="4"/>
+    <rect x="132" y="36" width="104" height="34" rx="4"/>
+    <rect x="264" y="36" width="104" height="34" rx="4"/>
+    <rect x="396" y="36" width="104" height="34" rx="4"/>
+    <rect x="528" y="36" width="104" height="34" rx="4"/>
+    <rect x="660" y="36" width="120" height="34" rx="4"/>
+  </g>
+  <g fill="currentColor" font-size="12" text-anchor="middle">
+    <text x="52"  y="57">Browse listing</text>
+    <text x="184" y="57">Agree order</text>
+    <text x="316" y="51">Invoice +</text><text x="316" y="64">signed claim</text>
+    <text x="448" y="57">Pay (Lightning)</text>
+    <text x="580" y="57">Ship goods</text>
+    <text x="720" y="51">Arrives —</text><text x="720" y="64">buyer silent</text>
+  </g>
+
+  <!-- drop lines to public lane -->
+  <g stroke="currentColor" stroke-dasharray="3 3" stroke-opacity="0.6">
+    <line x1="184" y1="70" x2="184" y2="196" marker-end="url(#ah)"/>
+  </g>
+
+  <text x="0" y="234" fill="currentColor" font-weight="600" font-size="12">PUBLIC — written to the seller's contract, permanently</text>
+  <line x1="0" y1="244" x2="780" y2="244" stroke="currentColor" stroke-opacity="0.25"/>
+
+  <!-- public lane -->
+  <rect x="132" y="200" width="200" height="38" rx="4" fill="currentColor" fill-opacity="0.10" stroke="currentColor"/>
+  <text x="232" y="216" fill="currentColor" font-size="12" text-anchor="middle" font-weight="600">Order commitment</text>
+  <text x="232" y="231" fill="currentColor" font-size="11" text-anchor="middle">amount + timestamp</text>
+
+  <rect x="396" y="200" width="150" height="38" rx="4" fill="none" stroke="currentColor" stroke-opacity="0.35" stroke-dasharray="4 3"/>
+  <text x="471" y="216" fill="currentColor" font-size="11" text-anchor="middle" fill-opacity="0.7">nothing written</text>
+  <text x="471" y="231" fill="currentColor" font-size="11" text-anchor="middle" fill-opacity="0.7">on payment or delivery</text>
+
+  <rect x="600" y="200" width="180" height="38" rx="4" fill="none" stroke="currentColor" stroke-opacity="0.35" stroke-dasharray="4 3"/>
+  <text x="690" y="216" fill="currentColor" font-size="11" text-anchor="middle" fill-opacity="0.7">success writes nothing</text>
+  <text x="690" y="231" fill="currentColor" font-size="11" text-anchor="middle" fill-opacity="0.7">(commitment ages to closed)</text>
+
+  <text x="0" y="278" fill="currentColor" font-size="11.5" fill-opacity="0.85">If it goes wrong instead: a filed claim publishes the amount, the date, and the BUYER'S identity key.</text>
+  <text x="0" y="294" fill="currentColor" font-size="11.5" fill-opacity="0.85">A refund publishes a receipt containing the buyer's Lightning invoice.</text>
+</svg>
+
+<p>The critical detail is the second box. <strong>The commitment must be published before the buyer pays</strong> — that ordering is exactly what stops exit scams, because it forces the seller to declare their exposure before they can collect. It is also what turns every order into a public event.</p>
+
+<h2>3. What an observer reconstructs</h2>
+
+<h3>About a seller</h3>
+<ul>
+<li><strong>Order-by-order revenue</strong> — each order's value, timestamped to roughly a ten-minute window by the Bitcoin block anchor</li>
+<li><strong>Total lifetime volume, order count, and order-size distribution</strong></li>
+<li><strong>Growth curve and trend</strong> — is this business rising or dying, and since when</li>
+<li><strong>Working capital</strong> — standing burned, minus committed exposure, equals exactly how much more business they can currently accept</li>
+<li><strong>Capital history</strong> — every top-up, so when they invested and how much</li>
+<li><strong>True failure rate</strong> — claims divided by orders, now computable by anyone, because the denominator is public</li>
+<li><strong>Working hours and timezone</strong> — the seller's node must be online to publish a commitment, so publication times track when they are awake. Enough samples give you a timezone, and a timezone plus a product category narrows a person considerably.</li>
+<li><strong>Absences</strong> — holidays, illness, and any period the business paused</li>
+</ul>
+
+<div class="card">
+<p><strong>A derived metric nobody has mentioned:</strong> the seller's mailbox contract is also on the network. Its contents are encrypted, but <em>updates to it are visible as state changes</em>. Inquiry volume (mailbox writes) against order volume (commitments) gives an observer the seller's <strong>conversion rate</strong> — a number most businesses treat as confidential.</p>
+</div>
+
+<h3>About a buyer</h3>
+<p>A buyer who transacts successfully leaks nothing about themselves: the commitment carries a hashed nonce, not their identity. That is a genuine strength and it should be preserved.</p>
+<p>A buyer who <strong>files a claim</strong> is in an entirely different position. The claim carries their ghostkey signature, so it permanently publishes:</p>
+<ul>
+<li>that this buyer transacted with that seller</li>
+<li>the amount</li>
+<li>the date</li>
+<li>and, across multiple filings, a linkable profile of what they buy, from whom, and how often things go wrong</li>
+</ul>
+
+<h3>About the marketplace as a whole</h3>
+<p>Subscribe to every seller's reputation contract and you have, continuously and in real time: total marketplace volume, active seller count, growth rate, order-size distribution, the failure rate across the platform, and a ranked list of who is growing and who is dying. That is the complete economics of Harvest, available to competitors, researchers, journalists, and anyone with an adversarial interest in the project.</p>
+
+<h2>4. Practical impact for sellers</h2>
+
+<div class="card warning">
+<h3>Your books are open to your competitors</h3>
+<p>Exact revenue, exact order sizes, exact growth rate, updated live. In an ordinary market these are among a business's most closely held numbers. A competitor can undercut you with precision, time promotions against your quiet periods, and see immediately whether it worked.</p>
+</div>
+
+<div class="card warning">
+<h3>Your remaining capacity is public, and it is a target</h3>
+<p>Anyone can compute how much more business you can currently accept. Worse — see section 5 — anyone can consume it.</p>
+</div>
+
+<div class="card danger">
+<h3>You sign a permanent, itemised record of every order you ever take</h3>
+<p>This is the impact that deserves the most thought. Today, a Harvest seller's trading history does not exist anywhere. Under this design the seller <em>cryptographically signs</em> a timestamped ledger of every transaction, and publishes it to a network that cannot forget.</p>
+<p>The pseudonym is unlinkable to a person <em>until it isn't</em>. Pseudonyms fail for ordinary reasons: a reused shipping address, a payment that touches a KYC'd exchange, an operational mistake, a compelled disclosure. The moment a pseudonym is linked to a person, the full history is <strong>already recorded, already timestamped, and already signed by them</strong>. It is a pre-assembled evidentiary record that the seller built themselves and cannot retract.</p>
+<p>Whether that matters depends entirely on what is being sold and where the seller lives — which is precisely why it should be a decision the seller makes knowingly, rather than a property of the platform they discover later.</p>
+</div>
+
+<h2>5. Practical impact for buyers</h2>
+
+<div class="card danger">
+<h3>Buying is private. Complaining is not.</h3>
+<p>A successful purchase leaks nothing. Filing a claim publishes your identity key against that seller, that amount, that date, permanently.</p>
+<p>So the design charges you privacy for exercising the only protection you have. And the population that most values the privacy — anyone buying something sensitive — is exactly the population least able to pay that price. The predictable result is that the buyers most vulnerable to being defrauded are the least likely to report it, which also weakens the deterrent for everyone else.</p>
+<p>The game-theory analysis identified the <em>incentive</em> half of this (filing is costly for honest victims, which suppresses reporting and weakens seller deterrence). The privacy half compounds it.</p>
+</div>
+
+<div class="card warning">
+<h3>Your filing history follows you, and resetting it costs money</h3>
+<p>Sellers judge buyers by accumulated filings — that is the intended defence against serial extortion. The cost is that a genuine victim who reports twice starts looking like a problem customer, and clearing the record means buying a fresh ghostkey and losing whatever standing the old one had.</p>
+</div>
+
+<div class="card warning">
+<h3>Refund receipts may expose your Lightning node</h3>
+<p>The receipt contains the buyer's refund invoice. Lightning invoices can carry routing hints that name the payee's node, and nodes are long-lived and frequently identifiable. That is a potential jump from "anonymous pseudonym" to "a specific machine on the internet".</p>
+<p>This one appears to be straightforwardly fixable — publish a proof of refund rather than the invoice itself — and should be, before anything ships.</p>
+</div>
+
+<div class="card">
+<h3>Reading a seller's record is itself observable</h3>
+<p>You must fetch the seller's reputation contract before ordering, and again before paying. Freenet routes those requests toward the contract key, so peers on the path see which contract was requested. On its own that is unremarkable. Combined with a public, timestamped commitment appearing shortly afterwards, a well-placed observer can correlate the two and narrow down who the buyer was. Today there is no public event to correlate against.</p>
+</div>
+
+<h2>6. Two problems the game-theory analysis did not cover</h2>
+
+<div class="card danger">
+<h3>Capacity exhaustion — a free denial-of-service on any seller</h3>
+<p>The commitment is published <em>before</em> payment, and publishing one costs the buyer nothing. So an attacker opens orders they never intend to pay for. Each published commitment consumes the seller's advertised capacity, and once total commitments reach the seller's standing, <strong>every genuine buyer's client refuses to pay</strong> — the seller is closed for business.</p>
+<p>Cost to the attacker: nothing. Cost to the seller: their entire tradeable capacity, for as long as commitments take to age out, repeatable indefinitely.</p>
+<p>This is a direct consequence of the ordering that fixes exit scams, so the two are in tension: commitment-before-payment is what stops the seller stealing, and it is what lets a stranger shut them down. Plausible defences — requiring a buyer ghostkey before a commitment is published, per-buyer rate limits, or a small refundable hold — all add friction to the buyer side, which is the side the design is otherwise trying to keep frictionless.</p>
+</div>
+
+<div class="card warning">
+<h3>Anonymity and abuse-limiting are directly opposed here</h3>
+<p>Buyer privacy would be restored by letting claims be filed with a one-time key derived per transaction rather than a standing identity. That immediately destroys the serial-extortion rate limit, which depends on filings accumulating against a persistent key.</p>
+<p>This is the same information dilemma the analysis identified for deterrence-versus-extortion, appearing again in a different place: you cannot simultaneously make filing anonymous and make repeat filing costly.</p>
+</div>
+
+<h2>7. Why this cannot simply be fixed</h2>
+
+<div class="card insight">
+<p><strong>The transparency is the mechanism.</strong> The rule that stops exit scams — buyers refuse to pay unless total open commitments fit within the seller's standing — works precisely because every commitment is individually visible and independently countable by every buyer.</p>
+<p>The obvious privacy fix is to aggregate: publish a Merkle root plus a claimed total, and give each buyer a proof that their own order is included. It does not work. Each buyer can verify only their own leaf, so <strong>the seller can simply understate the total</strong> and no individual buyer can detect it. The exit-scam bound collapses.</p>
+<p>Buying the privacy back needs a zero-knowledge range proof — proving "the sum of my open commitments is within my standing" without revealing the components. That is real cryptography, it has to be verified by every buyer's client, and it is a research-grade addition rather than a tweak.</p>
+<p>So the honest framing is: <strong>this design trades seller privacy for scam resistance, and the trade is structural.</strong> It is not an implementation detail that can be tidied up later.</p>
+</div>
+
+<h2>8. Mitigations, and what each costs</h2>
+
+<table>
+<tr><th>Mitigation</th><th>What it hides</th><th>What it costs</th></tr>
+<tr><td>Round commitment amounts to buckets ($10 / $100 / $1k)</td><td>Exact order values</td><td>Order count and timing still leak, so revenue is still estimable. Capacity arithmetic must round up, over-reserving standing.</td></tr>
+<tr><td>Coarser time anchor (older block)</td><td>Precise timing, weakens timezone inference</td><td>Blurs the closure window that frees capacity</td></tr>
+<tr><td>Publish a refund proof, not the invoice</td><td>Buyer's Lightning node</td><td>Nothing — this looks like a pure win</td></tr>
+<tr><td>One-time keys for filing</td><td>Buyer identity when reporting</td><td>Destroys the serial-extortion limit entirely</td></tr>
+<tr><td>Require buyer identity before publishing a commitment</td><td>Nothing — it defends capacity</td><td>Friction on every buyer, including honest first-timers</td></tr>
+<tr><td>ZK range proof over commitments</td><td>Individual order values <em>and</em> the total</td><td>Research-grade cryptography; verification cost on every client</td></tr>
+</table>
+
+<h2>9. Side by side</h2>
+
+<table>
+<tr><th></th><th>Current design</th><th>Claims-as-spends</th></tr>
+<tr><td>Successful order</td><td>Nothing written</td><td>Amount + timestamp, permanently</td></tr>
+<tr><td>Seller's revenue</td><td>Unknowable</td><td>Fully itemised, live</td></tr>
+<tr><td>Seller's capacity</td><td>Unknowable</td><td>Public, and attackable</td></tr>
+<tr><td>Buyer who is defrauded</td><td>Files anonymously</td><td>Files under a persistent identity</td></tr>
+<tr><td>Failure rate</td><td>No denominator — unknowable</td><td>Public and exact</td></tr>
+<tr><td>Max order book per seller</td><td>Capped around $1,250, forever</td><td>Grows with burned capital</td></tr>
+<tr><td>Exit scam</td><td>Profitable above ~7 concurrent orders</td><td>Unprofitable by construction</td></tr>
+<tr><td>Capacity DoS</td><td>Not possible</td><td>Free, and unaddressed</td></tr>
+</table>
+
+<h2>10. The decision this actually poses</h2>
+
+<p>The two designs are not better and worse versions of the same thing. They sit at opposite ends of one axis:</p>
+
+<div class="card">
+<p><strong>The current design is private and small.</strong> Nothing is published, nobody can be profiled, and no seller can ever safely carry more than about a thousand dollars of open orders. It is a marketplace for low-value trades between people who accept the risk.</p>
+<p><strong>The proposed design is transparent and scalable.</strong> Scams stop paying at any size, sellers can grow by posting capital — and every seller operates a public ledger of their business, while every buyer who complains is named.</p>
+</div>
+
+<p>Which one is right depends on a question that is not technical: <strong>what is Harvest for?</strong> If it is for trading things people would rather not have permanently recorded, the transparency is not a cost to be weighed against the benefits — it defeats the purpose. If it is for ordinary commerce where sellers would happily publish their volume in exchange for being trusted with larger orders, it is a good trade.</p>
+
+<p>Worth considering: these could coexist. A seller could choose to be <em>bonded</em> — publishing commitments, accepting the ledger, and gaining the ability to take large orders — or to remain <em>unbonded and private</em>, with buyers seeing no volume history and rationally keeping orders small. The client would show which mode a seller is in, and buyers would price accordingly. That preserves the private-and-small market as the default rather than eliminating it, and lets sellers who want scale pay for it in transparency.</p>
+
+<footer>
+Analysis of the claims-as-spends proposal for Harvest, based on the game-theoretic report of 29 August 2026 and the Freenet contract model. Sections 5 and 6 identify issues not present in the source analysis. Prepared with AI assistance — Claude.
+</footer>
+
+</body>
+</html>

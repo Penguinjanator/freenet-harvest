@@ -42,21 +42,210 @@ jobs:
       - name: cargo test
         run: cargo test --locked --workspace
 
+      # `harvest-common`'s `address-guard` feature is OFF by default, and
+      # deliberately: that crate compiles into all three contracts and the
+      # delegate, and adding this code ungated moved all four code hashes. The
+      # cost is that the two steps above never compile `common/src/address.rs`
+      # or the `harvest-addresses` binary at all, so without this step the
+      # contract-address guard would rot unlinted and untested.
+      #
+      # It is also where a new parameter field becomes a compile error: the
+      # placeholder constructors name every field, so adding one and not
+      # updating them fails HERE, in the same PR that moves the address.
+      - name: clippy and test the contract-address guard
+        run: |
+          set -euo pipefail
+          cargo clippy --locked -p harvest-common --features address-guard --all-targets -- -D warnings
+          cargo test --locked -p harvest-common --features address-guard
+
+      # `tests/rehearsal` is a SEPARATE cargo workspace -- deliberately, so
+      # that building or locking it can never move a dependency version the
+      # contracts compile against and re-key an artifact. The cost of that
+      # isolation is that `--workspace` above does not reach it, and until
+      # 2026-09-05 nothing else did either: it was referenced by no workflow
+      # and no `Makefile.toml` task. It had been failing since V6 was added to
+      # `legacy/store_contract.toml`, because it asserted on candidate list
+      # POSITIONS and a new registry row shifted every index. Nobody noticed
+      # for several generations.
+      #
+      # BE CLEAR ABOUT WHAT A GREEN TICK HERE MEANS. This compiles the harness
+      # and nothing more. It catches compile-level rot -- a renamed function, a
+      # changed signature, a `migrate.rs` edit that does not typecheck against
+      # it -- which is real, because the harness includes `ui/src/migrate.rs`
+      # by `#[path]` and so breaks whenever that file grows a dependency the
+      # harness does not have.
+      #
+      # It would NOT have caught the bug described above. That compiled
+      # perfectly and failed only at runtime, against a live node. Running the
+      # harness needs a node, so it stays manual; a green tick here is not
+      # evidence that the rehearsal works.
+      #
+      # The one piece of it that needed neither a node nor git history -- that
+      # `migrate`'s address arithmetic agrees with the node's own key
+      # derivation -- has been moved into a real unit test instead, and runs
+      # in `cargo test` above.
+      #
+      # NOT `--all-targets`, and it is not an oversight. That enables
+      # `cfg(test)`, which reaches the `#[cfg(test)] mod tests;` inside the
+      # `#[path]`-included `ui/src/migrate.rs` and resolves it against this
+      # crate's directory, where no such file exists. The harness has no test
+      # target of its own, so there is nothing to gain and a hard build error
+      # to lose. The same limitation is why `rustfmt` cannot format
+      # `tests/rehearsal/src/main.rs` at all.
+      - name: check the migration rehearsal harness compiles
+        run: cargo check --locked --manifest-path tests/rehearsal/Cargo.toml
+
   wasm:
-    name: contracts and delegate build to wasm
+    name: contracts, delegate and UI build to wasm
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install && rustup show
       - uses: Swatinem/rust-cache@v2
+
+      # The UI is a wasm32 artifact too, and until this step nothing in CI
+      # ever compiled it for that target. The native job above builds it for
+      # the host, where every `#[cfg(target_arch = "wasm32")]` block -- which
+      # is most of the UI's actual logic, including all of store creation --
+      # is compiled out and therefore unchecked. A change that breaks the
+      # browser build passed CI green, and so did dead code inside those
+      # blocks: three arguments to `create_store_contracts` were accepted and
+      # silently ignored for as long as the function existed, which is
+      # precisely what `unused_variables` reports and nothing ever ran it.
+      #
+      # Warnings are denied so this cannot rot back into a wall of ignored
+      # output. The one exemption is `clippy::for_kv_map`, which fires on
+      # `common/src/payment.rs` -- `harvest-common` is a path dependency, so
+      # lint flags reach it, and it compiles into the contract WASM where any
+      # edit moves a panic location and re-keys the contract. Exempting the
+      # lint is the cheap half of that trade; editing `common` is not.
+      #
+      # Deliberately not `RUSTFLAGS`: that would apply to the contract build
+      # below, and nothing that can perturb a contract's compilation belongs
+      # anywhere near it.
+      - name: clippy the UI for wasm32
+        run: >
+          cargo clippy --locked -p harvest-ui
+          --target wasm32-unknown-unknown
+          -- -D warnings -A clippy::for_kv_map
+
       - name: install b3sum
         run: command -v b3sum || cargo install b3sum --locked
 
       # The contracts and the delegate are wasm32-only artifacts and are NOT
       # covered by the native job above -- `cargo test` compiles them for the
       # host, which links differently. A dependency bump can compile clean on
-      # the host and fail to link for wasm32 (that is exactly how the currently
-      # committed delegate ended up with an unresolvable `env.__getrandom_custom`
-      # import; see freenet/harvest#7). Build them for the real target.
+      # the host and fail to link for wasm32 (that is how a previously
+      # committed delegate ended up with an unresolvable
+      # `env.__getrandom_custom` import; see freenet/harvest#7). Build them for
+      # the real target.
       - name: build contract and delegate wasm
         run: ./scripts/build-contract-wasm.sh
+
+      # The registries under `legacy/` list SUPERSEDED generations only. If a
+      # current hash turns up in one, the lineage no longer describes reality
+      # -- either the entry was added and the artifact never rebuilt, or the
+      # change that moved it was reverted -- and the probe would walk to its
+      # own instance and report a successful migration having moved nothing.
+      # Nothing says so at runtime, which is why it is checked here.
+      #
+      # Runs the same script `cargo make code-hashes` runs, so the check
+      # developers get locally and the check CI enforces cannot drift apart.
+      # It reuses the build above rather than building again: these bytes are
+      # network addresses and there is exactly one build path for them.
+      # It also prints each artifact's full ADDRESS -- code hash paired with the
+      # CBOR of its live parameter struct -- from the same
+      # `harvest-addresses` binary `contract-drift.yml` uses. The refusal
+      # itself stays a code-hash check because that is what the registries
+      # record; the address is there so a reader can see a parameters-only
+      # move, which no registry entry describes.
+      - name: current code hashes are not recorded as superseded
+        run: ./scripts/check-code-hashes.sh
+
+  # WHAT THIS ANSWERS, AND WHY IT IS NOT THE DRIFT GUARD'S QUESTION.
+  #
+  # `contract-drift.yml` is a RELATIVE check: did this PR move an address
+  # compared with its merge base. It rebuilds both sides and compares them to
+  # each other, and never looks at `ui/public/contracts/` at all. So a
+  # committed artifact can drift arbitrarily far from the source it claims to
+  # be built from and the drift guard stays green.
+  #
+  # That gap is not hypothetical -- it is how the committed artifacts ended up
+  # carrying 45/63/24/43 absolute `/home/...` paths from the machine that built
+  # them, matching no build anyone else could reproduce, while every check
+  # passed.
+  #
+  # It matters because these bytes ARE what ships: `gateway::store_ops` embeds
+  # them with `include_bytes!`, so the contract every store is created under is
+  # the committed file, not whatever the source would compile to. A stale
+  # artifact means the code under review is not the code deployed.
+  #
+  # HOW TO FIX A RED CHECK HERE: `cargo make sync-wasm`, then commit the four
+  # files. If that moves an address, the drift guard will say so and the
+  # re-key has to be decided (label `contract-rekey-acknowledged`), which is
+  # exactly the intended order.
+  wasm-staleness:
+    name: committed contract wasm matches a fresh build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Same reasoning as the jobs above: rust-toolchain.toml pins the
+      # compiler, and the compiler decides the bytes. Naming a version here
+      # would let the two drift and turn this check into noise.
+      - run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: install b3sum
+        run: command -v b3sum || cargo install b3sum --locked
+
+      # The same build script the drift guard and `cargo make sync-wasm` use.
+      # Its `--remap-path-prefix` flags are what make this comparison possible
+      # at all: without them the runner's checkout and $CARGO_HOME leak into
+      # the binary and no two machines ever agree.
+      - name: compare the committed artifacts with a fresh build
+        run: |
+          set -uo pipefail
+          ./scripts/build-contract-wasm.sh || exit 1
+          stale=0
+          {
+            echo "## Committed contract WASM vs a fresh build"
+            echo
+            echo "| artifact | committed | rebuilt | |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for a in reputation_contract store_contract mailbox_contract harvest_delegate; do
+            committed="ui/public/contracts/$a.wasm"
+            built="target/wasm32-unknown-unknown/release/$a.wasm"
+            # A missing file is a failure, never a silent skip -- an artifact
+            # that is not there is one the UI cannot embed.
+            if [ ! -f "$committed" ]; then
+              echo "::error::$committed is missing; run 'cargo make sync-wasm' and commit it"
+              echo "| \`$a\` | — | — | :x: missing |" >> "$GITHUB_STEP_SUMMARY"
+              stale=1
+              continue
+            fi
+            c="$(b3sum "$committed" | cut -d' ' -f1)"
+            b="$(b3sum "$built" | cut -d' ' -f1)"
+            if [ "$c" = "$b" ]; then
+              echo "up to date: $a  $c"
+              echo "| \`$a\` | \`${c:0:16}…\` | \`${b:0:16}…\` | up to date |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::$committed is STALE: committed $c, rebuilt $b"
+              echo "| \`$a\` | \`${c:0:16}…\` | \`${b:0:16}…\` | :warning: **STALE** |" >> "$GITHUB_STEP_SUMMARY"
+              stale=1
+            fi
+          done
+          echo >> "$GITHUB_STEP_SUMMARY"
+          if [ "$stale" = 0 ]; then
+            echo "Every committed artifact matches a fresh build." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "::error::The committed WASM under ui/public/contracts/ does not match this source. Those bytes are what 'include_bytes!' ships, so the deployed contract is not the reviewed one. Run 'cargo make sync-wasm' and commit the four files."
+          {
+            echo "The UI embeds these files with \`include_bytes!\`, so they are what a"
+            echo "store is actually created under -- not whatever the source would compile to."
+            echo
+            echo "Fix: \`cargo make sync-wasm\`, then commit \`ui/public/contracts/*.wasm\`."
+            echo "If that moves an address, \`contract drift\` will say so and the re-key"
+            echo "has to be acknowledged, which is the intended order."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1

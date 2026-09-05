@@ -18,12 +18,30 @@ repository = "https://github.com/freenet/harvest"
 [workspace.dependencies]
 # Internal
 harvest-common = { path = "common" }
+# Local path dependency for the prototype. Switch to a git or crates.io
+# dependency before this leaves one machine -- a path dep does not survive a
+# clone, and CI would fail on it.
+freenet-bitcoin-common = { git = "https://github.com/freenet/freenet-bitcoin", branch = "main" }
+hex = "0.4"
 
 # Freenet ecosystem
-freenet-stdlib = { version = "0.6", features = ["contract"] }
+# 0.8.5 is what freenet-core, River and freenet-bitcoin are on. The bump from
+# 0.6 is not cosmetic and not optional: `freenet-migrate` links against
+# stdlib 0.8, and `__frnt_set_id` is unconditionally `#[no_mangle]` in both
+# 0.6 and 0.8, so the two versions cannot co-link in one wasm module. Adopting
+# the migration crate at all therefore requires this bump -- and the bump
+# itself re-keys all four artifacts, which is why generation 4 is recorded in
+# every registry under `legacy/`.
+freenet-stdlib = { version = "0.8.5", features = ["contract"] }
 freenet-scaffold = "0.2.2"
 freenet-scaffold-macro = "0.2.2"
-ghostkey-common = "0.2.3"
+# 0.3.0 is the first release built against freenet-stdlib 0.8; 0.2.x pulls 0.6
+# and would reintroduce the co-link conflict above.
+ghostkey-common = "0.3"
+
+# Upgrade migration: predecessor lineages, the contract probe driver, and the
+# delegate secret-export primitives. See `legacy/*.toml` and `ui/src/migrate.rs`.
+freenet-migrate = { version = "0.6", default-features = false }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -41,14 +59,27 @@ x25519-dalek = { version = "2.0", features = ["static_secrets", "getrandom"] }
 aes-gcm = "0.10"
 
 # Utilities
-chrono = { version = "0.4", features = ["serde"] }
+# default-features = false is load-bearing, not tidiness. chrono's default
+# `wasmbind` feature imports __wbindgen_placeholder__ /
+# __wbindgen_externref_xform__, which the Freenet contract runtime does not
+# register -- so a module built with it compiles, publishes, and then fails to
+# instantiate with no useful error. See freenet/harvest#8.
+#
+# The UI declares its own chrono WITH defaults: it is browser wasm, not a
+# contract, so wasmbind is correct there.
+chrono = { version = "0.4", default-features = false, features = ["serde", "alloc"] }
 getrandom = { version = "0.2", features = ["custom"] }
 
 # Dioxus UI
 dioxus = { version = "=0.7.3", features = ["web"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Window", "Document", "HtmlInputElement", "HtmlElement", "Storage", "Location", "WebSocket", "BinaryType", "Blob", "FileReader", "CloseEvent", "ErrorEvent", "MessageEvent"] }
+# No "Storage" feature: the one thing that used it was the migration marker,
+# which now lives in the harvest delegate. `localStorage` throws in the
+# gateway's sandboxed iframe (no `allow-same-origin`), so keeping the binding
+# available invites the next reader to reach for storage that cannot work
+# where this app actually runs.
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlInputElement", "HtmlElement", "Location", "WebSocket", "BinaryType", "Blob", "FileReader", "CloseEvent", "ErrorEvent", "MessageEvent"] }
 js-sys = "0.3"
 gloo-timers = { version = "0.3", features = ["futures"] }
 futures = "0.3"

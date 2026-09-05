@@ -2,22 +2,41 @@ name: contract drift
 
 # FAILS A PULL REQUEST THAT MOVES A CONTRACT OR DELEGATE ADDRESS.
 #
-# In Freenet the compiled WASM is the identity: a contract lives at
-# `BLAKE3(BLAKE3(wasm) || parameters)`, and a delegate likewise. So anything
-# that changes codegen re-keys the artifact and strands whatever state lived at
-# the old address. The dangerous property is that NONE of it looks like a
-# re-key in the diff:
+# A contract lives at `BLAKE3(BLAKE3(wasm) || parameters)`, and a delegate
+# likewise. BOTH halves are the identity, so anything that changes either one
+# re-keys the artifact and strands whatever state lived at the old address. The
+# dangerous property is that NONE of it looks like a re-key in the diff:
 #
 #   * a direct dependency bump in Cargo.toml
 #   * a TRANSITIVE bump, visible only as churn in Cargo.lock
 #   * a rustc change in rust-toolchain.toml
 #   * a change to the build flags in scripts/build-contract-wasm.sh
+#   * a field added to or removed from a PARAMETER struct in common/
+#
+# The last one used to pass this job unremarked, because the job compared only
+# the compiled WASM. `StoreParameters` shedding `trusted_bitcoin_bridges` and
+# `bitcoin_address_code_hash` took its CBOR from 109 bytes to 56 and re-keyed
+# every published store, with the WASM byte-identical and both drift guards
+# reporting "unchanged" -- truthfully. It was caught by someone measuring the
+# encoding by hand. The runtime symptom would have been none: the migration
+# probe walks addresses that never existed, takes NotFound at each, and reports
+# a clean "nothing to migrate".
+#
+# So this job compares the ADDRESS. `common/src/bin/harvest-addresses.rs`
+# encodes each artifact's live parameter structs with the same encoder the app
+# publishes with and pairs them with the built code hash; the same binary backs
+# `scripts/check-code-hashes.sh`, so there is one derivation rather than two
+# that drift.
 #
 # Dependabot is enabled on this repository and delivers a steady stream of
 # routine-LOOKING PRs of exactly the first two kinds. This job rebuilds the
-# contracts and the delegate on both sides of the PR and compares the BLAKE3
-# code hashes, so a re-key is a red check with the old and new addresses
-# printed, instead of something discovered after a publish.
+# contracts and the delegate on both sides of the PR and compares their
+# addresses, so a re-key is a red check with the old and new addresses printed,
+# instead of something discovered after a publish. The code hash is reported
+# alongside so a reader can tell "the code changed" from "only the parameters
+# changed": the first is a plain re-key, the second additionally needs a
+# parameter-generation split in `ui/src/migrate.rs` (see
+# `LAST_LEGACY_STORE_PARAM_GENERATION`), because no `legacy/` entry describes it.
 #
 # HOW TO PASS IT WHEN THE RE-KEY IS INTENDED: label the PR
 # `contract-rekey-acknowledged`. The job still runs and still prints every
@@ -26,13 +45,14 @@ name: contract drift
 # saying out loud that they moved.
 #
 # WHAT THIS JOB DOES NOT CHECK: whether the artifacts committed under
-# `ui/public/contracts/` match the current source. They do not, today -- they
-# were built with an older toolchain and older dependency versions and are not
-# reproducible (they carry absolute paths from the machine that built them).
-# Refreshing them is a deliberate re-key that has to be decided, not smuggled
-# into a CI change, so it is filed separately. This job is a RELATIVE check:
-# it answers "does this PR move the address", which is the question a
-# dependency bump raises.
+# `ui/public/contracts/` match the current source. This job is a RELATIVE
+# check -- it answers "does this PR move the address", which is the question a
+# dependency bump raises -- and it never reads the committed files at all.
+# That is `ci.yml`'s `wasm-staleness` job, which rebuilds and compares the
+# committed bytes. The two are complementary and neither substitutes for the
+# other: a PR can leave the address alone while shipping a stale artifact, and
+# refreshing a stale artifact is itself a re-key this job then has to
+# acknowledge.
 
 on:
   pull_request:
@@ -113,16 +133,28 @@ jobs:
           mkdir -p /tmp/head
           cp target/wasm32-unknown-unknown/release/*.wasm /tmp/head/
 
+      # The parameter half of every address, encoded from THIS side's parameter
+      # structs. Run against the copied artifacts rather than the target dir so
+      # it reads exactly the bytes the comparison below reads.
+      - name: derive the addresses at this PR's HEAD
+        run: |
+          set -euo pipefail
+          cargo run --locked --quiet \
+            -p harvest-common --features harvest-common/address-guard \
+            --bin harvest-addresses -- /tmp/head | tee /tmp/head-addr.tsv
+
       - name: report the current addresses (manual runs)
         if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
           {
-            echo "## Contract and delegate code hashes at this commit"
+            echo "## Contract and delegate addresses at this commit"
             echo
-            echo '```'
-            sed -n '/BLAKE3 code hashes/,$p' /tmp/head.log
-            echo '```'
+            echo "| artifact | code hash | parameters | address |"
+            echo "|---|---|---|---|"
+            grep -v '^#' /tmp/head-addr.tsv | while IFS=$'\t' read -r a _kind code plen _phex addr; do
+              echo "| \`$a\` | \`${code:0:16}…\` | ${plen} bytes | \`$addr\` |"
+            done
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: build the contracts and delegate at the merge base
@@ -155,6 +187,22 @@ jobs:
           cp scripts/build-contract-wasm.sh "$base_dir/scripts/"
           cp rust-toolchain.toml "$base_dir/"
 
+          # THIS side's address tool, for the same reason: both sides must be
+          # measured by the same procedure, or the comparison is between two
+          # different questions. What it must NOT carry over is the parameter
+          # SHAPE -- that has to come from each side's own `common/`, which is
+          # why the tool names no struct fields and asks each type for its
+          # placeholder instead. `common/src/address.rs` is deliberately not
+          # copied for the same reason.
+          #
+          # A merge base old enough to lack `harvest-common`'s `address-guard`
+          # feature cannot build this, which is a real state -- the PR that
+          # introduces the tool is exactly it. The step below tolerates the
+          # failure and the comparison turns it into a loud, acknowledgeable
+          # result rather than a silent pass.
+          mkdir -p "$base_dir/common/src/bin"
+          cp common/src/bin/harvest-addresses.rs "$base_dir/common/src/bin/"
+
           # The base may predate the committed Cargo.lock (it does for the PR
           # that introduces it). An unpinned resolve is not a meaningful
           # baseline, so say so loudly rather than comparing silently.
@@ -167,6 +215,34 @@ jobs:
           mkdir -p /tmp/base
           cp "$base_dir/target/wasm32-unknown-unknown/release/"*.wasm /tmp/base/
 
+      - name: derive the addresses at the merge base
+        if: github.event_name == 'pull_request'
+        # Failure here is tolerated ON PURPOSE and is NOT a hole: the merge base
+        # may predate the address tool, and the comparison step treats a missing
+        # file as "the address question could not be answered", which fails
+        # closed and needs the acknowledgement label like any other red result.
+        # Letting this step's own exit code decide would collapse "the base is
+        # too old" into an opaque build failure.
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          base_dir="$RUNNER_TEMP/base"
+          # Same reasoning as the build script's: the address depends on the
+          # resolved dependency versions, so pin them where the base has a
+          # lockfile and say so loudly where it does not.
+          locked=(--locked)
+          if [ ! -f "$base_dir/Cargo.lock" ]; then
+            locked=()
+            echo "::warning::merge base has no Cargo.lock; its address derivation resolves dependencies fresh"
+          fi
+          if ! ( cd "$base_dir" && cargo run "${locked[@]}" --quiet \
+                   -p harvest-common --features harvest-common/address-guard \
+                   --bin harvest-addresses -- /tmp/base ) > /tmp/base-addr.tsv
+          then
+            echo "::warning::could not derive addresses at the merge base; it may predate common/src/bin/harvest-addresses.rs"
+            rm -f /tmp/base-addr.tsv
+          fi
+
       - name: compare addresses
         if: github.event_name == 'pull_request'
         env:
@@ -174,11 +250,25 @@ jobs:
         run: |
           set -uo pipefail
           moved=0
+
+          # Whether the base could answer the address question at all. A base
+          # that predates the address tool cannot, and that is reported rather
+          # than quietly downgraded to the old code-hash-only comparison.
+          base_addresses=1
+          [ -s /tmp/base-addr.tsv ] || base_addresses=0
+
+          # One artifact's column out of a tool run. Column order is fixed by
+          # harvest-addresses.rs: artifact, kind, code_hash, params_len,
+          # params_hex, address.
+          field() {
+            grep -v '^#' "$1" | awk -F'\t' -v a="$2" -v f="$3" '$1 == a { print $f }'
+          }
+
           {
-            echo "## Contract and delegate code hashes"
+            echo "## Contract and delegate addresses"
             echo
-            echo "| artifact | merge base | this PR | |"
-            echo "|---|---|---|---|"
+            echo "| artifact | merge base | this PR | code | parameters | |"
+            echo "|---|---|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
 
           for a in reputation_contract store_contract mailbox_contract harvest_delegate; do
@@ -187,23 +277,97 @@ jobs:
             # having nothing to compare.
             if [ ! -f "/tmp/base/$a.wasm" ] || [ ! -f "/tmp/head/$a.wasm" ]; then
               echo "::error::$a.wasm is missing from one side of the comparison"
-              echo "| \`$a\` | — | — | :x: missing |" >> "$GITHUB_STEP_SUMMARY"
+              echo "| \`$a\` | — | — | — | — | :x: missing |" >> "$GITHUB_STEP_SUMMARY"
               moved=1
               continue
             fi
-            b="$(b3sum "/tmp/base/$a.wasm" | cut -d' ' -f1)"
-            h="$(b3sum "/tmp/head/$a.wasm" | cut -d' ' -f1)"
-            if [ "$b" = "$h" ]; then
-              echo "unchanged: $a  $h"
-              echo "| \`$a\` | \`${b:0:16}…\` | \`${h:0:16}…\` | unchanged |" >> "$GITHUB_STEP_SUMMARY"
-            else
-              echo "::error::$a RE-KEYS: $b -> $h  (see the job summary; label this PR contract-rekey-acknowledged if the re-key is intended)"
-              echo "| \`$a\` | \`${b:0:16}…\` | \`${h:0:16}…\` | :warning: **MOVED** |" >> "$GITHUB_STEP_SUMMARY"
+            bc="$(b3sum "/tmp/base/$a.wasm" | cut -d' ' -f1)"
+            hc="$(b3sum "/tmp/head/$a.wasm" | cut -d' ' -f1)"
+
+            head_addr="$(field /tmp/head-addr.tsv "$a" 6)"
+            head_params="$(field /tmp/head-addr.tsv "$a" 5)"
+            head_plen="$(field /tmp/head-addr.tsv "$a" 4)"
+            # An artifact the tool did not report is an artifact this job
+            # cannot check. Same rule as a missing .wasm.
+            if [ -z "$head_addr" ]; then
+              echo "::error::harvest-addresses reported no address for $a at HEAD; is it missing from the table in common/src/bin/harvest-addresses.rs?"
+              echo "| \`$a\` | — | — | — | — | :x: not reported |" >> "$GITHUB_STEP_SUMMARY"
               moved=1
+              continue
             fi
+
+            if [ "$bc" = "$hc" ]; then code_cell="unchanged"; else code_cell="**moved**"; fi
+
+            if [ "$base_addresses" = 0 ]; then
+              # No base address to compare against, so report what IS known and
+              # let the base-unavailable failure below carry the verdict.
+              echo "| \`$a\` | _unavailable_ | \`${head_addr:0:16}…\` | $code_cell | ${head_plen} bytes | :question: base not derivable |" >> "$GITHUB_STEP_SUMMARY"
+              [ "$bc" = "$hc" ] || moved=1
+              continue
+            fi
+
+            base_addr="$(field /tmp/base-addr.tsv "$a" 6)"
+            base_params="$(field /tmp/base-addr.tsv "$a" 5)"
+            base_plen="$(field /tmp/base-addr.tsv "$a" 4)"
+            if [ -z "$base_addr" ]; then
+              echo "::error::harvest-addresses reported no address for $a at the merge base"
+              echo "| \`$a\` | — | \`${head_addr:0:16}…\` | $code_cell | — | :x: not reported |" >> "$GITHUB_STEP_SUMMARY"
+              moved=1
+              continue
+            fi
+
+            if [ "$base_params" = "$head_params" ]; then
+              params_cell="unchanged (${head_plen} bytes)"
+            else
+              params_cell="**${base_plen} → ${head_plen} bytes**"
+            fi
+
+            if [ "$base_addr" = "$head_addr" ]; then
+              echo "unchanged: $a  $head_addr"
+              echo "| \`$a\` | \`${base_addr:0:16}…\` | \`${head_addr:0:16}…\` | $code_cell | $params_cell | unchanged |" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            # Name WHICH half moved in the log line as well as the table: the
+            # remedies differ, and a code-only re-key is a different amount of
+            # work from a parameter-encoding change.
+            if [ "$bc" = "$hc" ]; then
+              what="its PARAMETER ENCODING changed (the WASM is byte-identical)"
+            elif [ "$base_params" = "$head_params" ]; then
+              what="its code changed"
+            else
+              what="its code AND its parameter encoding changed"
+            fi
+            echo "::error::$a RE-KEYS: $base_addr -> $head_addr ($what) (see the job summary; label this PR contract-rekey-acknowledged if the re-key is intended)"
+            echo "| \`$a\` | \`${base_addr:0:16}…\` | \`${head_addr:0:16}…\` | $code_cell | $params_cell | :warning: **MOVED** |" >> "$GITHUB_STEP_SUMMARY"
+            moved=1
           done
 
           echo >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$base_addresses" = 0 ]; then
+            echo "::error::The merge base could not derive its addresses, so the address comparison did not run; only the code hashes above were compared, and a parameters-only re-key is invisible to that. This is expected exactly once, on the PR that introduces common/src/bin/harvest-addresses.rs. Confirm by hand that no parameter struct moved, then add the label 'contract-rekey-acknowledged'."
+            {
+              echo "**The merge base could not derive its addresses.** Only the code"
+              echo "hashes above were compared, and a change to a parameter struct alone"
+              echo "is invisible to that comparison -- which is the gap this job exists"
+              echo "to close."
+              echo
+              echo "Expected exactly once: on the PR that introduces"
+              echo "\`common/src/bin/harvest-addresses.rs\`. Every later PR has the tool"
+              echo "in its merge base."
+              echo
+              echo "Check by hand that no parameter struct changed, then acknowledge with"
+              echo "the \`contract-rekey-acknowledged\` label."
+            } >> "$GITHUB_STEP_SUMMARY"
+            if [ "$ACKNOWLEDGED" = "true" ]; then
+              echo "::warning::base addresses unavailable, but the PR carries contract-rekey-acknowledged"
+              echo "_Acknowledged via the \`contract-rekey-acknowledged\` label._" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            exit 1
+          fi
+
           if [ "$moved" = 0 ]; then
             echo "No address moved." >> "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -212,10 +376,10 @@ jobs:
           # Say the remedy in the log too, not only in the job summary. Someone
           # reading a red check should not have to open the workflow file to
           # find out what to do about it.
-          echo "::error::At least one contract or delegate address moved. State stored under the old address is not reachable from the new one. If the re-key is UNINTENDED, pin the dependency so the bytes stay put. If it is INTENDED, plan the migration and then add the label 'contract-rekey-acknowledged' to this PR -- applying it re-runs this check, no push needed."
+          echo "::error::At least one contract or delegate address moved. State stored under the old address is not reachable from the new one. If the re-key is UNINTENDED, pin the dependency or restore the parameter struct so the address stays put. If it is INTENDED, plan the migration and then add the label 'contract-rekey-acknowledged' to this PR -- applying it re-runs this check, no push needed."
 
           {
-            echo "A moved code hash means the contract or delegate lives at a new address."
+            echo "A moved address means the contract or delegate lives somewhere new."
             echo "State stored under the old address is not reachable from the new one."
             echo
             echo "Before merging, decide which this is:"
@@ -225,6 +389,21 @@ jobs:
             echo "* **Intended** — plan the migration, then add the"
             echo "  \`contract-rekey-acknowledged\` label to this PR to record the decision"
             echo "  and let it merge."
+            echo
+            echo "Read the **code** and **parameters** columns before planning it: they"
+            echo "call for different work."
+            echo
+            echo "* **Code moved** — append the outgoing hash to the artifact's"
+            echo "  \`legacy/*.toml\` **before** rebuilding, per \`legacy/README.md\`."
+            echo "  \`freenet_migrate\` re-derives each recorded generation from today's"
+            echo "  parameters, so that is enough on its own."
+            echo "* **Parameters moved** — that is *also* needed, and it is not enough."
+            echo "  Every generation recorded in \`legacy/\` was published under the OLD"
+            echo "  encoding, so re-deriving them from today's produces addresses that"
+            echo "  never existed. The lineage needs a generation split like the store's"
+            echo "  \`LAST_LEGACY_STORE_PARAM_GENERATION\` in \`ui/src/migrate.rs\`."
+            echo "  Skipping it fails **silently**: every probe returns NotFound and the"
+            echo "  sweep reports a clean migration having looked at nothing."
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$ACKNOWLEDGED" = "true" ]; then

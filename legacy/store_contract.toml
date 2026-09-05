@@ -1,0 +1,88 @@
+# Superseded generations of the Harvest store contract.
+#
+# See README.md in this directory for the rules. Oldest first; the CURRENT
+# generation is derived from the WASM this build ships and is never listed
+# here.
+#
+# Instance ids are derived per seller: `BLAKE3(code_hash || cbor(StoreParameters))`.
+# That makes every generation's store instance derivable from the seller's
+# ghostkey ALONE -- the probe does not need the delegate to have survived to
+# find an old store.
+#
+# CAREFUL: `cbor(StoreParameters)` is NOT the same bytes for every row here,
+# and the odd ones out are in the MIDDLE, not at the start.
+#
+# The encoding went 56 -> 109 -> 56 bytes:
+#
+#   V1     (built ded0e3a)             56 B -- seller key only
+#   V2-V5  (built 78d1020..9e3e1fb)   109 B -- plus trusted_bitcoin_bridges
+#                                             ([]) and bitcoin_address_code_hash
+#                                             (null)
+#   V6+    (built ea94a33 onwards)     56 B -- seller key only again
+#
+# `7c192d2` added the two Bitcoin fields to `StoreParameters` (first shipped in
+# the V2 artifact); `fc760ed` moved them onto `Order` (first shipped in V6).
+# Each "built" commit is the one whose committed
+# `ui/public/contracts/store_contract.wasm` hashes to that row's `code_hash`.
+#
+# So V1 is derived under TODAY's encoding, not the legacy one. An earlier
+# version of this comment said "V1-V5 were published when StoreParameters still
+# carried" the two fields, which is wrong about V1 -- and V1 is the ONLY
+# generation ever published to the network, so the probe derived the one store
+# that exists at an address it never had.
+#
+# `ui/src/migrate.rs::store_candidates` derives each generation under the
+# encoding it was published with, keyed on
+# `published_under_legacy_store_params`, which is a BAND
+# (`FIRST_LEGACY_STORE_PARAM_GENERATION..=LAST_LEGACY_STORE_PARAM_GENERATION`)
+# and not a threshold, for exactly that reason. A row added from here on is
+# published under the current shape and falls outside the band on its own.
+# Getting this wrong is silent -- the probe walks addresses that never existed
+# and reports a clean migration.
+#
+# The state is a `#[composable]` CRDT merged by the contract's own
+# `update_state`, so folding an old generation forward is the same operation
+# the network runs between peers -- not a bespoke merge whose correctness has
+# to be argued separately.
+
+[[entry]]
+version = "V1"
+description = "First store contract; store creation flow and contract WASM embedding"
+date = "2026-04-16"
+code_hash = "4d7ad3c31238a4b7a45095ae8722df52f9931a5362568ed2c63b3f36a96c711d"
+
+[[entry]]
+version = "V2"
+description = "Superseded by the Bitcoin payments work: orders, payment proofs and the trusted-bridge parameters all changed the compiled bytes"
+date = "2026-09-02"
+code_hash = "0227238dccae77ef9f49d06b685fa3fed95fe63b292d7d7a4fa9d6ad3f42caa8"
+
+[[entry]]
+version = "V3"
+description = "Superseded by the chrono wasmbind fix (harvest#8) -- the module built before it imported __wbindgen_placeholder__ and could not be instantiated at all"
+date = "2026-09-03"
+code_hash = "ccc61113e758c463ab03a55612ac28a480c4733e9a82eb961566cf6496205233"
+
+[[entry]]
+version = "V4"
+description = "Superseded by the freenet-stdlib 0.6 -> 0.8.5 bump, taken so freenet-migrate could be adopted at all (0.6 and 0.8 cannot co-link). Built with --remap-path-prefix; V1-V3 were not, which is why their bytes carry absolute paths"
+date = "2026-09-04"
+code_hash = "df0e8dfbc12071b1ab80d1b5c05aa6a9265b9b4141669a740f04f96363118d4a"
+
+[[entry]]
+version = "V5"
+description = "Superseded by the per-order Bitcoin bridge list and the payment-proof claim bounds. Both changes are in `harvest-common`, which is compiled into every artifact here, so the bytes moved -- for this contract substantively: `StoreParameters` lost `trusted_bitcoin_bridges` and `bitcoin_address_code_hash` to `Order`, so its parameter encoding changed as well as its code"
+date = "2026-09-04"
+code_hash = "186f7784628f0f773dd711c91a35d822e2f1111fe052328227f924977df2d2c0"
+
+[[entry]]
+version = "V6"
+description = "Superseded by the per-order Bitcoin payment address: `harvest-common` gained the payment-xpub and order-address surface on `BitcoinDelegateRequest`, and it is compiled into every artifact here, so the bytes moved. Nothing this contract itself does changed"
+date = "2026-09-04"
+code_hash = "9add809b5af3b735114e0683fac23a459a1d3dde447cf4f921ced9a0719611cf"
+
+[[entry]]
+version = "V7"
+description = "Superseded by the 2026-09-05 correctness review. `harvest-common` is compiled into every artifact here, so its changes move these bytes whether or not this artifact's own behaviour changed. This generation carries the 2026-09-05 correctness review: `StoreStateV1::orders` gained `#[serde(default)]`, without which no V1 state decoded at all; `apply_delta` became all-or-nothing in orders, listings and feedback; the equal-rank order tie-break now keeps the SMALLER encoding and `AuthorizedOrder::verify` refuses any field the status does not consult, which together close a permanent third-party displacement of a paid order; a reversal now requires evidence the order was once covered; and confirmation depth is capped at what the bridge attested. The parameter structs also became `pub(crate)` with constructors so a second derivation no longer compiles -- a visibility change ONLY, not a field change: `cbor(StoreParameters)` is still 56 bytes and the V2..=V5 legacy parameter band is unaffected. `freenet-bitcoin-common` moved bbeed1e -> 0e5b9d9 for the attested-depth cap, and it links into all four artifacts as well. `scripts/build-contract-wasm.sh` is NOT among the causes: its reproducible-build fix landed in 47b67aa and was already in effect for the generation this supersedes"
+date = "2026-09-05"
+code_hash = "c1bf133c0029553bee0e092332aac933851e28a1054cce3bf72e42f517bece30"
