@@ -58,6 +58,7 @@ use harvest_common::store::StoreStateV1;
 
 use crate::migrate::{self, Artifact, MailboxOps, ProbeSession, ReputationOps, Seal, StoreOps};
 
+use super::migrate_gate::{self, Admission, SessionWalks};
 use super::migrate_seal::{self, Disposition, ForwardPut, SuccessorReference};
 use super::store_ops::{MAILBOX_CONTRACT_WASM, REPUTATION_CONTRACT_WASM, STORE_CONTRACT_WASM};
 
@@ -67,6 +68,15 @@ struct Probe {
     fingerprint: String,
     /// The durable marker this probe may write, and only if it earns it.
     marker: String,
+    /// Every candidate this walk has asked about, in the order it asked.
+    ///
+    /// Collected as the walk advances rather than derived afterwards: these
+    /// are exactly the generations that may still be named by a registration,
+    /// and `adopt_recovered` records all of them as superseded. Re-deriving
+    /// the lineage at the end would be a second derivation of the same
+    /// addresses, and the store's predecessors are not derivable from today's
+    /// parameters at all (see `start_identity_migration`).
+    probed: Vec<ContractInstanceId>,
     params: Parameters<'static>,
     session: Session,
 }
@@ -105,16 +115,19 @@ thread_local! {
     /// under exactly one key, and the key changes as the walk advances.
     static PROBES: RefCell<HashMap<ContractInstanceId, Probe>> = RefCell::new(HashMap::new());
 
-    /// Marker keys of probes that are running or finished in this session, so
-    /// a second `GhostKeyList` (the vault sends one per connect) does not start
-    /// a duplicate walk of the same lineage.
+    /// Which lineages this session has walked, so a second `GhostKeyList`
+    /// (the vault sends one per connect) neither starts a duplicate walk nor
+    /// re-runs a finished one.
     ///
-    /// In-memory only, and deliberately separate from the durable marker: this
-    /// suppresses a concurrent duplicate, the durable one suppresses a repeat
-    /// on a later load. Conflating them is how an in-flight probe becomes a
-    /// permanent "already done".
-    static IN_FLIGHT: RefCell<std::collections::HashSet<String>> =
-        RefCell::new(std::collections::HashSet::new());
+    /// In-memory only, and deliberately NOT the durable marker: this bounds
+    /// repetition within a session, the durable one would bound it across
+    /// loads. They used to be treated as interchangeable -- this was released
+    /// the moment a walk settled, on the assumption the durable marker took
+    /// over from there. It does not: the seal is withheld
+    /// (`successor_reference_is_durable`), so nothing was left holding the
+    /// gate and every reconnect re-walked the whole lineage. See
+    /// [`SessionWalks`].
+    static SESSION_WALKS: RefCell<SessionWalks> = RefCell::new(SessionWalks::default());
 
     /// Probes that are built and waiting on the delegate's answer about their
     /// durable marker, keyed by that marker.
@@ -323,20 +336,32 @@ fn start<F>(
     let current = migrate::current_id(&current_hash, &params);
     let marker = migrate::marker_key(artifact, &current, &current_hash);
 
-    // The in-memory guard comes first, and covers the marker query as well as
+    // The session guard comes first, and covers the marker query as well as
     // the walk. Without that, a second `GhostKeyList` arriving inside the
     // query's round trip would park a second probe under the same marker and
     // silently evict the first from `PENDING` -- a migration that never ran
     // and never reported anything.
-    let fresh = IN_FLIGHT.with(|f| f.borrow_mut().insert(marker.clone()));
-    if !fresh {
-        return;
+    match SESSION_WALKS.with(|w| w.borrow_mut().claim(&marker)) {
+        Admission::Admit => {}
+        Admission::AlreadyWalking => return,
+        Admission::AlreadyWalked => {
+            // Not silent, because this is the gate now doing the job the
+            // durable marker cannot: if it stops firing, the walk goes back to
+            // running once per connect and nothing else would say so.
+            info!(
+                "migration: the {} lineage for {fingerprint} was already walked in this \
+                 session; it runs again on the next load",
+                artifact.as_str()
+            );
+            return;
+        }
     }
 
     let probe = Probe {
         artifact,
         fingerprint: fingerprint.to_string(),
         marker: marker.clone(),
+        probed: Vec::new(),
         params: params.clone(),
         session: build(&params),
     };
@@ -416,11 +441,9 @@ fn drop_pending(marker: &str) {
             probe.fingerprint
         );
     }
-    // The in-flight guard is what stops a later `GhostKeyList` re-asking the
+    // The session guard is what stops a later `GhostKeyList` re-asking the
     // delegate about a marker this session has already settled.
-    IN_FLIGHT.with(|f| {
-        f.borrow_mut().insert(marker.to_string());
-    });
+    SESSION_WALKS.with(|w| w.borrow_mut().settled_without_walking(marker));
 }
 
 /// A delegate response arrived. Returns `true` if it belonged to the migration
@@ -479,6 +502,12 @@ fn pump(mut probe: Probe) {
         finish(probe);
         return;
     };
+
+    // Recorded before the send for the same reason it is registered before
+    // the send: this is the list of generations that may still be named by a
+    // registration, and a candidate that was asked about counts whatever the
+    // answer turns out to be.
+    probe.probed.push(candidate);
 
     // Register BEFORE sending. The response can arrive as soon as the send
     // returns, and an answer with nothing registered is dropped -- the same
@@ -570,6 +599,9 @@ struct Forwarded {
     artifact: Artifact,
     fingerprint: String,
     marker: String,
+    /// Every generation this walk asked about; all are superseded by the
+    /// successor and any of them may be what the registry names.
+    probed: Vec<ContractInstanceId>,
     seal: Seal,
     note: String,
 }
@@ -675,22 +707,21 @@ fn finish(mut probe: Probe) {
         // recovery cannot happen today -- only `Recovered` seals, and
         // `Recovered` always yields state -- but if a future outcome made it
         // possible, not sealing is the safe half.
-        IN_FLIGHT.with(|f| {
-            f.borrow_mut().remove(&probe.marker);
-        });
+        SESSION_WALKS.with(|w| w.borrow_mut().settled(&probe.marker));
         return;
     };
 
-    // The in-flight guard is deliberately still held. It covers the write as
+    // The session guard is deliberately still held. It covers the write as
     // well as the walk, so a second `GhostKeyList` arriving while the PUT is
     // outstanding cannot start a duplicate walk of a lineage this session is
-    // in the middle of carrying forward. It is released on every path out of
+    // in the middle of carrying forward. It is settled on every path out of
     // `settle_forward`.
     send_forward(
         Forwarded {
             artifact: probe.artifact,
             fingerprint: probe.fingerprint.clone(),
             marker: probe.marker.clone(),
+            probed: std::mem::take(&mut probe.probed),
             seal,
             note,
         },
@@ -788,12 +819,13 @@ fn settle_forward(successor: ContractInstanceId, how: Confirmation) {
         return;
     };
 
-    // Released on every path out, including the ones that seal nothing.
-    // Leaving it set would suppress the retry that not sealing exists to
-    // enable -- for the rest of the session, silently.
-    IN_FLIGHT.with(|f| {
-        f.borrow_mut().remove(&forwarded.marker);
-    });
+    // Settled on every path out, including the ones that seal nothing -- and
+    // settled means CLOSED for this session, not released. This used to
+    // release the marker so a failed migration could be retried; with the seal
+    // withheld there was then nothing holding the gate at all, and the retry
+    // it enabled was every reconnect re-walking the lineage and re-PUTting the
+    // full state, without bound. A transient failure is retried by reloading.
+    SESSION_WALKS.with(|w| w.borrow_mut().settled(&forwarded.marker));
 
     let put = match how {
         Confirmation::Acknowledged => ForwardPut::Acknowledged,
@@ -855,7 +887,7 @@ fn adopt_and_announce(forwarded: &Forwarded, successor: ContractInstanceId) {
         "migration: PUT recovered {} state forward to {successor}",
         forwarded.artifact.as_str()
     );
-    adopt_recovered(forwarded.artifact, &forwarded.fingerprint, successor);
+    adopt_recovered(&forwarded.probed, successor);
     super::APP_STATE.write().notifications.push(format!(
         "Recovered your {} from an earlier version of Harvest.",
         forwarded.artifact.as_str()
@@ -939,49 +971,36 @@ fn encode_forward<T: serde::Serialize>(state: &T, wasm: &'static [u8]) -> Option
     }
 }
 
-/// Point this session's registration at the generation that now holds the
-/// recovered data.
+/// Record every generation this walk asked about as superseded by the one
+/// that now holds the data.
 ///
-/// All three artifacts, not just the store: `StoreRegistration` carries a
-/// mailbox and a reputation id too, and leaving those on the predecessor after
-/// their contracts migrated is what left the migrated instances unreferenced.
+/// `AppState::adopt_migrated_contract_id` both remembers the mapping and
+/// repoints anything currently held, across all three id fields of every
+/// registration -- so this repoints the store, the mailbox and the reputation
+/// contract, not just the store.
 ///
-/// The store's id is REPLACED rather than appended to: the recovered store is
-/// the SAME store at a new address, and appending would show the seller two.
+/// # Why no registration is read
 ///
-/// This is the in-memory half only, and it lasts as long as the session. The
-/// durable half is condition 2 of the sealing rule; see
-/// [`successor_reference_is_durable`] for why it cannot be written yet.
+/// This used to read the predecessor out of `my_stores.first()` and return
+/// early when there was no entry -- which is the state the app is in until the
+/// delegate's `ListStores` answer arrives, and stays in permanently if that
+/// answer errors (its send only logs). Nothing was recorded in that window, so
+/// the answer that arrived afterwards installed the predecessor's triple and
+/// the migration reverted: exactly the failure the remembering exists to
+/// prevent, in exactly the case it was needed. A decision whose job is to
+/// survive the registry being late cannot take the registry as an input, so
+/// this one does not have it: see `migrate_gate::superseded_ids`.
 ///
-/// A `ListStores` answer arriving after this runs used to overwrite it, on a
-/// race whose timing nobody controls, because the delegate's registry still
-/// names the predecessor and always will. `AppState::adopt_migrated_contract_id`
-/// records the move so `merge_store_registrations` can rewrite those stale ids
-/// as they arrive; the durable gap remains, so the migration still re-runs on
-/// the next load, but it no longer un-does itself within a session.
-fn adopt_recovered(artifact: Artifact, fingerprint: &str, successor: ContractInstanceId) {
+/// Every probed generation is recorded rather than only the one that hit,
+/// because the registry may name any of them and all are equally superseded.
+///
+/// This is still the in-memory half. The durable half is condition 2 of the
+/// sealing rule; see [`successor_reference_is_durable`].
+fn adopt_recovered(probed: &[ContractInstanceId], successor: ContractInstanceId) {
+    let superseded = migrate_gate::superseded_ids(probed, successor);
     let successor_bytes = successor.as_bytes().to_vec();
     let mut app = super::APP_STATE.write();
-    let Some(stores) = app.my_stores.get(fingerprint) else {
-        return;
-    };
-    if artifact == Artifact::Store
-        && stores
-            .iter()
-            .any(|s| s.store_contract_id == successor_bytes)
-    {
-        return;
+    for predecessor in superseded {
+        app.adopt_migrated_contract_id(predecessor.as_bytes(), successor_bytes.clone());
     }
-    let Some(existing) = stores.first() else {
-        return;
-    };
-    // The id this artifact is moving FROM. Read before the write, because the
-    // repoint has to be remembered and not merely applied: see
-    // `AppState::adopt_migrated_contract_id`, which also does the write.
-    let predecessor = match artifact {
-        Artifact::Store => existing.store_contract_id.clone(),
-        Artifact::Mailbox => existing.mailbox_contract_id.clone(),
-        Artifact::Reputation => existing.reputation_contract_id.clone(),
-    };
-    app.adopt_migrated_contract_id(&predecessor, successor_bytes);
 }

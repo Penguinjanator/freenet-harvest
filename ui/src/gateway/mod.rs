@@ -18,6 +18,7 @@ pub mod migrate_ops;
 // a migration may declare itself done. NOT wasm-gated, deliberately -- it is
 // pure, and keeping it here is what makes it reachable from `cargo test`,
 // which nothing inside `migrate_ops` is.
+pub mod migrate_gate;
 pub mod migrate_seal;
 pub mod response_handler;
 pub mod store_ops;
