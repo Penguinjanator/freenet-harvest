@@ -261,14 +261,47 @@ fn order_content_digest(record: &AuthorizedOrder) -> [u8; 8] {
 /// peers each independently assemble a different, but individually valid,
 /// proof for the same transition (e.g. two different sets of bridge claims
 /// that both establish `Paid`) -- the tie is broken by comparing the CBOR
-/// bytes of the two records and keeping the greater. Comparing bytes rather
-/// than, say, "whichever arrived first" is what makes the choice a pure
-/// function of content: every replica that ends up holding both candidate
-/// records picks the same winner, regardless of which one it received
-/// first or via which peer.
+/// bytes of the two records and keeping the **smaller**. Comparing bytes
+/// rather than, say, "whichever arrived first" is what makes the choice a
+/// pure function of content: every replica that ends up holding both
+/// candidate records picks the same winner, regardless of which one it
+/// received first or via which peer.
 ///
-/// This is a `max` over the total order `(rank, cbor_bytes)`, so it is
-/// associative, commutative and idempotent -- the three properties the
+/// # Why the smaller encoding, not the greater
+///
+/// A `Paid` transition is authorized by evidence, not by a signature over
+/// the status, so any third party who can read the store can take a genuine
+/// record, leave the seller's signature and the status exactly as they are,
+/// staple additional VALID claims onto the payment proof and resubmit it.
+/// A `Claim::ScannedTo` names no outpoint, so it changes no verdict at all
+/// and is published publicly by every bridge; a handful of them is free to
+/// obtain and adds hundreds of bytes.
+///
+/// While the greater encoding won, that resubmission was permanent -- merge
+/// is a monotonic maximum, so the compact honest record could never win the
+/// order back on any replica -- and repeatable, up to
+/// [`crate::payment::MAX_PROOF_CLAIM_BYTES`] (256 KiB) for every order in the
+/// store, re-verified on every state validation.
+///
+/// Preferring the smaller encoding removes the reward. It is exactly as total,
+/// deterministic and content-derived as the old rule, so convergence is
+/// unaffected. What it cannot be turned into is the converse attack, because
+/// at an equal rank a record's *only* attacker-variable field is
+/// `payment_proof`: `order`, `scoped_payload` and `signature` are pinned by
+/// [`AuthorizedOrder::verify_terms`], and `Cancelled`'s status signature by
+/// `verify` -- and every record reaching this function has already passed
+/// `verify`. So a smaller record is not a weaker one: it still establishes
+/// the same status by the same rules, and the only thing an attacker can do
+/// with it is make the state cheaper, bounded below by the smallest encoding
+/// that still verifies.
+///
+/// A digest over the order TERMS was considered instead and rejected: two
+/// records for one order id normally carry identical terms, so it ties, and
+/// the winner would fall back to arrival order -- which is the divergence the
+/// tie-break exists to prevent.
+///
+/// This is a `max` over the total order `(rank, Reverse(cbor_bytes))`, so it
+/// is associative, commutative and idempotent -- the three properties the
 /// merge tests in this module pin directly on serialized bytes.
 fn merge_order(orders: &mut BTreeMap<OrderId, AuthorizedOrder>, incoming: AuthorizedOrder) {
     let id = incoming.order.id.clone();
@@ -288,7 +321,7 @@ fn merge_order(orders: &mut BTreeMap<OrderId, AuthorizedOrder>, incoming: Author
                 crate::to_cbor(existing).expect("AuthorizedOrder always serializes to CBOR");
             let incoming_bytes =
                 crate::to_cbor(&incoming).expect("AuthorizedOrder always serializes to CBOR");
-            if incoming_bytes > existing_bytes {
+            if incoming_bytes < existing_bytes {
                 orders.insert(id, incoming);
             }
         }
@@ -684,6 +717,31 @@ mod order_tests {
         let tip = SignedTipEntry::sign(bridge, &tip_body).unwrap();
 
         OrderPaymentProof::on_chain(vec![claim], tip)
+    }
+
+    /// A valid, bridge-signed `ScannedTo` claim for this order's script.
+    ///
+    /// `ScannedTo` names no outpoint, so `verify_on_chain_proof`'s fold skips
+    /// it entirely: it adds nothing to the confirmed total and cannot change
+    /// the confirmation depth. It is still a genuine claim about the right
+    /// script, signed by a bridge the order trusts, so it passes every check
+    /// the proof makes. That combination -- costs the attacker nothing,
+    /// changes no verdict, adds bytes -- is what makes it padding.
+    ///
+    /// It is also free to obtain: a bridge publishes these into the public
+    /// address contract, so anyone can harvest them. Signing with the bridge
+    /// key here stands in for that harvesting, not for a stolen key.
+    fn scanned_to_claim(order: &Order, bridge: &SigningKey, height: u32) -> SignedClaim {
+        let body = ClaimBody {
+            script_id: order.bitcoin_params().script_id(),
+            network: order.network,
+            as_of: BlockAnchor {
+                height,
+                hash: BlockHash([height as u8; 32]),
+            },
+            claim: Claim::ScannedTo,
+        };
+        SignedClaim::sign(bridge, &body).unwrap()
     }
 
     /// Reach into an on-chain proof to tamper with it in tests.
@@ -1434,9 +1492,10 @@ mod order_tests {
             "the tie-break winner must not depend on merge order"
         );
 
-        // The winner must be whichever record has the greater CBOR bytes.
+        // The winner must be whichever record has the smaller CBOR bytes --
+        // see `merge_order` for why that direction and not the other.
         let expected_winner =
-            if crate::to_cbor(&record_1).unwrap() > crate::to_cbor(&record_2).unwrap() {
+            if crate::to_cbor(&record_1).unwrap() < crate::to_cbor(&record_2).unwrap() {
                 &record_1
             } else {
                 &record_2
@@ -1444,7 +1503,7 @@ mod order_tests {
         assert_eq!(
             crate::to_cbor(&a_then_b.orders[&order.id]).unwrap(),
             crate::to_cbor(expected_winner).unwrap(),
-            "the tie-break must deterministically pick the greater CBOR encoding"
+            "the tie-break must deterministically pick the smaller CBOR encoding"
         );
 
         // Idempotent: merging the winner into itself changes nothing.
@@ -1580,6 +1639,100 @@ mod order_tests {
             forward.keys().collect::<Vec<_>>(),
             backward.keys().collect::<Vec<_>>(),
             "pruning must depend only on content, not on insertion order"
+        );
+    }
+
+    /// Padding a proof must not win the tie-break.
+    ///
+    /// An order's `Paid` status is not signed by anybody -- it is authorized
+    /// by evidence any peer can check -- so any third party who can read the
+    /// store can take a genuine `Paid` record, leave the seller's signature
+    /// and the status untouched, staple extra VALID claims onto the payment
+    /// proof and resubmit it. The record still verifies, and it still says
+    /// exactly what it said before.
+    ///
+    /// While the tie-break kept the GREATER encoding, that resubmission won,
+    /// permanently: merge is a monotonic maximum, so the honest compact
+    /// record could never displace the padded one again, on any replica. Repeat
+    /// it and every order in the store walks up toward
+    /// `MAX_PROOF_CLAIM_BYTES` (256 KiB) each, which the store then re-verifies
+    /// on every state validation and carries in every merge.
+    #[test]
+    fn a_padded_proof_does_not_displace_the_honest_record() {
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let p = params(&seller);
+        let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+
+        let honest_proof = make_payment_proof(&order, &bridge, 5);
+        let honest = make_authorized_order(
+            &seller,
+            order.clone(),
+            OrderStatus::Paid,
+            Some(honest_proof.clone()),
+        );
+
+        // The attacker's copy: same order, same seller signature, same
+        // status, same evidence -- plus eight claims that change nothing.
+        let mut padded_proof = honest_proof.clone();
+        for height in 1..=8u32 {
+            on_chain_mut(&mut padded_proof)
+                .claims
+                .push(scanned_to_claim(&order, &bridge, height));
+        }
+        let padded = make_authorized_order(
+            &seller,
+            order.clone(),
+            OrderStatus::Paid,
+            Some(padded_proof),
+        );
+
+        let honest_bytes = crate::to_cbor(&honest).unwrap();
+        let padded_bytes = crate::to_cbor(&padded).unwrap();
+        assert!(
+            padded_bytes.len() > honest_bytes.len(),
+            "the padded record must actually be bigger for this test to mean anything"
+        );
+        assert!(
+            padded_bytes > honest_bytes,
+            "padding must actually win the old greater-bytes tie-break, or this \
+             test would pass for the wrong reason"
+        );
+        assert_eq!(
+            honest.status.rank(),
+            padded.status.rank(),
+            "the attack works at an exact rank tie; anything else is a different bug"
+        );
+
+        // Both are individually valid -- the attacker has broken no rule.
+        let honest_state = orders_of([(order.id.clone(), honest.clone())]);
+        let padded_state = orders_of([(order.id.clone(), padded.clone())]);
+        assert!(honest_state.verify(&StoreStateV1::default(), &p).is_ok());
+        assert!(
+            padded_state.verify(&StoreStateV1::default(), &p).is_ok(),
+            "the padded record must still verify -- that is what makes this an \
+             attack rather than a rejected update"
+        );
+
+        // Whichever way round they meet, the compact record is what survives.
+        let mut honest_then_padded = honest_state.clone();
+        honest_then_padded
+            .merge(&StoreStateV1::default(), &p, &padded_state)
+            .unwrap();
+        let mut padded_then_honest = padded_state.clone();
+        padded_then_honest
+            .merge(&StoreStateV1::default(), &p, &honest_state)
+            .unwrap();
+
+        assert_eq!(
+            crate::to_cbor(&honest_then_padded.orders[&order.id]).unwrap(),
+            honest_bytes,
+            "a padded resubmission must not displace the honest record"
+        );
+        assert_eq!(
+            crate::to_cbor(&padded_then_honest.orders[&order.id]).unwrap(),
+            honest_bytes,
+            "and it must not survive merely by having arrived first"
         );
     }
 }
