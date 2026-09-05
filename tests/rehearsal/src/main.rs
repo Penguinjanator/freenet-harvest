@@ -45,11 +45,19 @@ fn repo_root() -> PathBuf {
         .expect("tests/rehearsal is two directories below the repo root")
 }
 
-/// The generations to plant state at, and the registry hash each must have.
+/// The generations to plant STATE at, and the registry hash each must have.
 ///
-/// Both are `<= LAST_LEGACY_STORE_PARAM_GENERATION`, so between them they
-/// exercise the parameter-encoding split, which is the part `freenet_migrate`
-/// cannot do on its own.
+/// Both are inside the legacy parameter band (V2..=V5), which is deliberate
+/// but is NOT what exercises the encoding split -- two generations on the same
+/// side of it cannot. An earlier version of this comment claimed they did,
+/// reasoning from "both are `<= LAST_LEGACY_STORE_PARAM_GENERATION`", which
+/// stopped being a sound test for "legacy" when the band gained a lower end.
+/// The split is checked separately and over EVERY generation, by
+/// `assert_candidate_addresses` below.
+///
+/// What these two are for is the FOLD: different data at two generations, so a
+/// walk that stops at the first hit shows up as a missing listing rather than
+/// as a pass.
 const PLANT_AT: &[(u32, &str)] = &[
     (
         5,
@@ -420,6 +428,110 @@ fn read_wasm(path: &Path) -> Vec<u8> {
     bytes
 }
 
+/// Every registry generation is walked at the address it ACTUALLY has.
+///
+/// This is the part `freenet_migrate` cannot do on its own:
+/// `ContractLineageEntry` carries only a code hash, so the crate derives every
+/// predecessor from one set of parameter bytes, and the store's encoding
+/// changed twice -- 56 bytes for V1, 109 for V2..=V5, 56 again from V6. Each
+/// generation is checked against an id derived the way the NODE derives one
+/// (`WrappedContract::key`), from that generation's real WASM out of git
+/// history and the parameters it shipped with.
+///
+/// Keyed on the generation NUMBER, never on a position in the candidate list.
+/// The two assertions this replaced were `derived[0] == v5_id` and
+/// `derived[1] == v4_id`, correct when written against a five-row registry and
+/// silently wrong from the moment V6 was recorded (`d9cddad`) -- V6 took index
+/// 0 and every position shifted. Nothing caught it because this harness needs
+/// a live node and does not run in CI. Looking generations up by number means
+/// adding V7 cannot break it again.
+///
+/// The table is written out per generation rather than asking
+/// `published_under_legacy_store_params`, for the same reason its counterpart
+/// in `ui/src/migrate/tests.rs` is: deriving the expectation from the code
+/// under test cannot catch that code having the boundary wrong, and the
+/// boundary WAS wrong -- it put V1, the only generation ever published, on the
+/// legacy side.
+const ENCODING_BY_GENERATION: &[(u32, bool)] = &[
+    (1, false),
+    (2, true),
+    (3, true),
+    (4, true),
+    (5, true),
+    (6, false),
+];
+
+fn assert_candidate_addresses(
+    repo: &Path,
+    vk: &VerifyingKey,
+    legacy: &Parameters<'static>,
+    current: &Parameters<'static>,
+) {
+    let derived = migrate::store_candidate_ids(vk).expect("derive candidates");
+    let mut newest_first: Vec<_> = migrate::store_lineage().iter().collect();
+    newest_first.sort_by_key(|e| std::cmp::Reverse(e.generation));
+
+    assert_eq!(
+        derived.len(),
+        newest_first.len(),
+        "every recorded generation must be walked"
+    );
+    assert_eq!(
+        ENCODING_BY_GENERATION.len(),
+        newest_first.len(),
+        "the encoding table must cover every recorded generation, and only those"
+    );
+
+    println!("  migrate::store_candidate_ids, checked against the node's own derivation:");
+    let mut saw_legacy = false;
+    let mut saw_current = false;
+
+    for (entry, got) in newest_first.iter().zip(&derived) {
+        let (_, is_legacy) = ENCODING_BY_GENERATION
+            .iter()
+            .find(|(g, _)| *g == entry.generation)
+            .unwrap_or_else(|| {
+                panic!(
+                    "generation {} is not in the encoding table",
+                    entry.generation
+                )
+            });
+
+        let wasm = legacy_wasm_from_git(repo, "store_contract", &hex::encode(entry.code_hash));
+        let params = if *is_legacy {
+            saw_legacy = true;
+            legacy.clone()
+        } else {
+            saw_current = true;
+            current.clone()
+        };
+        let (_, expected) = container(&wasm, params);
+
+        println!(
+            "    V{} {} params -> {}",
+            entry.generation,
+            if *is_legacy { "legacy " } else { "current" },
+            got
+        );
+        assert_eq!(
+            *got,
+            expected,
+            "generation {} must be walked at the address it was published under \
+             ({} parameter encoding)",
+            entry.generation,
+            if *is_legacy { "legacy" } else { "current" }
+        );
+    }
+
+    // Without generations on BOTH sides this checks nothing about the split:
+    // deriving every id under one encoding would pass.
+    assert!(
+        saw_legacy && saw_current,
+        "the registry must span the parameter split for this check to mean anything \
+         (legacy seen: {saw_legacy}, current seen: {saw_current})"
+    );
+}
+
 #[tokio::main]
 async fn main() {
     println!("== artifacts ==");
@@ -472,14 +584,10 @@ async fn main() {
     println!("  current instance:                    {curr_id}");
 
     // The arithmetic that matters: the ids migrate.rs will walk must equal the
-    // ids the node addresses these containers by.
-    let derived = migrate::store_candidate_ids(&vk).expect("derive candidates");
-    println!("  migrate::store_candidate_ids (newest first):");
-    for (i, id) in derived.iter().enumerate() {
-        println!("    [{i}] {id}");
-    }
-    assert_eq!(derived[0], v5_id, "candidate[0] must be the V5 address");
-    assert_eq!(derived[1], v4_id, "candidate[1] must be the V4 address");
+    // ids the node addresses those generations by -- every generation, each
+    // under the parameter encoding IT shipped with.
+    assert_candidate_addresses(&repo, &vk, &legacy, &curr_p);
+
     for (generation, want) in PLANT_AT {
         let row = migrate::store_lineage()
             .iter()
@@ -491,6 +599,13 @@ async fn main() {
             "generation {generation} no longer has the hash this harness plants at"
         );
     }
+    // Named for the fold below, and cross-checked against the walk rather than
+    // assumed: these are the two generations state is planted at.
+    let derived = migrate::store_candidate_ids(&vk).expect("derive candidates");
+    assert!(
+        derived.contains(&v5_id) && derived.contains(&v4_id),
+        "the walk must reach both generations this harness plants state at"
+    );
     assert_eq!(
         migrate::current_id(&current_hash, &curr_p),
         curr_id,
