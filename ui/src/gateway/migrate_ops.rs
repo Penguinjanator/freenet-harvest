@@ -954,6 +954,29 @@ fn adopt_and_announce(forwarded: &Forwarded, successor: ContractInstanceId) {
 /// duplicate handling that `RegisterStore`'s append semantics currently dodge.
 /// When it exists, this function sends it, awaits its acknowledgement, and
 /// returns `Ok` on that acknowledgement alone.
+///
+/// # Making this return `Ok` arms three things at once
+///
+/// Nothing seals today, so three separate protections are currently
+/// unreachable and have never run against a real migration. All three become
+/// load-bearing on the same commit, which is why that commit wants reviewing
+/// as one change rather than as a small fix to this function:
+///
+/// 1. **Sealing becomes reachable at all.** `migrate_seal::disposition` can
+///    return `AdoptAndSeal` for the first time, so every path into it starts
+///    mattering.
+/// 2. **Acknowledgement attribution becomes load-bearing.** A `PutResponse`
+///    cannot be attributed to a particular put, so `put_response_evidence`
+///    caps the evidence at `AcknowledgedForInstance`, which never seals. If
+///    that cap is lifted or bypassed, a store creation's put to the same id
+///    seals a migration that never landed.
+/// 3. **The session gate becomes the only bound on repetition.** With sealing
+///    live, a walk that fails to seal must still not re-run per connect;
+///    `migrate_gate::SessionWalks` is what stops it.
+///
+/// Each is pinned by a test, so the protections will not vanish silently. What
+/// no test covers is their INTERACTION, because it does not exist until this
+/// function returns `Ok`.
 fn successor_reference_is_durable(_artifact: Artifact) -> Result<(), String> {
     Err(
         "the harvest delegate has no request that can replace a StoreRegistration, so the \

@@ -83,6 +83,30 @@ that leaves the timer un-injected while adding host tests is unsafe.
 That table is the whole scope of the work. Three effects, not a thousand
 lines.
 
+### If you repeat this measurement, assert that a test actually RAN
+
+The first version of the table above was wrong, and wrong in the direction
+that matters: it reported all four calls as working. The probe checked the
+exit code of
+
+```
+cargo test -p harvest-ui <filter> -- --exact
+```
+
+and **a filter that matches nothing also exits 0.** Three of the four names
+did not match, so the measurement reported success while measuring nothing.
+
+The remedy generalises past cargo: check that the tool did the work, not that
+it returned without complaining. Here that means parsing the
+`test result: ok. N passed` line and requiring `N >= 1`; the corrected probe
+also greps for `SIGABRT`, because the timer's non-unwinding panic does not
+produce a failing test result at all.
+
+This is the same shape as the defects this file's history is made of -- an
+instrument reporting success because it was measuring the wrong thing -- and
+it is worth noticing that it appeared in the tool used to investigate them,
+not only in the code under investigation.
+
 ## The plan, in three landable stages
 
 Each stage leaves the tree better than it found it and can be reviewed alone.
