@@ -797,6 +797,22 @@ enum Confirmation {
 /// Called from the shared response handler, which otherwise only logs
 /// `PutResponse`. Every other PUT this app makes is fire-and-forget by design
 /// (a store creation, a listing, an order); this is the one that has to know.
+///
+/// # This correlates on the instance id, which is not the same as on the PUT
+///
+/// `FORWARDS` is keyed by successor instance, and that is the only thing a
+/// `PutResponse` carries. But the successor instance is the CURRENT
+/// generation's id for that seller -- the id `create_store_contracts` writes a
+/// fresh default state to, and the id another tab on the same node may be
+/// writing. An acknowledgement matched here may therefore be answering
+/// somebody else's PUT while ours failed.
+///
+/// So this settles the forward, and `migrate_seal::put_response_evidence`
+/// decides what that is worth: enough to adopt, never enough to seal. Do NOT
+/// "simplify" that into `ForwardPut::Acknowledged` -- today the seal is
+/// withheld for an unrelated reason, so the mistake would be invisible until
+/// `successor_reference_is_durable` is implemented, and then it would seal
+/// migrations that never landed.
 pub fn deliver_put_ack(id: &ContractInstanceId) -> bool {
     if FORWARDS.with(|f| f.borrow().contains_key(id)) {
         settle_forward(*id, Confirmation::Acknowledged);
@@ -828,7 +844,10 @@ fn settle_forward(successor: ContractInstanceId, how: Confirmation) {
     SESSION_WALKS.with(|w| w.borrow_mut().settled(&forwarded.marker));
 
     let put = match how {
-        Confirmation::Acknowledged => ForwardPut::Acknowledged,
+        // Never `ForwardPut::Acknowledged` directly: how much a `PutResponse`
+        // is worth is decided once, in `migrate_seal`, and it is not worth
+        // enough to seal on. See `put_response_evidence`.
+        Confirmation::Acknowledged => migrate_seal::put_response_evidence(),
         // Two different events, one epistemic state: a send that failed and a
         // deadline that expired both leave this code knowing nothing about
         // whether the state reached the contract.

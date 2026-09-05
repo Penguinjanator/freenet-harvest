@@ -13,9 +13,23 @@ use crate::migrate::Seal;
 /// Whether the recovered state actually reached the successor.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ForwardPut {
-    /// The node answered `PutResponse` for the successor instance. This is the
-    /// only signal that establishes the write landed.
+    /// The node confirmed THIS put landed.
+    ///
+    /// **Nothing can produce this today.** The client API carries no way to
+    /// attribute a `PutResponse` to the put it answers -- see
+    /// [`put_response_evidence`] -- so this variant exists to say what the
+    /// seal actually requires, and to keep the requirement in the type rather
+    /// than in a comment somebody has to remember.
     Acknowledged,
+    /// A `PutResponse` naming the successor instance arrived, but nothing says
+    /// WHOSE put it answers.
+    ///
+    /// The successor instance id is the current generation's id for that
+    /// seller: the same id `create_store_contracts` puts a fresh default state
+    /// to, and the same id another tab on the same node may be writing. Any of
+    /// those acknowledgements looks exactly like this one, so this is evidence
+    /// that SOMETHING landed at the target, not that our recovery did.
+    AcknowledgedForInstance,
     /// The send failed, or the deadline expired with no answer. Both say the
     /// same thing: nothing is known about whether the state arrived.
     ///
@@ -52,6 +66,24 @@ pub enum Disposition {
     Discard,
 }
 
+/// The strongest evidence a `PutResponse` can give about a forward put.
+///
+/// It is [`ForwardPut::AcknowledgedForInstance`] and cannot be better, because
+/// `ContractResponse::PutResponse` carries a `key` and nothing else
+/// (freenet-stdlib 0.8.5), and `ContractRequest::Put` carries no
+/// client-supplied id to echo back. Two puts to one instance are therefore
+/// indistinguishable in the response: correlating on the instance id, which is
+/// all `FORWARDS` can key on, cannot tell our recovery's put from a store
+/// creation's put or another tab's.
+///
+/// A function rather than a literal at the call site so the ceiling is stated
+/// once and tested. Raising it needs an upstream change -- a correlation token
+/// on `ContractRequest::Put` echoed in `PutResponse` -- and when that exists
+/// this takes the token and may return [`ForwardPut::Acknowledged`].
+pub fn put_response_evidence() -> ForwardPut {
+    ForwardPut::AcknowledgedForInstance
+}
+
 /// The sealing rule, in one place.
 ///
 /// The marker is not a note about what happened; it is a claim that nothing
@@ -71,6 +103,12 @@ pub fn disposition(put: ForwardPut, reference: SuccessorReference, seal: Seal) -
         // telling the seller their data was recovered would be a claim this
         // code cannot support.
         ForwardPut::Unconfirmed => Disposition::Discard,
+        // Something landed at the target, but not provably ours. Worth
+        // adopting -- the successor is where this session should point either
+        // way -- and never worth sealing, because sealing on it would record
+        // "this migration is done, never run again" on the strength of
+        // somebody else's put.
+        ForwardPut::AcknowledgedForInstance => Disposition::AdoptWithoutSealing,
         ForwardPut::Acknowledged => match (reference, seal) {
             (SuccessorReference::Durable, Seal::Seal) => Disposition::AdoptAndSeal,
             // Adopting without sealing is the safe half of every remaining
@@ -85,7 +123,11 @@ pub fn disposition(put: ForwardPut, reference: SuccessorReference, seal: Seal) -
 mod tests {
     use super::*;
 
-    const PUTS: [ForwardPut; 2] = [ForwardPut::Acknowledged, ForwardPut::Unconfirmed];
+    const PUTS: [ForwardPut; 3] = [
+        ForwardPut::Acknowledged,
+        ForwardPut::AcknowledgedForInstance,
+        ForwardPut::Unconfirmed,
+    ];
     const REFERENCES: [SuccessorReference; 2] =
         [SuccessorReference::Durable, SuccessorReference::Stale];
     const SEALS: [Seal; 2] = [Seal::Seal, Seal::Retry];
@@ -151,6 +193,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An acknowledgement that cannot be attributed to this put must never
+    /// seal. The successor instance id is the current generation's id, so a
+    /// `PutResponse` for it may be answering `create_store_contracts`'s put of
+    /// a fresh default state, or another tab's, while OUR forward put failed.
+    ///
+    /// This is currently latent rather than harmful: `reference` is always
+    /// `Stale`, so nothing seals whatever the put evidence says. It stops
+    /// being latent the day `successor_reference_is_durable` is implemented,
+    /// which the migration's own comments name as the next step -- and then a
+    /// false acknowledgement seals a migration that never landed. Pinning it
+    /// now is what stops that fix arming this one.
+    #[test]
+    fn an_ack_that_cannot_be_attributed_to_this_put_never_seals() {
+        for reference in REFERENCES {
+            for seal in SEALS {
+                assert_ne!(
+                    disposition(ForwardPut::AcknowledgedForInstance, reference, seal),
+                    Disposition::AdoptAndSeal,
+                    "an unattributable acknowledgement must not seal ({reference:?}, {seal:?})"
+                );
+            }
+        }
+    }
+
+    /// The other half: an unattributable acknowledgement is still worth
+    /// acting on. The successor IS where this session should be pointing, and
+    /// the walk repeats on the next load anyway, so refusing to adopt would
+    /// leave the seller on the predecessor for no gain.
+    #[test]
+    fn an_unattributable_ack_still_adopts() {
+        assert_eq!(
+            disposition(
+                ForwardPut::AcknowledgedForInstance,
+                SuccessorReference::Durable,
+                Seal::Seal
+            ),
+            Disposition::AdoptWithoutSealing
+        );
+    }
+
+    /// The evidence ceiling, pinned where it is produced rather than where it
+    /// is consumed. `migrate_ops` has exactly one way to turn a `PutResponse`
+    /// into evidence, and this is it.
+    #[test]
+    fn a_put_response_is_never_attributable_to_one_put() {
+        assert_eq!(put_response_evidence(), ForwardPut::AcknowledgedForInstance);
+        assert_ne!(
+            put_response_evidence(),
+            ForwardPut::Acknowledged,
+            "the client API carries nothing that attributes a PutResponse to a put"
+        );
     }
 
     /// Stated as an implication over the whole input space rather than as
