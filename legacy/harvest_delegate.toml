@@ -98,3 +98,10 @@ description = "The first build of the payment-address work, superseded by its ow
 date = "2026-09-04"
 code_hash = "f563abc42391938ad99ea47202177acbeddd1e41d517a1b92a49a6aa03a3a6eb"
 delegate_key = "00db1a23517217b598b03af5e35fc418d15c8d00b09fe2f42c20a2bc935d7fe3"
+
+[[entry]]
+version = "V9"
+description = "Superseded by the 2026-09-05 correctness review. Its own changes are the ones that matter here: every request is now gated on the caller, because the delegate's secret store is per-USER rather than per-app, so any web app the user had ever opened on this node could address it and reach the seller's payment key; and a migration seal is written only once the recovery is durably written and reachable. `harvest-common` is compiled into every artifact here, so its changes move these bytes whether or not this artifact's own behaviour changed. This generation carries the 2026-09-05 correctness review: `StoreStateV1::orders` gained `#[serde(default)]`, without which no V1 state decoded at all; `apply_delta` became all-or-nothing in orders, listings and feedback; the equal-rank order tie-break now keeps the SMALLER encoding and `AuthorizedOrder::verify` refuses any field the status does not consult, which together close a permanent third-party displacement of a paid order; a reversal now requires evidence the order was once covered; and confirmation depth is capped at what the bridge attested. The parameter structs also became `pub(crate)` with constructors so a second derivation no longer compiles -- a visibility change ONLY, not a field change: `cbor(StoreParameters)` is still 56 bytes and the V2..=V5 legacy parameter band is unaffected. `freenet-bitcoin-common` moved bbeed1e -> 0e5b9d9 for the attested-depth cap, and it links into all four artifacts as well. `scripts/build-contract-wasm.sh` is NOT among the causes: its reproducible-build fix landed in 47b67aa and was already in effect for the generation this supersedes"
+date = "2026-09-05"
+code_hash = "c11c732fce7c00344739cf94ec0934c45fd2fbb152d24fe7de1d353b9ee207a4"
+delegate_key = "9def598ae700df7f914eb16f2d5399121783bd432cbc9f2a0a417540cfff58da"

@@ -456,6 +456,9 @@ const ENCODING_BY_GENERATION: &[(u32, bool)] = &[
     (4, true),
     (5, true),
     (6, false),
+    // V7: visibility-only change to `StoreParameters`, so the encoding is
+    // unchanged at 56 bytes. See the same table in `ui/src/migrate/tests.rs`.
+    (7, false),
 ];
 
 fn assert_candidate_addresses(

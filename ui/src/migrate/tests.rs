@@ -630,6 +630,11 @@ const PUBLISHED_UNDER_LEGACY_PARAMS: &[(u32, bool)] = &[
     (4, true),
     (5, true),
     (6, false),
+    // V7: the 2026-09-05 review. `StoreParameters` changed VISIBILITY only --
+    // `pub` to `pub(crate)` plus a constructor -- which moves the code hash
+    // like any `common` edit but leaves the encoding at 56 bytes. Current
+    // shape, as every generation from V6 on will be unless a FIELD moves.
+    (7, false),
 ];
 
 /// V1 is derived under TODAY's parameter encoding, not the legacy one.
