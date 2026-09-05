@@ -238,6 +238,26 @@ pub fn unpad_from_bucket(padded: &[u8]) -> Result<Vec<u8>, String> {
 /// buyer-to-seller ciphertext simply does not authenticate under the
 /// seller-to-buyer key. It costs one BLAKE3 invocation and no wire bytes.
 ///
+/// # What this channel guarantees, in one line
+///
+/// **Confidentiality yes; direction yes against third parties; authorship no;
+/// freshness no.**
+///
+/// * **Confidentiality** — AES-256-GCM under a key derived from an X25519
+///   exchange, so only the two parties read the content.
+/// * **Direction, against third parties** — the two directions use different
+///   keys, so nobody outside the conversation can make a message appear to
+///   travel the other way.
+/// * **Authorship, no** — see below. Both parties hold both keys.
+/// * **Freshness, no** — `EncryptedMessage::timestamp` is chosen by whoever
+///   wrote the message. It is now authenticated (see [`message_aad`]), which
+///   stops a THIRD party re-dating somebody else's message, and does nothing
+///   at all about an author dating their own however they like. Nothing here
+///   establishes when a message was written or that it is current.
+///
+/// Anything built on this channel should read that line before deciding what
+/// to trust.
+///
 /// # What it does NOT defend against, and why nothing here can
 ///
 /// **The counterparty.** Both parties derive BOTH keys from the same
@@ -626,14 +646,23 @@ impl MailboxStateV1 {
     ///
     /// # What remains open
     ///
-    /// A cap is a smaller weapon, not no weapon. An attacker willing to pay
-    /// for [`MAX_MESSAGES`] contract updates can fill a mailbox, and because
-    /// eviction is a deterministic function of content they can pick
-    /// timestamps that keep their own messages at the top of that order and
-    /// hold the space. What changes is the cost curve: the timestamp defect
-    /// cost exactly one message and was permanent, whereas this scales with
-    /// what an attacker spends, and is the ordinary exposure of any open-write
-    /// contract with bounded state. It is reduced here, not closed.
+    /// A cap is a smaller weapon, not no weapon. One update carrying
+    /// [`MAX_MESSAGES`] messages fills a mailbox -- a `MailboxDelta` is a
+    /// bare `Vec` and this function merges the whole of it, so a flood is one
+    /// update and not many -- and because eviction is a deterministic
+    /// function of content, an attacker can pick timestamps that keep their
+    /// own messages at the top of that order.
+    ///
+    /// What changed from the timestamp defect is the PRICE, and it is a price
+    /// in bytes rather than in updates: that defect cost one message, whereas
+    /// this costs a full cap's worth (about 122 KiB, measured by
+    /// `known_gap_the_byte_budget_did_not_make_a_flood_cheaper`). Both are
+    /// **permanent** once paid: far-future timestamps outrank honest traffic
+    /// for as long as they sit there, so there is no ongoing spend. An
+    /// earlier version of this paragraph said this one "scales with what an
+    /// attacker spends", which read as though the cost recurred. It does not.
+    ///
+    /// It is reduced here, not closed.
     ///
     /// Closing it needs an authenticated retention signal. The natural one is
     /// a checkpoint signed by the mailbox owner, whose verifying key is
@@ -676,7 +705,19 @@ impl MailboxStateV1 {
         dedupe_by_nonce(&mut self.messages);
         enforce_message_cap(&mut self.messages);
 
-        // Sort deterministically by nonce for CRDT convergence
+        // Normalisation, NOT the thing that makes the state converge. This
+        // line's comment used to say "sort deterministically by nonce for
+        // CRDT convergence", and that stopped being true when
+        // `dedupe_by_nonce` arrived: it already sorts by nonce, and
+        // `enforce_message_cap` either preserves that order or imposes its
+        // own deterministic one, so both peers agree on the byte order
+        // without this. Deleting it passes the whole workspace.
+        //
+        // It stays because it normalises the over-cap case back to
+        // nonce-ascending, which keeps ONE stored order rather than two. What
+        // it must not do is carry the claim, because a comment attributing a
+        // property to the wrong mechanism is how the next person deletes the
+        // mechanism that actually provides it.
         self.messages.sort_by(|a, b| a.nonce.cmp(&b.nonce));
 
         Ok(())
@@ -1170,6 +1211,42 @@ mod byte_budget_tests {
         );
     }
 
+    /// **Convergence when neither cap binds**, which none of the other
+    /// convergence tests reach.
+    ///
+    /// Every one of them uses an over-cap fixture, so all four exercise
+    /// `enforce_message_cap`'s ordering and none exercises the under-cap
+    /// path. That gap was found by mutation: deleting `apply_delta`'s final
+    /// sort left the entire workspace green, because `dedupe_by_nonce` also
+    /// orders by nonce -- true, but the tests could not distinguish which
+    /// mechanism was doing the work, which is the same thing as not testing
+    /// either.
+    #[test]
+    fn merging_converges_when_neither_cap_binds() {
+        let base = 1_700_000_000;
+        let few: Vec<_> = (0..8u32).map(|i| sized(i, base + i as i64, 512)).collect();
+        assert!(few.len() < MAX_MESSAGES);
+        assert!(
+            few.iter().map(message_bytes).sum::<usize>() < MAX_MAILBOX_BYTES,
+            "precondition: neither cap binds, so pruning does no ordering"
+        );
+
+        let mut a = MailboxStateV1::default();
+        a.apply_delta(&Some(few.clone())).unwrap();
+
+        let mut b = MailboxStateV1::default();
+        for message in few.iter().rev() {
+            b.apply_delta(&Some(vec![message.clone()])).unwrap();
+        }
+
+        assert_eq!(
+            crate::to_cbor(&a).unwrap(),
+            crate::to_cbor(&b).unwrap(),
+            "an under-cap merge diverged between two arrival orders"
+        );
+        assert_eq!(a.messages.len(), 8, "nothing was pruned");
+    }
+
     /// The same across BATCHING, for the reason the count-cap version gives:
     /// peers do not agree on how many merges they performed, so anything
     /// counted per-merge diverges.
@@ -1333,60 +1410,76 @@ mod byte_budget_tests {
         );
     }
 
-    /// **THIS TEST PINS A KNOWN GAP, AND IT IS ONE THIS CHANGE MADE WORSE.**
+    /// **THIS TEST PINS A KNOWN GAP, AND CORRECTS WHAT I FIRST CLAIMED
+    /// ABOUT IT.**
     ///
     /// `enforce_message_cap` ranks by `(timestamp, nonce)`, both chosen by
-    /// whoever wrote the message, so eviction is grindable -- that was
-    /// already true and is pinned by
+    /// whoever wrote the message, so eviction is grindable. That is
+    /// pre-existing and is pinned by
     /// `known_gap_a_funded_flood_still_evicts_every_honest_message`.
     ///
-    /// What the byte budget changes is the PRICE. Filling the count cap took
-    /// [`MAX_MESSAGES`] contract updates; filling the byte budget takes about
-    /// [`MAX_MAILBOX_BYTES`] / [`MAX_MESSAGE_BYTES`] of them, roughly 63 --
-    /// an eighth of the updates for the same total eviction. The budget bounds
-    /// what a flood costs the NETWORK and cheapens what it costs the
-    /// ATTACKER, and both halves are real.
+    /// What I claimed the byte budget changed was the PRICE -- "512 contract
+    /// updates become about 63", "cheaper for the attacker". **Both halves
+    /// were wrong**, and the fixture below disproves them:
     ///
-    /// That is a deliberate trade and not an oversight: unbounded state is
-    /// the worse of the two, and the flood was already affordable. It is
-    /// recorded here so that closing the flood gap is understood to need
-    /// admission control -- payment, proof-of-work, or a per-sender quota --
-    /// rather than a retuned cap.
+    /// * A `MailboxDelta` is a bare `Vec<EncryptedMessage>` and `apply_delta`
+    ///   merges the whole vector, so NEITHER route is a number of contract
+    ///   updates. Both are **one**.
+    /// * Measured in the currency that actually costs -- bytes on the wire --
+    ///   the byte-budget route is far MORE expensive, not less. The count cap
+    ///   still binds first for small messages, so **the cheapest total
+    ///   eviction is unchanged by the byte budget**.
+    ///
+    /// I conceded a downside that does not exist and understated the
+    /// pre-existing one. The security conclusion survives intact and is the
+    /// part that matters: closing this needs admission control -- payment,
+    /// proof-of-work, or a per-sender quota -- not a retuned cap.
+    ///
+    /// The assertions now measure both routes so the comment cannot drift
+    /// from the fixture again, which is how the wrong claim survived: the
+    /// test measured message COUNT while its comment drew a conclusion about
+    /// COST.
     #[test]
-    fn known_gap_a_byte_budget_flood_evicts_with_far_fewer_messages() {
+    fn known_gap_the_byte_budget_did_not_make_a_flood_cheaper() {
         let base = 1_700_000_000;
         let honest: Vec<_> = (0..3).map(|i| sized(i, base + i as i64, 1024)).collect();
 
-        let mut m = MailboxStateV1::default();
-        m.apply_delta(&Some(honest.clone())).unwrap();
+        // Dated after the honest traffic, which is free: nothing signs a
+        // timestamp.
+        let flood = |count: usize, ciphertext: usize| -> Vec<EncryptedMessage> {
+            (0..count as u32)
+                .map(|i| sized(1_000 + i, base + 1_000_000 + i as i64, ciphertext))
+                .collect()
+        };
 
-        // Dated after the honest traffic, which is free.
-        let flood: Vec<_> = (0..(MAX_MAILBOX_BYTES / MAX_MESSAGE_BYTES + 1) as u32)
-            .map(|i| {
-                sized(
-                    1_000 + i,
-                    base + 1_000_000 + i as i64,
-                    LARGEST_BUCKET + AEAD_TAG_BYTES,
-                )
-            })
-            .collect();
-        let flood_size = flood.len();
+        let evicts_everything = |messages: Vec<EncryptedMessage>| -> usize {
+            let wire = crate::to_cbor(&messages).expect("cbor").len();
+            let mut m = MailboxStateV1::default();
+            m.apply_delta(&Some(honest.clone())).unwrap();
+            m.apply_delta(&Some(messages)).unwrap();
+            for honest_nonce in honest.iter().map(|h| h.nonce) {
+                assert!(
+                    !m.messages.iter().any(|kept| kept.nonce == honest_nonce),
+                    "KNOWN GAP no longer reproduces: an honest message survived a flood. \
+                     If you just made that happen, invert these assertions."
+                );
+            }
+            wire
+        };
+
+        // Route A: fill the COUNT cap with the smallest messages there are.
+        let by_count = evicts_everything(flood(MAX_MESSAGES, 64));
+        // Route B: fill the BYTE budget with the largest.
+        let by_bytes = evicts_everything(flood(
+            MAX_MAILBOX_BYTES / MAX_MESSAGE_BYTES + 1,
+            LARGEST_BUCKET + AEAD_TAG_BYTES,
+        ));
+
         assert!(
-            flood_size <= MAX_MESSAGES / 4,
-            "the point of this test is that the flood is far smaller than the count cap: \
-             {flood_size} vs {MAX_MESSAGES}"
+            by_bytes > by_count * 10,
+            "the byte-budget route is supposed to be far MORE expensive, not less: \
+             {by_bytes} bytes vs {by_count}"
         );
-
-        m.apply_delta(&Some(flood)).unwrap();
-
-        for honest_nonce in honest.iter().map(|h| h.nonce) {
-            assert!(
-                !m.messages.iter().any(|kept| kept.nonce == honest_nonce),
-                "KNOWN GAP no longer reproduces: an honest message survived a byte-budget \
-                 flood of {flood_size} messages. If you just made that happen, invert this \
-                 assertion."
-            );
-        }
     }
 }
 

@@ -176,19 +176,45 @@ pad cannot fit. Every message a reader can see has therefore been padded, and
 the size privacy the buckets claim now holds for everything rather than for
 everything under 64 KiB.
 
-## What the byte budget costs, honestly
+## What the byte budget costs — corrected
 
-It makes a flood **cheaper for the attacker** while bounding what the flood
-costs everyone else. Filling the count cap took 512 contract updates; filling
-the byte budget takes about 63. The eviction ranking is unchanged and still
-grindable — `(timestamp, nonce)`, both sender-chosen — so the same total
-eviction is now available for an eighth of the updates.
+An earlier version of this section said the budget "makes a flood **cheaper
+for the attacker**", that filling the count cap "took 512 contract updates"
+against about 63 for the byte budget, and that the same eviction was available
+"for an eighth of the updates".
 
-That is a deliberate trade rather than an oversight: unbounded state is the
-worse of the two, and the flood was already affordable at 512 updates. It is
-pinned by `known_gap_a_byte_budget_flood_evicts_with_far_fewer_messages` so
-that closing it is understood to need admission control — payment,
-proof-of-work, or a per-sender quota — rather than a retuned cap.
+**All of that was wrong, and measurement is what showed it.**
+
+* A `MailboxDelta` is a bare `Vec<EncryptedMessage>` and `apply_delta` merges
+  the whole vector, so neither route is a *number of contract updates*. Both
+  are **one**.
+* In the currency that actually costs — bytes on the wire — the byte-budget
+  route is far more expensive:
+
+| Route | Messages | Wire bytes | Honest survivors |
+|---|---|---|---|
+| Fill the count cap with the smallest messages | 512 | **124,883** | 0 |
+| Fill the byte budget with the largest | 64 | **4,207,018** | 0 |
+
+The count cap still binds first for small messages, so **the cheapest total
+eviction is unchanged by the byte budget** — it was one ~122 KiB update before
+this change and it still is. The budget conceded a downside it does not have.
+
+What it does buy is a bound on what a flood costs everyone else: without it,
+512 top-bucket entries were admissible and the mailbox had no size limit at
+all.
+
+The eviction ranking is unchanged and still grindable — `(timestamp, nonce)`,
+both sender-chosen. Closing that needs admission control (payment,
+proof-of-work, or a per-sender quota) and not a retuned cap. Pinned by
+`known_gap_the_byte_budget_did_not_make_a_flood_cheaper`, which now measures
+both routes so the prose cannot drift from the fixture again — that drift is
+exactly how the wrong claim survived, because the test measured message COUNT
+while its comment drew a conclusion about COST.
+
+**One flood is also permanent, not a recurring cost.** Far-future timestamps
+rank above all honest traffic for as long as they sit there, so a single
+paid-for flood holds the mailbox indefinitely with no further spend.
 
 ## The one that limits the mechanism rather than leaking from it
 

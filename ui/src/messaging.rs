@@ -16,6 +16,15 @@
 //! matching secret and answers the derived conversation key; nothing else
 //! ever sees it.
 //!
+//! # What this channel guarantees, in one line
+//!
+//! **Confidentiality yes; direction yes against third parties; authorship no;
+//! freshness no.** The full statement, with what each half rests on, is on
+//! [`harvest_common::mailbox::MessageDirection`]. Read it before building
+//! anything on top of this that has to be trusted -- in particular, anything
+//! whose authenticity matters must carry its own signature rather than
+//! resting on which key decrypted it.
+//!
 //! # Replies, and why they need no buyer mailbox
 //!
 //! Contract state is public and the mailbox is open-write, so the seller

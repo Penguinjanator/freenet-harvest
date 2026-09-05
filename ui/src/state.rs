@@ -137,6 +137,19 @@ pub struct AppState {
     /// update retries them.
     pub pending_conversation_key_requests: std::collections::BTreeMap<u64, Vec<Vec<u8>>>,
 
+    /// Routing tags the delegate was asked about and declined to answer.
+    ///
+    /// Its omissions are PERMANENT, not transient: it drops a peer key only
+    /// when the key is malformed or low-order, and both are deterministic
+    /// properties of the bytes. Without remembering them, one message
+    /// carrying an unusable tag puts the tab into an unbounded loop, because
+    /// mailbox state re-arrives on every update notification and each arrival
+    /// would ask again.
+    ///
+    /// A transient failure is the `Err` answer instead, where nothing was
+    /// derived and nothing is recorded here, so those retry.
+    pub declined_conversation_tags: HashSet<Vec<u8>>,
+
     /// Request ids for the messaging requests above. A separate counter from
     /// `BitcoinState::next_request_id` because they are different request
     /// enums answered by different response enums; sharing one would imply a
@@ -1436,7 +1449,15 @@ impl AppState {
         let mut wanted: Vec<Vec<u8>> = Vec::new();
         for message in &store.mailbox_messages {
             let peer = &message.sender_public_key;
+            // An X25519 public key is 32 bytes. Anything else the delegate
+            // would decline, so the round trip buys nothing -- and the tag is
+            // bounded only by `MAX_MESSAGE_BYTES`, so it is a round trip an
+            // attacker can make tens of kilobytes wide.
+            if peer.len() != harvest_common::mailbox::SENDER_KEY_BYTES {
+                continue;
+            }
             if self.conversation_keys.contains_key(peer)
+                || self.declined_conversation_tags.contains(peer)
                 || wanted.contains(peer)
                 || self
                     .pending_conversation_key_requests
@@ -1465,12 +1486,22 @@ impl AppState {
 
     /// Fold the delegate's answer into the cached conversation keys.
     ///
-    /// Keys the delegate did NOT answer are left un-asked rather than
-    /// recorded as done: it drops peer keys it cannot use (malformed, or
-    /// low-order), and it is also how a partial failure looks, so a short
-    /// answer is ordinary. Leaving them askable means the next mailbox update
-    /// tries again; recording them as asked-and-answered would make a
-    /// transient failure permanent for the life of the tab.
+    /// # Two kinds of "not answered", and they are not the same
+    ///
+    /// A tag present in the request and absent from an `Ok` answer was
+    /// **declined**, and the delegate's decisions are deterministic: it drops
+    /// a peer key only when the key is malformed or low-order. Asking again
+    /// gets the same answer forever, and since mailbox state re-arrives on
+    /// every update notification, "ask again" means an unbounded loop for one
+    /// attacker-supplied message. Those tags are recorded and never re-asked.
+    ///
+    /// An `Err` answer is the transient case -- nothing was derived, usually
+    /// because the identity has no encryption key yet -- and it records
+    /// nothing, so the next mailbox update tries the whole set again.
+    ///
+    /// This comment said the opposite until 2026-09-05, justifying re-asking
+    /// by transient failure while the delegate's actual omissions were
+    /// permanent.
     fn on_conversation_keys(
         &mut self,
         request_id: u64,
@@ -1480,21 +1511,30 @@ impl AppState {
         // Dropping the pending entry is what un-asks everything in it. An
         // answer to a request we are not waiting on takes nothing with it and
         // contributes nothing -- see `an_answer_to_an_unknown_request_is_ignored`.
-        if self
-            .pending_conversation_key_requests
-            .remove(&request_id)
-            .is_none()
-        {
+        let Some(asked) = self.pending_conversation_key_requests.remove(&request_id) else {
             warn!("Conversation keys arrived for request {request_id}, which nothing asked for");
             return;
-        }
+        };
 
         match result {
             Ok(keys) => {
                 info!(
-                    "Delegate derived {} conversation key(s) for {ghostkey_fingerprint}",
-                    keys.len()
+                    "Delegate derived {} conversation key(s) of {} asked, for {ghostkey_fingerprint}",
+                    keys.len(),
+                    asked.len()
                 );
+                // Whatever was asked about and not answered was declined, and
+                // will be declined again. `asked` is used ONLY for this --
+                // never to pair answers with questions, which is what the
+                // echoed `peer_public_key` is for. Pairing positionally here
+                // would hand one buyer's key to another buyer's messages the
+                // first time an answer came back short, which is the ordinary
+                // case rather than an exotic one.
+                for tag in asked {
+                    if !keys.iter().any(|key| key.peer_public_key == tag) {
+                        self.declined_conversation_tags.insert(tag);
+                    }
+                }
                 for key in keys {
                     self.conversation_keys.insert(
                         key.peer_public_key,
@@ -5414,6 +5454,8 @@ mod mailbox_read_tests {
     }
 
     fn conversation(text: &str) -> Conversation {
+        // One seller, distinct buyers: each call opens a fresh
+        // `BuyerConversation`, so the routing tags differ.
         let seller = StaticSecret::from([21u8; 32]);
         let message =
             crate::messaging::BuyerConversation::open(PublicKey::from(&seller).as_bytes())
@@ -5585,16 +5627,30 @@ mod mailbox_read_tests {
         );
     }
 
-    /// A key the delegate did not answer stays un-asked, so it can be
-    /// retried, while the ones it did answer are not asked for again.
+    /// **A tag the delegate declined is never asked about again.**
     ///
-    /// The delegate drops peer keys it cannot use -- malformed, or low-order
-    /// -- so a short answer is normal rather than exceptional.
+    /// This test asserted the OPPOSITE when it was written, and the reasoning
+    /// behind that was wrong. I justified re-asking by transient failure --
+    /// but the delegate's omissions are not transient. It drops a peer key
+    /// only when the key is malformed or low-order (`harvest-delegate`'s
+    /// `messaging::derive_conversation_keys`), and both are deterministic
+    /// properties of the bytes: the same tag will be dropped every time.
+    ///
+    /// Because mailbox state re-arrives on every update notification, that
+    /// made ONE message carrying an unusable tag enough to put the seller's
+    /// tab into an unbounded loop -- a fresh `DeriveConversationKeys` on
+    /// every update, for the life of the tab, never answered.
+    ///
+    /// Transient failure is a different case and still retries: it is the
+    /// `Err` answer, where nothing was derived, covered by
+    /// `an_error_answer_lets_the_next_update_retry`.
+    ///
+    /// Observed red against the "stays askable" behaviour this replaces.
     #[test]
-    fn keys_the_delegate_did_not_answer_stay_askable() {
+    fn a_tag_the_delegate_declined_is_not_asked_about_again() {
         let answered = conversation("answered");
-        let unanswered = conversation("unanswered");
-        let mut state = state_with(vec![answered.message.clone(), unanswered.message.clone()]);
+        let declined = conversation("declined");
+        let mut state = state_with(vec![answered.message.clone(), declined.message.clone()]);
 
         let request = state.conversation_keys_to_request(OURS).expect("asks");
         assert_eq!(peer_keys(&request).len(), 2);
@@ -5605,13 +5661,36 @@ mod mailbox_read_tests {
             result: Ok(vec![answered.answer()]),
         });
 
-        let retry = state
-            .conversation_keys_to_request(OURS)
-            .expect("the unanswered key must be askable again");
+        assert!(
+            state.conversation_keys_to_request(OURS).is_none(),
+            "a tag the delegate will never answer was asked about again"
+        );
+        // And it stays that way however many update notifications arrive.
+        for _ in 0..5 {
+            assert!(state.conversation_keys_to_request(OURS).is_none());
+        }
+    }
+
+    /// A tag that could not possibly be a public key is not sent to the
+    /// delegate at all.
+    ///
+    /// The delegate would drop it, so the round trip buys nothing -- and the
+    /// tag is bounded only by `MAX_MESSAGE_BYTES`, so it is a round trip that
+    /// can carry tens of kilobytes of an attacker's choosing.
+    #[test]
+    fn a_tag_that_cannot_be_a_public_key_is_never_asked_about() {
+        let good = conversation("good");
+        let mut junk = good.message.clone();
+        junk.nonce = [0xEE; 24];
+        junk.sender_public_key = vec![0u8; 60_000];
+
+        let mut state = state_with(vec![good.message.clone(), junk]);
+
+        let request = state.conversation_keys_to_request(OURS).expect("asks");
         assert_eq!(
-            peer_keys(&retry),
-            vec![unanswered.message.sender_public_key.clone()],
-            "only the key that went unanswered should be re-asked"
+            peer_keys(&request),
+            vec![good.message.sender_public_key.clone()],
+            "an impossible tag was sent to the delegate"
         );
     }
 
@@ -5683,6 +5762,99 @@ mod mailbox_read_tests {
         );
     }
 
+    /// **The answer is paired by echoed tag, not by position.**
+    ///
+    /// The delegate drops peer keys it cannot use -- malformed, or low-order
+    /// -- so a SHORT answer is ordinary rather than exceptional, and the
+    /// delegate's own test calls the positional case "the mutation that
+    /// matters". But that test proves the DELEGATE echoes the tag. It cannot
+    /// prove the consumer uses it, and the consumer is the only side that
+    /// could correlate positionally, because it is the side holding the list
+    /// of what was asked.
+    ///
+    /// So the guard lived on one side of the boundary and the thing it
+    /// guarded on the other. Verified: replacing the echo with
+    /// `asked.into_iter().zip(keys)` passed all 216 tests.
+    ///
+    /// Observed red on 2026-09-05 with exactly that mutation.
+    #[test]
+    fn a_short_answer_does_not_hand_one_buyers_key_to_another() {
+        let first = conversation("first");
+        let second = conversation("second");
+        let mut state = state_with(vec![first.message.clone(), second.message.clone()]);
+
+        let request = state.conversation_keys_to_request(OURS).expect("asks");
+        let asked = peer_keys(&request);
+        assert_eq!(asked.len(), 2, "precondition: both tags were asked about");
+        assert_eq!(
+            asked[0], first.message.sender_public_key,
+            "precondition: the FIRST tag asked about is the one left unanswered below, \
+             so a positional pairing would misfile the answer rather than drop it"
+        );
+
+        // The delegate answers only the SECOND. Positional correlation would
+        // file that key under the first tag.
+        state.on_delegate_response(HarvestDelegateResponse::ConversationKeys {
+            request_id: request_id(&request),
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            result: Ok(vec![second.answer()]),
+        });
+
+        assert!(
+            !state
+                .conversation_keys
+                .contains_key(&first.message.sender_public_key),
+            "a key was filed under a tag the delegate did not answer"
+        );
+        let filed = state
+            .conversation_keys
+            .get(&second.message.sender_public_key)
+            .expect("the answered tag must have its key");
+        assert_eq!(filed.to_seller, second.answer().buyer_to_seller);
+        assert_eq!(filed.from_seller, second.answer().seller_to_buyer);
+    }
+
+    /// The same, end to end: with the answer REORDERED, both buyers'
+    /// messages still decrypt.
+    ///
+    /// A positional pairing survives the test above only by luck of which tag
+    /// was dropped; it cannot survive this one at all, because every key is
+    /// present and simply in the wrong order.
+    #[test]
+    fn a_reordered_answer_still_decrypts_both_buyers() {
+        let first = conversation("from the first buyer");
+        let second = conversation("from the second buyer");
+        let mut state = state_with(vec![first.message.clone(), second.message.clone()]);
+
+        let request = state.conversation_keys_to_request(OURS).expect("asks");
+        state.on_delegate_response(HarvestDelegateResponse::ConversationKeys {
+            request_id: request_id(&request),
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            // Reversed relative to the order they were asked in.
+            result: Ok(vec![second.answer(), first.answer()]),
+        });
+
+        let readable: Vec<String> = state
+            .mailbox_entries(OURS)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                crate::messaging::MailboxEntry::Readable {
+                    content: crate::messaging::MessageContent::Text(text),
+                    ..
+                } => Some(text),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            readable.len(),
+            2,
+            "both buyers' messages must decrypt regardless of the answer's order: {readable:?}"
+        );
+        assert!(readable.contains(&"from the first buyer".to_string()));
+        assert!(readable.contains(&"from the second buyer".to_string()));
+    }
+
     /// The delegate's `EncryptionKeyReady` lands where publishing reads it.
     #[test]
     fn the_encryption_key_is_recorded_for_publishing() {
@@ -5694,6 +5866,61 @@ mod mailbox_read_tests {
         assert_eq!(
             state.encryption_public_keys.get(FINGERPRINT),
             Some(&[7u8; 32])
+        );
+    }
+
+    /// **The encryption key is filed under the fingerprint the DELEGATE
+    /// named**, not under whichever identity happens to be in flight.
+    ///
+    /// The same producer/consumer split as
+    /// `a_short_answer_does_not_hand_one_buyers_key_to_another`: the delegate
+    /// has a test proving two identities get different keys, and that test
+    /// cannot say anything about where the consumer files them. A key filed
+    /// under the wrong identity is published in that identity's signed store
+    /// details, so every buyer encrypts to a key the seller cannot read --
+    /// permanently, in a record they cannot retract.
+    ///
+    /// Observed red by filing under `pending_store_creation`'s fingerprint
+    /// instead of the response's.
+    #[test]
+    fn an_encryption_key_is_filed_under_the_identity_the_delegate_named() {
+        // An unrelated creation in flight, which is the value a consumer
+        // reaching for the wrong fingerprint would most naturally pick up.
+        let mut state = AppState {
+            pending_store_creation: Some(PendingStoreCreation {
+                ghostkey_fingerprint: "someone-else".to_string(),
+                seller_verifying_key_bytes: [0u8; 32],
+                certificate_pem: String::new(),
+                store_name: String::new(),
+                description: String::new(),
+                payment_instructions: String::new(),
+                rsa_public_key_der: None,
+                encryption_public_key: None,
+            }),
+            ..AppState::default()
+        };
+
+        state.on_delegate_response(HarvestDelegateResponse::EncryptionKeyReady {
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            x25519_public_key: vec![7u8; 32],
+        });
+
+        assert_eq!(
+            state.encryption_public_keys.get(FINGERPRINT),
+            Some(&[7u8; 32]),
+            "the key must be filed under the identity the delegate answered about"
+        );
+        assert!(
+            !state.encryption_public_keys.contains_key("someone-else"),
+            "a key was filed under an identity the delegate said nothing about"
+        );
+        assert_eq!(
+            state
+                .pending_store_creation
+                .as_ref()
+                .and_then(|p| p.encryption_public_key),
+            None,
+            "a creation for a different identity must not adopt this key"
         );
     }
 
