@@ -6202,3 +6202,174 @@ mod conversation_tests {
         assert!(state.unconfirmed_sent(STORE).is_empty());
     }
 }
+
+/// The delegate/UI boundary: every answer is filed against the identity the
+/// DELEGATE named, never against whatever this client had in flight.
+///
+/// # Why these are a group
+///
+/// Each of these responses carries an identity, and the consumer is the only
+/// side that could file it under a different one. A delegate test proving it
+/// answers about the right identity cannot say anything about that, because
+/// the consumer is the side holding the local state a wrong answer would be
+/// filed against. The same gap in `on_conversation_keys` passed all 216 tests
+/// (`a_short_answer_does_not_hand_one_buyers_key_to_another`), so these are
+/// the rest of the boundary rather than a hypothetical.
+///
+/// The Bitcoin surface already had its consumer-side test
+/// (`invoice_tests::...` on `pending_invoices`), and its comment is worth
+/// reading beside these: it records that with a `HashMap` instead of a
+/// `BTreeMap` the positional shortcut passes "about half the time", which is
+/// why a correlation test that happens to pass is not evidence of a
+/// correlation.
+#[cfg(test)]
+mod delegate_correlation_tests {
+    use super::*;
+
+    const OURS: &str = "fp-ours";
+    const THEIRS: &str = "fp-theirs";
+
+    /// A creation in flight for a DIFFERENT identity -- the value a consumer
+    /// reaching for the wrong fingerprint would most naturally pick up.
+    fn with_another_creation_in_flight() -> AppState {
+        AppState {
+            pending_store_creation: Some(PendingStoreCreation {
+                ghostkey_fingerprint: THEIRS.to_string(),
+                seller_verifying_key_bytes: [0u8; 32],
+                // Empty on purpose: `start_store_creation_if_ready` gates on
+                // the certificate, so the creation cannot complete and be
+                // taken out from under these tests. They are about where an
+                // answer is FILED, not about the creation gate.
+                certificate_pem: String::new(),
+                store_name: "Theirs".to_string(),
+                description: String::new(),
+                payment_instructions: String::new(),
+                rsa_public_key_der: None,
+                encryption_public_key: None,
+            }),
+            ..AppState::default()
+        }
+    }
+
+    /// **The RSA key decides where the reputation contract LIVES.**
+    ///
+    /// `ReputationParameters` carries the RSA public key, and a contract's
+    /// address is `BLAKE3(code_hash || cbor(parameters))` -- so a key filed
+    /// under the wrong identity puts that identity's reputation contract at an
+    /// address derived from somebody else's key. The store then publishes a
+    /// reputation link pointing at a contract nobody owns, inside a signed
+    /// record, and every buyer follows it to nothing.
+    ///
+    /// Observed red by filing under `pending_store_creation`'s fingerprint.
+    #[test]
+    fn an_rsa_key_is_filed_under_the_identity_the_delegate_named() {
+        let mut state = with_another_creation_in_flight();
+
+        state.on_delegate_response(HarvestDelegateResponse::ReputationKeysInitialized {
+            ghostkey_fingerprint: OURS.to_string(),
+            rsa_public_key_der: vec![7u8; 16],
+        });
+
+        assert_eq!(
+            state.rsa_public_keys.get(OURS),
+            Some(&vec![7u8; 16]),
+            "the key must be filed under the identity the delegate answered about"
+        );
+        assert!(
+            !state.rsa_public_keys.contains_key(THEIRS),
+            "a key was filed under an identity the delegate said nothing about"
+        );
+    }
+
+    /// And the creation waiting on a DIFFERENT identity must not adopt it.
+    ///
+    /// This is the sharper half: adopting it would let the creation proceed
+    /// (`start_store_creation_if_ready` gates on this field being `Some`) and
+    /// publish a store whose reputation contract is addressed by another
+    /// seller's key. The guard is the `pending.ghostkey_fingerprint ==
+    /// ghostkey_fingerprint` check.
+    ///
+    /// Observed red by removing that check.
+    #[test]
+    fn a_creation_does_not_adopt_another_identitys_rsa_key() {
+        let mut state = with_another_creation_in_flight();
+
+        state.on_delegate_response(HarvestDelegateResponse::ReputationKeysInitialized {
+            ghostkey_fingerprint: OURS.to_string(),
+            rsa_public_key_der: vec![7u8; 16],
+        });
+
+        assert_eq!(
+            state
+                .pending_store_creation
+                .as_ref()
+                .and_then(|p| p.rsa_public_key_der.clone()),
+            None,
+            "a creation adopted an RSA key answered about a different identity"
+        );
+
+        // The matching answer IS adopted, so the assertion above is not
+        // passing because the field is never filled.
+        state.on_delegate_response(HarvestDelegateResponse::ReputationKeysInitialized {
+            ghostkey_fingerprint: THEIRS.to_string(),
+            rsa_public_key_der: vec![8u8; 16],
+        });
+        assert_eq!(
+            state
+                .pending_store_creation
+                .as_ref()
+                .and_then(|p| p.rsa_public_key_der.clone()),
+            Some(vec![8u8; 16])
+        );
+    }
+
+    /// `RsaPublicKey` is the other response carrying the same value, for an
+    /// identity that already had keys, and files it the same way.
+    #[test]
+    fn a_recalled_rsa_key_is_filed_under_the_identity_the_delegate_named() {
+        let mut state = with_another_creation_in_flight();
+
+        state.on_delegate_response(HarvestDelegateResponse::RsaPublicKey {
+            ghostkey_fingerprint: OURS.to_string(),
+            rsa_public_key_der: vec![5u8; 16],
+        });
+
+        assert_eq!(state.rsa_public_keys.get(OURS), Some(&vec![5u8; 16]));
+        assert!(!state.rsa_public_keys.contains_key(THEIRS));
+    }
+
+    /// **A store registry filed under the wrong identity makes somebody
+    /// else's stores look like yours.**
+    ///
+    /// `my_stores` is what decides which stores this client will publish
+    /// details for, issue invoices on, and treat as owned when reading a
+    /// mailbox (`store_owner_fingerprint`). Filing another identity's
+    /// registrations under this one offers the seller controls over contracts
+    /// they cannot sign for.
+    ///
+    /// Observed red by filing under `pending_store_creation`'s fingerprint.
+    #[test]
+    fn a_store_list_is_filed_under_the_identity_the_delegate_named() {
+        let mut state = with_another_creation_in_flight();
+
+        state.on_delegate_response(HarvestDelegateResponse::StoreList {
+            ghostkey_fingerprint: OURS.to_string(),
+            stores: vec![StoreRegistration {
+                store_contract_id: vec![1u8; 32],
+                reputation_contract_id: vec![2u8; 32],
+                mailbox_contract_id: vec![3u8; 32],
+                store_contract_key: None,
+            }],
+        });
+
+        assert_eq!(
+            state.my_stores.get(OURS).map(|s| s.len()),
+            Some(1),
+            "the registry must be filed under the identity the delegate answered about"
+        );
+        assert!(
+            !state.my_stores.contains_key(THEIRS),
+            "another identity was given stores it does not own"
+        );
+    }
+}
