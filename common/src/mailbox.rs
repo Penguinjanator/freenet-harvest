@@ -85,6 +85,72 @@ pub const MAX_MESSAGE_BYTES: usize =
 /// has flooded (see `docs/messaging-privacy.md`).
 pub const MAX_MAILBOX_BYTES: usize = 4 * 1024 * 1024;
 
+/// The bytes of a message that are authenticated but not encrypted.
+///
+/// # Why every field except the ciphertext is bound in
+///
+/// AES-GCM authenticates what it encrypts and nothing else, so before this
+/// existed only `ciphertext` was protected. Every other field of
+/// [`EncryptedMessage`] could be edited by anyone who could read the mailbox
+/// -- which is everyone -- and the result still authenticated:
+///
+/// * **`nonce`.** Only its first 12 bytes are the AES-GCM nonce; bytes 12..24
+///   are padding that feeds deduplication and nothing else. Randomising them
+///   re-submits the same ciphertext as a new message. That is a replay, and
+///   it also occupies mailbox slots the attacker cannot read but can refill
+///   at will.
+/// * **`timestamp`.** It is the primary key of the eviction ranking (see
+///   [`enforce_message_cap`]), so re-dating a genuine message moves somebody
+///   else's traffic up or down the order that decides what survives a flood.
+/// * **`sender_public_key`.** The conversation's routing tag.
+/// * **`conversation_id`.** The cleartext copy of the id the ciphertext also
+///   carries.
+///
+/// Binding them costs no wire bytes: associated data is derived from fields
+/// that are transmitted anyway, never sent. It is defined here rather than
+/// beside the cipher because both ends must derive it identically and this is
+/// the crate they share -- the same argument as
+/// [`conversation_key_from_dh`], and the same silent failure if they drift.
+///
+/// # The layout
+///
+/// A domain-separating label, then fixed-width fields, then the ONE
+/// variable-length field last and length-prefixed. That ordering is what
+/// makes the encoding unambiguous: no two different messages can produce the
+/// same bytes by shifting a boundary.
+pub fn message_aad(
+    conversation_id: &ConversationId,
+    sender_public_key: &[u8],
+    timestamp: &DateTime<Utc>,
+    nonce: &[u8; 24],
+) -> Vec<u8> {
+    const LABEL: &[u8] = b"harvest-mailbox-envelope-v1";
+
+    let mut aad = Vec::with_capacity(LABEL.len() + 32 + 24 + 12 + 8 + sender_public_key.len());
+    aad.extend_from_slice(LABEL);
+    aad.extend_from_slice(&conversation_id.0);
+    aad.extend_from_slice(nonce);
+    // Seconds and sub-second nanoseconds together, so the binding is exact
+    // rather than truncated to whatever unit happened to be convenient. Both
+    // are infallible, unlike `timestamp_nanos_opt`.
+    aad.extend_from_slice(&timestamp.timestamp().to_le_bytes());
+    aad.extend_from_slice(&timestamp.timestamp_subsec_nanos().to_le_bytes());
+    aad.extend_from_slice(&(sender_public_key.len() as u64).to_le_bytes());
+    aad.extend_from_slice(sender_public_key);
+    aad
+}
+
+/// [`message_aad`] for a message that already exists, which is what the
+/// decrypting side has.
+pub fn message_aad_for(message: &EncryptedMessage) -> Vec<u8> {
+    message_aad(
+        &message.conversation_id,
+        &message.sender_public_key,
+        &message.timestamp,
+        &message.nonce,
+    )
+}
+
 /// **No single message may consume the mailbox.**
 ///
 /// The fact `enforce_message_cap`'s prefix rule rests on, held by the
@@ -172,10 +238,14 @@ pub fn unpad_from_bucket(padded: &[u8]) -> Result<Vec<u8>, String> {
 /// buyer-to-seller ciphertext simply does not authenticate under the
 /// seller-to-buyer key. It costs one BLAKE3 invocation and no wire bytes.
 ///
-/// Verbatim replay is separately impossible -- [`MailboxStateV1::apply_delta`]
-/// dedupes on nonce -- but changing the nonce to evade dedup changes the AES
-/// nonce with it, so the ciphertext no longer authenticates. Neither of those
-/// is what this guards; this guards the direction.
+/// Replay is separately impossible, but NOT for the reason this comment gave
+/// until 2026-09-05. It said that changing the nonce to evade dedup changes
+/// the AES nonce with it -- true only of the first 12 of the 24 bytes. Bytes
+/// 12..24 fed deduplication and nothing else, so randomising them resubmitted
+/// the same ciphertext as a new message, and it was verified working. What
+/// closes it is [`message_aad`], which authenticates the whole envelope.
+/// Neither of those is what direction separation guards; this guards the
+/// direction.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MessageDirection {
     /// Written by the buyer, read by the seller.
@@ -364,6 +434,48 @@ pub type MailboxDelta = Vec<EncryptedMessage>;
 /// -- an attacker can put their message at the top of this ranking for free,
 /// so "one message empties the mailbox" would have been cheaper and more
 /// total than the unbounded growth the budget exists to stop.
+/// Keep one message per nonce, chosen by CONTENT rather than by arrival.
+///
+/// # Why this exists at all
+///
+/// [`MailboxStateV1::verify`] rejects a state holding a duplicate nonce, so a
+/// state carrying one is permanently invalid: it cannot be updated, cannot
+/// converge, and pruning never removes it, because pruning truncates a sorted
+/// prefix and both copies sit in it together. Producing such a state has to
+/// be impossible here, and it was not: the dedup set used to be snapshotted
+/// from `self.messages` before the loop and never updated inside it, so a
+/// delta naming one message twice stored both. One contract update, no key,
+/// no relationship with either party.
+///
+/// # Why the winner is decided by content
+///
+/// Two DIFFERENT messages may share a nonce -- an attacker submits both, in
+/// different orders, to different peers. First-arrival-wins makes the two
+/// peers keep different bytes forever, which for a contract is as bad as
+/// invalidity and much harder to notice. So the survivor is the one that
+/// ranks highest under a total order over the fields, and both peers reach it
+/// from the same set regardless of the order they saw it in.
+///
+/// The order is `(timestamp, ciphertext, sender_public_key, conversation_id)`,
+/// which is total because it ends in fields that together cannot tie without
+/// the messages being equal. Like every other ranking here it is made of
+/// attacker-chosen values and is not offered as a defence -- it is offered as
+/// a function of the SET, which is what convergence needs.
+fn dedupe_by_nonce(messages: &mut Vec<EncryptedMessage>) {
+    messages.sort_by(|a, b| {
+        a.nonce.cmp(&b.nonce).then_with(|| {
+            b.timestamp
+                .cmp(&a.timestamp)
+                .then_with(|| b.ciphertext.cmp(&a.ciphertext))
+                .then_with(|| b.sender_public_key.cmp(&a.sender_public_key))
+                .then_with(|| b.conversation_id.0.cmp(&a.conversation_id.0))
+        })
+    });
+    // Duplicates are now adjacent with the winner first, so this keeps the
+    // winner and drops the rest.
+    messages.dedup_by(|later, kept| later.nonce == kept.nonce);
+}
+
 fn enforce_message_cap(messages: &mut Vec<EncryptedMessage>) {
     let over_count = messages.len() > MAX_MESSAGES;
     let over_bytes = messages.iter().map(message_bytes).sum::<usize>() > MAX_MAILBOX_BYTES;
@@ -511,12 +623,7 @@ impl MailboxStateV1 {
     /// flood rather than the retention.
     pub fn apply_delta(&mut self, delta: &Option<MailboxDelta>) -> Result<(), String> {
         if let Some(new_messages) = delta {
-            let existing_nonces: HashSet<_> = self.messages.iter().map(|m| m.nonce).collect();
-
             for msg in new_messages {
-                if existing_nonces.contains(&msg.nonce) {
-                    continue;
-                }
                 // Refused rather than stored and pruned. Storing it first
                 // would put it at the head of the eviction ranking (its
                 // timestamp is free to choose) and prune the mailbox to
@@ -531,6 +638,18 @@ impl MailboxStateV1 {
             }
         }
 
+        // Everything is pushed and THEN deduplicated, rather than filtered on
+        // the way in against a set captured beforehand. That shape is what
+        // produced a state `verify` rejects: the set did not learn about the
+        // messages the loop itself added, so one delta naming a message twice
+        // stored both. Deduplicating the whole collection afterwards cannot
+        // have that defect, and it also REPAIRS a state that already carries
+        // a duplicate -- which matters, because this was live on `main` and a
+        // mailbox on the network may be holding one now.
+        //
+        // It runs before the cap, not after, so a duplicate cannot occupy two
+        // of the slots the cap is about to hand out.
+        dedupe_by_nonce(&mut self.messages);
         enforce_message_cap(&mut self.messages);
 
         // Sort deterministically by nonce for CRDT convergence
@@ -1244,5 +1363,147 @@ mod byte_budget_tests {
                  assertion."
             );
         }
+    }
+}
+
+/// Nonce deduplication: the thing `verify` rejects a state for, and therefore
+/// the thing `apply_delta` must never produce.
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+
+    fn message(nonce: [u8; 24], secs: i64, ciphertext: u8) -> EncryptedMessage {
+        EncryptedMessage {
+            conversation_id: ConversationId([1u8; 32]),
+            sender_public_key: vec![9u8; SENDER_KEY_BYTES],
+            ciphertext: vec![ciphertext; 64],
+            timestamp: DateTime::from_timestamp(secs, 0).unwrap(),
+            nonce,
+        }
+    }
+
+    /// **A delta naming one message twice must not brick the mailbox.**
+    ///
+    /// `verify` rejects a state holding a duplicate nonce, and pruning only
+    /// truncates a sorted prefix -- it never removes a duplicate -- so both
+    /// copies survive together and no later merge repairs it. The mailbox is
+    /// then permanently invalid: it cannot be updated, cannot converge, and
+    /// there is no way back.
+    ///
+    /// The cost is one contract update with no key and no relationship to
+    /// either party, because both of the mailbox contract's update paths hand
+    /// attacker bytes to this function: `UpdateData::Delta` deserialises them
+    /// straight into a `MailboxDelta`, and `UpdateData::State` filters the
+    /// incoming state against what is already held but not against itself.
+    ///
+    /// Observed red on 2026-09-05 against the snapshot-before-the-loop form,
+    /// which is what shipped: `duplicate message nonce`.
+    #[test]
+    fn a_delta_naming_one_message_twice_leaves_a_valid_state() {
+        let twice = message([7u8; 24], 1_700_000_000, 0xAA);
+
+        let mut m = MailboxStateV1::default();
+        m.apply_delta(&Some(vec![twice.clone(), twice.clone()]))
+            .unwrap();
+
+        assert_eq!(m.messages.len(), 1, "one message, stored once");
+        m.verify()
+            .expect("apply_delta must never produce a state verify rejects");
+    }
+
+    /// The same through the path a hostile `UpdateData::State` takes: the
+    /// contract filters the incoming state against what it already holds and
+    /// hands the rest here, so internal duplicates arrive intact.
+    #[test]
+    fn a_delta_carrying_many_copies_of_one_message_leaves_a_valid_state() {
+        let flood = vec![message([3u8; 24], 1_700_000_000, 0xBB); 64];
+
+        let mut m = MailboxStateV1::default();
+        m.apply_delta(&Some(flood)).unwrap();
+
+        assert_eq!(m.messages.len(), 1);
+        m.verify().expect("still valid");
+    }
+
+    /// **A mailbox already bricked must repair itself on the next merge.**
+    ///
+    /// This defect is pre-existing on `main`, so a mailbox on the live
+    /// network can be holding a duplicate right now. Fixing only the
+    /// production of duplicates would leave those permanently invalid, which
+    /// is the outcome the fix exists to prevent.
+    #[test]
+    fn an_already_duplicated_state_is_repaired_by_the_next_merge() {
+        let duplicated = message([5u8; 24], 1_700_000_000, 0xCC);
+        let mut m = MailboxStateV1 {
+            messages: vec![duplicated.clone(), duplicated],
+        };
+        assert!(m.verify().is_err(), "precondition: this state is invalid");
+
+        m.apply_delta(&None).unwrap();
+
+        assert_eq!(m.messages.len(), 1);
+        m.verify().expect("a merge must heal a state it can heal");
+    }
+
+    /// **Two DIFFERENT messages sharing a nonce must converge.**
+    ///
+    /// A separate defect from the one above and reachable the same way: an
+    /// attacker submits both, in different orders, to different peers. If the
+    /// winner is decided by arrival order, the two peers keep different bytes
+    /// and never converge -- which for a contract is as bad as invalidity and
+    /// harder to notice.
+    ///
+    /// Observed red on 2026-09-05 against first-arrival-wins, which is what
+    /// the snapshot form did across batches.
+    #[test]
+    fn two_different_messages_sharing_a_nonce_converge() {
+        let one = message([2u8; 24], 1_700_000_000, 0x11);
+        let other = message([2u8; 24], 1_700_000_000, 0x22);
+
+        let mut a = MailboxStateV1::default();
+        a.apply_delta(&Some(vec![one.clone()])).unwrap();
+        a.apply_delta(&Some(vec![other.clone()])).unwrap();
+
+        let mut b = MailboxStateV1::default();
+        b.apply_delta(&Some(vec![other])).unwrap();
+        b.apply_delta(&Some(vec![one])).unwrap();
+
+        assert_eq!(
+            crate::to_cbor(&a).unwrap(),
+            crate::to_cbor(&b).unwrap(),
+            "two peers given the same pair in different orders kept different bytes"
+        );
+        a.verify().expect("valid");
+    }
+
+    /// And within a single delta, for the same reason.
+    #[test]
+    fn a_nonce_collision_inside_one_delta_converges() {
+        let one = message([4u8; 24], 1_700_000_000, 0x33);
+        let other = message([4u8; 24], 1_700_000_000, 0x44);
+
+        let mut a = MailboxStateV1::default();
+        a.apply_delta(&Some(vec![one.clone(), other.clone()]))
+            .unwrap();
+        let mut b = MailboxStateV1::default();
+        b.apply_delta(&Some(vec![other, one])).unwrap();
+
+        assert_eq!(crate::to_cbor(&a).unwrap(), crate::to_cbor(&b).unwrap());
+    }
+
+    /// Deduplication must not swallow distinct messages -- the guard above is
+    /// only worth having if ordinary traffic still lands.
+    #[test]
+    fn distinct_messages_are_all_kept() {
+        let base = 1_700_000_000;
+        let messages: Vec<_> = (0..8u8)
+            .map(|i| message([i; 24], base + i as i64, i))
+            .collect();
+
+        let mut m = MailboxStateV1::default();
+        m.apply_delta(&Some(messages)).unwrap();
+
+        assert_eq!(m.messages.len(), 8);
+        m.verify().expect("valid");
     }
 }

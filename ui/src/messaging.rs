@@ -58,11 +58,11 @@
 //! to that store. The buyer's half is ephemeral, which is what stops one
 //! buyer's messages linking across stores; it does not protect the archive.
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use harvest_common::mailbox::{
-    conversation_key_from_dh, pad_to_bucket, unpad_from_bucket, ConversationId, EncryptedMessage,
-    MessageDirection,
+    conversation_key_from_dh, message_aad, message_aad_for, pad_to_bucket, unpad_from_bucket,
+    ConversationId, EncryptedMessage, MessageDirection,
 };
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
@@ -453,27 +453,42 @@ pub fn encrypt_message(
     // Pad to reduce size-based analysis
     let padded = pad_to_bucket(&plaintext_bytes);
 
-    // Generate a random nonce for AES-GCM
-    let mut nonce_bytes = [0u8; 12];
-    getrandom::getrandom(&mut nonce_bytes).map_err(|e| format!("generate nonce: {e}"))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    // The whole 24-byte mailbox nonce is drawn first, because it is bound
+    // into the authenticated data below -- it cannot be assembled after the
+    // ciphertext the way it used to be. Its first 12 bytes are the AES-GCM
+    // nonce; the rest exist so that deduplication has more entropy than the
+    // cipher needs.
+    let mut mailbox_nonce = [0u8; 24];
+    getrandom::getrandom(&mut mailbox_nonce).map_err(|e| format!("generate nonce: {e}"))?;
+    let timestamp = chrono::Utc::now();
 
-    // Encrypt with AES-256-GCM
+    // Every field of the message except the ciphertext, authenticated but not
+    // encrypted. See `harvest_common::mailbox::message_aad` for what each one
+    // costs to leave unbound -- the sharpest is the nonce padding, whose
+    // mutation was a working replay.
+    let aad = message_aad(
+        &plaintext.conversation_id,
+        tag.as_slice(),
+        &timestamp,
+        &mailbox_nonce,
+    );
+
     let cipher = Aes256Gcm::new_from_slice(aes_key).map_err(|e| format!("create cipher: {e}"))?;
     let ciphertext = cipher
-        .encrypt(nonce, padded.as_ref())
+        .encrypt(
+            Nonce::from_slice(&mailbox_nonce[..12]),
+            Payload {
+                msg: padded.as_ref(),
+                aad: &aad,
+            },
+        )
         .map_err(|e| format!("encrypt: {e}"))?;
-
-    // Build the mailbox nonce (24 bytes: 12-byte AES nonce + 12 bytes random)
-    let mut mailbox_nonce = [0u8; 24];
-    mailbox_nonce[..12].copy_from_slice(&nonce_bytes);
-    getrandom::getrandom(&mut mailbox_nonce[12..]).map_err(|e| format!("generate nonce: {e}"))?;
 
     Ok(EncryptedMessage {
         conversation_id: plaintext.conversation_id.clone(),
         sender_public_key: tag.to_vec(),
         ciphertext,
-        timestamp: chrono::Utc::now(),
+        timestamp,
         nonce: mailbox_nonce,
     })
 }
@@ -483,13 +498,22 @@ pub fn decrypt_message(
     encrypted: &EncryptedMessage,
     aes_key: &[u8; 32],
 ) -> Result<PlaintextMessage, String> {
-    // Extract the AES nonce from the first 12 bytes of the mailbox nonce
+    // The AES nonce is the first 12 bytes of the mailbox nonce; the whole 24
+    // are bound into the associated data, so a change to any of the rest --
+    // or to any other envelope field -- fails the tag rather than passing
+    // unnoticed.
     let nonce = Nonce::from_slice(&encrypted.nonce[..12]);
+    let aad = message_aad_for(encrypted);
 
-    // Decrypt with AES-256-GCM
     let cipher = Aes256Gcm::new_from_slice(aes_key).map_err(|e| format!("create cipher: {e}"))?;
     let padded = cipher
-        .decrypt(nonce, encrypted.ciphertext.as_ref())
+        .decrypt(
+            nonce,
+            Payload {
+                msg: encrypted.ciphertext.as_ref(),
+                aad: &aad,
+            },
+        )
         .map_err(|e| format!("decrypt: {e}"))?;
 
     // Unpad
@@ -659,12 +683,17 @@ mod tests {
 
         let original = buyer.seal("I will pay tomorrow".into()).expect("seal");
 
-        // The forgery: the same ciphertext, re-tagged with a nonce that has
-        // not been used, which is the most an attacker can do without a key.
-        // (A verbatim copy is refused by the mailbox's own nonce dedup, so it
-        // would not even arrive.)
+        // The forgery: the same ciphertext under a nonce the mailbox has not
+        // seen, so its dedup does not refuse it.
+        //
+        // Only bytes 12..24 are touched. The first 12 ARE the AES-GCM nonce,
+        // so changing those breaks decryption for a reason that has nothing
+        // to do with direction -- an earlier version of this test replaced
+        // the whole 24 bytes and passed for that reason, which made it a test
+        // of the wrong thing. Bytes 12..24 are dedup padding and feed nothing
+        // else, so this is the mutation an attacker would actually make.
         let mut forged = original.clone();
-        forged.nonce = [0xAB; 24];
+        forged.nonce[12..].copy_from_slice(&[0xAB; 12]);
 
         let thread = buyer.read(&[original.clone(), forged]);
 
@@ -679,6 +708,105 @@ mod tests {
             thread[0].content,
             MessageContent::Text("I will pay tomorrow".into())
         );
+    }
+
+    /// **A message must not be replayable.**
+    ///
+    /// The mailbox dedupes on the full 24-byte nonce, but only the first 12
+    /// are the AES-GCM nonce -- bytes 12..24 are padding that feeds dedup and
+    /// nothing else. Randomise them and the same ciphertext arrives again as
+    /// a new message: the buyer sees whatever they were told, twice, and an
+    /// attacker chooses when.
+    ///
+    /// That matters beyond duplication. The eviction ranking is
+    /// `(timestamp, nonce)`, so a replay is also a way to occupy mailbox
+    /// slots with content the attacker cannot read but can resubmit at will.
+    ///
+    /// Closed by authenticating the whole envelope, not just the ciphertext:
+    /// every field of `EncryptedMessage` except the ciphertext itself is
+    /// bound in as AES-GCM associated data, so ANY change to any of them
+    /// fails the tag. The wire layout is unchanged -- associated data is
+    /// derived from the fields, never transmitted.
+    ///
+    /// Observed red on 2026-09-05, before the associated data existed: the
+    /// replay decrypted and the buyer's thread held two identical messages.
+    #[test]
+    fn a_replayed_message_with_fresh_padding_does_not_authenticate() {
+        let seller = Seller::new(61);
+        let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+        let original = buyer
+            .seal("send it to the usual address".into())
+            .expect("seal");
+
+        let mut replayed = original.clone();
+        replayed.nonce[12..].copy_from_slice(&[0x5A; 12]);
+        assert_ne!(
+            replayed.nonce, original.nonce,
+            "precondition: the mailbox would treat this as a new message"
+        );
+        assert_eq!(
+            replayed.nonce[..12],
+            original.nonce[..12],
+            "precondition: the AES nonce is untouched, so only the envelope binding can refuse it"
+        );
+
+        let thread = buyer.read(&[original.clone(), replayed.clone()]);
+        assert_eq!(
+            thread.len(),
+            1,
+            "a replay was accepted: the buyer sees the same message twice"
+        );
+
+        // The seller's side refuses it too, and for the same reason.
+        let inbox = seller.inbox(&[original, replayed]);
+        assert_eq!(inbox.len(), 2, "both entries are present in the mailbox");
+        let readable = inbox
+            .iter()
+            .filter(|entry| matches!(entry, MailboxEntry::Readable { .. }))
+            .count();
+        assert_eq!(readable, 1, "only the genuine message authenticates");
+    }
+
+    /// The other envelope fields are bound too, so a message cannot be
+    /// re-timestamped to change where it ranks for eviction, nor re-tagged
+    /// into another conversation.
+    ///
+    /// Re-timestamping is the sharper of the two: the eviction ranking is
+    /// `(timestamp, nonce)`, so moving a genuine message to the top of it is
+    /// a way to make somebody else's traffic survive a flood -- or, with the
+    /// nonce unchanged, to have it replace itself at a rank of the attacker's
+    /// choosing.
+    #[test]
+    fn the_whole_envelope_is_authenticated() {
+        let seller = Seller::new(67);
+        let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+        let original = buyer.seal("hello".into()).expect("seal");
+
+        let mut re_timestamped = original.clone();
+        re_timestamped.timestamp =
+            chrono::DateTime::from_timestamp(2_000_000_000, 0).expect("timestamp");
+
+        let mut re_tagged = original.clone();
+        re_tagged.sender_public_key = vec![0x77; 32];
+
+        let mut re_labelled = original.clone();
+        re_labelled.conversation_id = ConversationId([0x88; 32]);
+
+        for (what, tampered) in [
+            ("timestamp", re_timestamped),
+            ("routing tag", re_tagged),
+            ("conversation id", re_labelled),
+        ] {
+            assert_eq!(
+                buyer.read(&[tampered]).len(),
+                0,
+                "a message with an altered {what} authenticated"
+            );
+        }
+
+        // And the untouched original still reads, so the assertions above are
+        // not passing because nothing decrypts.
+        assert_eq!(buyer.read(&[original]).len(), 1);
     }
 
     /// A reply carrying a different conversation id is not shown, even though

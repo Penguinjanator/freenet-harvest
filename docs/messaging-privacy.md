@@ -37,6 +37,25 @@ that struct is.
   visible. An observer cannot tell a reply from a question by inspection, only
   by inference from timing.
 
+## Not forgeable, and it was
+
+Every field of an entry except the ciphertext is authenticated as AES-GCM
+associated data (`harvest_common::mailbox::message_aad`). Before that, only
+the ciphertext was protected, and three things followed that a reader of this
+document should know were once true:
+
+* **Replay.** The mailbox dedupes on the full 24-byte nonce, but only the
+  first 12 are the AES-GCM nonce. Randomising bytes 12..24 resubmitted the
+  same ciphertext as a new message. Verified working.
+* **Re-dating.** `timestamp` is the primary key of the eviction ranking, so a
+  genuine message could be moved up or down the order that decides what
+  survives a flood.
+* **Re-tagging and re-labelling.** The routing tag and the cleartext
+  conversation id could be edited freely.
+
+None of these needed a key or any relationship with either party, because
+anybody can read the mailbox and anybody can write to it.
+
 ## NOT visible
 
 * **What was said.** AES-256-GCM under a key derived from an X25519 exchange
