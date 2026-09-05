@@ -119,7 +119,7 @@ have tripped. Its own claims are covered.
 
 | Line | Claim | Caught? |
 |---|---|---|
-| 190 | `store_params` is the one place a store's parameters are derived. | **Yes, since 2026-09-05** — `store_ops_derives_no_contract_parameters_of_its_own`. There is no longer a second copy to drift: `create_store_contracts` calls `migrate::{store,mailbox,reputation}_params`. The test is a source scrape (`include_str!`) because the caller is `wasm32`-gated and no host test can reach it; it asserts both that no parameter struct is constructed there and that the shared derivations are called. Retained in this list because the property is enforced by a scrape rather than by the type system. |
+| 190 | `store_params` is the one place a store's parameters are derived. | **No.** The duplicate copies were removed on 2026-09-05 and `store_ops_derives_no_contract_parameters_of_its_own` was added to hold the line, but that test is a source scrape and **both halves are evadable** — see the correction note below. The code is currently correct; nothing reliably keeps it so. |
 | 615 | Listings are "grow-only … the contract has no removal path at all, so absence is never a deletion" — the soundness precondition for `FoldAll`. | **No.** True (verified by inspection: `ListingsV1::apply_delta` only pushes). Nothing asserts it, and `common/src/store.rs:152` asserted the opposite until 2026-09-05. |
 | 620 | Reputation is "a grow-only set keyed by nonce with no removal path whatsoever" — same precondition. | **No.** Same shape as above. |
 | 300 | Candidates are ordered "by the registry's declared generation, never by slice order". | **Yes** — `superseded_store_generations_are_probed_under_their_own_parameter_encoding`. |
@@ -143,7 +143,7 @@ belongs in the durable record.
 Ranked by what breaks if the claim turns out to be false, not by how easy the
 test would be.
 
-### 1. `ui/src/migrate.rs:190` — parameters are derived in one place — **CLOSED 2026-09-05**
+### 1. `ui/src/migrate.rs:190` — parameters are derived in one place — **STILL OPEN**
 
 **Data survival.** Ranked first when this list was compiled, and fixed rather
 than left listed. `create_store_contracts` held a second, hand-maintained copy
@@ -159,17 +159,33 @@ and fixing that symptom had left the structural cause standing. It was also
 the only entry whose counterparty is invisible to every automated check in the
 repository, `create_store_contracts` being wasm-gated.
 
-There is now one derivation. The duplication was worse than recorded: three
-production copies (store, mailbox, reputation), not one, plus a fourth in that
-file's own test module which meant the test could pass against parameters the
-real PUT would never produce. `common/src/delegate.rs` was checked and is
-already a single shared const.
+There is now one derivation *in the code as written*. The duplication was
+worse than recorded: three production copies (store, mailbox, reputation), not
+one, plus a fourth in that file's own test module which meant the test could
+pass against parameters the real PUT would never produce.
+`common/src/delegate.rs` was checked and is already a single shared const.
 
-What remains is that the property is held by a source scrape rather than by
-the type system: nothing stops a future edit constructing the struct again in
-a file the scrape does not read. Making it structural would mean a constructor
-the parameter types can only be built through, which is a larger change than
-this review's scope.
+**This entry was marked CLOSED on 2026-09-05 and that was wrong.** A third
+review round mutation-tested the scrape meant to hold the line and beat both
+halves of it. Both mutations were reproduced before this correction was
+written:
+
+* **The negative half** matches the literal `"StoreParameters {"`. A type
+  alias evades it entirely — `use harvest_common::store::StoreParameters as
+  SP; let p = SP { seller_verifying_key: vk };` reintroduces the second
+  derivation, passes the test, and passes `cargo fmt --check`. That is an
+  ordinary refactor, not a contrived evasion.
+* **The positive half** asserts the file contains `"migrate::store_params"`.
+  It is satisfied by a COMMENT at `ui/src/gateway/store_ops.rs:176` and by the
+  `#[cfg(test)]` module, so deleting the production call does not trip it.
+
+One mutation beats both at once, which is how it should have been tested when
+it was written. Writing a test to confirm a fix, rather than to attack it, is
+the failure this whole document exists to record, and it happened here in the
+document itself.
+
+**A wrong "CLOSED" is worse than an open item**, because it stops the next
+person looking. That is why this note is longer than the entry it corrects.
 
 ### 2. `contracts/store-contract/src/lib.rs:100` — the cross-check is additive only
 
