@@ -226,7 +226,15 @@ fn IdentityCard(
                         name.as_deref(),
                     ),
                     link: crate::store_link::share_link(&store.store_contract_id),
-                    gap: crate::state::store_details_gap(info),
+                    // The seller can only be prompted to publish a key the
+                    // delegate has actually produced -- see
+                    // `state::store_details_gap`.
+                    gap: crate::state::store_details_gap(
+                        info,
+                        app_state
+                            .encryption_public_keys
+                            .contains_key(&identity.fingerprint),
+                    ),
                     details: StoreDetails {
                         store_name: info.map(|i| i.store_name.clone()).unwrap_or_default(),
                         description: info.map(|i| i.description.clone()).unwrap_or_default(),
@@ -558,6 +566,9 @@ fn initiate_store_creation(_fingerprint: String, _details: StoreDetails) {
                 description: details.description,
                 payment_instructions: details.payment_instructions,
                 rsa_public_key_der: None,
+                // Filled by `EncryptionKeyReady` below. Creation does not
+                // wait for it -- see the field's own documentation.
+                encryption_public_key: None,
             });
 
             // Step 1: Request the ghostkey certificate to get the verifying key
@@ -607,13 +618,62 @@ fn initiate_store_creation(_fingerprint: String, _details: StoreDetails) {
                 return;
             }
 
+            // Step 3: and the messaging key, so the store publishes with one.
+            //
+            // Sent here rather than waited on: a store that publishes without
+            // it is a store buyers cannot message, which `store_details_gap`
+            // reports and re-publishing repairs. A store whose creation hangs
+            // waiting for a third delegate answer has no name at all.
+            request_encryption_key(fingerprint.clone()).await;
+
             dioxus::logger::tracing::info!(
-                "Sent GetCertificate + InitReputationKeys for {} -- store creation pending",
+                "Sent GetCertificate + InitReputationKeys + InitEncryptionKey for {} -- store \
+                 creation pending",
                 fingerprint
             );
         });
     }
 }
+
+/// Ask the harvest delegate to mint (or recall) this identity's long-term
+/// X25519 key, so the seller has one to publish.
+///
+/// Idempotent at the delegate, which is what lets this be called both at
+/// store creation and whenever a ghostkey is connected without either caller
+/// having to know about the other.
+#[cfg(target_arch = "wasm32")]
+async fn request_encryption_key(fingerprint: String) {
+    let Some(delegate_key) = APP_STATE.read().harvest_delegate_key.clone() else {
+        dioxus::logger::tracing::error!(
+            "Harvest delegate not registered -- cannot mint an encryption key"
+        );
+        return;
+    };
+    let request = harvest_common::HarvestDelegateRequest::InitEncryptionKey {
+        ghostkey_fingerprint: fingerprint.clone(),
+    };
+    let payload = match harvest_common::to_cbor(&request) {
+        Ok(payload) => payload,
+        Err(e) => {
+            dioxus::logger::tracing::error!("Failed to serialize InitEncryptionKey: {e}");
+            return;
+        }
+    };
+    if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
+        dioxus::logger::tracing::error!("Failed to send InitEncryptionKey: {e}");
+    }
+}
+
+/// The same request, spawned, for callers that are not already async.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn ensure_encryption_key(fingerprint: String) {
+    wasm_bindgen_futures::spawn_local(async move {
+        request_encryption_key(fingerprint).await;
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn ensure_encryption_key(_fingerprint: String) {}
 
 fn sign_and_submit_listing(_fingerprint: String, _listing: Listing) {
     #[cfg(target_arch = "wasm32")]

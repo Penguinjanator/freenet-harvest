@@ -11,9 +11,11 @@ authoritative. This file exists because the reviewed fix for that is not more
 comments.
 
 Scope: `common/src/{store,payment,mailbox,reputation,listing,address}.rs`,
-`contracts/*/src/lib.rs`, `ui/src/migrate.rs`, `ui/src/state.rs`. It does not
-cover `delegates/` or `ui/src/gateway/`, which were held by other people during
-the review and are collected separately.
+`contracts/*/src/lib.rs`, `ui/src/migrate.rs`, `ui/src/state.rs`. It did not
+originally cover `delegates/` or `ui/src/gateway/`, which were held by other
+people during the review and are collected separately -- but the messaging
+section below does, because that change touched both and there is no reason to
+leave a fresh gap for a later review to find.
 
 A note on what CI does and does not compile, because it was got wrong twice
 during this review in the pessimistic direction. `ui/src/gateway/` **is**
@@ -135,6 +137,31 @@ belongs in the durable record.
 | 1249 | `withdraw_pending_signature` matches on signed bytes, "so this cannot withdraw a different request that happens to sit at the same position". | **No.** The function is host-compilable, but both call sites are `#[cfg(target_arch = "wasm32")]` and no test calls it. The sibling claim about matching an *answer* is tested (`an_answer_goes_to_the_request_whose_bytes_it_carries`); withdrawal is not. |
 | 834 | The migration map is kept flat, so "resolving is a single lookup and can never chase a cycle". | **Partly.** The single-hop case is tested. Chained hops (A→B then B→C) and the degenerate case (B→A) are not. |
 | 881 | "never lose a locally-known registration" — the delegate's answer only adds. | **Yes** — `a_store_list_answer_never_drops_a_store_it_does_not_name`, `a_store_list_answer_keeps_a_locally_known_contract_key`. |
+
+## Buyer-to-seller messaging (added on `feat/messaging`, 2026-09-05)
+
+Recorded at the time the code was written rather than by a later review, which
+is the only way this file stays a record rather than an archaeology exercise.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `ui/src/gateway/mailbox_ops.rs::send_message` | A client GET primes the local node's store, so issuing one before the update gives the node the contract it is about to run. | **No, and it cannot be here.** Nothing in this repository can reach a node. The doc comment says so in those words rather than asserting the send works; the whole path is unexercised against a live node. |
+| same | The GET-then-update race is tolerable. | **No.** Both calls resolve on WebSocket send, so the ordering at the node is not observable from here. Stated as a residual in the comment, not as a property. |
+| `ui/src/gateway/store_ops.rs::create_store_contracts` | The store is published carrying the seller's encryption key. | **No.** The function is `#[cfg(target_arch = "wasm32")]`, so `cargo test` never reaches it -- the same blind spot as entry 1 below, and the same reason: it is the counterparty of a derivation, not the derivation itself. What IS tested is that `PendingStoreEdit::store_info` carries the key on the *edit* path, which is the path a seller uses to repair a store. |
+| `ui/src/state.rs::ask_for_conversation_keys` | The request actually reaches the delegate. | **No.** The decision half (`conversation_keys_to_request`) is host-tested to eight assertions; the send is a wasm-gated `spawn_local`. |
+| `ui/src/components/message_view.rs` | Everything the component says on screen. | **No.** There are no component tests in this repository at all. This is the file whose *previous* version claimed "messages are end-to-end encrypted" beside a button that encrypted nothing, so it is worth being explicit: the claims were re-enabled on the strength of the crypto tests below, and nothing checks that the words on screen still match them. A future change that makes messaging conditional again will not fail any test by leaving the reassuring paragraph in place. |
+| `common/src/mailbox.rs::conversation_key_from_dh` | Buyer and seller derive the same key. | **Yes**, three ways: a known-answer test against `b3sum` (`the_conversation_key_derivation_is_pinned`), the delegate's `the_seller_derives_the_key_the_buyer_derived`, and the UI's `a_sealed_message_is_readable_by_the_seller_who_holds_the_secret`, which reconstructs the seller from a bare X25519 secret rather than from the UI's own code. |
+| `common/src/store.rs::StoreInfoV1::encryption_public_key` | `skip_serializing_if` keeps every pre-existing ghostkey signature verifying. | **Yes** -- `a_store_info_that_predates_the_encryption_key_re_encodes_unchanged`, observed red against the naive `#[serde(default)]`-only form. |
+| `ui/src/ghostkey_cert.rs::store_verifying_key` | A stolen certificate yields no key, so a buyer cannot be routed to the victim's mailbox. | **Yes** -- `a_stolen_certificate_yields_no_key_to_derive_a_mailbox_from`, mutated red by trusting any certificate that parses and chains. |
+| `ui/src/state.rs::BrowsingStore::seller_verifying_key` | A store the buyer is told is unverified is never one the compose box is offered for, because both come from one call. | **Yes** -- `an_unverified_store_yields_no_key_to_message_it_with`, mutated red by setting the key unconditionally. It pins the wiring; the check itself is the `ghostkey_cert` row above. |
+| `delegates/harvest-delegate/src/messaging.rs` | Everything the delegate writes is under the exported prefix. | **Yes** -- `everything_this_module_writes_is_under_the_exported_prefix`, which drives the real writer. The pre-existing `every_secret_the_delegate_writes_is_under_the_exported_prefix` stayed GREEN under the same mutation, because it reads a hand-maintained list; that is the gap the new test closes. |
+
+Two things follow that are worth saying plainly rather than leaving as a
+pattern in the table. First, **the seller's read path is fully host-tested and
+the buyer's write path is not**, because the write ends at a node and the read
+ends in a pure function. Second, **the component is the least-covered file in
+the change and is the one that makes claims to users**, which is the exact
+shape of the defect that produced this document.
 
 ---
 

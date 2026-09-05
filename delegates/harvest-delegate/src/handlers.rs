@@ -43,6 +43,7 @@ pub(crate) fn all_secret_key_shapes(fp: &str, tx_id: &str) -> Vec<Vec<u8>> {
         rsa_pk_key(fp),
         tx_key(tx_id),
         stores_key(fp),
+        crate::messaging::x25519_sk_key(fp),
         TX_INDEX_KEY.to_vec(),
         crate::bitcoin::BITCOIN_WATCHES_KEY.to_vec(),
         crate::bitcoin::BITCOIN_BRIDGE_KEY.to_vec(),
@@ -151,6 +152,32 @@ pub fn handle<S: SecretStore>(
         } => handle_record_blind_signature(store, request_id, &transaction_id, blind_signature),
 
         HarvestDelegateRequest::ListTransactions => handle_list_transactions(store),
+
+        // Buyer-to-seller messaging. `messaging` owns the secret and the
+        // Diffie-Hellman; this is only the routing, the same shape as the
+        // migration markers below.
+        //
+        // Both are gated by the `authorize` above -- and by the one in
+        // `lib.rs::handle_request`, which every request family passes
+        // through, so a new family is gated by arriving rather than by
+        // somebody remembering. `DeriveConversationKeys` is a read of the
+        // seller's private correspondence and `InitEncryptionKey` decides
+        // which key buyers will encrypt to, so neither may be reached by
+        // another web app.
+        HarvestDelegateRequest::InitEncryptionKey {
+            ghostkey_fingerprint,
+        } => crate::messaging::init_encryption_key(store, &ghostkey_fingerprint),
+
+        HarvestDelegateRequest::DeriveConversationKeys {
+            request_id,
+            ghostkey_fingerprint,
+            peer_public_keys,
+        } => crate::messaging::derive_conversation_keys(
+            store,
+            request_id,
+            &ghostkey_fingerprint,
+            &peer_public_keys,
+        ),
 
         HarvestDelegateRequest::RegisterStore {
             ghostkey_fingerprint,
@@ -592,6 +619,66 @@ mod origin_gating_tests {
                 "a foreign web app read Harvest's private state"
             );
         }
+    }
+
+    /// The seller's messaging key, both halves of the exposure.
+    ///
+    /// `InitEncryptionKey` decides which key every future buyer encrypts to,
+    /// so a foreign caller reaching it before the seller does gets to publish
+    /// a key of its own choosing under the seller's identity.
+    /// `DeriveConversationKeys` is a Diffie-Hellman oracle against the
+    /// seller's long-term secret, which is to say it is a read of the
+    /// seller's entire private correspondence.
+    ///
+    /// Mutated red by removing the `authorize` call from `handle`.
+    #[test]
+    fn another_web_app_cannot_mint_or_use_the_sellers_encryption_key() {
+        let mut store = MemSecrets::default();
+
+        let response = handle(
+            &mut store,
+            Some(&a_different_web_app()),
+            HarvestDelegateRequest::InitEncryptionKey {
+                ghostkey_fingerprint: FINGERPRINT.to_string(),
+            },
+        );
+        assert!(
+            refusal_message(&response).contains("Harvest web app"),
+            "a foreign web app minted the seller's encryption key"
+        );
+        assert!(store.is_empty(), "a foreign web app wrote a secret");
+
+        // The seller mints it for real, so the assertions above are not
+        // passing because the request does nothing.
+        let seller_key = match handle(
+            &mut store,
+            Some(&harvest()),
+            HarvestDelegateRequest::InitEncryptionKey {
+                ghostkey_fingerprint: FINGERPRINT.to_string(),
+            },
+        ) {
+            HarvestDelegateResponse::EncryptionKeyReady {
+                x25519_public_key, ..
+            } => x25519_public_key,
+            other => panic!("the seller must be able to mint their key: {other:?}"),
+        };
+        assert_eq!(seller_key.len(), 32);
+
+        // And now that a secret exists, the oracle is refused too -- which is
+        // the half that would otherwise read the seller's messages.
+        let response = handle(
+            &mut store,
+            Some(&a_different_web_app()),
+            HarvestDelegateRequest::DeriveConversationKeys {
+                request_id: 1,
+                ghostkey_fingerprint: FINGERPRINT.to_string(),
+                peer_public_keys: vec![vec![9u8; 32]],
+            },
+        );
+        assert!(
+            refusal_message(&response).contains("Harvest web app"),
+            "a foreign web app derived a conversation key against the seller's secret"
+        );
     }
 
     /// A marker sealed by a foreign caller would report a migration as already

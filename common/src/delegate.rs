@@ -37,6 +37,48 @@ pub enum HarvestDelegateRequest {
         blinded_token: Vec<u8>,
     },
 
+    // === Buyer-to-seller messaging ===
+    /// Mint (or return) this identity's long-term X25519 public key.
+    ///
+    /// The private half stays in the delegate under
+    /// `harvest:x25519_sk:{fingerprint}`; the public half is what the seller
+    /// publishes in [`crate::store::StoreInfoV1::encryption_public_key`] so a
+    /// buyer has something to encrypt to. Idempotent: a second call returns
+    /// the key the first one minted, because re-minting would strand every
+    /// message already in flight to the old one.
+    InitEncryptionKey { ghostkey_fingerprint: String },
+
+    /// Derive the conversation keys for a batch of buyer ephemeral public
+    /// keys, so the UI can decrypt what is sitting in the mailbox.
+    ///
+    /// # Why the delegate answers keys rather than plaintext
+    ///
+    /// The long-term X25519 secret is the thing that must not leave: it
+    /// decrypts every conversation this seller will ever have, including ones
+    /// that have not happened yet. A conversation key decrypts one buyer's
+    /// messages and nothing else, and the plaintext is going to the UI in any
+    /// case -- that is where the seller reads it.
+    ///
+    /// Doing the AEAD here instead would mean a second copy of the padding,
+    /// CBOR and AES-GCM path inside the delegate, and `harvest-common` is
+    /// compiled into all three contracts, so it cannot host that code without
+    /// putting `aes-gcm` in every contract's WASM. One crypto path, in
+    /// `harvest-ui`'s `messaging`, is the trade.
+    ///
+    /// # This is a DH oracle, deliberately
+    ///
+    /// A caller who reaches this can derive a shared secret against any
+    /// public key it likes. That is what makes it a read of the seller's
+    /// mailbox and why it is behind `origin::authorize` along with everything
+    /// else -- see the module docs on `harvest-delegate`'s `origin`.
+    DeriveConversationKeys {
+        request_id: RequestId,
+        ghostkey_fingerprint: String,
+        /// Raw 32-byte X25519 public keys, as they appear in
+        /// [`crate::mailbox::EncryptedMessage::sender_public_key`].
+        peer_public_keys: Vec<Vec<u8>>,
+    },
+
     // === Listing Management ===
     /// Create and sign a new listing using the seller's ghostkey.
     CreateListing {
@@ -119,6 +161,30 @@ pub enum HarvestDelegateResponse {
         rsa_public_key_der: Vec<u8>,
     },
 
+    /// This identity's long-term X25519 public key, minted or recalled.
+    EncryptionKeyReady {
+        ghostkey_fingerprint: String,
+        /// Raw 32 bytes. A `Vec` rather than `[u8; 32]` because every other
+        /// key on this wire is one, and a length mismatch is then a message
+        /// the UI can report rather than a decode failure with no context.
+        x25519_public_key: Vec<u8>,
+    },
+
+    /// Conversation keys for the peer public keys that were asked about.
+    ///
+    /// One entry per key the delegate could derive against, in no particular
+    /// order; a peer key that was malformed is simply absent, and
+    /// [`ConversationKey::peer_public_key`] is what pairs an answer with its
+    /// question. Positional correlation would put one buyer's key against
+    /// another buyer's messages the first time an entry was dropped.
+    ConversationKeys {
+        request_id: RequestId,
+        /// Echoed so a reader of a node log can see which identity was asked
+        /// about, and so the UI is not correlating on `request_id` alone.
+        ghostkey_fingerprint: String,
+        result: Result<Vec<ConversationKey>, String>,
+    },
+
     BlindSignatureResult {
         request_id: RequestId,
         result: Result<Vec<u8>, String>,
@@ -187,6 +253,16 @@ pub enum HarvestDelegateResponse {
     Error {
         message: String,
     },
+}
+
+/// One buyer's ephemeral public key and the conversation key derived from it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct ConversationKey {
+    /// The buyer ephemeral public key this was derived against, echoed back
+    /// so the caller does not have to rely on ordering.
+    pub peer_public_key: Vec<u8>,
+    /// AES-256 key, from [`crate::mailbox::conversation_key_from_dh`].
+    pub key: [u8; 32],
 }
 
 /// A store's contract IDs, registered with the delegate for notifications.

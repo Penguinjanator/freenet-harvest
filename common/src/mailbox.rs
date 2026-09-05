@@ -48,6 +48,27 @@ pub fn unpad_from_bucket(padded: &[u8]) -> Result<Vec<u8>, String> {
     Ok(padded[4..4 + len].to_vec())
 }
 
+/// Turn a raw X25519 shared secret into the AES-256 key a conversation uses.
+///
+/// # Why this is in `harvest-common` rather than beside either caller
+///
+/// The two ends run in different crates and on different machines. A buyer's
+/// browser computes it from an ephemeral secret it generated
+/// (`harvest-ui`'s `messaging::EphemeralKeypair`); the seller's harvest
+/// delegate computes it from the long-term secret it holds, because that
+/// secret must not leave the delegate. If those two derivations ever disagree
+/// -- one adds a domain separator, one changes hash -- nothing errors: the
+/// AES-GCM tag simply fails to verify and every message in the conversation
+/// reads as corrupt, on both sides, forever. There is no negotiation and no
+/// version byte to catch it.
+///
+/// So it is written once, here, and pinned by a known-answer test whose
+/// expected value came from an independent BLAKE3 implementation rather than
+/// from this function.
+pub fn conversation_key_from_dh(shared_secret: &[u8; 32]) -> [u8; 32] {
+    *blake3::hash(shared_secret).as_bytes()
+}
+
 /// Opaque conversation identifier chosen by the buyer.
 ///
 /// Privacy: this is a random 32-byte value, NOT derived from party identities.
@@ -292,6 +313,39 @@ impl MailboxStateV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A known-answer test for the one function both ends of a conversation
+    /// must compute identically.
+    ///
+    /// The expected value is `b3sum` over 32 bytes of `0x07`, taken from the
+    /// `b3sum` CLI rather than from this crate -- a test that asks the
+    /// implementation what it does and then asserts it does that would pass
+    /// under any change at all, which is exactly the failure this repository
+    /// keeps finding.
+    ///
+    /// If this goes red, do not update the constant. A changed derivation
+    /// makes every existing conversation permanently undecryptable in both
+    /// directions, with no error anywhere -- just AES-GCM tags that stop
+    /// verifying.
+    ///
+    /// Observed red on 2026-09-05 against a placeholder that returned the
+    /// shared secret unchanged.
+    #[test]
+    fn the_conversation_key_derivation_is_pinned() {
+        let expected: [u8; 32] =
+            hex_literal("ebaf85b465a09de21b398fb112c1500f2cbe658c42f379e0c0f18d24b819f637");
+        assert_eq!(conversation_key_from_dh(&[7u8; 32]), expected);
+    }
+
+    /// Parse a hex string into 32 bytes, so the constant above can be read
+    /// against `b3sum`'s output without transcribing it into byte syntax.
+    fn hex_literal(hex: &str) -> [u8; 32] {
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+            .collect();
+        bytes.try_into().expect("32 bytes")
+    }
 
     #[test]
     fn test_conversation_id_random_is_unique() {

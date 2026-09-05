@@ -1909,6 +1909,7 @@ dependencies = [
  "rsa 0.9.10",
  "serde",
  "sha2 0.10.9",
+ "x25519-dalek",
 ]
 
 [[package]]

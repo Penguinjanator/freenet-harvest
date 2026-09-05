@@ -309,11 +309,32 @@ mod tests {
         })
         .expect("cbor");
         let bitcoin = to_cbor(&BitcoinDelegateRequest::ListWatched).expect("cbor");
+        // The messaging family, added after this rule was written down. A
+        // `DeriveConversationKeys` misrouted into the migration branch would
+        // reach the code that exports this delegate's private keys.
+        let init_encryption_key = to_cbor(&HarvestDelegateRequest::InitEncryptionKey {
+            ghostkey_fingerprint: "fp".into(),
+        })
+        .expect("cbor");
+        let derive_keys = to_cbor(&HarvestDelegateRequest::DeriveConversationKeys {
+            request_id: 1,
+            ghostkey_fingerprint: "fp".into(),
+            peer_public_keys: vec![vec![1u8; 32]],
+        })
+        .expect("cbor");
 
         assert!(from_cbor::<HarvestDelegateRequest>(&migration).is_err());
         assert!(from_cbor::<BitcoinDelegateRequest>(&migration).is_err());
 
-        for other in [&harvest, &harvest_unit, &marker_get, &marker_set, &bitcoin] {
+        for other in [
+            &harvest,
+            &harvest_unit,
+            &marker_get,
+            &marker_set,
+            &bitcoin,
+            &init_encryption_key,
+            &derive_keys,
+        ] {
             assert!(
                 from_cbor::<HarvestMigrationRequest>(other).is_err(),
                 "a non-migration payload decoded as a migration request, which \

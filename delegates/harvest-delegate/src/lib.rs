@@ -4,6 +4,7 @@ mod bip32;
 mod bitcoin;
 mod handlers;
 mod markers;
+mod messaging;
 mod migration;
 mod origin;
 mod secrets;
@@ -323,6 +324,20 @@ mod boundary_tests {
             .expect("cbor"),
             to_cbor(&HarvestDelegateRequest::ListTransactions).expect("cbor"),
             to_cbor(&BtcReq::ListWatched).expect("cbor"),
+            // The messaging family. `InitEncryptionKey` decides which key
+            // buyers will encrypt to, and `DeriveConversationKeys` is a
+            // Diffie-Hellman oracle against the seller's long-term secret --
+            // which is to say, a read of their private correspondence.
+            to_cbor(&HarvestDelegateRequest::InitEncryptionKey {
+                ghostkey_fingerprint: "fp".into(),
+            })
+            .expect("cbor"),
+            to_cbor(&HarvestDelegateRequest::DeriveConversationKeys {
+                request_id: 1,
+                ghostkey_fingerprint: "fp".into(),
+                peer_public_keys: vec![vec![1u8; 32]],
+            })
+            .expect("cbor"),
         ];
         for payload in payloads {
             assert!(refusal(&payload, Some(&a_different_web_app())).contains("Harvest web app"));

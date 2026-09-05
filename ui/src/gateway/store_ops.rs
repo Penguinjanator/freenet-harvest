@@ -22,7 +22,7 @@ pub(crate) const STORE_CONTRACT_WASM: &[u8] =
     include_bytes!("../../public/contracts/store_contract.wasm");
 pub(crate) const REPUTATION_CONTRACT_WASM: &[u8] =
     include_bytes!("../../public/contracts/reputation_contract.wasm");
-pub(crate) const MAILBOX_CONTRACT_WASM: &[u8] =
+pub const MAILBOX_CONTRACT_WASM: &[u8] =
     include_bytes!("../../public/contracts/mailbox_contract.wasm");
 
 /// Whether a store's `ContractKey` was recovered from local state or rebuilt
@@ -139,11 +139,21 @@ pub async fn create_store_contracts(
     seller_verifying_key_bytes: [u8; 32],
     rsa_public_key_der: Vec<u8>,
     certificate_pem: String,
-    store_name: String,
-    description: String,
-    payment_instructions: String,
+    // What the seller typed, as one value rather than three -- the three are
+    // never meaningful apart, and threading them separately is what pushed
+    // this past clippy's argument limit when the encryption key arrived.
+    details: crate::state::StoreDetails,
+    // The seller's long-term X25519 public key, if their delegate has
+    // produced one. See the field on `state::PendingStoreCreation` for why
+    // creation does not wait for it.
+    encryption_public_key: Option<[u8; 32]>,
 ) -> Result<(), String> {
-    use dioxus::logger::tracing::info;
+    let crate::state::StoreDetails {
+        store_name,
+        description,
+        payment_instructions,
+    } = details;
+    use dioxus::logger::tracing::{info, warn};
     use dioxus::prelude::{ReadableExt, WritableExt};
     use freenet_stdlib::prelude::*;
     use std::sync::Arc;
@@ -302,7 +312,18 @@ pub async fn create_store_contracts(
         store_name,
         description,
         payment_instructions,
+        // The delegate's answer to `InitEncryptionKey`, which the UI sends
+        // alongside `InitReputationKeys` when creation starts. `None` here is
+        // not fatal and is not silent: `state::store_details_gap` reports the
+        // missing key on the seller's own page, and re-publishing adds it.
+        encryption_public_key,
     };
+    if encryption_public_key.is_none() {
+        warn!(
+            "Publishing this store with no encryption key -- buyers will be told they cannot \
+             message this seller until the details are published again"
+        );
+    }
     request_store_info_signature(seller_fingerprint, store_id.as_bytes().to_vec(), info).await?;
 
     Ok(())
@@ -720,6 +741,7 @@ mod tests {
             store_name: "Bean Shop".to_string(),
             description: "Coffee".to_string(),
             payment_instructions: "BTC: bc1q...".to_string(),
+            encryption_public_key: None,
         };
 
         // Exactly what `request_store_info_signature` sends as `message`.
