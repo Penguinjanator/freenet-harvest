@@ -232,6 +232,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // V6, from `git show 94a3fd1:ui/public/contracts/store_contract.wasm`.
                 // Superseded by the per-order Bitcoin payment address.
                 "9add809b5af3b735114e0683fac23a459a1d3dde447cf4f921ced9a0719611cf",
+                // V7, from `git show d9cddad:ui/public/contracts/store_contract.wasm`.
+                // Superseded by the 2026-09-05 correctness review; see the
+                // registry entry for the per-artifact causes.
+                "c1bf133c0029553bee0e092332aac933851e28a1054cce3bf72e42f517bece30",
             ],
         ),
         (
@@ -244,6 +248,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 "5c4d0eec19bf023c32c1723fc6676e43ecc1638922e952ab06c572b407350750",
                 // V6, from `git show 94a3fd1:ui/public/contracts/reputation_contract.wasm`.
                 "fd91d10d8100cec85ce5719290b57b2c56908352c31f5038fe0e78168eca9f35",
+                // V7, from `git show d9cddad:ui/public/contracts/reputation_contract.wasm`.
+                // Superseded by the 2026-09-05 correctness review; see the
+                // registry entry for the per-artifact causes.
+                "7163be62207ae9f77ee2ccb8e0249fe2d824cb52788732eb6fe60cca52b0f801",
             ],
         ),
         (
@@ -256,6 +264,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 "a00fd23796d2d87c6652749ac2365a94bf060f27f5fbe5e70929cc6635c19433",
                 // V6, from `git show 94a3fd1:ui/public/contracts/mailbox_contract.wasm`.
                 "e49cb3038b321a895850adcf594e09b6a5a698b7ba469a991a529910493628dc",
+                // V7, from `git show d9cddad:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by the 2026-09-05 correctness review; see the
+                // registry entry for the per-artifact causes.
+                "2eb1403aa35b94b8c6a0cbf252c7858e07b704740b0b76d4412871a643a78afa",
             ],
         ),
     ];
@@ -297,6 +309,13 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // The first build of the payment-address work, superseded by its
             // own review fixes before it left the branch.
             "f563abc42391938ad99ea47202177acbeddd1e41d517a1b92a49a6aa03a3a6eb".to_string(),
+            // V9, from `git show 4b8894b:ui/public/contracts/harvest_delegate.wasm`.
+            // Note the provenance commit differs from the contracts' above: the
+            // delegate was rebuilt again at 4b8894b after d9cddad, so its outgoing
+            // bytes are not the ones d9cddad committed.
+            // Superseded by the 2026-09-05 correctness review, principally the
+            // origin gate on every request.
+            "c11c732fce7c00344739cf94ec0934c45fd2fbb152d24fe7de1d353b9ee207a4".to_string(),
         ],
     );
 }
