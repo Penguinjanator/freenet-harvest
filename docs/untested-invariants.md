@@ -119,7 +119,7 @@ have tripped. Its own claims are covered.
 
 | Line | Claim | Caught? |
 |---|---|---|
-| 190 | `store_params` is the one place a store's parameters are derived. | **No.** The duplicate copies were removed on 2026-09-05 and `store_ops_derives_no_contract_parameters_of_its_own` was added to hold the line, but that test is a source scrape and **both halves are evadable** — see the correction note below. The code is currently correct; nothing reliably keeps it so. |
+| 190 | `store_params` is the one place a store's parameters are derived. | **Not a test — the compiler.** The parameter structs' fields are `pub(crate)`, so outside `harvest-common` the only way to build one is its `new`, and a second derivation does not compile whatever it is spelled. `contract_parameter_fields_stay_crate_private` guards the one step that would silently give that up (a field made `pub` again); it is a substring match and says so. |
 | 615 | Listings are "grow-only … the contract has no removal path at all, so absence is never a deletion" — the soundness precondition for `FoldAll`. | **No.** True (verified by inspection: `ListingsV1::apply_delta` only pushes). Nothing asserts it, and `common/src/store.rs:152` asserted the opposite until 2026-09-05. |
 | 620 | Reputation is "a grow-only set keyed by nonce with no removal path whatsoever" — same precondition. | **No.** Same shape as above. |
 | 300 | Candidates are ordered "by the registry's declared generation, never by slice order". | **Yes** — `superseded_store_generations_are_probed_under_their_own_parameter_encoding`. |
@@ -143,7 +143,7 @@ belongs in the durable record.
 Ranked by what breaks if the claim turns out to be false, not by how easy the
 test would be.
 
-### 1. `ui/src/migrate.rs:190` — parameters are derived in one place — **STILL OPEN**
+### 1. `ui/src/migrate.rs:190` — parameters are derived in one place — **CLOSED STRUCTURALLY 2026-09-05**
 
 **Data survival.** Ranked first when this list was compiled, and fixed rather
 than left listed. `create_store_contracts` held a second, hand-maintained copy
@@ -185,7 +185,24 @@ the failure this whole document exists to record, and it happened here in the
 document itself.
 
 **A wrong "CLOSED" is worse than an open item**, because it stops the next
-person looking. That is why this note is longer than the entry it corrects.
+person looking. That is why this note is longer than the entry it corrects,
+and why it stays here now that the entry really is closed.
+
+**The repair, and why it counts as closed this time.** The fields are now
+`pub(crate)` with a `new` on each struct, so the invariant is held by the
+compiler rather than by a test: outside `harvest-common` a second derivation
+does not compile. The aliased mutation that beat the scrape was re-run and
+now fails with E0451. This was judged too large when the scrape was chosen —
+it edits `harvest-common`, which re-keys every contract — but the committed
+WASM is already stale by ten `common/` commits on this branch, so the re-key
+and its `contract-rekey-acknowledged` label were pending regardless.
+
+Residual, stated so it is not discovered later as a surprise: nothing stops
+someone making a field `pub` again. `contract_parameter_fields_stay_crate_
+private` is a substring scrape over three files and catches the ordinary
+form of that change; a rename, unusual spacing, or a fourth parameter struct
+added elsewhere slips past it. It is a guard on a review-visible change, not
+the thing that makes the invariant true.
 
 ### 2. `contracts/store-contract/src/lib.rs:100` — the cross-check is additive only
 
