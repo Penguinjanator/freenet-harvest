@@ -697,6 +697,68 @@ fn each_store_generation_is_derived_under_the_encoding_it_shipped_with() {
     }
 }
 
+/// `migrate`'s address arithmetic agrees with the one the NODE uses.
+///
+/// Everything in this module derives instance ids with
+/// `freenet_migrate::contract_id_from_code_hash`. The node derives them by
+/// building a `WrappedContract` and taking its key. If those two ever
+/// disagreed, every id the probe walks would be wrong -- and wrong in the
+/// silent direction, since a walk to an address that was never written just
+/// reports "nothing to migrate".
+///
+/// The rehearsal harness asserted this, for the current generation only, and
+/// that harness needs a live node and until today had been failing since V6
+/// was recorded. It costs nothing to assert here instead: it needs no node,
+/// and no git history either, so it runs in CI on every PR.
+///
+/// Both parameter encodings are checked, because the whole point of
+/// `store_candidate_ids` is that it addresses some generations under one and
+/// some under the other.
+#[test]
+fn migrate_addresses_agree_with_the_stdlib_key_derivation() {
+    use freenet_stdlib::prelude::WrappedContract;
+    use std::sync::Arc;
+
+    let wasm = crate::gateway::store_ops::STORE_CONTRACT_WASM;
+    let code_hash: [u8; 32] = {
+        let hash = *ContractCode::from(wasm.to_vec()).hash();
+        let bytes: &[u8] = hash.as_ref();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes[..32]);
+        out
+    };
+
+    let vk = seller_vk();
+    let current = encode_params(&store_params(&vk)).expect("encode");
+    let legacy = Parameters::from(legacy_store_param_bytes(&vk));
+
+    let mut ids = Vec::new();
+    for (name, params) in [("current", &current), ("legacy", &legacy)] {
+        let ours = current_id(&code_hash, params);
+        let theirs = *WrappedContract::new(
+            Arc::new(ContractCode::from(wasm.to_vec())),
+            (*params).clone(),
+        )
+        .key()
+        .id();
+        assert_eq!(
+            ours, theirs,
+            "under the {name} parameter encoding, migrate's derivation and the node's \
+             must name the same instance"
+        );
+        ids.push(ours);
+    }
+
+    // Non-vacuous: the two encodings must actually produce different
+    // addresses, or the assertions above would hold for a derivation that
+    // ignored its parameters entirely.
+    assert_ne!(
+        ids[0], ids[1],
+        "the two parameter encodings must address different instances, or this test \
+         would pass for a derivation that ignored parameters"
+    );
+}
+
 /// A contract's parameters are derived in exactly ONE place.
 ///
 /// # Why this is a source scrape and not a behavioural test

@@ -15,6 +15,13 @@ Scope: `common/src/{store,payment,mailbox,reputation,listing,address}.rs`,
 cover `delegates/` or `ui/src/gateway/`, which were held by other people during
 the review and are collected separately.
 
+A note on what CI does and does not compile, because it was got wrong twice
+during this review in the pessimistic direction. `ui/src/gateway/` **is**
+type-checked and linted on every PR, by the `clippy the UI for wasm32` step;
+it is never EXECUTED, which is the real gap. `tests/rehearsal/` was reached by
+nothing at all until 2026-09-05 and is now compile-checked; it still cannot be
+run without a live node.
+
 **This list is not a to-do list.** Most entries are cheap to leave uncovered.
 The four that are not are named at the end, and that section is the point of
 the document.

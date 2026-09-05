@@ -58,6 +58,43 @@ jobs:
           cargo clippy --locked -p harvest-common --features address-guard --all-targets -- -D warnings
           cargo test --locked -p harvest-common --features address-guard
 
+      # `tests/rehearsal` is a SEPARATE cargo workspace -- deliberately, so
+      # that building or locking it can never move a dependency version the
+      # contracts compile against and re-key an artifact. The cost of that
+      # isolation is that `--workspace` above does not reach it, and until
+      # 2026-09-05 nothing else did either: it was referenced by no workflow
+      # and no `Makefile.toml` task. It had been failing since V6 was added to
+      # `legacy/store_contract.toml`, because it asserted on candidate list
+      # POSITIONS and a new registry row shifted every index. Nobody noticed
+      # for several generations.
+      #
+      # BE CLEAR ABOUT WHAT A GREEN TICK HERE MEANS. This compiles the harness
+      # and nothing more. It catches compile-level rot -- a renamed function, a
+      # changed signature, a `migrate.rs` edit that does not typecheck against
+      # it -- which is real, because the harness includes `ui/src/migrate.rs`
+      # by `#[path]` and so breaks whenever that file grows a dependency the
+      # harness does not have.
+      #
+      # It would NOT have caught the bug described above. That compiled
+      # perfectly and failed only at runtime, against a live node. Running the
+      # harness needs a node, so it stays manual; a green tick here is not
+      # evidence that the rehearsal works.
+      #
+      # The one piece of it that needed neither a node nor git history -- that
+      # `migrate`'s address arithmetic agrees with the node's own key
+      # derivation -- has been moved into a real unit test instead, and runs
+      # in `cargo test` above.
+      #
+      # NOT `--all-targets`, and it is not an oversight. That enables
+      # `cfg(test)`, which reaches the `#[cfg(test)] mod tests;` inside the
+      # `#[path]`-included `ui/src/migrate.rs` and resolves it against this
+      # crate's directory, where no such file exists. The harness has no test
+      # target of its own, so there is nothing to gain and a hard build error
+      # to lose. The same limitation is why `rustfmt` cannot format
+      # `tests/rehearsal/src/main.rs` at all.
+      - name: check the migration rehearsal harness compiles
+        run: cargo check --locked --manifest-path tests/rehearsal/Cargo.toml
+
   wasm:
     name: contracts, delegate and UI build to wasm
     runs-on: ubuntu-latest
