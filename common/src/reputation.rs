@@ -9,9 +9,26 @@ use crate::feedback::{FeedbackCategory, FeedbackToken};
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct ReputationParameters {
     /// RSA public key in PKCS#1 DER format, for verifying blind-signed feedback tokens.
-    pub rsa_public_key_der: Vec<u8>,
+    ///
+    /// `pub(crate)` on purpose -- see [`ReputationParameters::new`].
+    pub(crate) rsa_public_key_der: Vec<u8>,
     /// Owner's Ed25519 verifying key (from ghostkey certificate), for identity linkage.
-    pub owner_verifying_key: VerifyingKey,
+    pub(crate) owner_verifying_key: VerifyingKey,
+}
+
+impl ReputationParameters {
+    /// The only way to build these parameters from outside `harvest-common`.
+    ///
+    /// The field set of this struct is hashed into the reputation contract's
+    /// address, so a second place building it by hand can address a different
+    /// contract. See [`crate::store::StoreParameters::new`] for the incident
+    /// that argument comes from.
+    pub fn new(rsa_public_key_der: Vec<u8>, owner_verifying_key: VerifyingKey) -> Self {
+        Self {
+            rsa_public_key_der,
+            owner_verifying_key,
+        }
+    }
 }
 
 /// A single piece of negative feedback submitted to a seller's reputation contract.

@@ -27,7 +27,39 @@ use crate::payment::{AuthorizedOrder, OrderId, OrderStatus};
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct StoreParameters {
     /// The seller's Ed25519 verifying key (from their ghostkey certificate).
-    pub seller_verifying_key: VerifyingKey,
+    ///
+    /// `pub(crate)` on purpose -- see [`StoreParameters::new`].
+    pub(crate) seller_verifying_key: VerifyingKey,
+}
+
+impl StoreParameters {
+    /// The only way to build these parameters from outside `harvest-common`.
+    ///
+    /// # Why the fields are not public
+    ///
+    /// A contract's address is `BLAKE3(code_hash || cbor(parameters))`, so the
+    /// FIELD SET of this struct is a network address. Two places building it
+    /// by hand can disagree about that field set, and when they do, the PUT
+    /// and the migration probe address different contracts -- silently, in the
+    /// direction that reports a clean "nothing to migrate" over a seller's
+    /// entire store.
+    ///
+    /// That is not hypothetical. `StoreParameters` gained two Bitcoin fields
+    /// and lost them again; the probe went on deriving V1, the only generation
+    /// ever published, at an address it never had. Removing the duplicate
+    /// constructions fixed the instance. A source-scrape test was written to
+    /// stop them coming back and was beaten by a type alias, which is an
+    /// ordinary refactor rather than an exotic evasion.
+    ///
+    /// Private fields are what actually holds it: a second derivation outside
+    /// this crate does not compile. Adding a field changes this signature, so
+    /// the decision is made once, here, rather than in every place that
+    /// happens to construct one.
+    pub fn new(seller_verifying_key: VerifyingKey) -> Self {
+        Self {
+            seller_verifying_key,
+        }
+    }
 }
 
 /// Information about the store owner. Single-value, version-bumped on update.
@@ -337,10 +369,19 @@ fn order_content_digest(record: &AuthorizedOrder) -> [u8; 8] {
 /// BELOW `None`. A third party could set `status_scoped_payload: Some(vec![])`
 /// on a genuine `Paid` record, change nothing else, and permanently own the
 /// copy every replica keeps. Smaller-wins turned an ignored field into the
-/// winning move. See
+/// winning move.
+///
+/// "Every field" above is a claim about the struct as it is TODAY, and it is
+/// held by the compiler rather than by this comment:
+/// `verify_unused_fields_absent` destructures `AuthorizedOrder` without `..`,
+/// so a new optional field does not compile until somebody has said which
+/// statuses consult it, and `fields_used` is an exhaustive match, so a new
+/// status does not compile until somebody has said which fields it uses. Both
+/// halves are needed: this paragraph was field-complete prose over
+/// status-complete enforcement until 2026-09-05, which meant the next field
+/// added would have silently reopened the attack. See
 /// `crate::payment::AuthorizedOrder::verify_unused_fields_absent` and
-/// `order_tests::a_field_the_status_does_not_use_is_rejected`; a new status
-/// that leaves a field unchecked reopens this.
+/// `order_tests::a_field_the_status_does_not_use_is_rejected`.
 ///
 /// A digest over the order TERMS was considered instead and rejected: two
 /// records for one order id normally carry identical terms, so it ties, and

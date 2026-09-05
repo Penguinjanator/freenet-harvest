@@ -759,66 +759,57 @@ fn migrate_addresses_agree_with_the_stdlib_key_derivation() {
     );
 }
 
-/// A contract's parameters are derived in exactly ONE place.
+/// The parameter structs keep their fields crate-private.
 ///
-/// # Why this is a source scrape and not a behavioural test
+/// # What holds the invariant, and what this adds
 ///
-/// `gateway::store_ops::create_store_contracts` is `#[cfg(target_arch =
-/// "wasm32")]`. Neither `cargo test --workspace` nor `cargo clippy
-/// --workspace --all-targets` compiles it, so no host test can call it and
-/// compare what it derives against what the probe derives. Scraping the
-/// source is what is left, and it is enough for the property that matters:
-/// that there is no SECOND derivation to drift.
+/// "Contract parameters are derived in exactly one place" is enforced by the
+/// COMPILER, not by this test: the fields are `pub(crate)` and the only way to
+/// build one of these structs outside `harvest-common` is its `new`. A second
+/// derivation does not compile, whatever it is spelled.
 ///
-/// # Why the property is worth a test at all
+/// This test guards the one step that would silently give that up -- making a
+/// field `pub` again. It exists because the check it replaces tried to hold
+/// the whole invariant by scraping source, and was beaten by
+/// `use StoreParameters as SP`, which is an ordinary refactor rather than an
+/// exotic evasion.
 ///
-/// A contract's address is `BLAKE3(code_hash || cbor(parameters))`. Two
-/// hand-maintained copies of a parameter struct means the PUT and the
-/// migration probe can disagree about a store's address, and the disagreement
-/// is silent in both directions: the probe walks addresses that were never
-/// written, takes `NotFound` at each, and reports a clean "nothing to
-/// migrate" over a seller's entire store.
+/// # Be precise about what a green result here means
 ///
-/// That is not hypothetical. A parameter-derivation mismatch is exactly the
-/// defect this branch opened with -- `StoreParameters` gained two fields and
-/// lost them again, and the probe derived V1, the only generation ever
-/// published, at an address it never had. Fixing that symptom left the
-/// structural cause standing: `create_store_contracts` still built all three
-/// parameter structs itself.
-///
-/// `include_str!` rather than a runtime read, so renaming the file fails the
-/// build instead of silently skipping the check.
+/// It means these three files do not contain the exact strings below. It is a
+/// substring match: unusual spacing, a field rename, or a fourth parameter
+/// struct added elsewhere all slip past it. It is a cheap guard on a change
+/// that would otherwise be easy to miss in review, NOT the thing that makes
+/// the invariant true. Reading a scrape as more than it is, is what put this
+/// comment here.
 #[test]
-fn store_ops_derives_no_contract_parameters_of_its_own() {
-    const STORE_OPS: &str = include_str!("../gateway/store_ops.rs");
-
-    // Every parameter type whose encoding is hashed into a contract address.
-    // A literal construction of any of them outside `migrate` is a second
-    // derivation, whatever it happens to contain today.
-    for ty in [
-        "StoreParameters {",
-        "MailboxParameters {",
-        "ReputationParameters {",
+fn contract_parameter_fields_stay_crate_private() {
+    for (file, source, fields) in [
+        (
+            "common/src/store.rs",
+            include_str!("../../../common/src/store.rs"),
+            &["pub seller_verifying_key"][..],
+        ),
+        (
+            "common/src/mailbox.rs",
+            include_str!("../../../common/src/mailbox.rs"),
+            &["pub owner_verifying_key"][..],
+        ),
+        (
+            "common/src/reputation.rs",
+            include_str!("../../../common/src/reputation.rs"),
+            &["pub rsa_public_key_der", "pub owner_verifying_key"][..],
+        ),
     ] {
-        assert!(
-            !STORE_OPS.contains(ty),
-            "gateway/store_ops.rs constructs `{ty}` itself. Contract parameters are \
-             derived in `migrate::{{store,mailbox,reputation}}_params` and nowhere else -- \
-             call those instead. A second copy drifts silently and re-keys every \
-             contract it addresses."
-        );
-    }
-
-    // And the shared derivations are what it should be calling.
-    for f in [
-        "migrate::store_params",
-        "migrate::mailbox_params",
-        "migrate::reputation_params",
-    ] {
-        assert!(
-            STORE_OPS.contains(f),
-            "gateway/store_ops.rs should derive its parameters through `{f}`"
-        );
+        for field in fields {
+            assert!(
+                !source.contains(field),
+                "{file} declares `{field}` public. These fields are hashed into a \
+                 contract's address, and a public field lets a second derivation be \
+                 written outside `harvest-common` -- which is how the probe came to \
+                 look for V1 at an address it never had. Construct through `new`."
+            );
+        }
     }
 }
 

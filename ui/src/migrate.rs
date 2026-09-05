@@ -188,9 +188,7 @@ impl Artifact {
 /// from the seller's ghostkey alone -- the Bitcoin trust configuration used to
 /// sit here too and is now per-order, so it can no longer re-key a store.
 pub fn store_params(seller_verifying_key: &ed25519_dalek::VerifyingKey) -> StoreParameters {
-    StoreParameters {
-        seller_verifying_key: *seller_verifying_key,
-    }
+    StoreParameters::new(*seller_verifying_key)
 }
 
 /// The FIRST store generation published under the old `StoreParameters` shape.
@@ -315,19 +313,14 @@ pub fn store_candidates(
 }
 
 pub fn mailbox_params(owner_verifying_key: &ed25519_dalek::VerifyingKey) -> MailboxParameters {
-    MailboxParameters {
-        owner_verifying_key: *owner_verifying_key,
-    }
+    MailboxParameters::new(*owner_verifying_key)
 }
 
 pub fn reputation_params(
     rsa_public_key_der: Vec<u8>,
     owner_verifying_key: &ed25519_dalek::VerifyingKey,
 ) -> ReputationParameters {
-    ReputationParameters {
-        rsa_public_key_der,
-        owner_verifying_key: *owner_verifying_key,
-    }
+    ReputationParameters::new(rsa_public_key_der, *owner_verifying_key)
 }
 
 /// The reputation probe's inputs, which cannot be assembled without the RSA

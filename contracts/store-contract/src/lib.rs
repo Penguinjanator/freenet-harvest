@@ -446,9 +446,7 @@ mod tests {
     }
 
     fn params_bytes(seller: &SigningKey) -> Vec<u8> {
-        let params = StoreParameters {
-            seller_verifying_key: seller.verifying_key(),
-        };
+        let params = StoreParameters::new(seller.verifying_key());
         let mut bytes = vec![];
         into_writer(&params, &mut bytes).unwrap();
         bytes

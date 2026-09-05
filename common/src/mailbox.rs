@@ -98,7 +98,23 @@ pub struct EncryptedMessage {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct MailboxParameters {
     /// The mailbox owner's Ed25519 verifying key (for identity linkage).
-    pub owner_verifying_key: VerifyingKey,
+    ///
+    /// `pub(crate)` on purpose -- see [`MailboxParameters::new`].
+    pub(crate) owner_verifying_key: VerifyingKey,
+}
+
+impl MailboxParameters {
+    /// The only way to build these parameters from outside `harvest-common`.
+    ///
+    /// The field set of this struct is hashed into the mailbox's address, so a
+    /// second place building it by hand can address a different contract. See
+    /// [`crate::store::StoreParameters::new`] for the incident that argument
+    /// comes from.
+    pub fn new(owner_verifying_key: VerifyingKey) -> Self {
+        Self {
+            owner_verifying_key,
+        }
+    }
 }
 
 /// Mailbox contract state: a collection of encrypted messages with TTL-based pruning.

@@ -131,10 +131,7 @@ fn legacy_params(vk: &VerifyingKey) -> Parameters<'static> {
 }
 
 fn current_params(vk: &VerifyingKey) -> Parameters<'static> {
-    migrate::encode_params(&StoreParameters {
-        seller_verifying_key: *vk,
-    })
-    .expect("encode current store parameters")
+    migrate::encode_params(&StoreParameters::new(*vk)).expect("encode current store parameters")
 }
 
 fn code_hash(wasm: &[u8]) -> [u8; 32] {
