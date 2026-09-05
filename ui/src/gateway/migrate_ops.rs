@@ -942,14 +942,18 @@ fn encode_forward<T: serde::Serialize>(state: &T, wasm: &'static [u8]) -> Option
 ///
 /// This is the in-memory half only, and it lasts as long as the session. The
 /// durable half is condition 2 of the sealing rule; see
-/// [`successor_reference_is_durable`] for why it cannot be written yet, and
-/// note that a `ListStores` answer arriving after this runs will overwrite it
-/// -- `AppState::merge_store_registrations` replaces a registration wholesale
-/// when the store id matches.
+/// [`successor_reference_is_durable`] for why it cannot be written yet.
+///
+/// A `ListStores` answer arriving after this runs used to overwrite it, on a
+/// race whose timing nobody controls, because the delegate's registry still
+/// names the predecessor and always will. `AppState::adopt_migrated_contract_id`
+/// records the move so `merge_store_registrations` can rewrite those stale ids
+/// as they arrive; the durable gap remains, so the migration still re-runs on
+/// the next load, but it no longer un-does itself within a session.
 fn adopt_recovered(artifact: Artifact, fingerprint: &str, successor: ContractInstanceId) {
     let successor_bytes = successor.as_bytes().to_vec();
     let mut app = super::APP_STATE.write();
-    let Some(stores) = app.my_stores.get_mut(fingerprint) else {
+    let Some(stores) = app.my_stores.get(fingerprint) else {
         return;
     };
     if artifact == Artifact::Store
@@ -959,19 +963,16 @@ fn adopt_recovered(artifact: Artifact, fingerprint: &str, successor: ContractIns
     {
         return;
     }
-    let Some(existing) = stores.first_mut() else {
+    let Some(existing) = stores.first() else {
         return;
     };
-    match artifact {
-        Artifact::Store => {
-            existing.store_contract_id = successor_bytes;
-            // The recorded key belonged to the predecessor's code hash and is
-            // now wrong. Clearing it makes `store_contract_key` rebuild from
-            // the bundled contract, which is the right answer for the current
-            // generation.
-            existing.store_contract_key = None;
-        }
-        Artifact::Mailbox => existing.mailbox_contract_id = successor_bytes,
-        Artifact::Reputation => existing.reputation_contract_id = successor_bytes,
-    }
+    // The id this artifact is moving FROM. Read before the write, because the
+    // repoint has to be remembered and not merely applied: see
+    // `AppState::adopt_migrated_contract_id`, which also does the write.
+    let predecessor = match artifact {
+        Artifact::Store => existing.store_contract_id.clone(),
+        Artifact::Mailbox => existing.mailbox_contract_id.clone(),
+        Artifact::Reputation => existing.reputation_contract_id.clone(),
+    };
+    app.adopt_migrated_contract_id(&predecessor, successor_bytes);
 }

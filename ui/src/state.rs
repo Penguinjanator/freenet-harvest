@@ -55,6 +55,13 @@ pub struct AppState {
     /// Our own stores (ghostkey fingerprint -> list of registrations).
     pub my_stores: HashMap<String, Vec<StoreRegistration>>,
 
+    /// Contract ids a completed migration has superseded, as
+    /// `predecessor -> successor`.
+    ///
+    /// See [`AppState::adopt_migrated_contract_id`] for why this has to be
+    /// remembered rather than simply applied and forgotten.
+    pub migrated_contract_ids: HashMap<Vec<u8>, Vec<u8>>,
+
     /// Store contracts we have already asked the gateway for. Every
     /// `StoreList` answer names every store the ghostkey owns, and a
     /// ghostkey re-connecting in the same session produces another answer,
@@ -791,6 +798,68 @@ impl AppState {
         true
     }
 
+    /// Record that a migration has moved a contract, and repoint what we hold.
+    ///
+    /// # Why the mapping is REMEMBERED and not just applied
+    ///
+    /// The harvest delegate has no request that can replace a
+    /// `StoreRegistration` -- `RegisterStore` appends and is a no-op for a
+    /// store id it already holds (see
+    /// `gateway::migrate_ops::successor_reference_is_durable`). So after a
+    /// migration its registry still names the PREDECESSOR, and every
+    /// `ListStores` answer for the rest of the session says so. Applying the
+    /// repoint and forgetting it meant the next such answer silently un-did
+    /// the migration, on a race whose timing nobody controls: the seller's
+    /// mailbox id went back to a contract nothing writes to any more.
+    ///
+    /// Remembering it lets [`AppState::merge_store_registrations`] rewrite
+    /// the stale ids as they arrive, which also stops the stale answer being
+    /// filed as a SECOND store -- it matches on `store_contract_id`, so once
+    /// the store has moved, the predecessor's triple no longer matches
+    /// anything and used to be appended.
+    ///
+    /// # Why this is not a veto on the delegate
+    ///
+    /// Only the exact superseded id is rewritten. Any other value passes
+    /// through untouched, so a delegate that has genuinely been updated --
+    /// which is what the replace request above will make possible -- wins,
+    /// as it should: a durable write is newer than our in-memory guess. The
+    /// masking is therefore self-limiting, confined to the one value the
+    /// probe has positively established is stale.
+    pub fn adopt_migrated_contract_id(&mut self, predecessor: &[u8], successor: Vec<u8>) {
+        if predecessor == successor {
+            return;
+        }
+        // Keep the map flat: a later hop rewrites the target of an earlier
+        // one, so resolving is a single lookup and can never chase a cycle.
+        for target in self.migrated_contract_ids.values_mut() {
+            if target == predecessor {
+                *target = successor.clone();
+            }
+        }
+        self.migrated_contract_ids
+            .insert(predecessor.to_vec(), successor.clone());
+
+        for stores in self.my_stores.values_mut() {
+            for registration in stores.iter_mut() {
+                if registration.store_contract_id == predecessor {
+                    registration.store_contract_id = successor.clone();
+                    // The recorded key belonged to the predecessor's code
+                    // hash and is now wrong. Clearing it makes the key
+                    // rebuild from the bundled contract, which is the right
+                    // answer for the current generation.
+                    registration.store_contract_key = None;
+                }
+                if registration.reputation_contract_id == predecessor {
+                    registration.reputation_contract_id = successor.clone();
+                }
+                if registration.mailbox_contract_id == predecessor {
+                    registration.mailbox_contract_id = successor.clone();
+                }
+            }
+        }
+    }
+
     /// Fold the delegate's answer to `ListStores` into what we already know,
     /// rather than replacing it.
     ///
@@ -812,6 +881,16 @@ impl AppState {
     /// is never stale. The invariant is "never lose a locally-known
     /// registration"; the delegate's answer only adds, and only fills in
     /// fields we don't already have.
+    ///
+    /// It can also be stale in a way that matters more than a missing field:
+    /// after a migration the registry still names the PREDECESSOR of every id
+    /// it holds, because the delegate has no request that can replace a
+    /// registration. Those ids are rewritten on the way in -- see
+    /// [`AppState::adopt_migrated_contract_id`], which is also where the
+    /// argument for why that is not a veto on the delegate lives. Rewriting
+    /// BEFORE the match is what makes it one store rather than two: the match
+    /// is on `store_contract_id`, so a migrated store's predecessor triple
+    /// would otherwise match nothing and be filed as a second store.
     pub fn merge_store_registrations(
         &mut self,
         ghostkey_fingerprint: &str,
@@ -825,12 +904,32 @@ impl AppState {
             return;
         }
 
+        // Taken before `known` borrows `self.my_stores` mutably. It is
+        // normally empty, and never holds more than one entry per migrated
+        // artifact per session.
+        let migrated = self.migrated_contract_ids.clone();
+
         let known = self
             .my_stores
             .entry(ghostkey_fingerprint.to_string())
             .or_default();
 
         for mut registration in stores {
+            for id in [
+                &mut registration.store_contract_id,
+                &mut registration.reputation_contract_id,
+                &mut registration.mailbox_contract_id,
+            ] {
+                if let Some(successor) = migrated.get(id.as_slice()) {
+                    if id.as_slice() != successor.as_slice() {
+                        // The delegate cannot know this store moved. Anything
+                        // it says that is NOT a superseded id passes through
+                        // untouched.
+                        *id = successor.clone();
+                    }
+                }
+            }
+
             match known
                 .iter_mut()
                 .find(|s| s.store_contract_id == registration.store_contract_id)
@@ -2712,6 +2811,90 @@ mod tests {
         state.on_delegate_response(store_list(vec![]));
 
         assert!(!state.my_stores.contains_key(FINGERPRINT));
+    }
+
+    /// A completed migration must survive the next `ListStores` answer.
+    ///
+    /// The migration probe repoints all three ids in memory once it has
+    /// recovered a store at its successor address. The harvest delegate has no
+    /// request that can replace a `StoreRegistration`, so its registry still
+    /// names the PREDECESSOR and will keep saying so for the life of the
+    /// session. A wholesale `*existing = registration` therefore un-did the
+    /// migration on a race whose timing nobody controls -- silently, and
+    /// without so much as a log line.
+    #[test]
+    fn a_store_list_answer_does_not_revert_a_completed_migration() {
+        let mut state = AppState::default();
+        state.merge_store_registrations(FINGERPRINT, vec![registration(1, None)]);
+
+        // What the probe did: store 1 -> 9, and its mailbox and reputation
+        // with it.
+        state.adopt_migrated_contract_id(&[1u8; 32], vec![9u8; 32]);
+        state.adopt_migrated_contract_id(&[2u8; 32], vec![10u8; 32]);
+        state.adopt_migrated_contract_id(&[3u8; 32], vec![11u8; 32]);
+
+        let migrated = &state.my_stores[FINGERPRINT];
+        assert_eq!(
+            migrated.len(),
+            1,
+            "a migration moves a store, it does not add one"
+        );
+        assert_eq!(migrated[0].store_contract_id, vec![9u8; 32]);
+        assert_eq!(migrated[0].reputation_contract_id, vec![10u8; 32]);
+        assert_eq!(migrated[0].mailbox_contract_id, vec![11u8; 32]);
+
+        // The delegate answers with the predecessor triple, because that is
+        // the only thing it can say.
+        state.on_delegate_response(store_list(vec![registration(1, None)]));
+
+        let stores = &state.my_stores[FINGERPRINT];
+        assert_eq!(
+            stores.len(),
+            1,
+            "the stale answer names the same store, not a second one"
+        );
+        assert_eq!(
+            stores[0].store_contract_id,
+            vec![9u8; 32],
+            "the delegate's answer must not move the store back"
+        );
+        assert_eq!(
+            stores[0].reputation_contract_id,
+            vec![10u8; 32],
+            "nor its reputation contract"
+        );
+        assert_eq!(
+            stores[0].mailbox_contract_id,
+            vec![11u8; 32],
+            "nor its mailbox -- this is the id the seller's messages arrive at"
+        );
+    }
+
+    /// The converse: the repoint must not become a permanent veto on the
+    /// delegate.
+    ///
+    /// Only the specific id a migration superseded is rewritten. Anything else
+    /// the delegate says is taken as-is, including a value for a field the
+    /// probe has repointed -- because a delegate that can say something OTHER
+    /// than the stale predecessor is one that has been updated, and an update
+    /// is newer than our in-memory guess.
+    #[test]
+    fn a_repoint_does_not_mask_a_genuinely_new_delegate_value() {
+        let mut state = AppState::default();
+        state.merge_store_registrations(FINGERPRINT, vec![registration(1, None)]);
+        state.adopt_migrated_contract_id(&[2u8; 32], vec![10u8; 32]);
+
+        // Not the predecessor and not the successor: a value only a durable
+        // write could have produced.
+        let mut fresh = registration(1, None);
+        fresh.reputation_contract_id = vec![42u8; 32];
+        state.on_delegate_response(store_list(vec![fresh]));
+
+        assert_eq!(
+            state.my_stores[FINGERPRINT][0].reputation_contract_id,
+            vec![42u8; 32],
+            "a delegate value that is not the superseded id must win"
+        );
     }
 
     /// A registration the delegate knows about but we don't is added, key and
