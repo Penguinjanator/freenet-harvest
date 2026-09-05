@@ -697,6 +697,69 @@ fn each_store_generation_is_derived_under_the_encoding_it_shipped_with() {
     }
 }
 
+/// A contract's parameters are derived in exactly ONE place.
+///
+/// # Why this is a source scrape and not a behavioural test
+///
+/// `gateway::store_ops::create_store_contracts` is `#[cfg(target_arch =
+/// "wasm32")]`. Neither `cargo test --workspace` nor `cargo clippy
+/// --workspace --all-targets` compiles it, so no host test can call it and
+/// compare what it derives against what the probe derives. Scraping the
+/// source is what is left, and it is enough for the property that matters:
+/// that there is no SECOND derivation to drift.
+///
+/// # Why the property is worth a test at all
+///
+/// A contract's address is `BLAKE3(code_hash || cbor(parameters))`. Two
+/// hand-maintained copies of a parameter struct means the PUT and the
+/// migration probe can disagree about a store's address, and the disagreement
+/// is silent in both directions: the probe walks addresses that were never
+/// written, takes `NotFound` at each, and reports a clean "nothing to
+/// migrate" over a seller's entire store.
+///
+/// That is not hypothetical. A parameter-derivation mismatch is exactly the
+/// defect this branch opened with -- `StoreParameters` gained two fields and
+/// lost them again, and the probe derived V1, the only generation ever
+/// published, at an address it never had. Fixing that symptom left the
+/// structural cause standing: `create_store_contracts` still built all three
+/// parameter structs itself.
+///
+/// `include_str!` rather than a runtime read, so renaming the file fails the
+/// build instead of silently skipping the check.
+#[test]
+fn store_ops_derives_no_contract_parameters_of_its_own() {
+    const STORE_OPS: &str = include_str!("../gateway/store_ops.rs");
+
+    // Every parameter type whose encoding is hashed into a contract address.
+    // A literal construction of any of them outside `migrate` is a second
+    // derivation, whatever it happens to contain today.
+    for ty in [
+        "StoreParameters {",
+        "MailboxParameters {",
+        "ReputationParameters {",
+    ] {
+        assert!(
+            !STORE_OPS.contains(ty),
+            "gateway/store_ops.rs constructs `{ty}` itself. Contract parameters are \
+             derived in `migrate::{{store,mailbox,reputation}}_params` and nowhere else -- \
+             call those instead. A second copy drifts silently and re-keys every \
+             contract it addresses."
+        );
+    }
+
+    // And the shared derivations are what it should be calling.
+    for f in [
+        "migrate::store_params",
+        "migrate::mailbox_params",
+        "migrate::reputation_params",
+    ] {
+        assert!(
+            STORE_OPS.contains(f),
+            "gateway/store_ops.rs should derive its parameters through `{f}`"
+        );
+    }
+}
+
 // --- sealing ------------------------------------------------------------
 
 /// Only a complete recovery may seal.

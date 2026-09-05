@@ -112,7 +112,7 @@ have tripped. Its own claims are covered.
 
 | Line | Claim | Caught? |
 |---|---|---|
-| 185 | `store_params` "must match `create_store_contracts` exactly, or every id derived here names a contract that does not exist". | **No, and this is the same shape as the defect that started the review.** `create_store_contracts` builds `StoreParameters` inline as a second copy, in a `#[cfg(target_arch = "wasm32")]` file that neither `cargo test --workspace` nor `cargo clippy --workspace --all-targets` compiles. Two hand-maintained copies of the fact whose last divergence re-keyed every store. |
+| 190 | `store_params` is the one place a store's parameters are derived. | **Yes, since 2026-09-05** — `store_ops_derives_no_contract_parameters_of_its_own`. There is no longer a second copy to drift: `create_store_contracts` calls `migrate::{store,mailbox,reputation}_params`. The test is a source scrape (`include_str!`) because the caller is `wasm32`-gated and no host test can reach it; it asserts both that no parameter struct is constructed there and that the shared derivations are called. Retained in this list because the property is enforced by a scrape rather than by the type system. |
 | 615 | Listings are "grow-only … the contract has no removal path at all, so absence is never a deletion" — the soundness precondition for `FoldAll`. | **No.** True (verified by inspection: `ListingsV1::apply_delta` only pushes). Nothing asserts it, and `common/src/store.rs:152` asserted the opposite until 2026-09-05. |
 | 620 | Reputation is "a grow-only set keyed by nonce with no removal path whatsoever" — same precondition. | **No.** Same shape as above. |
 | 300 | Candidates are ordered "by the registry's declared generation, never by slice order". | **Yes** — `superseded_store_generations_are_probed_under_their_own_parameter_encoding`. |
@@ -136,22 +136,33 @@ belongs in the durable record.
 Ranked by what breaks if the claim turns out to be false, not by how easy the
 test would be.
 
-### 1. `ui/src/migrate.rs:185` — `store_params` must match `create_store_contracts`
+### 1. `ui/src/migrate.rs:190` — parameters are derived in one place — **CLOSED 2026-09-05**
 
-**Data survival.** If these two copies drift, every derived instance id names a
-contract that was never published. The migration probe then walks addresses
-that do not exist, takes `NotFound` at each, and reports a clean "nothing to
-migrate" over a seller's entire store — listings, reputation and mailbox. The
-failure is silent at every layer: no error, no log, no failing test, and a
-green CI run.
+**Data survival.** Ranked first when this list was compiled, and fixed rather
+than left listed. `create_store_contracts` held a second, hand-maintained copy
+of all three parameter structs. If the copies drifted, every derived instance
+id named a contract that was never published: the migration probe would walk
+addresses that do not exist, take `NotFound` at each, and report a clean
+"nothing to migrate" over a seller's entire store — listings, reputation and
+mailbox. Silent at every layer: no error, no log, no failing test, green CI.
 
-This is worst not because it is most likely but because **it has already
-happened once, in this exact shape**, and cost the review that produced this
-file. It is also the only entry whose counterparty is invisible to every
-automated check in the repository: `create_store_contracts` is wasm-gated, so
-host tests and host clippy never compile it. A parameter-encoding change is
-precisely what `common/src/address.rs` exists to catch, and `address.rs` does
-not cover this pair.
+It ranked first because **it had already happened once in this exact shape** —
+a parameter-derivation mismatch is the defect this whole review opened with,
+and fixing that symptom had left the structural cause standing. It was also
+the only entry whose counterparty is invisible to every automated check in the
+repository, `create_store_contracts` being wasm-gated.
+
+There is now one derivation. The duplication was worse than recorded: three
+production copies (store, mailbox, reputation), not one, plus a fourth in that
+file's own test module which meant the test could pass against parameters the
+real PUT would never produce. `common/src/delegate.rs` was checked and is
+already a single shared const.
+
+What remains is that the property is held by a source scrape rather than by
+the type system: nothing stops a future edit constructing the struct again in
+a file the scrape does not read. Making it structural would mean a constructor
+the parameter types can only be built through, which is a larger change than
+this review's scope.
 
 ### 2. `contracts/store-contract/src/lib.rs:100` — the cross-check is additive only
 

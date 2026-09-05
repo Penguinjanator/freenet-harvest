@@ -166,10 +166,16 @@ pub async fn create_store_contracts(
     }
 
     // 1. Reputation contract
-    let reputation_params = harvest_common::reputation::ReputationParameters {
-        rsa_public_key_der: rsa_public_key_der.clone(),
-        owner_verifying_key: seller_vk,
-    };
+    //
+    // Parameters come from `crate::migrate`, which is the ONE place any
+    // contract's parameters are derived. A contract's address is
+    // `BLAKE3(code_hash || cbor(parameters))`, so a second copy here would let
+    // this PUT and the migration probe disagree about where a seller's
+    // contracts live -- silently, in the direction that reports a clean
+    // "nothing to migrate". This file used to hold that second copy for all
+    // three contracts; see `migrate::store_params`.
+    let reputation_params =
+        crate::migrate::reputation_params(rsa_public_key_der.clone(), &seller_vk);
     let reputation_params_bytes = harvest_common::to_cbor(&reputation_params)
         .map_err(|e| format!("serialize reputation params: {e}"))?;
 
@@ -191,15 +197,13 @@ pub async fn create_store_contracts(
     .await?;
 
     // 2. Store contract (initially empty, version 0)
-    // The seller's key is the store's whole identity. The Bitcoin trust
-    // configuration deliberately is NOT here: as a contract parameter it was
-    // hashed into the store's address and therefore frozen for the store's
-    // life, which meant every store this function created was permanently
-    // incapable of accepting an on-chain payment. It now travels per-order,
-    // under the seller's signature -- see `harvest_common::payment::Order`.
-    let store_params = harvest_common::store::StoreParameters {
-        seller_verifying_key: seller_vk,
-    };
+    //
+    // The seller's key is the store's whole identity, and why that is so --
+    // the Bitcoin trust configuration was once a parameter here, was therefore
+    // frozen into every store's address, and made every store this function
+    // created permanently incapable of accepting an on-chain payment -- is
+    // recorded on `StoreParameters` itself, next to the field it is about.
+    let store_params = crate::migrate::store_params(&seller_vk);
     let store_params_bytes = harvest_common::to_cbor(&store_params)
         .map_err(|e| format!("serialize store params: {e}"))?;
 
@@ -214,9 +218,7 @@ pub async fn create_store_contracts(
     super::put_contract(store_container, WrappedState::new(store_state_bytes)).await?;
 
     // 3. Mailbox contract
-    let mailbox_params = harvest_common::mailbox::MailboxParameters {
-        owner_verifying_key: seller_vk,
-    };
+    let mailbox_params = crate::migrate::mailbox_params(&seller_vk);
     let mailbox_params_bytes = harvest_common::to_cbor(&mailbox_params)
         .map_err(|e| format!("serialize mailbox params: {e}"))?;
 
@@ -629,7 +631,7 @@ mod tests {
         use freenet_stdlib::prelude::ContractInstanceId;
         use harvest_common::listing::ListingId;
         use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderStatus};
-        use harvest_common::store::{StoreParameters, StoreStateV1};
+        use harvest_common::store::StoreStateV1;
 
         let signing_key = SigningKey::from_bytes(&[11u8; 32]);
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
@@ -680,9 +682,9 @@ mod tests {
         let delta: harvest_common::store::StoreStateV1Delta =
             harvest_common::from_cbor(&bytes).expect("the contract must read its own delta");
 
-        let parameters = StoreParameters {
-            seller_verifying_key: signing_key.verifying_key(),
-        };
+        // The same derivation the production path uses, so this test cannot
+        // pass against parameters the real PUT would never produce.
+        let parameters = crate::migrate::store_params(&signing_key.verifying_key());
         let mut state = StoreStateV1::default();
         state
             .apply_delta(&state.clone(), &parameters, &Some(delta))
