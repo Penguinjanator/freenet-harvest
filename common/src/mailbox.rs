@@ -15,9 +15,114 @@ pub const MAX_MESSAGES: usize = 512;
 /// bucket boundary to reduce size-based traffic analysis.
 pub const SIZE_BUCKETS: &[usize] = &[1024, 4096, 16384, 65536];
 
+/// The largest plaintext that gets padded at all.
+///
+/// [`pad_to_bucket`] does NOT pad data larger than this -- it returns it with
+/// a length prefix and nothing else. That is not a silent hole any more:
+/// [`MAX_MESSAGE_BYTES`] is set so that a message whose plaintext exceeded
+/// this could not fit, and [`MailboxStateV1::apply_delta`] refuses it. So
+/// every message that reaches a mailbox IS padded to a bucket, and the size
+/// privacy the buckets buy holds for everything a reader can see.
+pub const LARGEST_BUCKET: usize = SIZE_BUCKETS[SIZE_BUCKETS.len() - 1];
+
+/// The AES-256-GCM authentication tag the ciphertext carries beyond its
+/// plaintext.
+///
+/// `harvest-common` does no encryption -- that is `harvest-ui`'s `messaging`
+/// -- but it has to size the envelope it stores, and the tag is part of what
+/// arrives. A cipher change that altered this would make [`MAX_MESSAGE_BYTES`]
+/// refuse legitimate top-bucket messages, which is the safe direction and a
+/// loud one.
+pub const AEAD_TAG_BYTES: usize = 16;
+
+/// An X25519 public key, which is what a message's routing tag is.
+pub const SENDER_KEY_BYTES: usize = 32;
+
+/// A conservative upper bound on the CBOR bytes one message costs beyond its
+/// two variable-length fields.
+///
+/// Measured at 145 bytes for an empty message and 150 for a full one (the
+/// difference is CBOR's longer length prefixes), so this carries deliberate
+/// slack. The slack is in the safe direction -- it over-charges, so the
+/// budget binds slightly early -- and
+/// `the_byte_charge_is_never_less_than_the_encoded_size` is what keeps that
+/// true rather than this comment.
+pub const MESSAGE_ENVELOPE_BYTES: usize = 192;
+
+/// The largest message a mailbox will accept.
+///
+/// Set to exactly a full top-bucket message so that TWO things follow, rather
+/// than being a round number someone picked:
+///
+/// * every accepted message is padded (see [`LARGEST_BUCKET`]), so the
+///   bucketing actually delivers the size privacy it claims; and
+/// * no single message can consume the whole of [`MAX_MAILBOX_BYTES`], which
+///   is what stops one oversized entry pruning a mailbox to nothing.
+///
+/// It also bounds `sender_public_key`, which is a `Vec<u8>` on the wire and
+/// was otherwise unbounded.
+pub const MAX_MESSAGE_BYTES: usize =
+    MESSAGE_ENVELOPE_BYTES + SENDER_KEY_BYTES + LARGEST_BUCKET + AEAD_TAG_BYTES;
+
+/// How many bytes of message one mailbox contract will hold.
+///
+/// # Why a count cap was not a bound
+///
+/// [`MAX_MESSAGES`] caps entries, and each entry holds a
+/// contract-controlled `ciphertext` and a contract-controlled
+/// `sender_public_key`. A count cap READS like a memory bound and is not one:
+/// multiply it by the largest value the other side may send. Before this
+/// existed, `pad_to_bucket` stopped padding above its top bucket rather than
+/// refusing, so a single message could be arbitrarily large and a mailbox
+/// with it -- 512 entries of no particular size.
+///
+/// # Why this number
+///
+/// 512 messages at the smallest bucket -- which is what text traffic
+/// produces -- comes to roughly 580 KiB, so honest use never reaches this and
+/// the cap binds only on abuse. At the largest bucket it admits about 63
+/// messages, which also bounds what a buyer pays to read a mailbox somebody
+/// has flooded (see `docs/messaging-privacy.md`).
+pub const MAX_MAILBOX_BYTES: usize = 4 * 1024 * 1024;
+
+/// **No single message may consume the mailbox.**
+///
+/// The fact `enforce_message_cap`'s prefix rule rests on, held by the
+/// compiler rather than by a test: if one message could fill the budget, and
+/// it ranked first -- which is free, because timestamps are unsigned -- the
+/// mailbox would prune to nothing behind it. Retuning either constant into
+/// that corner fails the BUILD rather than a test somebody might not run.
+const _: () = assert!(
+    MAX_MESSAGE_BYTES * 2 <= MAX_MAILBOX_BYTES,
+    "one message must not be able to crowd out every other"
+);
+
+/// What one message costs against [`MAX_MAILBOX_BYTES`].
+///
+/// Both variable-length fields are charged, plus a constant envelope. It is a
+/// model of the CBOR size rather than the CBOR size itself, because computing
+/// the real thing means serializing every message on every merge -- and
+/// because a model that can be proved to over-charge is a bound, whereas one
+/// that might under-charge is a proxy. `the_byte_charge_is_never_less_than_
+/// the_encoded_size` is what makes it the former.
+pub fn message_bytes(message: &EncryptedMessage) -> usize {
+    MESSAGE_ENVELOPE_BYTES + message.sender_public_key.len() + message.ciphertext.len()
+}
+
 /// Pad data to the next size bucket boundary. Returns the padded data.
 /// The first 4 bytes encode the original length (little-endian u32) so the
 /// receiver can strip padding.
+///
+/// **Data larger than [`LARGEST_BUCKET`] is NOT padded** -- it comes back with
+/// a length prefix and nothing else, so its size is exactly its size and the
+/// bucketing provides no privacy for it whatsoever.
+///
+/// That used to be a silent hole; it is now closed at the other end.
+/// [`MAX_MESSAGE_BYTES`] is set to exactly a full top-bucket message, so a
+/// message built from unpadded data cannot fit in a mailbox and
+/// [`MailboxStateV1::apply_delta`] drops it. Every message a reader can see
+/// has therefore been padded. Pinned by
+/// `every_message_a_mailbox_accepts_has_been_padded`.
 pub fn pad_to_bucket(data: &[u8]) -> Vec<u8> {
     let len = data.len();
     let padded_len = SIZE_BUCKETS
@@ -227,27 +332,65 @@ pub type MailboxSummary = HashSet<[u8; 24]>;
 /// Delta: new messages to add.
 pub type MailboxDelta = Vec<EncryptedMessage>;
 
-/// Drop the lowest-ranked messages if `messages` is over [`MAX_MESSAGES`].
+/// Drop the lowest-ranked messages until `messages` satisfies BOTH
+/// [`MAX_MESSAGES`] and [`MAX_MAILBOX_BYTES`].
 ///
 /// Rank is `(timestamp, nonce)`, highest kept. Both fields are chosen by
 /// whoever wrote the message, so this ordering is grindable and is not offered
-/// as a defence -- see [`MailboxStateV1::apply_delta`] for what the cap does
-/// and does not buy. What it has to be is *total* and a pure function of
+/// as a defence -- see [`MailboxStateV1::apply_delta`] for what the caps do
+/// and do not buy. What it has to be is *total* and a pure function of
 /// message content, so that two replicas holding the same set of messages keep
 /// the same subset. Ranking by anything else available here has the same
 /// property and the same weakness, and `(timestamp, nonce)` at least leaves a
 /// mailbox carrying only honest traffic behaving as a recency window, which is
 /// what the age-based rule it replaces was for.
+///
+/// # Why both caps are one pass, and why the kept set is a PREFIX
+///
+/// The kept set is the longest prefix of that ranking which satisfies both
+/// budgets: the walk stops at the first message that does not fit rather than
+/// skipping it and trying smaller ones behind it. Packing greedily would keep
+/// more bytes, and it would also mean a lower-ranked message could survive
+/// while a higher-ranked one was dropped -- a rule that is still
+/// deterministic, but whose convergence argument is a bin-packing walk rather
+/// than "both peers keep the same prefix of the same total order". The
+/// simpler argument is worth more here than the extra bytes, because
+/// divergence in this function is silent and permanent.
+///
+/// A prefix rule has one failure mode, and it is closed elsewhere rather than
+/// here: if the FIRST message did not fit, nothing would be kept at all. That
+/// is why [`MAX_MESSAGE_BYTES`] is far below [`MAX_MAILBOX_BYTES`] and why
+/// [`MailboxStateV1::apply_delta`] refuses an oversized message on the way in
+/// -- an attacker can put their message at the top of this ranking for free,
+/// so "one message empties the mailbox" would have been cheaper and more
+/// total than the unbounded growth the budget exists to stop.
 fn enforce_message_cap(messages: &mut Vec<EncryptedMessage>) {
-    if messages.len() <= MAX_MESSAGES {
+    let over_count = messages.len() > MAX_MESSAGES;
+    let over_bytes = messages.iter().map(message_bytes).sum::<usize>() > MAX_MAILBOX_BYTES;
+    if !over_count && !over_bytes {
         return;
     }
+
     messages.sort_by(|a, b| {
         b.timestamp
             .cmp(&a.timestamp)
             .then_with(|| b.nonce.cmp(&a.nonce))
     });
-    messages.truncate(MAX_MESSAGES);
+
+    let mut bytes = 0usize;
+    let mut kept = 0usize;
+    for message in messages.iter() {
+        if kept == MAX_MESSAGES {
+            break;
+        }
+        let with_this = bytes + message_bytes(message);
+        if with_this > MAX_MAILBOX_BYTES {
+            break;
+        }
+        bytes = with_this;
+        kept += 1;
+    }
+    messages.truncate(kept);
 }
 
 impl MailboxStateV1 {
@@ -372,6 +515,16 @@ impl MailboxStateV1 {
 
             for msg in new_messages {
                 if existing_nonces.contains(&msg.nonce) {
+                    continue;
+                }
+                // Refused rather than stored and pruned. Storing it first
+                // would put it at the head of the eviction ranking (its
+                // timestamp is free to choose) and prune the mailbox to
+                // nothing behind it -- see `enforce_message_cap`. Dropping an
+                // incoming message is recoverable in a way that invalidating
+                // existing state is not, which is the same reason `verify`
+                // does not check the byte budget at all.
+                if message_bytes(msg) > MAX_MESSAGE_BYTES {
                     continue;
                 }
                 self.messages.push(msg.clone());
@@ -782,5 +935,314 @@ mod retention_security_tests {
             .collect();
         m.apply_delta(&Some(flood)).unwrap();
         assert_eq!(m.messages.len(), MAX_MESSAGES);
+    }
+}
+
+/// The byte budget: that it exists, that pruning is how it is met, and the
+/// two things that would break if either changed.
+#[cfg(test)]
+mod byte_budget_tests {
+    use super::*;
+
+    fn total_bytes(state: &MailboxStateV1) -> usize {
+        state.messages.iter().map(message_bytes).sum()
+    }
+
+    /// A message of `ciphertext` bytes, distinct by index.
+    fn sized(i: u32, secs: i64, ciphertext: usize) -> EncryptedMessage {
+        let mut nonce = [0u8; 24];
+        nonce[..4].copy_from_slice(&i.to_be_bytes());
+        EncryptedMessage {
+            conversation_id: ConversationId([1u8; 32]),
+            sender_public_key: vec![9u8; SENDER_KEY_BYTES],
+            ciphertext: vec![0u8; ciphertext],
+            timestamp: DateTime::from_timestamp(secs, 0).unwrap(),
+            nonce,
+        }
+    }
+
+    /// Enough top-bucket messages to blow the byte budget several times over
+    /// while staying under the COUNT cap -- so a failure here is about bytes
+    /// and cannot be the count cap doing the work.
+    fn over_budget_but_under_count() -> Vec<EncryptedMessage> {
+        let base = 1_700_000_000;
+        let count = (MAX_MAILBOX_BYTES / MAX_MESSAGE_BYTES) * 3;
+        assert!(
+            count < MAX_MESSAGES,
+            "this fixture must not rely on the count cap"
+        );
+        (0..count as u32)
+            .map(|i| sized(i, base + i as i64, LARGEST_BUCKET + AEAD_TAG_BYTES))
+            .collect()
+    }
+
+    /// The bound itself.
+    ///
+    /// Observed red on 2026-09-05 against `enforce_message_cap` as it was --
+    /// count-only -- which kept every one of these.
+    #[test]
+    fn the_mailbox_is_bounded_in_bytes_and_not_only_in_count() {
+        let flood = over_budget_but_under_count();
+        let uncapped: usize = flood.iter().map(message_bytes).sum();
+        assert!(
+            uncapped > MAX_MAILBOX_BYTES,
+            "precondition: the fixture must exceed the budget"
+        );
+
+        let mut m = MailboxStateV1::default();
+        m.apply_delta(&Some(flood)).unwrap();
+
+        assert!(
+            total_bytes(&m) <= MAX_MAILBOX_BYTES,
+            "mailbox holds {} bytes, budget is {MAX_MAILBOX_BYTES}",
+            total_bytes(&m)
+        );
+        assert!(
+            !m.messages.is_empty(),
+            "pruning to the budget must not empty the mailbox"
+        );
+    }
+
+    /// **Convergence across the byte budget**, which is the property that
+    /// matters: two peers given the same messages in different ORDERS must
+    /// prune to byte-identical state.
+    ///
+    /// The existing `merging_is_order_independent` crosses the count cap
+    /// only. A byte budget met by a different rule -- one that packed
+    /// greedily by size, say -- could satisfy that test and diverge here.
+    #[test]
+    fn merging_is_order_independent_across_the_byte_budget() {
+        let forward = over_budget_but_under_count();
+        let backward: Vec<_> = forward.iter().rev().cloned().collect();
+
+        let mut a = MailboxStateV1::default();
+        a.apply_delta(&Some(forward)).unwrap();
+        let mut b = MailboxStateV1::default();
+        b.apply_delta(&Some(backward)).unwrap();
+
+        assert_eq!(
+            crate::to_cbor(&a).unwrap(),
+            crate::to_cbor(&b).unwrap(),
+            "the same messages in a different order pruned to different state"
+        );
+    }
+
+    /// The same across BATCHING, for the reason the count-cap version gives:
+    /// peers do not agree on how many merges they performed, so anything
+    /// counted per-merge diverges.
+    #[test]
+    fn merging_is_batch_independent_across_the_byte_budget() {
+        let all = over_budget_but_under_count();
+
+        let mut one_shot = MailboxStateV1::default();
+        one_shot.apply_delta(&Some(all.clone())).unwrap();
+
+        let mut dribbled = MailboxStateV1::default();
+        for chunk in all.chunks(3) {
+            dribbled.apply_delta(&Some(chunk.to_vec())).unwrap();
+        }
+
+        assert_eq!(
+            crate::to_cbor(&one_shot).unwrap(),
+            crate::to_cbor(&dribbled).unwrap(),
+            "the same messages in different batch sizes pruned to different state"
+        );
+    }
+
+    /// **One oversized message must not empty the mailbox.**
+    ///
+    /// Pruning keeps a prefix of the ranking, so if the highest-ranked
+    /// message did not fit, nothing after it would be reached and the mailbox
+    /// would prune to nothing. An attacker who can pick a timestamp can put
+    /// their message at the top of that ranking for free, so this would have
+    /// been a cheaper and more total attack than the unbounded growth the
+    /// budget exists to stop.
+    ///
+    /// It is closed by refusing the message on the way in rather than by
+    /// special-casing the pruning: `MAX_MESSAGE_BYTES` is far below
+    /// `MAX_MAILBOX_BYTES`, so the first-message-does-not-fit case is
+    /// unreachable.
+    #[test]
+    fn an_oversized_message_is_refused_rather_than_emptying_the_mailbox() {
+        let base = 1_700_000_000;
+        let honest = vec![sized(1, base, 1024), sized(2, base + 60, 1024)];
+
+        let mut m = MailboxStateV1::default();
+        m.apply_delta(&Some(honest)).unwrap();
+        assert_eq!(m.messages.len(), 2, "precondition");
+
+        // Dated after the honest traffic, which is free, so ranking cannot
+        // save us -- and larger than the whole budget.
+        let mut monster = sized(99, base + 1_000_000, MAX_MAILBOX_BYTES * 2);
+        monster.nonce = [0xFF; 24];
+        m.apply_delta(&Some(vec![monster])).unwrap();
+
+        assert_eq!(
+            m.messages.len(),
+            2,
+            "an oversized message must be refused, not stored and not fatal"
+        );
+        assert!(total_bytes(&m) <= MAX_MAILBOX_BYTES);
+    }
+
+    /// A message with an absurd routing tag is refused by the same rule --
+    /// `sender_public_key` is a `Vec<u8>` on the wire and nothing else
+    /// bounds it.
+    #[test]
+    fn an_oversized_routing_tag_is_refused() {
+        let mut message = sized(1, 1_700_000_000, 64);
+        message.sender_public_key = vec![7u8; MAX_MESSAGE_BYTES];
+
+        let mut m = MailboxStateV1::default();
+        m.apply_delta(&Some(vec![message])).unwrap();
+        assert!(m.messages.is_empty());
+    }
+
+    /// **The accounting must never under-charge**, or the budget is a proxy
+    /// rather than a bound.
+    ///
+    /// Checked against the real CBOR encoding across the shapes that vary:
+    /// empty, small, top-bucket, and a far-future timestamp (which encodes
+    /// longer).
+    #[test]
+    fn the_byte_charge_is_never_less_than_the_encoded_size() {
+        let mut shapes = vec![
+            sized(0, 0, 0),
+            sized(1, 1_700_000_000, 1024 + AEAD_TAG_BYTES),
+            sized(2, 1_700_000_000, LARGEST_BUCKET + AEAD_TAG_BYTES),
+        ];
+        let mut late = sized(3, 253_402_300_000, LARGEST_BUCKET + AEAD_TAG_BYTES);
+        late.timestamp = DateTime::from_timestamp(253_402_300_000, 999_000_000).unwrap();
+        shapes.push(late);
+        let mut empty_tag = sized(4, 1_700_000_000, 64);
+        empty_tag.sender_public_key = Vec::new();
+        shapes.push(empty_tag);
+
+        for message in shapes {
+            let encoded = crate::to_cbor(&message).unwrap().len();
+            assert!(
+                message_bytes(&message) >= encoded,
+                "charged {} for a message that encodes to {encoded}",
+                message_bytes(&message)
+            );
+        }
+    }
+
+    /// Every message a mailbox accepts has been padded to a bucket, so the
+    /// size privacy the buckets claim holds for everything a reader sees.
+    ///
+    /// The link is `MAX_MESSAGE_BYTES`: it is exactly a full top-bucket
+    /// message, so a message built from data `pad_to_bucket` declined to pad
+    /// cannot fit. Raise the constant and this goes red.
+    #[test]
+    fn every_message_a_mailbox_accepts_has_been_padded() {
+        // The smallest plaintext `pad_to_bucket` refuses to pad.
+        let unpadded = pad_to_bucket(&vec![0u8; LARGEST_BUCKET]);
+        assert!(
+            unpadded.len() > LARGEST_BUCKET,
+            "precondition: this size is past the top bucket"
+        );
+
+        let message = sized(1, 1_700_000_000, unpadded.len() + AEAD_TAG_BYTES);
+        assert!(
+            message_bytes(&message) > MAX_MESSAGE_BYTES,
+            "an unpadded message must not fit in a mailbox"
+        );
+
+        let mut m = MailboxStateV1::default();
+        m.apply_delta(&Some(vec![message])).unwrap();
+        assert!(m.messages.is_empty());
+    }
+
+    /// **`verify` deliberately does NOT check the byte budget.**
+    ///
+    /// The count cap IS checked there, and the argument given for it is that
+    /// `apply_delta` never produces an over-cap state, so only a hand-built
+    /// state is rejected. That argument does not transfer, and the difference
+    /// is what this test exists to hold: the count cap has been enforced
+    /// since the mailbox existed, so no honest state was ever over it. The
+    /// byte budget is NEW. Mailboxes already on the network were produced by
+    /// an honest `apply_delta` under the old rules and may exceed it, and a
+    /// `verify` that rejected them would make them permanently invalid --
+    /// never convergeable again, with no way back. That is a worse failure
+    /// than the unbounded growth being fixed, and this repository has already
+    /// been bitten by exactly it once (the TTL check that rejected a whole
+    /// mailbox because one message had aged out).
+    ///
+    /// So an over-budget state is accepted and pruned on the next merge,
+    /// which only ever shrinks it.
+    ///
+    /// **Residual, stated rather than discovered later:** between arriving
+    /// and the next update, a peer may hold an over-budget state. Nothing
+    /// here bounds that; the node's own maximum state size does.
+    #[test]
+    fn verify_accepts_an_over_budget_state_so_an_existing_mailbox_is_never_stranded() {
+        let m = MailboxStateV1 {
+            messages: over_budget_but_under_count(),
+        };
+        assert!(
+            total_bytes(&m) > MAX_MAILBOX_BYTES,
+            "precondition: the fixture is over budget"
+        );
+        assert!(
+            m.verify().is_ok(),
+            "a state that was legal when it was written must not become permanently invalid"
+        );
+    }
+
+    /// **THIS TEST PINS A KNOWN GAP, AND IT IS ONE THIS CHANGE MADE WORSE.**
+    ///
+    /// `enforce_message_cap` ranks by `(timestamp, nonce)`, both chosen by
+    /// whoever wrote the message, so eviction is grindable -- that was
+    /// already true and is pinned by
+    /// `known_gap_a_funded_flood_still_evicts_every_honest_message`.
+    ///
+    /// What the byte budget changes is the PRICE. Filling the count cap took
+    /// [`MAX_MESSAGES`] contract updates; filling the byte budget takes about
+    /// [`MAX_MAILBOX_BYTES`] / [`MAX_MESSAGE_BYTES`] of them, roughly 63 --
+    /// an eighth of the updates for the same total eviction. The budget bounds
+    /// what a flood costs the NETWORK and cheapens what it costs the
+    /// ATTACKER, and both halves are real.
+    ///
+    /// That is a deliberate trade and not an oversight: unbounded state is
+    /// the worse of the two, and the flood was already affordable. It is
+    /// recorded here so that closing the flood gap is understood to need
+    /// admission control -- payment, proof-of-work, or a per-sender quota --
+    /// rather than a retuned cap.
+    #[test]
+    fn known_gap_a_byte_budget_flood_evicts_with_far_fewer_messages() {
+        let base = 1_700_000_000;
+        let honest: Vec<_> = (0..3).map(|i| sized(i, base + i as i64, 1024)).collect();
+
+        let mut m = MailboxStateV1::default();
+        m.apply_delta(&Some(honest.clone())).unwrap();
+
+        // Dated after the honest traffic, which is free.
+        let flood: Vec<_> = (0..(MAX_MAILBOX_BYTES / MAX_MESSAGE_BYTES + 1) as u32)
+            .map(|i| {
+                sized(
+                    1_000 + i,
+                    base + 1_000_000 + i as i64,
+                    LARGEST_BUCKET + AEAD_TAG_BYTES,
+                )
+            })
+            .collect();
+        let flood_size = flood.len();
+        assert!(
+            flood_size <= MAX_MESSAGES / 4,
+            "the point of this test is that the flood is far smaller than the count cap: \
+             {flood_size} vs {MAX_MESSAGES}"
+        );
+
+        m.apply_delta(&Some(flood)).unwrap();
+
+        for honest_nonce in honest.iter().map(|h| h.nonce) {
+            assert!(
+                !m.messages.iter().any(|kept| kept.nonce == honest_nonce),
+                "KNOWN GAP no longer reproduces: an honest message survived a byte-budget \
+                 flood of {flood_size} messages. If you just made that happen, invert this \
+                 assertion."
+            );
+        }
     }
 }

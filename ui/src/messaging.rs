@@ -277,20 +277,44 @@ pub fn seal_reply(
 }
 
 /// The one place a message is built, whichever direction it travels.
+///
+/// # Why the size is checked HERE
+///
+/// `MailboxStateV1::apply_delta` refuses a message over
+/// [`harvest_common::mailbox::MAX_MESSAGE_BYTES`], and it refuses it
+/// silently -- a contract has nobody to report to. So a compose box that did
+/// not check would seal an unacceptable message, dispatch it, and show the
+/// sender "handed to your Freenet node"; it would then never appear, looking
+/// exactly like the write race and never resolving.
+///
+/// The check is the real one rather than a character limit: it charges the
+/// finished message with the same `message_bytes` the contract uses, so the
+/// two cannot disagree about what fits. A character limit would have to model
+/// CBOR and UTF-8 and would be wrong at the boundary.
 fn seal(
     key: &[u8; 32],
     tag: &[u8; 32],
     conversation_id: &ConversationId,
     content: MessageContent,
 ) -> Result<EncryptedMessage, String> {
-    encrypt_message(
+    let message = encrypt_message(
         &PlaintextMessage {
             conversation_id: conversation_id.clone(),
             content,
         },
         tag,
         key,
-    )
+    )?;
+
+    let charged = harvest_common::mailbox::message_bytes(&message);
+    if charged > harvest_common::mailbox::MAX_MESSAGE_BYTES {
+        return Err(format!(
+            "that message is too long: it comes to {charged} bytes once encrypted and padded, \
+             and a mailbox will not accept more than {}. Nothing was sent.",
+            harvest_common::mailbox::MAX_MESSAGE_BYTES
+        ));
+    }
+    Ok(message)
 }
 
 /// One message in a seller's mailbox, as far as this browser can read it.
@@ -879,6 +903,65 @@ mod tests {
         let entries = read_mailbox(&[at(100, 1), at(300, 3), at(200, 2)], &HashMap::new());
         let order: Vec<i64> = entries.iter().map(|e| e.timestamp().timestamp()).collect();
         assert_eq!(order, vec![300, 200, 100]);
+    }
+
+    /// **A message too large to be accepted must be refused where the buyer
+    /// can be told**, not sealed and dispatched into silence.
+    ///
+    /// Found by accident on 2026-09-05: a measurement fixture asked for a
+    /// message near the top padding bucket, and every one of them was
+    /// silently dropped by `apply_delta` because the CBOR envelope pushed it
+    /// past `MAX_MESSAGE_BYTES`. The buyer's UI would have shown "handed to
+    /// your Freenet node" and the message would never have appeared --
+    /// indistinguishable, from the buyer's side, from the write race.
+    ///
+    /// Observed red before `seal` learned to check.
+    #[test]
+    fn a_message_too_large_for_a_mailbox_is_refused_at_the_compose_box() {
+        use harvest_common::mailbox::{message_bytes, MailboxStateV1, MAX_MESSAGE_BYTES};
+
+        let seller = Seller::new(53);
+        let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+
+        let error = buyer
+            .seal("x".repeat(harvest_common::mailbox::LARGEST_BUCKET))
+            .expect_err("a message that no mailbox would accept must be refused");
+        assert!(
+            error.contains("too long"),
+            "the refusal must be something a compose box can show: {error}"
+        );
+
+        // The largest message that IS accepted really is accepted, so the
+        // check is not simply refusing everything near the limit.
+        let big = buyer
+            .seal("x".repeat(60_000))
+            .expect("a large but legal message must still send");
+        assert!(message_bytes(&big) <= MAX_MESSAGE_BYTES);
+        let mut state = MailboxStateV1::default();
+        state.apply_delta(&Some(vec![big.clone()])).unwrap();
+        assert_eq!(
+            state.messages.len(),
+            1,
+            "a message the compose box accepted must be one a mailbox accepts"
+        );
+    }
+
+    /// The same for the seller's side, which composes into the same mailbox
+    /// under the same cap.
+    #[test]
+    fn an_oversized_reply_is_refused_at_the_compose_box() {
+        let seller = Seller::new(59);
+        let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+        let keys = seller.keys_for(&buyer.buyer_public_key);
+
+        let error = seal_reply(
+            &keys,
+            &buyer.buyer_public_key,
+            &buyer.conversation_id,
+            "x".repeat(harvest_common::mailbox::LARGEST_BUCKET),
+        )
+        .expect_err("must be refused");
+        assert!(error.contains("too long"), "got: {error}");
     }
 
     /// A low-order "public key" is refused rather than encrypted to under a

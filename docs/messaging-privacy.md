@@ -24,8 +24,10 @@ that struct is.
 * **How many messages it holds**, up to `MAX_MESSAGES` (512).
 * **When each arrived** — not from `timestamp`, which is unsigned and
   self-asserted, but from observing the contract change.
-* **Each message's padded size**, one of 1 KiB / 4 KiB / 16 KiB / 64 KiB (see
-  the size note below, which is a real defect).
+* **Each message's padded size**, one of 1 KiB / 4 KiB / 16 KiB / 64 KiB.
+  Every message that lands has been padded to one of those; see the size-bound
+  section below for why that is now true of all of them rather than only of
+  those under 64 KiB.
 * **The conversation tag** (`sender_public_key`): the buyer's ephemeral X25519
   public key, carried on every message of that conversation **in both
   directions**. So an observer can group a mailbox into conversations, count
@@ -57,17 +59,18 @@ the thread structure but force the buyer to attempt decryption against every
 entry in the mailbox.
 
 Measured on this machine (x86-64, hardware AES, `--release`, 2026-09-05), a
-buyer reading a mailbox of 512 entries all carrying their tag:
+buyer reading a mailbox filled to the enforced budget with entries all
+carrying their tag:
 
-| Entry size | Per read |
+| Mailbox | Per read |
 |---|---|
-| 1 KiB (a text message) | **3.4 ms** |
-| 64 KiB (the largest padding bucket) | **193 ms** |
+| 512 entries at the 1 KiB bucket (632 KiB — the count cap binds) | **3.2 ms** |
+| 63 entries at the top bucket (3.95 MiB — the byte budget binds) | **20.7 ms** |
 
-So the trial-decryption cost the tag saves is small in absolute terms, and the
-tag is not buying much performance. What it *is* buying is that the common
-case is bounded by the buyer's own conversation rather than by the mailbox —
-which matters because the flood below is cheap to mount.
+Both are measured at the real cap, through the real pruning, rather than
+extrapolated. The second figure was **193 ms** before `MAX_MAILBOX_BYTES`
+existed, when 512 top-bucket entries were admissible; bounding the mailbox in
+bytes bounds this too, which is the second reason the budget is worth having.
 
 **Caveat on those numbers, stated because it is the half that could be wrong:**
 they are native x86-64 with AES-NI. The UI runs on `wasm32-unknown-unknown`,
@@ -76,8 +79,12 @@ instruction. An attempt to force the software path with
 `--cfg aes_force_soft` produced numbers within noise of the hardware ones,
 which almost certainly means the flag did not take effect rather than that
 the backends perform alike — so **the wasm cost is unmeasured**, and a 5-20x
-multiple on the figures above would not be surprising. 3.4 ms is fine at any
-plausible multiple; 193 ms is not obviously fine.
+multiple on the figures above would not be surprising. At that multiple 3.2 ms
+stays comfortable and 20.7 ms becomes noticeable but not pathological; before
+the byte budget, the same multiple on 193 ms would not have been survivable.
+
+No timing assertion is committed anywhere. A wall-clock bound in CI is a flaky
+test, and this repository treats a flaky test as a broken one.
 
 ## The flood, and what bounds it
 
@@ -93,26 +100,60 @@ The same flood evicts the honest traffic, which is a pre-existing and
 separately-pinned gap: see
 `harvest_common::mailbox::known_gap_a_funded_flood_still_evicts_every_honest_message`.
 
-## A size bound that does not exist — found while writing this, NOT fixed here
+## The size bound, and the shape of it
 
 `MailboxStateV1::verify` bounds the mailbox by **message count** and nothing
-else. `pad_to_bucket` pads up to 64 KiB and then gives up:
+else — a count cap over entries holding contract-controlled `ciphertext` and
+`sender_public_key`, which reads like a memory bound and is not one. That was
+found while writing this document and is now fixed, but the SHAPE of the fix
+is the part worth recording.
 
-```rust
-.unwrap_or(len + 4) // if larger than all buckets, no padding
-```
+**Pruning, not rejection.** `MAX_MAILBOX_BYTES` (4 MiB) is met by
+`enforce_message_cap` dropping the lowest-ranked messages, exactly as the
+count cap is. `verify` deliberately does **not** check it, and that is not an
+oversight: mailboxes already on the network were produced by an honest
+`apply_delta` under the old rules and may exceed the new budget, so a `verify`
+that rejected them would make them permanently invalid — never convergeable
+again, with no way back. This repository has already been bitten by exactly
+that once, when a TTL check rejected a whole mailbox because one message had
+aged out. Pruning can only ever produce a smaller valid state.
 
-So a single message may be arbitrarily large, and 512 of them make the
-mailbox's state arbitrarily large. Nothing in `harvest-common` caps it; the
-only ceiling is the node's own maximum state size. This is the
-"bounded by entry COUNT while holding contract-controlled values" shape that
-freenet-core's own bug-prevention rules name, and the consequences are a
-buyer's fetch cost, a seller's fetch cost, and the network's storage.
+The count cap IS checked in `verify`, and the difference is worth stating: it
+has been enforced since the mailbox existed, so no honest state was ever over
+it. A cap added later has no such guarantee. Pinned by
+`verify_accepts_an_over_budget_state_so_an_existing_mailbox_is_never_stranded`.
 
-It is **not** fixed on this branch: adding a byte bound changes
-`MailboxStateV1::verify`, which is contract behaviour, and a change that can
-make an existing state invalid needs its own review and its own convergence
-argument. Recorded here so it is a known open item rather than a discovery.
+**One oversized message is refused on the way in.** Pruning keeps a prefix of
+the ranking, so if the highest-ranked message did not fit, nothing behind it
+would be reached and the mailbox would prune to nothing — and an attacker can
+put their message at the top of that ranking for free, because timestamps are
+unsigned. So `MAX_MESSAGE_BYTES` is set well below the total budget and
+`apply_delta` drops anything over it. Refusing an incoming message is
+recoverable; invalidating existing state is not.
+
+**The residual:** between arriving and the next merge, a peer may hold an
+over-budget state. Nothing here bounds that; the node's own maximum state size
+does.
+
+**And a cost this change also fixes:** `MAX_MESSAGE_BYTES` is exactly a full
+top-bucket message, so a message built from data `pad_to_bucket` declined to
+pad cannot fit. Every message a reader can see has therefore been padded, and
+the size privacy the buckets claim now holds for everything rather than for
+everything under 64 KiB.
+
+## What the byte budget costs, honestly
+
+It makes a flood **cheaper for the attacker** while bounding what the flood
+costs everyone else. Filling the count cap took 512 contract updates; filling
+the byte budget takes about 63. The eviction ranking is unchanged and still
+grindable — `(timestamp, nonce)`, both sender-chosen — so the same total
+eviction is now available for an eighth of the updates.
+
+That is a deliberate trade rather than an oversight: unbounded state is the
+worse of the two, and the flood was already affordable at 512 updates. It is
+pinned by `known_gap_a_byte_budget_flood_evicts_with_far_fewer_messages` so
+that closing it is understood to need admission control — payment,
+proof-of-work, or a per-sender quota — rather than a retuned cap.
 
 ## The one that limits the mechanism rather than leaking from it
 
