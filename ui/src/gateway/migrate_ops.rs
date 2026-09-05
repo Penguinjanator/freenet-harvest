@@ -889,6 +889,15 @@ fn adopt_and_announce(forwarded: &Forwarded, successor: ContractInstanceId) {
 /// contracts merge idempotently, and re-adopts in memory; the seller's store
 /// works, at the cost of a lineage walk per load.
 ///
+/// **In-session adoption sticking does NOT satisfy this.**
+/// `AppState::adopt_migrated_contract_id` now keeps a `ListStores` answer from
+/// reverting the repoint mid-session, which is a real fix for a real race --
+/// but it holds the mapping in memory, and the delegate's registry still names
+/// the predecessor. A reload starts from that registry with nothing
+/// remembered, so condition 2 is false either way and this must keep returning
+/// `Err`. Reading a successful in-session adoption as durability is how a
+/// migration would start sealing again over exactly the state that reverts.
+///
 /// Closing this needs a delegate request that replaces a `StoreRegistration`
 /// -- `common/src/delegate.rs` plus the delegate's own handler, with the
 /// duplicate handling that `RegisterStore`'s append semantics currently dodge.
