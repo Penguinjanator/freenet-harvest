@@ -381,20 +381,6 @@ pub fn current_id(code_hash: &[u8; 32], params: &Parameters<'_>) -> ContractInst
 
 // --- state semantics ----------------------------------------------------
 
-/// Decode a probed state, saying out loud when bytes that ARE there cannot be
-/// read.
-///
-/// `ProbeStateOps::decode` returns an `Option`, so on its own it collapses two
-/// completely different situations into `None`: "this address holds nothing"
-/// and "this address holds a state I could not parse". The probe treats the
-/// second as the first, walks on, and can go on to report a clean "nothing to
-/// migrate" over a store it actually found and read off the network.
-///
-/// That is not hypothetical -- it is exactly what hid `StoreStateV1::orders`
-/// having no `#[serde(default)]`, which made every real V1 state undecodable.
-/// The control flow is unchanged (an unreadable state is still not a
-/// migration candidate: there is nothing useful to do with bytes we cannot
-/// parse), but it no longer happens silently.
 /// Say something the operator needs to hear, from a file that is compiled
 /// twice.
 ///
@@ -411,6 +397,20 @@ fn probe_warn(message: &str) {
     eprintln!("{message}");
 }
 
+/// Decode a probed state, saying out loud when bytes that ARE there cannot be
+/// read.
+///
+/// `ProbeStateOps::decode` returns an `Option`, so on its own it collapses two
+/// completely different situations into `None`: "this address holds nothing"
+/// and "this address holds a state I could not parse". The probe treats the
+/// second as the first, walks on, and can go on to report a clean "nothing to
+/// migrate" over a store it actually found and read off the network.
+///
+/// That is not hypothetical -- it is exactly what hid `StoreStateV1::orders`
+/// having no `#[serde(default)]`, which made every real V1 state undecodable.
+/// The control flow is unchanged (an unreadable state is still not a
+/// migration candidate: there is nothing useful to do with bytes we cannot
+/// parse), but it no longer happens silently.
 fn decode_probed_state<T>(artifact: &str, bytes: &[u8]) -> Option<T>
 where
     T: for<'de> serde::Deserialize<'de>,
