@@ -489,6 +489,17 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
 pub struct StoreStateV1 {
     pub info: AuthorizedStoreInfoV1,
     pub listings: ListingsV1,
+    /// `#[serde(default)]` so store states written before orders existed
+    /// still decode; they come back with no orders, which is what they had.
+    ///
+    /// Not optional: V1 (`legacy/store_contract.toml`, code hash
+    /// `4d7ad3c3...`) is the only generation ever deployed, and its state has
+    /// no `orders` key at all. `OrdersV1` derives `Default`, but serde does
+    /// not consult `Default` for a missing field without this attribute and
+    /// `#[composable]` does not add one -- so without it every real V1 state
+    /// fails to decode with "missing field `orders`", and the migration probe
+    /// cannot tell that from an address that was never written.
+    #[serde(default)]
     pub orders: OrdersV1,
 }
 
@@ -1569,6 +1580,85 @@ mod order_tests {
             forward.keys().collect::<Vec<_>>(),
             backward.keys().collect::<Vec<_>>(),
             "pruning must depend only on content, not on insertion order"
+        );
+    }
+}
+
+/// Decoding state that predates a field the struct has since grown.
+///
+/// Kept apart from `order_tests` because it is not about orders: it is about
+/// the wire format staying readable across a generation boundary, which is
+/// the thing the migration probe depends on and the thing nothing else here
+/// checks.
+#[cfg(test)]
+mod wire_compat_tests {
+    use super::*;
+
+    /// A real V1 store state, as CBOR, written out byte by byte.
+    ///
+    /// V1 (`ded0e3a`, contract code hash `4d7ad3c3...`, the first row of
+    /// `legacy/store_contract.toml`) had a two-field `StoreStateV1` -- `info`
+    /// and `listings`, no `orders`. These bytes are that encoding:
+    ///
+    /// ```text
+    /// a2                          map(2)
+    ///   64 "info"                 AuthorizedStoreInfoV1
+    ///   a3                          map(3)
+    ///     64 "info"                 StoreInfoV1
+    ///     a7                          map(7): version 1, empty strings,
+    ///                                 a 32-element zero array for
+    ///                                 reputation_contract_id (serde encodes
+    ///                                 [u8; 32] as a tuple, i.e. an array of
+    ///                                 numbers, NOT a byte string), and
+    ///                                 store_name "V1 store"
+    ///     6e "scoped_payload" 80    empty seq (Vec<u8> is a seq too)
+    ///     69 "signature"      80    empty seq
+    ///   68 "listings"             ListingsV1
+    ///   a1 68 "listings" 80         map(1) holding an empty seq
+    /// ```
+    ///
+    /// Written as a literal rather than produced by serializing a struct with
+    /// the field taken out: the point is to pin today's decoder against bytes
+    /// whose shape comes from somewhere other than today's types. A generated
+    /// fixture would move whenever the types moved, which is exactly the
+    /// change it is supposed to catch.
+    const V1_STORE_STATE_CBOR: &[u8] = &[
+        0xa2, 0x64, 0x69, 0x6e, 0x66, 0x6f, 0xa3, 0x64, 0x69, 0x6e, 0x66, 0x6f, 0xa7, 0x67, 0x76,
+        0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x01, 0x6f, 0x63, 0x65, 0x72, 0x74, 0x69, 0x66, 0x69,
+        0x63, 0x61, 0x74, 0x65, 0x5f, 0x70, 0x65, 0x6d, 0x60, 0x72, 0x73, 0x65, 0x6c, 0x6c, 0x65,
+        0x72, 0x5f, 0x66, 0x69, 0x6e, 0x67, 0x65, 0x72, 0x70, 0x72, 0x69, 0x6e, 0x74, 0x60, 0x76,
+        0x72, 0x65, 0x70, 0x75, 0x74, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x5f, 0x63, 0x6f, 0x6e, 0x74,
+        0x72, 0x61, 0x63, 0x74, 0x5f, 0x69, 0x64, 0x98, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6a, 0x73, 0x74, 0x6f,
+        0x72, 0x65, 0x5f, 0x6e, 0x61, 0x6d, 0x65, 0x68, 0x56, 0x31, 0x20, 0x73, 0x74, 0x6f, 0x72,
+        0x65, 0x6b, 0x64, 0x65, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x69, 0x6f, 0x6e, 0x60, 0x74,
+        0x70, 0x61, 0x79, 0x6d, 0x65, 0x6e, 0x74, 0x5f, 0x69, 0x6e, 0x73, 0x74, 0x72, 0x75, 0x63,
+        0x74, 0x69, 0x6f, 0x6e, 0x73, 0x60, 0x6e, 0x73, 0x63, 0x6f, 0x70, 0x65, 0x64, 0x5f, 0x70,
+        0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64, 0x80, 0x69, 0x73, 0x69, 0x67, 0x6e, 0x61, 0x74, 0x75,
+        0x72, 0x65, 0x80, 0x68, 0x6c, 0x69, 0x73, 0x74, 0x69, 0x6e, 0x67, 0x73, 0xa1, 0x68, 0x6c,
+        0x69, 0x73, 0x74, 0x69, 0x6e, 0x67, 0x73, 0x80,
+    ];
+
+    /// The whole migration story rests on this: an old generation's state has
+    /// to decode into the CURRENT type, or the probe finds the data, cannot
+    /// read it, and reports the same "nothing here" it reports for an address
+    /// that never existed.
+    ///
+    /// `OrdersV1` deriving `Default` is not enough on its own -- serde does
+    /// not consult `Default` for a missing field without `#[serde(default)]`,
+    /// and `#[composable]` does not add one.
+    #[test]
+    fn v1_store_state_decodes_without_an_orders_field() {
+        let state: StoreStateV1 = crate::from_cbor(V1_STORE_STATE_CBOR)
+            .expect("a V1 store state must still decode into today's StoreStateV1");
+
+        assert_eq!(state.info.info.version, 1);
+        assert_eq!(state.info.info.store_name, "V1 store");
+        assert!(state.listings.listings.is_empty());
+        assert!(
+            state.orders.orders.is_empty(),
+            "a state written before orders existed has none"
         );
     }
 }
