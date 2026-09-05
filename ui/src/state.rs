@@ -2394,7 +2394,27 @@ impl AppState {
                     freenet_bitcoin_common::OutpointStatus::Unconfirmed { value_sats } => {
                         (value_sats, TxRowStatus::Unconfirmed)
                     }
-                    freenet_bitcoin_common::OutpointStatus::Confirmed { value_sats, anchor } => (
+                    // `attested_depth` is genuinely not consulted HERE, and
+                    // that is worth stating rather than hiding behind `..`.
+                    // This row is display-only: `anchor.height` feeds a sort
+                    // key and the label "confirmed", and no confirmation
+                    // COUNT is derived from it. The figures this screen gates
+                    // on -- `confirmed_sats` and `pending_sats` above -- come
+                    // from upstream's `confirmed_value_sats` /
+                    // `pending_value_sats`, which apply the
+                    // `confirmations_at` cap themselves.
+                    //
+                    // If this row ever grows a depth to show, it must use
+                    // `status.confirmations_at(tip_height)` and not
+                    // `tip_height - anchor.height`: the latter is the
+                    // uncapped observed depth, which a submitter can inflate
+                    // by pairing a pre-reorg confirmation with a fresh tip.
+                    // See `harvest_common::payment::verify_on_chain_proof`.
+                    freenet_bitcoin_common::OutpointStatus::Confirmed {
+                        value_sats,
+                        anchor,
+                        attested_depth: _,
+                    } => (
                         value_sats,
                         TxRowStatus::Confirmed {
                             anchor_height: anchor.height,

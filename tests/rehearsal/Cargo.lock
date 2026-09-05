@@ -472,7 +472,7 @@ dependencies = [
 [[package]]
 name = "freenet-bitcoin-common"
 version = "0.1.0"
-source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#3f431db2d3510c7b401c0bd643ff8cc4ee117251"
+source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#0e5b9d91d15053f86f5d784ceab7036f7c99c150"
 dependencies = [
  "blake3",
  "bs58",

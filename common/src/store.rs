@@ -1074,6 +1074,45 @@ mod order_tests {
         (SignedClaim::sign(bridge, &body).unwrap(), outpoint)
     }
 
+    /// A confirmation the bridge signed from a chain position `as_of_height`,
+    /// about a block at `confirm_height`.
+    ///
+    /// `confirmed_claim` always signs with `as_of == anchor`, i.e. the bridge
+    /// saw the block at depth 1. This lets a test say how deep the BRIDGE
+    /// claimed the block was, which is the quantity `attested_depth` carries
+    /// and the only one a submitter cannot inflate.
+    fn confirmed_claim_seen_from(
+        order: &Order,
+        bridge: &SigningKey,
+        value_sats: u64,
+        confirm_height: u32,
+        as_of_height: u32,
+    ) -> (SignedClaim, OutPoint) {
+        let addr_params = order.bitcoin_params();
+        let (spv, txid, block_hash) =
+            payment_proof(&order.payment_script_pubkey, value_sats, 1, [1u8; 32]);
+        let outpoint = OutPoint { txid, vout: 0 };
+        let anchor = BlockAnchor {
+            height: confirm_height,
+            hash: block_hash,
+        };
+        let body = ClaimBody {
+            script_id: addr_params.script_id(),
+            network: order.network,
+            as_of: BlockAnchor {
+                height: as_of_height,
+                hash: BlockHash([3u8; 32]),
+            },
+            claim: Claim::ConfirmedOutput {
+                outpoint,
+                value_sats,
+                anchor,
+                spv,
+            },
+        };
+        (SignedClaim::sign(bridge, &body).unwrap(), outpoint)
+    }
+
     /// The claim a real reorg produces: as of a HIGHER chain position than
     /// the confirmation it supersedes, the bridge no longer sees `outpoint`
     /// on its best chain. It carries no SPV proof because it asserts an
@@ -1324,6 +1363,70 @@ mod order_tests {
                 "{name}: expected the reversal-evidence rejection, got: {err}"
             );
         }
+    }
+
+    /// Confirmation depth is capped at what the BRIDGE attested, not at what
+    /// the submitter's tip implies.
+    ///
+    /// The submitter chooses the claim set, so across a reorg it can present
+    /// the bridge's pre-reorg `ConfirmedOutput` and drop the `Retracted` that
+    /// superseded it. Every other check still passes: the confirmation is
+    /// genuinely signed, genuinely about this script, and names a
+    /// self-consistent block.
+    ///
+    /// What turned that from a stale reading into a forgery was pairing it
+    /// with a FRESH tip. Depth measured as `tip - anchor + 1` grows with the
+    /// chain, so an assertion the bridge made at depth 1 and has since
+    /// retracted reads as arbitrarily deep just by supplying a current tip.
+    /// `OutpointStatus::confirmations_at` caps at `attested_depth` -- the
+    /// depth inside the bridge's own signature -- which no submitter can
+    /// inflate.
+    ///
+    /// Mutated red by taking rustc's suggestion when `attested_depth` was
+    /// added upstream: `attested_depth: _` plus the uncapped free function
+    /// `confirmations(&anchor, tip_height)` compiles, passes every other test
+    /// in this workspace, and makes the order below `Paid`.
+    #[test]
+    fn depth_is_capped_at_what_the_bridge_attested() {
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let p = params(&seller);
+
+        // Six confirmations required, so the difference between a bridge that
+        // saw one and a tip that implies a hundred actually decides the order.
+        let mut order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+        order.required_confirmations = 6;
+
+        // The bridge signed this at the same height as the block: it had seen
+        // exactly one confirmation. That is the whole of what it attested.
+        let (shallow, _) = confirmed_claim_seen_from(&order, &bridge, order.amount_sats, 100, 100);
+
+        // ...presented against a tip a hundred blocks later.
+        let stale = OrderPaymentProof::on_chain(vec![shallow], signed_tip(&order, &bridge, 200));
+        assert_eq!(
+            crate::payment::verify_payment_proof(&order, &stale),
+            Err(crate::payment::ProofError::InsufficientConfirmations { have: 1, need: 6 }),
+            "a confirmation the bridge attested at depth 1 must be worth one \
+             confirmation however far ahead the supplied tip is"
+        );
+
+        let record = make_authorized_order(&seller, order.clone(), OrderStatus::Paid, Some(stale));
+        let state = orders_of([(order.id.clone(), record)]);
+        assert!(
+            state.verify(&StoreStateV1::default(), &p).is_err(),
+            "and the contract must refuse the record, not just the proof"
+        );
+
+        // The honest case still settles, so this is a cap and not a refusal:
+        // the bridge signed from height 105 about a block at 100, i.e. it
+        // really had seen six confirmations.
+        let (deep, _) = confirmed_claim_seen_from(&order, &bridge, order.amount_sats, 100, 105);
+        let genuine = OrderPaymentProof::on_chain(vec![deep], signed_tip(&order, &bridge, 105));
+        assert_eq!(
+            crate::payment::verify_payment_proof(&order, &genuine),
+            Ok(order.amount_sats),
+            "a bridge that attested six confirmations still settles a six-confirmation order"
+        );
     }
 
     /// **Pins a KNOWN GAP, not desired behaviour.** Invert this test when the

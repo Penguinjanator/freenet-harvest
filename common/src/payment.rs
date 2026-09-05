@@ -730,7 +730,17 @@ fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u
         let ever_confirmed: Option<u64> = claims
             .iter()
             .filter_map(|b| match &b.claim {
-                Claim::ConfirmedOutput { value_sats, .. } => Some(*value_sats),
+                // Spelled out rather than `..` for the same reason as the
+                // fold match below: this value decides `ever_confirmed_total`,
+                // which gates whether a retraction reads as a REVERSAL, so a
+                // field added to `ConfirmedOutput` upstream must stop the
+                // build rather than arrive here unexamined.
+                Claim::ConfirmedOutput {
+                    outpoint: _,
+                    value_sats,
+                    anchor: _,
+                    spv: _,
+                } => Some(*value_sats),
                 _ => None,
             })
             .min();
@@ -739,8 +749,32 @@ fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u
         }
 
         match fold_outpoint_status(claims.iter()) {
-            Some(OutpointStatus::Confirmed { value_sats, anchor }) => {
-                let confs = freenet_bitcoin_common::confirmations(&anchor, tip_height);
+            // Destructured WITHOUT `..`, and both `_` bindings below are
+            // deliberate rather than lazy.
+            //
+            // No `..`, because that is the only reason the arrival of
+            // `attested_depth` was noticed at all: the upstream bump failed
+            // here with E0027 instead of compiling and quietly declining a
+            // security fix. A `..` would let the next field arrive silently.
+            //
+            // `anchor` and `attested_depth` bound to `_` because the depth is
+            // computed by `confirmations_at`, which uses BOTH -- it caps the
+            // tip-derived count at the depth the BRIDGE attested inside its
+            // own signature. Do NOT read those underscores as "ignored", and
+            // do not re-derive the cap here: `confirmations(&anchor, tip)` is
+            // the uncapped observed depth, which grows with the chain, so a
+            // submitter presenting a pre-reorg confirmation against a fresh
+            // tip can make an assertion the bridge made at depth 1 read as
+            // arbitrarily deep. Computing the cap by hand would also be a
+            // second copy of a rule that belongs upstream.
+            Some(
+                status @ OutpointStatus::Confirmed {
+                    value_sats,
+                    anchor: _,
+                    attested_depth: _,
+                },
+            ) => {
+                let confs = status.confirmations_at(tip_height);
                 confirmed_total = confirmed_total.saturating_add(value_sats);
                 shallowest = Some(shallowest.map_or(confs, |s: u32| s.min(confs)));
             }
