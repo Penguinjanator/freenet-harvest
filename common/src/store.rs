@@ -298,15 +298,37 @@ fn order_content_digest(record: &AuthorizedOrder) -> [u8; 8] {
 ///
 /// Preferring the smaller encoding removes the reward. It is exactly as total,
 /// deterministic and content-derived as the old rule, so convergence is
-/// unaffected. What it cannot be turned into is the converse attack, because
-/// at an equal rank a record's *only* attacker-variable field is
-/// `payment_proof`: `order`, `scoped_payload` and `signature` are pinned by
-/// [`AuthorizedOrder::verify_terms`], and `Cancelled`'s status signature by
-/// `verify` -- and every record reaching this function has already passed
-/// `verify`. So a smaller record is not a weaker one: it still establishes
-/// the same status by the same rules, and the only thing an attacker can do
-/// with it is make the state cheaper, bounded below by the smallest encoding
-/// that still verifies.
+/// unaffected.
+///
+/// # Why there is no converse attack, and what it rests on
+///
+/// Every record reaching this function has already passed
+/// [`crate::payment::AuthorizedOrder::verify`], which pins every field a
+/// third party could otherwise vary at an equal rank:
+///
+/// * `order`, `scoped_payload` and `signature` by `verify_terms`;
+/// * `status_scoped_payload` / `status_signature` -- required and checked for
+///   `Cancelled`, and required to be ABSENT for every other status;
+/// * `payment_proof` -- required to verify for `Paid` / `PaymentReversed`, and
+///   required to be ABSENT for the others.
+///
+/// That leaves `payment_proof` on an evidence-backed status as the only thing
+/// an attacker may choose, and any value they choose still had to satisfy
+/// `verify`. So a smaller record is not a weaker one: it establishes the same
+/// status by the same rules, and the only thing an attacker gains is making
+/// the state cheaper, bounded below by the smallest encoding that verifies.
+///
+/// **The absence requirements are load-bearing here, not hygiene.** They were
+/// added because of this tie-break. `verify` used to ignore the fields a
+/// status does not use, and in CBOR `None` is `0xf6` while every `Some(..)`
+/// begins with an array header of `0x80..=0x9b` -- so `Some(anything)` sorts
+/// BELOW `None`. A third party could set `status_scoped_payload: Some(vec![])`
+/// on a genuine `Paid` record, change nothing else, and permanently own the
+/// copy every replica keeps. Smaller-wins turned an ignored field into the
+/// winning move. See
+/// `crate::payment::AuthorizedOrder::verify_unused_fields_absent` and
+/// `order_tests::a_field_the_status_does_not_use_is_rejected`; a new status
+/// that leaves a field unchecked reopens this.
 ///
 /// A digest over the order TERMS was considered instead and rejected: two
 /// records for one order id normally carry identical terms, so it ties, and
@@ -1926,6 +1948,87 @@ mod order_tests {
             crate::to_cbor(&padded_then_honest.orders[&order.id]).unwrap(),
             honest_bytes,
             "and it must not survive merely by having arrived first"
+        );
+    }
+
+    /// A field the status does not use must be REJECTED, not merely ignored.
+    ///
+    /// `verify` reads `status_scoped_payload` / `status_signature` only for
+    /// `Cancelled`, and `payment_proof` only for `Paid` / `PaymentReversed`.
+    /// Anywhere else those fields used to be unchecked bytes that any third
+    /// party could set on a record that still verified -- and that is not
+    /// harmless, because `merge_order` breaks an equal-rank tie on the full
+    /// CBOR encoding and keeps the SMALLER.
+    ///
+    /// In CBOR `None` is `0xf6`, and every `Some(..)` here begins with an
+    /// array header in `0x80..=0x9b`. So `Some(anything)` sorts BELOW `None`:
+    /// an attacker could set `status_scoped_payload: Some(vec![])` on a
+    /// genuine `Paid` record and permanently displace the honest copy, because
+    /// merge is a monotonic maximum. Smaller-encoding-wins made that the
+    /// winning move rather than a losing one, which is why this is pinned here
+    /// next to the tie-break it protects and not only in `payment.rs`.
+    #[test]
+    fn a_field_the_status_does_not_use_is_rejected() {
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let p = params(&seller);
+        let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+
+        // The byte fact the attack rests on, asserted rather than asserted-in-
+        // prose: any `Some` sorts below `None` at that field position.
+        assert!(
+            crate::to_cbor(&Some(Vec::<u8>::new())).unwrap()
+                < crate::to_cbor(&Option::<Vec<u8>>::None).unwrap(),
+            "if this ever stops holding, the tie-break's exposure changes and the \
+             reasoning on `merge_order` needs redoing"
+        );
+
+        let honest = make_authorized_order(
+            &seller,
+            order.clone(),
+            OrderStatus::Paid,
+            Some(make_payment_proof(&order, &bridge, 5)),
+        );
+        assert!(
+            orders_of([(order.id.clone(), honest.clone())])
+                .verify(&StoreStateV1::default(), &p)
+                .is_ok(),
+            "the honest record is unaffected"
+        );
+
+        // Same order, same status, same proof, plus the smallest possible
+        // value in a field `Paid` never reads.
+        let mut stuffed = honest.clone();
+        stuffed.status_scoped_payload = Some(Vec::new());
+        stuffed.status_signature = Some(Vec::new());
+        assert!(
+            crate::to_cbor(&stuffed).unwrap() < crate::to_cbor(&honest).unwrap(),
+            "the attacker's record really does win a smaller-wins tie-break, so \
+             rejecting it at verify is what has to stop this"
+        );
+        let err = orders_of([(order.id.clone(), stuffed)])
+            .verify(&StoreStateV1::default(), &p)
+            .expect_err("a Paid record carrying a status signature must be rejected");
+        assert!(err.contains("status signature"), "got: {err}");
+
+        // The same rule in the other direction: evidence on a status that
+        // does not rest on evidence.
+        let mut early =
+            make_authorized_order(&seller, order.clone(), OrderStatus::AwaitingPayment, None);
+        early.payment_proof = Some(make_payment_proof(&order, &bridge, 5));
+        let err = orders_of([(order.id.clone(), early)])
+            .verify(&StoreStateV1::default(), &p)
+            .expect_err("an AwaitingPayment record carrying payment evidence must be rejected");
+        assert!(err.contains("payment evidence"), "got: {err}");
+
+        // And a status that DOES use a field still accepts it -- so this is a
+        // narrowing, not a blanket refusal.
+        let cancelled = make_authorized_order(&seller, order.clone(), OrderStatus::Cancelled, None);
+        assert!(
+            orders_of([(order.id.clone(), cancelled)])
+                .verify(&StoreStateV1::default(), &p)
+                .is_ok(),
+            "Cancelled genuinely uses its status signature"
         );
     }
 

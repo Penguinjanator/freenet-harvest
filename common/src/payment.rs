@@ -846,6 +846,72 @@ impl AuthorizedOrder {
         )
     }
 
+    /// Which of the optional fields each status actually consults.
+    ///
+    /// Written as an exhaustive `match` on purpose: a new status stops this
+    /// compiling until somebody decides what it authorizes, which is the
+    /// decision [`Self::verify_unused_fields_absent`] depends on.
+    fn fields_used(status: OrderStatus) -> (bool, bool) {
+        match status {
+            // Nothing is asserted yet, so nothing may be attached.
+            OrderStatus::AwaitingPayment => (false, false),
+            // The seller's signature over `(id, status)`, and nothing else.
+            OrderStatus::Cancelled => (false, true),
+            // Bitcoin evidence, and nothing else. `Cancelled` ranks BELOW
+            // `Paid`, so a paid order never reaches `Cancelled` under merge
+            // and a proof on one of these is not a record of anything.
+            OrderStatus::Paid | OrderStatus::PaymentReversed => (true, false),
+        }
+    }
+
+    /// Reject a record carrying evidence or authorization its status does not
+    /// use.
+    ///
+    /// # Why an unchecked field is not harmless
+    ///
+    /// `verify`'s `Paid` arm never reads `status_scoped_payload` or
+    /// `status_signature`, and its `AwaitingPayment` arm reads nothing at all.
+    /// Left unchecked, those fields are bytes any third party may set on a
+    /// record that still verifies — and `store::merge_order` breaks an
+    /// equal-rank tie on the full CBOR encoding, keeping the smaller. In CBOR
+    /// `None` is `0xf6` and *every* `Some(..)` here begins with an array
+    /// header of `0x80..=0x9b`, so `Some(anything)` sorts BELOW `None`.
+    ///
+    /// A third party could therefore take a genuine `Paid` record, set
+    /// `status_scoped_payload: Some(vec![])` — a field nothing reads — and
+    /// permanently displace the honest record, because merge is a monotonic
+    /// maximum. Nothing about the order changed; the attacker simply owns the
+    /// copy every replica keeps.
+    ///
+    /// Pinning the unused fields to `None` closes that, and it is the reason
+    /// `merge_order`'s soundness argument can talk about `payment_proof` as
+    /// the only field an attacker may vary at an equal rank. Do not relax this
+    /// without redoing that argument.
+    ///
+    /// Safe to add: both production constructors
+    /// (`state::authorize_new_order` and the one in `gateway::store_ops`)
+    /// already build `AwaitingPayment` with every optional field `None`, and
+    /// `orders` did not exist in V1 — the only generation ever published — so
+    /// no deployed state contains an order at all.
+    fn verify_unused_fields_absent(&self) -> Result<(), String> {
+        let (uses_proof, uses_status_signature) = Self::fields_used(self.status);
+        if !uses_proof && self.payment_proof.is_some() {
+            return Err(format!(
+                "{:?} carries payment evidence, which nothing checks for that status",
+                self.status
+            ));
+        }
+        if !uses_status_signature
+            && (self.status_scoped_payload.is_some() || self.status_signature.is_some())
+        {
+            return Err(format!(
+                "{:?} carries a status signature, which nothing checks for that status",
+                self.status
+            ));
+        }
+        Ok(())
+    }
+
     /// Verify the whole record: terms, and whatever authorizes the status.
     ///
     /// The bridges the payment evidence is judged against come from
@@ -854,6 +920,7 @@ impl AuthorizedOrder {
     /// be called with a set the seller did not sign for.
     pub fn verify(&self, seller_key: &VerifyingKey) -> Result<(), String> {
         self.verify_terms(seller_key)?;
+        self.verify_unused_fields_absent()?;
         match self.status {
             OrderStatus::AwaitingPayment => Ok(()),
             OrderStatus::Paid => {
