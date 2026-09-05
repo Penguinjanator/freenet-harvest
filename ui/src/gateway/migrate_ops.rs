@@ -653,6 +653,33 @@ thread_local! {
 /// Condition 2 cannot be satisfied today; see
 /// [`successor_reference_is_durable`]. Nothing seals, and the walk repeats.
 fn finish(mut probe: Probe) {
+    // # The `None => return` arms below
+    //
+    // They are unreachable, and they are deliberate rather than an oversight
+    // or a forgotten path -- do not "tidy" them into an `unwrap` or a panic.
+    //
+    // `pump` calls this only when `next_get` returned `None`, and `next_get`
+    // returns `None` only after it has stored a result (`ProbeSession`, in
+    // `crate::migrate`): either it was already finished, or the driver
+    // answered `Step::Done`, at which point `take_outcome` yields the outcome.
+    // freenet-migrate asserts that invariant itself -- "Step::Done implies an
+    // untaken outcome", `driver.rs` -- and `take_outcome` returns `None` only
+    // while still `Probing`. A probe is also moved into this function, so it
+    // cannot be finished twice.
+    //
+    // So the arms encode an invariant this code depends on but cannot enforce,
+    // held in a dependency. Returning is the right response to it being
+    // violated: nothing was recovered, so there is nothing to adopt, forward
+    // or seal, and the lineage stays claimed as `Walking` in `SESSION_WALKS`.
+    // That is safe in the direction everything here resolves -- `claim` refuses
+    // a `Walking` lineage exactly as it refuses a settled one, so no repeat can
+    // start, and a reload clears the record and retries. It is the same
+    // retry-on-reload bound the rest of the module takes.
+    //
+    // One honest gap if it ever does fire: `start`'s `AlreadyWalking` arm
+    // returns silently where `AlreadyWalked` logs, so a lineage stuck this way
+    // would not announce itself. Nothing would be lost, but nothing would say
+    // the migration had not run either.
     let (note, seal, forward) = match &mut probe.session {
         Session::Store(s) => match s.take_result() {
             Some((outcome, seal)) => {
