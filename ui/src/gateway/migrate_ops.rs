@@ -343,7 +343,22 @@ fn start<F>(
     // and never reported anything.
     match SESSION_WALKS.with(|w| w.borrow_mut().claim(&marker)) {
         Admission::Admit => {}
-        Admission::AlreadyWalking => return,
+        Admission::AlreadyWalking => {
+            // Ordinarily routine: the vault sends a `GhostKeyList` per connect
+            // and two can overlap, so refusing the second is the normal case.
+            //
+            // Logged anyway because this arm is also where a lineage would sit
+            // if `finish`'s unreachable arms ever fired, and silence there
+            // would be a migration that quietly did not run. The two are told
+            // apart by repetition: this line recurring on every connect, with
+            // no completion line ever following it, is the stuck case.
+            info!(
+                "migration: a walk of the {} lineage for {fingerprint} is already in \
+                 flight; not starting a second",
+                artifact.as_str()
+            );
+            return;
+        }
         Admission::AlreadyWalked => {
             // Not silent, because this is the gate now doing the job the
             // durable marker cannot: if it stops firing, the walk goes back to
