@@ -52,6 +52,26 @@ pub fn mailbox_contract_key(
     ))
 }
 
+/// The `ContractKey` of a mailbox whose instance id is already known.
+///
+/// The seller's own mailbox is reached this way rather than by re-deriving
+/// it: the id they are READING came from their delegate's registration, and
+/// replying into a different one than they are reading would put the answer
+/// somewhere the buyer is not looking. Same reasoning, and the same residual,
+/// as `store_ops::store_contract_key`'s reconstructed path -- the code hash
+/// is this build's, so a mailbox published by an older build is addressed
+/// wrongly here.
+pub fn mailbox_key_from_id(instance_id: &[u8]) -> Result<ContractKey, String> {
+    let id: [u8; 32] = instance_id
+        .try_into()
+        .map_err(|_| format!("mailbox contract id is {} bytes, not 32", instance_id.len()))?;
+    let code_hash = *ContractCode::from(MAILBOX_CONTRACT_WASM.to_vec()).hash();
+    Ok(ContractKey::from_id_and_code(
+        freenet_stdlib::prelude::ContractInstanceId::new(id),
+        code_hash,
+    ))
+}
+
 /// Bytes of a mailbox update carrying new messages.
 ///
 /// The mailbox contract's delta is `MailboxDelta`, a bare
@@ -76,39 +96,56 @@ pub fn mailbox_delta_bytes(messages: Vec<EncryptedMessage>) -> Result<Vec<u8>, S
 /// match a confirmation against even if one arrived. Callers must not report
 /// delivery; see `components::message_view` for the wording that does not.
 ///
-/// # The GET first, and what it is and is not worth
+/// # The GET first: what is known, what is not, and how it fails
 ///
-/// A buyer has never touched this contract before, so their node very likely
-/// does not hold it -- and an update has to be applied by the contract's own
-/// WASM. A client GET primes the local store, so issuing one first is the
-/// cheapest way to give the node the contract it is about to be asked to
-/// update.
+/// **What is known.** A buyer has never touched this contract, so their node
+/// very likely does not hold it -- and an update has to be applied by the
+/// contract's own WASM, which the node must have. A client GET primes the
+/// local store, so issuing one first is the cheapest way to give the node the
+/// contract it is about to be asked to update.
 ///
-/// It is best-effort and the race is real: `get_contract` also resolves when
-/// the SEND succeeds, not when state comes back, so the update can be
-/// dispatched while the fetch is still in flight. There is nothing to await
-/// -- a GET that dead-ends produces no response at all, which is why
-/// `state::subscribe_to_own_store` needs a deadline to conclude anything --
-/// and blocking a buyer's message on a timeout would be worse than the race.
-/// So the GET improves the odds and guarantees nothing, and the failure it
-/// leaves is a message the node refuses to apply. **This path has not been
-/// exercised against a live node.**
+/// **What is NOT known, and cannot be established from this repository.**
+/// Whether the update succeeds when the node does not yet hold the contract.
+/// It might fetch the contract itself; it might refuse. Nothing here can
+/// answer that, because answering it needs a running node, and the only
+/// harness that talks to one is `tests/rehearsal/`, which is compile-checked
+/// in CI and never executed there. **This path has not been run against a
+/// live node.**
 ///
-/// The GET does NOT subscribe. A buyer subscribing to a seller's mailbox
-/// would advertise a standing interest in it to the network, which is a
-/// longer-lived signal than the single write they are making, and the buyer
-/// cannot read what comes back in any case -- their ephemeral secret is gone
-/// (see `messaging::seal_to_seller`). The state that arrives belongs to no
-/// store this browser has registered a mailbox for, so `on_contract_state`
-/// logs it and drops it; that log line is expected here rather than a sign
-/// of anything wrong.
+/// **The ordering is not guaranteed.** Both `get_contract` and
+/// `update_contract` resolve when the WebSocket SEND succeeds, not when the
+/// node has done anything, so the update can be dispatched while the fetch is
+/// still in flight. There is nothing to await: a GET that dead-ends produces
+/// no response at all -- which is why `state::subscribe_to_own_store` needs a
+/// deadline before it can conclude anything -- so "wait for the GET" means
+/// "block the buyer's message behind a timeout that usually fires for a
+/// reason unrelated to them".
+///
+/// **What it looks like when the race is lost.** The node rejects or drops
+/// the update. `update_contract` has already returned `Ok` (the send
+/// succeeded), so the UI shows the message as handed over. It never appears
+/// in the mailbox, so it stays in the "not yet visible" list
+/// (`state::AppState::unconfirmed_sent`) indefinitely, and the seller never
+/// receives it. The buyer is not told it failed, because nothing told this
+/// code it failed -- an `UpdateResponse` carries no correlation id, so even a
+/// rejection that did come back could not be matched to this send.
+///
+/// **What must NOT be done about it here.** Not a sleep, and not a retry
+/// loop: both would paper over a question that has an answer, and a retry
+/// that re-sends a message the node actually did apply would deposit it
+/// twice (deduped by nonce, but only because the nonce is reused -- a fresh
+/// seal would not be). Characterising this needs the rehearsal harness and a
+/// node; until then it is a stated residual, recorded in
+/// `docs/untested-invariants.md`.
+///
+/// The GET does NOT subscribe. Subscription is a separate decision made once,
+/// on the buyer's first message, by `components::message_view` -- a reader
+/// who never writes advertises no interest in anybody's mailbox.
 #[cfg(target_arch = "wasm32")]
 pub async fn send_message(
     owner_verifying_key: &ed25519_dalek::VerifyingKey,
     message: EncryptedMessage,
 ) -> Result<(), String> {
-    use freenet_stdlib::prelude::{StateDelta, UpdateData};
-
     let key = mailbox_contract_key(owner_verifying_key)?;
 
     // Failure here is logged rather than returned: the update below is worth
@@ -120,8 +157,29 @@ pub async fn send_message(
         );
     }
 
+    write_to_mailbox(&key, message).await
+}
+
+/// Write into a mailbox whose key is already known.
+///
+/// The seller's own replies take this path: they are already subscribed to
+/// their mailbox, so there is nothing to prime, and the id comes from their
+/// delegate's registration rather than from a derivation.
+#[cfg(target_arch = "wasm32")]
+pub async fn reply_to_mailbox(
+    mailbox_instance_id: &[u8],
+    message: EncryptedMessage,
+) -> Result<(), String> {
+    write_to_mailbox(&mailbox_key_from_id(mailbox_instance_id)?, message).await
+}
+
+/// The one place a message becomes a contract update.
+#[cfg(target_arch = "wasm32")]
+async fn write_to_mailbox(key: &ContractKey, message: EncryptedMessage) -> Result<(), String> {
+    use freenet_stdlib::prelude::{StateDelta, UpdateData};
+
     let delta = mailbox_delta_bytes(vec![message])?;
-    super::update_contract(&key, UpdateData::Delta(StateDelta::from(delta))).await
+    super::update_contract(key, UpdateData::Delta(StateDelta::from(delta))).await
 }
 
 #[cfg(test)]
@@ -157,10 +215,47 @@ mod tests {
         )
         .key();
 
+        let derived = mailbox_contract_key(&vk).expect("derive");
         assert_eq!(
-            mailbox_contract_key(&vk).expect("derive"),
-            expected,
+            derived.id(),
+            expected.id(),
             "the buyer would address a contract the seller never published"
+        );
+        // Separately, for the reason spelled out on
+        // `the_two_ways_to_address_a_mailbox_agree`: `ContractKey`'s
+        // `PartialEq` ignores the code hash, so `assert_eq!` on the keys
+        // alone would not notice a wrong one.
+        assert_eq!(derived.code_hash(), expected.code_hash());
+    }
+
+    /// The two ways to reach a mailbox must agree.
+    ///
+    /// A buyer derives the key from the seller's verifying key; the seller
+    /// rebuilds it from the instance id their delegate recorded. If those
+    /// disagreed, a seller would reply into a contract the buyer never reads
+    /// -- and both sides would report success.
+    ///
+    /// **The code hash is compared explicitly, and that is not pedantry.**
+    /// `ContractKey`'s `PartialEq` compares the instance id only, so
+    /// `assert_eq!(derived, from_id)` on its own passes even when the two
+    /// carry different code hashes -- which was checked rather than assumed:
+    /// the first version of this test was written that way and survived the
+    /// mutation below unchanged.
+    ///
+    /// Observed red on 2026-09-05 by hashing `STORE_CONTRACT_WASM` in
+    /// `mailbox_key_from_id`, but only once the code-hash assertion was
+    /// added.
+    #[test]
+    fn the_two_ways_to_address_a_mailbox_agree() {
+        let derived = mailbox_contract_key(&seller()).expect("derive");
+        let from_id = mailbox_key_from_id(derived.id().as_bytes()).expect("rebuild");
+
+        assert_eq!(derived.id(), from_id.id(), "different instance");
+        assert_eq!(
+            derived.code_hash(),
+            from_id.code_hash(),
+            "same instance, different code hash -- the seller would reply into a contract \
+             addressed by a hash the buyer is not reading"
         );
     }
 

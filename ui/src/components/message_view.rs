@@ -26,9 +26,12 @@ use crate::messaging::{MailboxEntry, MessageContent};
 ///   contract is a contract update, and the mailbox's address is derived from
 ///   the seller's identity. Anybody watching knows this node wrote to this
 ///   seller. The message CONTENT is hidden; the fact of contact is not.
-/// * **No reply.** A buyer has no identity and no mailbox, so the seller has
-///   no channel to answer through. Saying "messaged" without saying this
-///   would leave a buyer waiting for a response Harvest cannot deliver.
+/// * **Replies work, and are lost by a reload.** The seller answers into
+///   their own mailbox and the buyer reads it out of the same contract. The
+///   buyer's keys live in the tab and nowhere else -- there is no buyer
+///   delegate and `localStorage` throws in the gateway's sandboxed iframe --
+///   so a buyer who reloads before the answer arrives can never read it. That
+///   has to be on screen BEFORE they send, not discovered afterwards.
 /// * **Handed over, not delivered.** `update_contract` resolves when the
 ///   local node accepts the send. Nothing confirms the contract took it or
 ///   that the seller ever looks. The button is an action label and says
@@ -67,7 +70,9 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
     if owned {
         let entries = app_state.mailbox_entries(&store_contract_id);
         drop(app_state);
-        return rsx! { Inbox { entries: entries } };
+        return rsx! {
+            Inbox { store_contract_id: store_contract_id.clone(), entries: entries }
+        };
     }
 
     let seller_key = info.and_then(|i| i.encryption_public_key);
@@ -76,7 +81,8 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
     // notary signature, and this component re-renders on every keystroke in
     // the box below. See `state::BrowsingStore::seller_verifying_key`.
     let seller_identity = store.and_then(|s| s.seller_verifying_key);
-    let sent = store.map(|s| s.sent_messages.clone()).unwrap_or_default();
+    let thread = app_state.conversation_thread(&store_contract_id);
+    let unconfirmed = app_state.unconfirmed_sent(&store_contract_id);
     let loaded = info.is_some();
     drop(app_state);
 
@@ -120,8 +126,63 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
                 },
             }
 
-            if !sent.is_empty() {
-                SentList { sent: sent }
+            if !thread.is_empty() || !unconfirmed.is_empty() {
+                Thread { thread: thread, unconfirmed: unconfirmed }
+            }
+        }
+    }
+}
+
+/// The buyer's conversation with one store: what they wrote, what came back,
+/// and what has not been seen landing yet.
+#[component]
+fn Thread(
+    thread: Vec<crate::messaging::ConversationMessage>,
+    unconfirmed: Vec<crate::state::SentMessage>,
+) -> Element {
+    rsx! {
+        div { style: "margin-top: 1.5rem;",
+            h4 { "Your conversation" }
+            p { class: "text-muted",
+                style: "font-size: 0.85rem;",
+                "This conversation is gone when you reload the page: the key that reads it "
+                "lives in this tab and nowhere else. A reply that arrives after a reload "
+                "cannot be read by anyone, including you."
+            }
+
+            for message in thread.iter() {
+                {
+                    let when = message.timestamp.format("%Y-%m-%d %H:%M UTC").to_string();
+                    let who = if message.from_seller { "Seller" } else { "You" };
+                    rsx! {
+                        div { class: "card",
+                            style: "margin-top: 0.5rem;",
+                            p { class: "text-muted", style: "font-size: 0.8rem;", "{who}" }
+                            p { style: "white-space: pre-wrap;", "{describe(&message.content)}" }
+                            p { class: "text-muted",
+                                style: "font-size: 0.8rem;",
+                                "Sender's timestamp: {when}"
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Handed to the node, not yet seen in the seller's mailbox. Kept
+            // separate from the thread above rather than shown as sent,
+            // because "the node accepted it" and "it is in the mailbox" are
+            // different claims and only the second is evidence.
+            for message in unconfirmed.iter() {
+                div { class: "card",
+                    style: "margin-top: 0.5rem;",
+                    p { class: "text-muted", style: "font-size: 0.8rem;", "You — not yet visible" }
+                    p { style: "white-space: pre-wrap;", "{message.text}" }
+                    p { class: "text-warning",
+                        style: "font-size: 0.8rem;",
+                        "Handed to your Freenet node. It has not appeared in the seller's "
+                        "mailbox yet, so Harvest cannot say it arrived."
+                    }
+                }
             }
         }
     }
@@ -206,17 +267,30 @@ fn send(
     let seller = ed25519_dalek::VerifyingKey::from_bytes(seller_verifying_key)
         .map_err(|e| format!("this store's identity key is unusable: {e}"))?;
 
-    let plaintext = crate::messaging::PlaintextMessage {
-        conversation_id: harvest_common::mailbox::ConversationId::random(),
-        content: MessageContent::Text(text.clone()),
-    };
-    let sealed = crate::messaging::seal_to_seller(seller_encryption_key, &plaintext)?;
+    let sealed = APP_STATE.write().compose_to_seller(
+        store_contract_id,
+        seller_encryption_key,
+        text.clone(),
+    )?;
 
-    dispatch(seller, sealed);
+    // Subscribe to the seller's mailbox, once, on the first message. This is
+    // what makes a reply reachable: without it the buyer never fetches the
+    // contract again and the answer sits there unread.
+    //
+    // Deliberately NOT done merely by opening a storefront. Subscribing
+    // advertises a standing interest in that mailbox to the network, which is
+    // a longer-lived signal than a single write -- so a reader who never
+    // messages anyone advertises nothing.
+    let mailbox = crate::gateway::mailbox_ops::mailbox_contract_key(&seller)?;
+    APP_STATE
+        .write()
+        .register_store_mailbox(store_contract_id, mailbox.id().as_bytes());
+
+    dispatch(seller, sealed.clone());
 
     APP_STATE
         .write()
-        .record_sent_message(store_contract_id, text);
+        .record_sent_message(store_contract_id, text, sealed.nonce);
     Ok(())
 }
 
@@ -256,34 +330,6 @@ fn Unavailable(why: String) -> Element {
     }
 }
 
-/// What this browser has handed to the node for this store.
-#[component]
-fn SentList(sent: Vec<crate::state::SentMessage>) -> Element {
-    rsx! {
-        div { style: "margin-top: 1.5rem;",
-            h4 { "Messages you wrote" }
-            p { class: "text-muted",
-                style: "font-size: 0.85rem;",
-                "Handed to your Freenet node. Harvest cannot confirm the seller received it, "
-                "and this list is gone when you reload the page -- your copy is encrypted to "
-                "the seller and not to you."
-            }
-            for message in sent.iter().rev() {
-                {
-                    let when = message.sent_at.format("%Y-%m-%d %H:%M UTC").to_string();
-                    rsx! {
-                        div { class: "card",
-                            style: "margin-top: 0.5rem;",
-                            p { style: "white-space: pre-wrap;", "{message.text}" }
-                            p { class: "text-muted", style: "font-size: 0.8rem;", "{when}" }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// The seller's own mailbox.
 ///
 /// Unreadable entries are shown rather than hidden. The mailbox is
@@ -291,7 +337,7 @@ fn SentList(sent: Vec<crate::state::SentMessage>) -> Element {
 /// the readable ones could not tell "nobody wrote" from "I cannot read what
 /// they wrote".
 #[component]
-fn Inbox(entries: Vec<MailboxEntry>) -> Element {
+fn Inbox(store_contract_id: Vec<u8>, entries: Vec<MailboxEntry>) -> Element {
     if entries.is_empty() {
         return rsx! {
             div { class: "card",
@@ -306,14 +352,26 @@ fn Inbox(entries: Vec<MailboxEntry>) -> Element {
         .filter(|entry| matches!(entry, MailboxEntry::Unreadable { .. }))
         .count();
 
+    // Grouped by conversation, newest conversation first, because a reply
+    // belongs to a conversation rather than to a message -- and because an
+    // ungrouped list of a busy mailbox gives the seller no way to see which
+    // messages are one exchange.
+    let mut conversations: Vec<(Vec<u8>, Vec<MailboxEntry>)> = Vec::new();
+    for entry in entries.iter() {
+        match conversations
+            .iter_mut()
+            .find(|(tag, _)| tag == entry.conversation())
+        {
+            Some((_, group)) => group.push(entry.clone()),
+            None => conversations.push((entry.conversation().to_vec(), vec![entry.clone()])),
+        }
+    }
+
     rsx! {
         div { class: "card",
             h3 { "Messages" }
-            p { class: "section-count", "{entries.len()} message(s)" }
-            p { class: "text-warning",
-                style: "font-size: 0.85rem;",
-                "Harvest cannot reply to these yet -- the sender has no inbox to reply to. "
-                "Any contact route is in the message itself."
+            p { class: "section-count",
+                "{entries.len()} message(s) in {conversations.len()} conversation(s)"
             }
             if unreadable > 0 {
                 p { class: "text-muted",
@@ -322,11 +380,124 @@ fn Inbox(entries: Vec<MailboxEntry>) -> Element {
                     "so some entries are junk or were encrypted to a key you do not hold."
                 }
             }
-            for entry in entries.iter() {
-                MessageCard { entry: entry.clone() }
+            for (tag, group) in conversations.iter() {
+                Conversation {
+                    key: "{bs58::encode(tag).into_string()}",
+                    store_contract_id: store_contract_id.clone(),
+                    tag: tag.clone(),
+                    entries: group.clone(),
+                }
             }
         }
     }
+}
+
+/// One exchange with one buyer, and the box to answer it.
+#[component]
+fn Conversation(store_contract_id: Vec<u8>, tag: Vec<u8>, entries: Vec<MailboxEntry>) -> Element {
+    let mut draft = use_signal(String::new);
+    let mut problem = use_signal(|| Option::<String>::None);
+
+    // A conversation with nothing readable in it cannot be replied to: the
+    // reply has to name the conversation id, which only a decrypted message
+    // carries. Saying so beside the exchange is better than a Send button
+    // that refuses.
+    let readable = entries
+        .iter()
+        .any(|entry| matches!(entry, MailboxEntry::Readable { .. }));
+
+    rsx! {
+        div { class: "card", style: "margin-top: 1rem;",
+            p { class: "text-muted", style: "font-size: 0.8rem;",
+                "Conversation {short_tag(&tag)}"
+            }
+            for entry in entries.iter() {
+                MessageCard { entry: entry.clone() }
+            }
+
+            if readable {
+                div { class: "form-group", style: "margin-top: 0.5rem;",
+                    textarea {
+                        class: "form-textarea",
+                        value: "{draft}",
+                        placeholder: "Reply to this buyer.",
+                        oninput: move |event| draft.set(event.value()),
+                    }
+                }
+                if let Some(message) = problem() {
+                    p { class: "text-warning", "{message}" }
+                }
+                button {
+                    class: "btn btn-primary",
+                    disabled: draft().trim().is_empty(),
+                    onclick: {
+                        let store_contract_id = store_contract_id.clone();
+                        let tag = tag.clone();
+                        move |_| {
+                            let text = draft().trim().to_string();
+                            if text.is_empty() {
+                                return;
+                            }
+                            match reply(&store_contract_id, &tag, text) {
+                                Ok(()) => {
+                                    draft.set(String::new());
+                                    problem.set(None);
+                                }
+                                Err(e) => problem.set(Some(e)),
+                            }
+                        }
+                    },
+                    "Reply"
+                }
+                p { class: "text-muted", style: "font-size: 0.8rem;",
+                    "Your reply goes into this mailbox encrypted to this buyer alone. They can "
+                    "only read it while the browser tab they wrote from is still open."
+                }
+            } else {
+                p { class: "text-muted text-italic", style: "font-size: 0.85rem;",
+                    "Nothing here can be read, so there is nothing to reply to."
+                }
+            }
+        }
+    }
+}
+
+/// Enough of a conversation tag to tell two apart on screen, and no more --
+/// the whole thing is 44 characters of base58 that means nothing to a reader.
+fn short_tag(tag: &[u8]) -> String {
+    let encoded = bs58::encode(tag).into_string();
+    encoded.chars().take(8).collect()
+}
+
+/// Seal a seller's reply and hand it to the node.
+fn reply(store_contract_id: &[u8], tag: &[u8], text: String) -> Result<(), String> {
+    let (sealed, mailbox) = {
+        let state = APP_STATE.read();
+        let sealed = state.compose_reply(store_contract_id, tag, text)?;
+        let mailbox = state
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|store| store.mailbox_contract_id.clone())
+            .ok_or("this store's mailbox id is not known, so there is nowhere to reply into")?;
+        (sealed, mailbox)
+    };
+    dispatch_reply(mailbox, sealed);
+    Ok(())
+}
+
+/// Hand a sealed reply to the local node. Fire-and-forget for the same
+/// reason `dispatch` is; see `gateway::mailbox_ops::send_message`.
+fn dispatch_reply(_mailbox: Vec<u8>, _sealed: harvest_common::mailbox::EncryptedMessage) {
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = crate::gateway::mailbox_ops::reply_to_mailbox(&_mailbox, _sealed).await {
+            dioxus::logger::tracing::error!("Failed to send reply: {e}");
+            APP_STATE
+                .write()
+                .notifications
+                .push(format!("Your reply could not be sent: {e}"));
+        }
+    });
 }
 
 #[component]

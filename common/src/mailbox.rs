@@ -48,13 +48,61 @@ pub fn unpad_from_bucket(padded: &[u8]) -> Result<Vec<u8>, String> {
     Ok(padded[4..4 + len].to_vec())
 }
 
-/// Turn a raw X25519 shared secret into the AES-256 key a conversation uses.
+/// Which way along a conversation a message travels.
+///
+/// # Why the two directions do not share a key
+///
+/// Both ends compute the same X25519 shared secret, so a single key derived
+/// from it would encrypt and decrypt in both directions -- and then **a copy
+/// of the buyer's own message reads as a reply from the seller**. Anyone can
+/// read the mailbox and anyone can write to it, so mounting that is a copy
+/// and a paste: no key, no relationship with either party. What the buyer
+/// would see is a reply, in the seller's own mailbox, decrypting correctly,
+/// saying whatever the buyer had earlier said. In the phase this mechanism
+/// exists for, the thing the seller sends back is the buyer's sole
+/// authorization to complain, so "a message that reads as coming from the
+/// seller" is not a cosmetic confusion.
+///
+/// Separating the directions makes that impossible rather than detectable: a
+/// buyer-to-seller ciphertext simply does not authenticate under the
+/// seller-to-buyer key. It costs one BLAKE3 invocation and no wire bytes.
+///
+/// Verbatim replay is separately impossible -- [`MailboxStateV1::apply_delta`]
+/// dedupes on nonce -- but changing the nonce to evade dedup changes the AES
+/// nonce with it, so the ciphertext no longer authenticates. Neither of those
+/// is what this guards; this guards the direction.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MessageDirection {
+    /// Written by the buyer, read by the seller.
+    BuyerToSeller,
+    /// Written by the seller, read by the buyer.
+    SellerToBuyer,
+}
+
+impl MessageDirection {
+    /// The BLAKE3 key-derivation context for this direction.
+    ///
+    /// Contexts are hard-coded, globally unique strings, as BLAKE3's
+    /// `derive_key` requires. They carry a date and a version because
+    /// changing one silently breaks every conversation in flight -- so a
+    /// future change must add a context rather than edit one, and this is
+    /// where a reader finds that out.
+    const fn context(self) -> &'static str {
+        match self {
+            MessageDirection::BuyerToSeller => "harvest mailbox v1 2026-09-05 buyer-to-seller",
+            MessageDirection::SellerToBuyer => "harvest mailbox v1 2026-09-05 seller-to-buyer",
+        }
+    }
+}
+
+/// Turn a raw X25519 shared secret into the AES-256 key one direction of a
+/// conversation uses.
 ///
 /// # Why this is in `harvest-common` rather than beside either caller
 ///
 /// The two ends run in different crates and on different machines. A buyer's
 /// browser computes it from an ephemeral secret it generated
-/// (`harvest-ui`'s `messaging::EphemeralKeypair`); the seller's harvest
+/// (`harvest-ui`'s `messaging::BuyerConversation`); the seller's harvest
 /// delegate computes it from the long-term secret it holds, because that
 /// secret must not leave the delegate. If those two derivations ever disagree
 /// -- one adds a domain separator, one changes hash -- nothing errors: the
@@ -62,11 +110,11 @@ pub fn unpad_from_bucket(padded: &[u8]) -> Result<Vec<u8>, String> {
 /// reads as corrupt, on both sides, forever. There is no negotiation and no
 /// version byte to catch it.
 ///
-/// So it is written once, here, and pinned by a known-answer test whose
-/// expected value came from an independent BLAKE3 implementation rather than
+/// So it is written once, here, and pinned by known-answer tests whose
+/// expected values came from an independent BLAKE3 implementation rather than
 /// from this function.
-pub fn conversation_key_from_dh(shared_secret: &[u8; 32]) -> [u8; 32] {
-    *blake3::hash(shared_secret).as_bytes()
+pub fn conversation_key_from_dh(shared_secret: &[u8; 32], direction: MessageDirection) -> [u8; 32] {
+    blake3::derive_key(direction.context(), shared_secret)
 }
 
 /// Opaque conversation identifier chosen by the buyer.
@@ -103,8 +151,37 @@ impl ConversationId {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct EncryptedMessage {
     pub conversation_id: ConversationId,
-    /// Sender's public key bytes. Buyers MUST use a fresh ephemeral key per store
-    /// to prevent cross-store linkability.
+    /// **The BUYER's ephemeral X25519 public key for this conversation, in
+    /// both directions.** The field name predates replies and is kept because
+    /// renaming it changes the CBOR and orphans every mailbox already on the
+    /// network.
+    ///
+    /// For a buyer-to-seller message it is the sender's key, which is what
+    /// the name says. For a seller's reply it is the RECIPIENT's -- the
+    /// seller echoes the buyer's key back rather than naming themselves.
+    ///
+    /// It is the conversation's routing tag: the only field in the clear that
+    /// says which conversation a message belongs to.
+    /// [`ConversationId`] cannot do that job because it is inside the
+    /// ciphertext, which is the whole point of it.
+    ///
+    /// Buyers MUST use a fresh ephemeral key per store to prevent cross-store
+    /// linkability.
+    ///
+    /// # What echoing it costs
+    ///
+    /// An observer can pair a reply with the message it answers, so the
+    /// thread structure of a conversation is public: how many messages, in
+    /// which direction, and when. What it does NOT reveal is who either party
+    /// is -- the key is freshly random per conversation and tied to no
+    /// identity -- or what was said.
+    ///
+    /// The alternative is a tag nobody can link, which costs the buyer a
+    /// decryption attempt against every entry in the mailbox rather than
+    /// against their own conversation. Both were considered; the leak is
+    /// small next to what a public per-store mailbox reveals anyway (entry
+    /// count, arrival times, padded sizes), and it is written down in
+    /// `docs/messaging-privacy.md` rather than left implicit.
     pub sender_public_key: Vec<u8>,
     /// Encrypted payload (plaintext format is application-defined).
     /// SHOULD be padded to a size bucket before encryption.
@@ -314,31 +391,53 @@ impl MailboxStateV1 {
 mod tests {
     use super::*;
 
-    /// A known-answer test for the one function both ends of a conversation
+    /// Known-answer tests for the one function both ends of a conversation
     /// must compute identically.
     ///
-    /// The expected value is `b3sum` over 32 bytes of `0x07`, taken from the
-    /// `b3sum` CLI rather than from this crate -- a test that asks the
-    /// implementation what it does and then asserts it does that would pass
-    /// under any change at all, which is exactly the failure this repository
-    /// keeps finding.
+    /// The expected values are `b3sum --derive-key <context>` over 32 bytes
+    /// of `0x07`, taken from the `b3sum` CLI rather than from this crate -- a
+    /// test that asks the implementation what it does and then asserts it
+    /// does that would pass under any change at all, which is exactly the
+    /// failure this repository keeps finding.
     ///
-    /// If this goes red, do not update the constant. A changed derivation
+    /// If these go red, do not update the constants. A changed derivation
     /// makes every existing conversation permanently undecryptable in both
     /// directions, with no error anywhere -- just AES-GCM tags that stop
-    /// verifying.
+    /// verifying. Add a context, do not edit one.
     ///
-    /// Observed red on 2026-09-05 against a placeholder that returned the
-    /// shared secret unchanged.
+    /// Observed red on 2026-09-05 against the undirected predecessor
+    /// (`blake3::hash`, one key for both directions).
     #[test]
     fn the_conversation_key_derivation_is_pinned() {
-        let expected: [u8; 32] =
-            hex_literal("ebaf85b465a09de21b398fb112c1500f2cbe658c42f379e0c0f18d24b819f637");
-        assert_eq!(conversation_key_from_dh(&[7u8; 32]), expected);
+        assert_eq!(
+            conversation_key_from_dh(&[7u8; 32], MessageDirection::BuyerToSeller),
+            hex_literal("efd38d9d8791a47b0c4e3be38542cb297b25167aa680d84b9be0ef51dfe202c1"),
+        );
+        assert_eq!(
+            conversation_key_from_dh(&[7u8; 32], MessageDirection::SellerToBuyer),
+            hex_literal("6565da998392cff761fc670a61bb365826b464e99449827bd1f4631033ab96a2"),
+        );
     }
 
-    /// Parse a hex string into 32 bytes, so the constant above can be read
-    /// against `b3sum`'s output without transcribing it into byte syntax.
+    /// **The two directions must not share a key.**
+    ///
+    /// Stated separately from the known-answer tests because it is the
+    /// property, and the constants above are only one way of holding it: a
+    /// future edit that changed both contexts to the same string would update
+    /// two constants and keep this test red.
+    #[test]
+    fn the_two_directions_do_not_share_a_key() {
+        let secret = [7u8; 32];
+        assert_ne!(
+            conversation_key_from_dh(&secret, MessageDirection::BuyerToSeller),
+            conversation_key_from_dh(&secret, MessageDirection::SellerToBuyer),
+            "one key for both directions means a copy of the buyer's own message reads as \
+             a reply from the seller"
+        );
+    }
+
+    /// Parse a hex string into 32 bytes, so the constants above can be read
+    /// against `b3sum`'s output without transcribing them into byte syntax.
     fn hex_literal(hex: &str) -> [u8; 32] {
         let bytes: Vec<u8> = (0..hex.len())
             .step_by(2)

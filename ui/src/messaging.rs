@@ -16,13 +16,36 @@
 //! matching secret and answers the derived conversation key; nothing else
 //! ever sees it.
 //!
+//! # Replies, and why they need no buyer mailbox
+//!
+//! Contract state is public and the mailbox is open-write, so the seller
+//! replies **into their own mailbox**, encrypted under the same conversation
+//! the buyer opened. The buyer already knows that mailbox's address -- they
+//! derived it to send in the first place -- and reads their replies out of
+//! it. No buyer mailbox, no buyer identity, no second contract.
+//!
+//! Two things make that work rather than merely sound plausible:
+//!
+//! * **Direction separation.** Both ends compute one X25519 shared secret, so
+//!   a single key would decrypt in both directions and a copy of the buyer's
+//!   own message would read as a reply from the seller. The two directions
+//!   get different keys; see [`harvest_common::mailbox::MessageDirection`].
+//! * **A routing tag in the clear.** The buyer's ephemeral public key rides on
+//!   every message in the conversation, in both directions, so the buyer
+//!   finds their own thread without attempting to decrypt the whole mailbox.
+//!   What that leaks is written down on
+//!   [`harvest_common::mailbox::EncryptedMessage::sender_public_key`] and in
+//!   `docs/messaging-privacy.md`.
+//!
 //! # What this module does NOT do
 //!
-//! **Replies.** The seller has no way to send anything back, because the
-//! buyer has no mailbox to write to and no identity to address. A seller
-//! reading a message here can act on it, but Harvest gives them no channel to
-//! answer through. `components::message_view` says so on screen rather than
-//! implying a conversation.
+//! **Survive a reload.** The buyer's conversation keys live in the tab and
+//! nowhere else. There is no buyer delegate, and `localStorage` throws inside
+//! the gateway's sandboxed iframe, so there is nowhere durable to put them. A
+//! buyer who reloads before the seller answers can never read that reply --
+//! the ciphertext is in the mailbox forever and the key is gone. This is the
+//! sharpest remaining limitation and `components::message_view` says it on
+//! screen.
 //!
 //! **Anything for a seller who has published no key.** `encryption_public_key`
 //! is `None` for every store created before it existed, and for a seller whose
@@ -39,6 +62,7 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use harvest_common::mailbox::{
     conversation_key_from_dh, pad_to_bucket, unpad_from_bucket, ConversationId, EncryptedMessage,
+    MessageDirection,
 };
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
@@ -75,65 +99,198 @@ pub enum MessageContent {
     Decline { reason: String },
 }
 
-/// An ephemeral keypair for a conversation. The buyer generates this
-/// per-store to prevent cross-store linkability.
-pub struct EphemeralKeypair {
-    secret: EphemeralSecret,
-    pub public_key: PublicKey,
-}
-
-impl EphemeralKeypair {
-    /// Generate a new ephemeral keypair.
-    pub fn generate() -> Self {
-        let secret = EphemeralSecret::random();
-        let public_key = PublicKey::from(&secret);
-        Self { secret, public_key }
-    }
-
-    /// Perform X25519 key exchange and derive an AES-256 key.
-    ///
-    /// Returns `None` for a non-contributory exchange -- a low-order peer
-    /// point, which makes the shared secret all zeros and the "conversation
-    /// key" a constant anyone can compute. The seller's delegate refuses the
-    /// same case (`harvest-delegate`'s `messaging`), so this is the buyer's
-    /// half of one rule rather than a second one.
-    ///
-    /// The derivation itself is [`conversation_key_from_dh`], in
-    /// `harvest-common`, because the seller computes the same value inside
-    /// their delegate. If the two ever disagreed nothing would error: the
-    /// AES-GCM tag would simply stop verifying and every message would read
-    /// as corrupt.
-    pub fn derive_shared_key(self, their_public_key: &PublicKey) -> Option<[u8; 32]> {
-        let shared_secret: SharedSecret = self.secret.diffie_hellman(their_public_key);
-        if !shared_secret.was_contributory() {
-            return None;
-        }
-        Some(conversation_key_from_dh(shared_secret.as_bytes()))
-    }
-}
-
-/// Encrypt one message for a seller, from a buyer who has no identity.
+/// Both keys of one conversation, derived from a single X25519 exchange.
 ///
-/// The ephemeral secret is generated here and dropped when this returns, so
-/// **the buyer cannot decrypt what they just sent** and could not read a
-/// reply even if one existed. That is not an oversight to fix later by
-/// keeping the secret around: a buyer has nowhere durable to keep it, and a
-/// secret held only in a browser tab is gone on the next reload anyway. The
-/// UI keeps the plaintext it was handed, locally, so the buyer can see what
-/// they wrote; see `components::message_view`.
-pub fn seal_to_seller(
-    seller_public_key: &[u8; 32],
-    plaintext: &PlaintextMessage,
+/// Held together because every party needs both: the seller reads with
+/// `to_seller` and writes with `from_seller`, and the buyer does the reverse.
+/// Two separate values that must be derived from the same shared secret are
+/// exactly the "paired fields that must co-occur" shape, so they are one
+/// type.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ConversationKeys {
+    /// Encrypts what the buyer writes.
+    pub to_seller: [u8; 32],
+    /// Encrypts what the seller writes back.
+    pub from_seller: [u8; 32],
+}
+
+impl ConversationKeys {
+    pub fn from_shared_secret(shared_secret: &[u8; 32]) -> Self {
+        Self {
+            to_seller: conversation_key_from_dh(shared_secret, MessageDirection::BuyerToSeller),
+            from_seller: conversation_key_from_dh(shared_secret, MessageDirection::SellerToBuyer),
+        }
+    }
+}
+
+/// Deliberately opaque: a `Debug` that printed these would put both
+/// conversation keys into a browser console and, from there, into any log a
+/// user pastes into a bug report.
+impl std::fmt::Debug for ConversationKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConversationKeys(redacted)")
+    }
+}
+
+/// The buyer's half of one conversation with one store.
+///
+/// Opened per store per tab. The ephemeral SECRET is consumed in
+/// [`Self::open`] and never stored -- the derived keys are all that is needed
+/// afterwards, and keeping the secret would only widen what a leak costs.
+///
+/// It does not survive a reload, and there is nowhere to put it that would:
+/// see the module docs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BuyerConversation {
+    /// The routing tag every message in this conversation carries, in both
+    /// directions.
+    pub buyer_public_key: [u8; 32],
+    /// Chosen once and echoed by the seller, so a decrypted message that
+    /// names a different conversation can be rejected rather than displayed.
+    pub conversation_id: ConversationId,
+    keys: ConversationKeys,
+}
+
+impl BuyerConversation {
+    /// Open a conversation with the holder of `seller_public_key`.
+    pub fn open(seller_public_key: &[u8; 32]) -> Result<Self, String> {
+        let secret = EphemeralSecret::random();
+        let buyer_public_key = *PublicKey::from(&secret).as_bytes();
+        let shared = secret.diffie_hellman(&PublicKey::from(*seller_public_key));
+        if !shared.was_contributory() {
+            return Err(
+                "this store's published encryption key is not usable (the key exchange \
+                        produced no shared secret), so nothing can be encrypted to it"
+                    .to_string(),
+            );
+        }
+        Ok(Self {
+            buyer_public_key,
+            conversation_id: ConversationId::random(),
+            keys: ConversationKeys::from_shared_secret(shared.as_bytes()),
+        })
+    }
+
+    /// Seal one message for the seller.
+    pub fn seal(&self, text: String) -> Result<EncryptedMessage, String> {
+        seal(
+            &self.keys.to_seller,
+            &self.buyer_public_key,
+            &self.conversation_id,
+            MessageContent::Text(text),
+        )
+    }
+
+    /// This conversation's messages, in both directions, out of a mailbox
+    /// that also holds everybody else's.
+    ///
+    /// # Why this filters and `read_mailbox` does not
+    ///
+    /// A buyer is one conversation in a mailbox that may hold up to
+    /// [`harvest_common::mailbox::MAX_MESSAGES`] of them. Reporting the rest
+    /// as "cannot be read" would be 511 lines of noise about other people's
+    /// traffic. The seller is the opposite case: unreadable entries in their
+    /// OWN mailbox are something they need told about, so `read_mailbox`
+    /// reports them.
+    ///
+    /// The tag filter is a fast path and not a security boundary. An attacker
+    /// can read the tag out of the public mailbox and stamp it on anything
+    /// they like -- so the AEAD is what decides, and a forged entry simply
+    /// fails to authenticate. What the tag bounds is WORK: without it a buyer
+    /// would attempt decryption against every entry in the mailbox.
+    pub fn read(&self, messages: &[EncryptedMessage]) -> Vec<ConversationMessage> {
+        let mut thread: Vec<ConversationMessage> = messages
+            .iter()
+            .filter(|message| message.sender_public_key == self.buyer_public_key)
+            .filter_map(|message| {
+                // The seller's reply first: it is the one the buyer is
+                // waiting for, and the common case for an entry they did not
+                // write themselves.
+                for (key, from_seller) in [
+                    (&self.keys.from_seller, true),
+                    (&self.keys.to_seller, false),
+                ] {
+                    let Ok(plaintext) = decrypt_message(message, key) else {
+                        continue;
+                    };
+                    // The conversation id is inside the ciphertext, so only
+                    // someone holding the key could have set it -- which is
+                    // the seller. Checking it stops a reply being spliced
+                    // from one of this buyer's conversations into another.
+                    if plaintext.conversation_id != self.conversation_id {
+                        continue;
+                    }
+                    return Some(ConversationMessage {
+                        from_seller,
+                        timestamp: message.timestamp,
+                        nonce: message.nonce,
+                        content: plaintext.content,
+                    });
+                }
+                None
+            })
+            .collect();
+        // Oldest first: a conversation reads top to bottom, unlike the
+        // seller's inbox, which is a queue and reads newest first.
+        thread.sort_by_key(|message| (message.timestamp, message.nonce));
+        thread
+    }
+}
+
+/// One message of a conversation, as the buyer sees it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationMessage {
+    /// Whether the seller wrote it. Decided by WHICH key authenticated the
+    /// ciphertext, not by anything the message claims about itself.
+    pub from_seller: bool,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// The mailbox nonce, so a caller can tell whether a message it sent has
+    /// actually appeared in the mailbox.
+    pub nonce: [u8; 24],
+    pub content: MessageContent,
+}
+
+/// Seal the seller's reply into their own mailbox.
+///
+/// `buyer_public_key` is echoed as the routing tag rather than replaced with
+/// the seller's own key: it is what lets the buyer find their thread, and
+/// naming the seller instead would tell every reader which entries are
+/// replies while telling the buyer nothing.
+pub fn seal_reply(
+    keys: &ConversationKeys,
+    buyer_public_key: &[u8],
+    conversation_id: &ConversationId,
+    text: String,
 ) -> Result<EncryptedMessage, String> {
-    let keypair = EphemeralKeypair::generate();
-    let our_public = keypair.public_key;
-    let key = keypair
-        .derive_shared_key(&PublicKey::from(*seller_public_key))
-        .ok_or(
-            "this store's published encryption key is not usable (the key exchange produced \
-             no shared secret), so nothing can be encrypted to it",
-        )?;
-    encrypt_message(plaintext, &our_public, &key)
+    let tag: [u8; 32] = buyer_public_key.try_into().map_err(|_| {
+        format!(
+            "conversation tag is {} bytes, not 32",
+            buyer_public_key.len()
+        )
+    })?;
+    seal(
+        &keys.from_seller,
+        &tag,
+        conversation_id,
+        MessageContent::Text(text),
+    )
+}
+
+/// The one place a message is built, whichever direction it travels.
+fn seal(
+    key: &[u8; 32],
+    tag: &[u8; 32],
+    conversation_id: &ConversationId,
+    content: MessageContent,
+) -> Result<EncryptedMessage, String> {
+    encrypt_message(
+        &PlaintextMessage {
+            conversation_id: conversation_id.clone(),
+            content,
+        },
+        tag,
+        key,
+    )
 }
 
 /// One message in a seller's mailbox, as far as this browser can read it.
@@ -148,15 +305,29 @@ pub fn seal_to_seller(
 pub enum MailboxEntry {
     /// Decrypted successfully. The AES-GCM tag verified, so these bytes were
     /// written by someone holding the conversation key -- which for an
-    /// honestly-derived key means the holder of `sender_public_key`.
+    /// honestly-derived key means the holder of `conversation`, or this
+    /// seller themselves.
     Readable {
-        sender_public_key: Vec<u8>,
+        /// The conversation's routing tag: the buyer's ephemeral public key.
+        conversation: Vec<u8>,
+        /// The conversation id the buyer chose, recovered from inside the
+        /// ciphertext.
+        ///
+        /// Carried out rather than discarded because the seller needs it to
+        /// reply: a reply naming a different id is refused by the buyer
+        /// (`a_reply_naming_another_conversation_is_not_shown`), so the only
+        /// place a seller can learn the right one is a message they decrypted.
+        conversation_id: ConversationId,
+        /// Whether the seller wrote it. Decided by WHICH direction key
+        /// authenticated the ciphertext, so it cannot be spoofed by a copy of
+        /// somebody else's message.
+        from_seller: bool,
         timestamp: chrono::DateTime<chrono::Utc>,
         content: MessageContent,
     },
     /// Present and not readable, with the reason.
     Unreadable {
-        sender_public_key: Vec<u8>,
+        conversation: Vec<u8>,
         timestamp: chrono::DateTime<chrono::Utc>,
         why: String,
     },
@@ -169,12 +340,20 @@ impl MailboxEntry {
             | MailboxEntry::Unreadable { timestamp, .. } => *timestamp,
         }
     }
+
+    /// The conversation this entry belongs to, readable or not.
+    pub fn conversation(&self) -> &[u8] {
+        match self {
+            MailboxEntry::Readable { conversation, .. }
+            | MailboxEntry::Unreadable { conversation, .. } => conversation,
+        }
+    }
 }
 
 /// Read a mailbox with whatever conversation keys are on hand.
 ///
-/// `keys` maps a sender's public key to the conversation key the seller's
-/// delegate derived for it. A message whose sender is absent from the map is
+/// `keys` maps a conversation's routing tag to the key pair the seller's
+/// delegate derived for it. A message whose tag is absent from the map is
 /// [`MailboxEntry::Unreadable`] with "no key yet" rather than an error: the
 /// keys arrive from the delegate a round trip after the mailbox state does,
 /// so this is the ordinary state of the screen for a moment.
@@ -187,29 +366,40 @@ impl MailboxEntry {
 /// node.
 pub fn read_mailbox(
     messages: &[EncryptedMessage],
-    keys: &std::collections::HashMap<Vec<u8>, [u8; 32]>,
+    keys: &std::collections::HashMap<Vec<u8>, ConversationKeys>,
 ) -> Vec<MailboxEntry> {
     let mut entries: Vec<MailboxEntry> = messages
         .iter()
         .map(|message| {
-            let Some(key) = keys.get(&message.sender_public_key) else {
+            let conversation = message.sender_public_key.clone();
+            let Some(pair) = keys.get(&conversation) else {
                 return MailboxEntry::Unreadable {
-                    sender_public_key: message.sender_public_key.clone(),
+                    conversation,
                     timestamp: message.timestamp,
                     why: "waiting for the key from your delegate".to_string(),
                 };
             };
-            match decrypt_message(message, key) {
-                Ok(plaintext) => MailboxEntry::Readable {
-                    sender_public_key: message.sender_public_key.clone(),
-                    timestamp: message.timestamp,
-                    content: plaintext.content,
-                },
-                Err(why) => MailboxEntry::Unreadable {
-                    sender_public_key: message.sender_public_key.clone(),
-                    timestamp: message.timestamp,
-                    why,
-                },
+            // Inbound first: it is what a seller opens their mailbox for, and
+            // their own replies are the smaller half.
+            let mut last_error = String::new();
+            for (key, from_seller) in [(&pair.to_seller, false), (&pair.from_seller, true)] {
+                match decrypt_message(message, key) {
+                    Ok(plaintext) => {
+                        return MailboxEntry::Readable {
+                            conversation,
+                            conversation_id: plaintext.conversation_id,
+                            from_seller,
+                            timestamp: message.timestamp,
+                            content: plaintext.content,
+                        }
+                    }
+                    Err(why) => last_error = why,
+                }
+            }
+            MailboxEntry::Unreadable {
+                conversation,
+                timestamp: message.timestamp,
+                why: last_error,
             }
         })
         .collect();
@@ -220,12 +410,16 @@ pub fn read_mailbox(
     entries
 }
 
-/// Encrypt a plaintext message for a recipient.
+/// Encrypt a plaintext message under a conversation key.
+///
+/// `tag` is the conversation's routing tag -- the buyer's ephemeral public
+/// key, whichever direction this message travels. See
+/// [`harvest_common::mailbox::EncryptedMessage::sender_public_key`].
 ///
 /// Returns an `EncryptedMessage` ready to be sent to the mailbox contract.
 pub fn encrypt_message(
     plaintext: &PlaintextMessage,
-    sender_public_key: &PublicKey,
+    tag: &[u8; 32],
     aes_key: &[u8; 32],
 ) -> Result<EncryptedMessage, String> {
     // Serialize the plaintext to CBOR
@@ -253,7 +447,7 @@ pub fn encrypt_message(
 
     Ok(EncryptedMessage {
         conversation_id: plaintext.conversation_id.clone(),
-        sender_public_key: sender_public_key.as_bytes().to_vec(),
+        sender_public_key: tag.to_vec(),
         ciphertext,
         timestamp: chrono::Utc::now(),
         nonce: mailbox_nonce,
@@ -284,217 +478,396 @@ pub fn decrypt_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harvest_common::mailbox::MAX_MESSAGES;
+    use std::collections::HashMap;
+    use x25519_dalek::StaticSecret;
 
-    #[test]
-    fn test_encrypt_decrypt_roundtrip() {
-        let keypair = EphemeralKeypair::generate();
-        let their_keypair = EphemeralKeypair::generate();
-
-        let their_public = their_keypair.public_key;
-        let our_public = keypair.public_key;
-
-        // Both sides derive the same shared key
-        let our_key = keypair
-            .derive_shared_key(&their_public)
-            .expect("contributory");
-        let their_key = their_keypair
-            .derive_shared_key(&our_public)
-            .expect("contributory");
-        assert_eq!(our_key, their_key);
-
-        let conversation_id = ConversationId::random();
-        let plaintext = PlaintextMessage {
-            conversation_id: conversation_id.clone(),
-            content: MessageContent::Text("Hello from buyer!".into()),
-        };
-
-        let encrypted = encrypt_message(&plaintext, &our_public, &our_key).unwrap();
-        assert_ne!(
-            encrypted.ciphertext,
-            harvest_common::to_cbor(&plaintext).unwrap()
-        );
-
-        let decrypted = decrypt_message(&encrypted, &their_key).unwrap();
-        assert_eq!(decrypted.conversation_id, conversation_id);
-        match decrypted.content {
-            MessageContent::Text(s) => assert_eq!(s, "Hello from buyer!"),
-            _ => panic!("wrong message type"),
-        }
+    /// A seller, reconstructed from nothing but a long-term secret -- which
+    /// is what the harvest delegate holds. Deliberately NOT built out of this
+    /// module's own types, so a test cannot pass because the buyer's half and
+    /// the seller's half drifted together.
+    struct Seller {
+        secret: StaticSecret,
     }
 
-    /// The whole buyer path, against a seller reconstructed from nothing but
-    /// a long-term secret.
-    ///
-    /// The seller half here is deliberately NOT this module's code: it is
-    /// X25519 plus [`conversation_key_from_dh`], which is what the harvest
-    /// delegate actually runs. So this fails if the buyer's derivation drifts
-    /// from the shared one -- the failure that produces no error anywhere,
-    /// only messages that stop decrypting.
-    #[test]
-    fn a_sealed_message_is_readable_by_the_seller_who_holds_the_secret() {
-        use x25519_dalek::StaticSecret;
+    impl Seller {
+        fn new(seed: u8) -> Self {
+            Self {
+                secret: StaticSecret::from([seed; 32]),
+            }
+        }
 
-        let seller_secret = StaticSecret::from([17u8; 32]);
-        let seller_public = *PublicKey::from(&seller_secret).as_bytes();
+        fn public_key(&self) -> [u8; 32] {
+            *PublicKey::from(&self.secret).as_bytes()
+        }
 
-        let plaintext = PlaintextMessage {
-            conversation_id: ConversationId::random(),
-            content: MessageContent::Text("is the blue one still available?".into()),
-        };
-        let sealed = seal_to_seller(&seller_public, &plaintext).expect("seal");
-
-        assert_ne!(
-            sealed.sender_public_key, seller_public,
-            "the buyer must send their OWN ephemeral public key, not the seller's"
-        );
-
-        // The seller's side, as the delegate computes it.
-        let peer: [u8; 32] = sealed
-            .sender_public_key
-            .clone()
-            .try_into()
-            .expect("32 bytes");
-        let key = conversation_key_from_dh(
-            &seller_secret
+        /// The keys the delegate would answer for one conversation tag.
+        fn keys_for(&self, tag: &[u8]) -> ConversationKeys {
+            let peer: [u8; 32] = tag.try_into().expect("32-byte tag");
+            let shared = self
+                .secret
                 .diffie_hellman(&PublicKey::from(peer))
-                .to_bytes(),
-        );
-
-        let read = decrypt_message(&sealed, &key).expect("the seller must be able to read it");
-        match read.content {
-            MessageContent::Text(text) => assert_eq!(text, "is the blue one still available?"),
-            other => panic!("wrong content: {other:?}"),
+                .to_bytes();
+            ConversationKeys {
+                to_seller: conversation_key_from_dh(&shared, MessageDirection::BuyerToSeller),
+                from_seller: conversation_key_from_dh(&shared, MessageDirection::SellerToBuyer),
+            }
         }
-        assert_eq!(read.conversation_id, plaintext.conversation_id);
+
+        fn inbox(&self, messages: &[EncryptedMessage]) -> Vec<MailboxEntry> {
+            let mut keys = HashMap::new();
+            for message in messages {
+                if message.sender_public_key.len() == 32 {
+                    keys.insert(
+                        message.sender_public_key.clone(),
+                        self.keys_for(&message.sender_public_key),
+                    );
+                }
+            }
+            read_mailbox(messages, &keys)
+        }
     }
 
-    /// Two messages to the same seller carry different sender keys, so a
-    /// passive observer cannot tell they came from one buyer.
-    ///
-    /// This is what `EphemeralKeypair` is for, and it is a property that a
-    /// perfectly reasonable optimisation -- reusing a keypair per store to
-    /// save an allocation -- would silently delete.
-    #[test]
-    fn each_sealed_message_carries_a_fresh_sender_key() {
-        let seller_public =
-            *PublicKey::from(&x25519_dalek::StaticSecret::from([3u8; 32])).as_bytes();
-        let plaintext = PlaintextMessage {
-            conversation_id: ConversationId::random(),
-            content: MessageContent::Text("hello".into()),
-        };
-
-        let first = seal_to_seller(&seller_public, &plaintext).expect("seal");
-        let second = seal_to_seller(&seller_public, &plaintext).expect("seal");
-
-        assert_ne!(first.sender_public_key, second.sender_public_key);
-        assert_ne!(first.nonce, second.nonce, "nonces must not repeat either");
-    }
-
-    /// The seller's read path, end to end, over a mailbox holding one
-    /// readable message, one whose key has not arrived, and one written by
-    /// somebody the key does not belong to.
-    ///
-    /// The third is the one worth having. A wrong conversation key cannot
-    /// silently produce wrong plaintext -- AES-GCM authenticates -- so the
-    /// only way it can go wrong is by being reported as readable when it is
-    /// not, and this asserts it is not.
-    #[test]
-    fn a_mailbox_is_read_with_the_keys_on_hand_and_says_so_when_it_cannot_be() {
-        use std::collections::HashMap;
-        use x25519_dalek::StaticSecret;
-
-        let seller_secret = StaticSecret::from([21u8; 32]);
-        let seller_public = *PublicKey::from(&seller_secret).as_bytes();
-
-        let mine = seal_to_seller(
-            &seller_public,
-            &PlaintextMessage {
-                conversation_id: ConversationId::random(),
-                content: MessageContent::Text("readable".into()),
-            },
-        )
-        .expect("seal");
-        let unkeyed = seal_to_seller(
-            &seller_public,
-            &PlaintextMessage {
-                conversation_id: ConversationId::random(),
-                content: MessageContent::Text("no key yet".into()),
-            },
-        )
-        .expect("seal");
-        // Written to a DIFFERENT seller, so our key cannot open it -- the
-        // shape a junk deposit into an open-write mailbox takes.
-        let stranger_public = *PublicKey::from(&StaticSecret::from([99u8; 32])).as_bytes();
-        let foreign = seal_to_seller(
-            &stranger_public,
-            &PlaintextMessage {
-                conversation_id: ConversationId::random(),
-                content: MessageContent::Text("not for us".into()),
-            },
-        )
-        .expect("seal");
-
-        let key_for = |message: &EncryptedMessage| -> [u8; 32] {
-            let peer: [u8; 32] = message.sender_public_key.clone().try_into().expect("32");
-            conversation_key_from_dh(
-                &seller_secret
-                    .diffie_hellman(&PublicKey::from(peer))
-                    .to_bytes(),
-            )
-        };
-
-        let mut keys = HashMap::new();
-        keys.insert(mine.sender_public_key.clone(), key_for(&mine));
-        // The foreign message DOES get a key -- the one our secret derives
-        // against its sender -- and it is the wrong key, which is the point.
-        keys.insert(foreign.sender_public_key.clone(), key_for(&foreign));
-
-        let entries = read_mailbox(&[mine.clone(), unkeyed.clone(), foreign.clone()], &keys);
-        assert_eq!(entries.len(), 3, "nothing may be dropped");
-
-        let find = |message: &EncryptedMessage| {
-            entries
-                .iter()
-                .find(|e| match e {
-                    MailboxEntry::Readable {
-                        sender_public_key, ..
-                    }
-                    | MailboxEntry::Unreadable {
-                        sender_public_key, ..
-                    } => sender_public_key == &message.sender_public_key,
-                })
-                .expect("every message must appear")
-                .clone()
-        };
-
-        match find(&mine) {
+    fn text(entry: &MailboxEntry) -> String {
+        match entry {
             MailboxEntry::Readable {
                 content: MessageContent::Text(text),
                 ..
-            } => assert_eq!(text, "readable"),
-            other => panic!("the keyed message should be readable: {other:?}"),
+            } => text.clone(),
+            other => panic!("expected readable text, got {other:?}"),
         }
-        match find(&unkeyed) {
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip() {
+        let seller = Seller::new(11);
+        let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+
+        let sealed = buyer.seal("Hello from buyer!".into()).expect("seal");
+        assert_ne!(
+            sealed.ciphertext,
+            harvest_common::to_cbor(&"Hello from buyer!").unwrap()
+        );
+
+        let inbox = seller.inbox(&[sealed]);
+        assert_eq!(text(&inbox[0]), "Hello from buyer!");
+    }
+
+    /// The whole buyer path, against a seller who exists only as an X25519
+    /// secret -- which is all the delegate is, from this module's point of
+    /// view.
+    #[test]
+    fn a_sealed_message_is_readable_by_the_seller_who_holds_the_secret() {
+        let seller = Seller::new(17);
+        let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+
+        let sealed = buyer
+            .seal("is the blue one still available?".into())
+            .expect("seal");
+
+        assert_ne!(
+            sealed.sender_public_key,
+            seller.public_key().to_vec(),
+            "the tag must be the BUYER's key, not the seller's"
+        );
+        assert_eq!(sealed.sender_public_key, buyer.buyer_public_key.to_vec());
+
+        let inbox = seller.inbox(&[sealed]);
+        assert_eq!(text(&inbox[0]), "is the blue one still available?");
+        match &inbox[0] {
+            MailboxEntry::Readable { from_seller, .. } => {
+                assert!(!from_seller, "an inbound message is not the seller's own")
+            }
+            other => panic!("expected readable: {other:?}"),
+        }
+    }
+
+    /// The seller replies into their own mailbox and the buyer reads it --
+    /// with no buyer mailbox, no buyer identity and no second contract.
+    #[test]
+    fn the_seller_replies_into_their_own_mailbox_and_the_buyer_reads_it() {
+        let seller = Seller::new(23);
+        let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+
+        let question = buyer.seal("do you ship to Ireland?".into()).expect("seal");
+
+        // The seller reads it, learns the conversation, and answers.
+        let keys = seller.keys_for(&question.sender_public_key);
+        let reply = seal_reply(
+            &keys,
+            &question.sender_public_key,
+            &buyer.conversation_id,
+            "yes, ten euro postage".into(),
+        )
+        .expect("reply");
+
+        let mailbox = vec![question.clone(), reply.clone()];
+        let thread = buyer.read(&mailbox);
+
+        assert_eq!(thread.len(), 2, "the buyer sees both halves");
+        assert!(!thread[0].from_seller, "oldest first: the buyer's question");
+        assert!(thread[1].from_seller, "then the seller's reply");
+        assert_eq!(
+            thread[1].content,
+            MessageContent::Text("yes, ten euro postage".into())
+        );
+        assert_eq!(
+            thread[0].nonce, question.nonce,
+            "the buyer's own message is identified by its nonce, so a caller can tell it landed"
+        );
+    }
+
+    /// **A copy of the buyer's own message must not read as a reply.**
+    ///
+    /// Anyone can read the mailbox and anyone can write to it, so this attack
+    /// is a copy and a paste: no key, no relationship with either party. The
+    /// message it would forge is the one the buyer is waiting for, and in the
+    /// phase this mechanism exists for that message is the buyer's only
+    /// authorization to complain.
+    ///
+    /// Direction separation makes it impossible rather than detectable.
+    /// Observed red on 2026-09-05 by deriving both keys under
+    /// `MessageDirection::BuyerToSeller`.
+    #[test]
+    fn a_copy_of_the_buyers_own_message_does_not_read_as_a_reply() {
+        let seller = Seller::new(29);
+        let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+
+        let original = buyer.seal("I will pay tomorrow".into()).expect("seal");
+
+        // The forgery: the same ciphertext, re-tagged with a nonce that has
+        // not been used, which is the most an attacker can do without a key.
+        // (A verbatim copy is refused by the mailbox's own nonce dedup, so it
+        // would not even arrive.)
+        let mut forged = original.clone();
+        forged.nonce = [0xAB; 24];
+
+        let thread = buyer.read(&[original.clone(), forged]);
+
+        assert!(
+            thread.iter().all(|message| !message.from_seller),
+            "a copy of the buyer's own message was presented as a reply from the seller"
+        );
+        // And the original is still readable, so the assertion above is not
+        // passing because nothing decrypted at all.
+        assert_eq!(thread.len(), 1, "the re-nonced copy does not authenticate");
+        assert_eq!(
+            thread[0].content,
+            MessageContent::Text("I will pay tomorrow".into())
+        );
+    }
+
+    /// A reply carrying a different conversation id is not shown, even though
+    /// it decrypts.
+    ///
+    /// Only the seller holds the key, so this is not an outsider attack -- it
+    /// is a splice, moving an answer from one of this buyer's conversations
+    /// into another. Cheap to refuse, and it makes `conversation_id` mean
+    /// something rather than being carried and ignored.
+    #[test]
+    fn a_reply_naming_another_conversation_is_not_shown() {
+        let seller = Seller::new(31);
+        let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+        let keys = seller.keys_for(&buyer.buyer_public_key);
+
+        let honest = seal_reply(
+            &keys,
+            &buyer.buyer_public_key,
+            &buyer.conversation_id,
+            "yours".into(),
+        )
+        .expect("reply");
+        let spliced = seal_reply(
+            &keys,
+            &buyer.buyer_public_key,
+            &ConversationId([0xEE; 32]),
+            "somebody else's".into(),
+        )
+        .expect("reply");
+
+        let thread = buyer.read(&[honest, spliced]);
+        assert_eq!(thread.len(), 1);
+        assert_eq!(thread[0].content, MessageContent::Text("yours".into()));
+    }
+
+    /// A buyer sees their own conversation and nobody else's, out of a
+    /// mailbox holding both.
+    #[test]
+    fn a_buyer_sees_only_their_own_conversation() {
+        let seller = Seller::new(37);
+        let alice = BuyerConversation::open(&seller.public_key()).expect("open");
+        let bob = BuyerConversation::open(&seller.public_key()).expect("open");
+
+        let mailbox = vec![
+            alice.seal("alice here".into()).expect("seal"),
+            bob.seal("bob here".into()).expect("seal"),
+        ];
+
+        let alices = alice.read(&mailbox);
+        assert_eq!(alices.len(), 1);
+        assert_eq!(alices[0].content, MessageContent::Text("alice here".into()));
+
+        // The seller sees both, and they are separate conversations.
+        let inbox = seller.inbox(&mailbox);
+        assert_eq!(inbox.len(), 2);
+        assert_ne!(inbox[0].conversation(), inbox[1].conversation());
+    }
+
+    /// **The worst case a buyer can be pushed into**, which is not the same
+    /// as the common case.
+    ///
+    /// The routing tag is in the clear in a public mailbox, so an attacker
+    /// can read a buyer's tag and stamp it on a full cap's worth of entries.
+    /// The buyer then attempts decryption against all of them. This asserts
+    /// the buyer still finds their own thread and reports nothing else --
+    /// the cost of doing so is measured separately and recorded in
+    /// `docs/messaging-privacy.md`.
+    #[test]
+    fn a_full_cap_flood_tagged_with_the_buyers_key_does_not_hide_their_thread() {
+        let seller = Seller::new(41);
+        let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+
+        let mine = buyer.seal("mine".into()).expect("seal");
+        let mut mailbox = vec![mine.clone()];
+        for i in 0..(MAX_MESSAGES - 1) {
+            let mut junk = mine.clone();
+            junk.nonce = {
+                let mut nonce = [0u8; 24];
+                nonce[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                nonce
+            };
+            junk.ciphertext = vec![0xCD; 1024];
+            mailbox.push(junk);
+        }
+        assert_eq!(mailbox.len(), MAX_MESSAGES);
+
+        let thread = buyer.read(&mailbox);
+        assert_eq!(thread.len(), 1, "only the real message authenticates");
+        assert_eq!(thread[0].content, MessageContent::Text("mine".into()));
+    }
+
+    /// Two conversations with the same seller carry different tags, so a
+    /// passive observer cannot tell they came from one buyer.
+    ///
+    /// This is what `EphemeralSecret` is for, and it is a property that a
+    /// perfectly reasonable optimisation -- one keypair per store, reused --
+    /// would silently delete.
+    #[test]
+    fn each_conversation_carries_a_fresh_tag() {
+        let seller = Seller::new(43);
+        let first = BuyerConversation::open(&seller.public_key()).expect("open");
+        let second = BuyerConversation::open(&seller.public_key()).expect("open");
+
+        assert_ne!(first.buyer_public_key, second.buyer_public_key);
+        assert_ne!(first.conversation_id, second.conversation_id);
+
+        let a = first.seal("hello".into()).expect("seal");
+        let b = first.seal("hello".into()).expect("seal");
+        assert_ne!(a.nonce, b.nonce, "nonces must not repeat within one thread");
+    }
+
+    /// The seller's read path, over a mailbox holding one readable message,
+    /// one whose key has not arrived, one written to somebody else, and one
+    /// of the seller's own replies.
+    #[test]
+    fn a_mailbox_is_read_with_the_keys_on_hand_and_says_so_when_it_cannot_be() {
+        let seller = Seller::new(21);
+        let stranger = Seller::new(99);
+
+        let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+        let unkeyed_buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+        let foreign_buyer = BuyerConversation::open(&stranger.public_key()).expect("open");
+
+        let mine = buyer.seal("readable".into()).expect("seal");
+        let unkeyed = unkeyed_buyer.seal("no key yet".into()).expect("seal");
+        let foreign = foreign_buyer.seal("not for us".into()).expect("seal");
+        let own_reply = seal_reply(
+            &seller.keys_for(&buyer.buyer_public_key),
+            &buyer.buyer_public_key,
+            &buyer.conversation_id,
+            "answered".into(),
+        )
+        .expect("reply");
+
+        let mut keys = HashMap::new();
+        keys.insert(
+            mine.sender_public_key.clone(),
+            seller.keys_for(&mine.sender_public_key),
+        );
+        // The foreign message DOES get a key -- the one our secret derives
+        // against its tag -- and it is the wrong key, which is the point.
+        keys.insert(
+            foreign.sender_public_key.clone(),
+            seller.keys_for(&foreign.sender_public_key),
+        );
+        keys.insert(
+            own_reply.sender_public_key.clone(),
+            seller.keys_for(&own_reply.sender_public_key),
+        );
+
+        let entries = read_mailbox(
+            &[
+                mine.clone(),
+                unkeyed.clone(),
+                foreign.clone(),
+                own_reply.clone(),
+            ],
+            &keys,
+        );
+        assert_eq!(entries.len(), 4, "nothing may be dropped");
+
+        // Located by (tag, timestamp) rather than by position, because
+        // `read_mailbox` reorders.
+        let by_nonce = |nonce: [u8; 24]| -> &MailboxEntry {
+            let index = [mine.nonce, unkeyed.nonce, foreign.nonce, own_reply.nonce]
+                .iter()
+                .position(|candidate| *candidate == nonce)
+                .expect("known nonce");
+            let sources = [&mine, &unkeyed, &foreign, &own_reply];
+            let source = sources[index];
+            entries
+                .iter()
+                .find(|entry| {
+                    entry.conversation() == source.sender_public_key
+                        && entry.timestamp() == source.timestamp
+                })
+                .expect("every message must appear")
+        };
+
+        assert_eq!(text(by_nonce(mine.nonce)), "readable");
+        match by_nonce(unkeyed.nonce) {
             MailboxEntry::Unreadable { why, .. } => assert!(
                 why.contains("waiting"),
                 "a missing key must be reported as temporary: {why}"
             ),
             other => panic!("expected an unreadable entry: {other:?}"),
         }
-        match find(&foreign) {
+        match by_nonce(foreign.nonce) {
             MailboxEntry::Unreadable { why, .. } => assert!(
                 !why.contains("waiting"),
                 "a message that will never decrypt must not read as merely pending: {why}"
             ),
             other => panic!("a message we hold no key for must not read as decrypted: {other:?}"),
         }
+        match by_nonce(own_reply.nonce) {
+            MailboxEntry::Readable {
+                from_seller,
+                content,
+                ..
+            } => {
+                assert!(
+                    from_seller,
+                    "the seller's own reply must be labelled as theirs"
+                );
+                assert_eq!(content, &MessageContent::Text("answered".into()));
+            }
+            other => panic!("the seller must be able to read their own reply: {other:?}"),
+        }
     }
 
     /// Newest first, so a busy mailbox shows the message that just arrived.
     #[test]
     fn a_mailbox_is_read_newest_first() {
-        use std::collections::HashMap;
-
         let at = |secs: i64, nonce: u8| EncryptedMessage {
             conversation_id: ConversationId([0u8; 32]),
             sender_public_key: vec![nonce; 32],
@@ -511,12 +884,8 @@ mod tests {
     /// A low-order "public key" is refused rather than encrypted to under a
     /// key the whole world can compute.
     #[test]
-    fn sealing_to_an_all_zero_key_is_refused() {
-        let plaintext = PlaintextMessage {
-            conversation_id: ConversationId::random(),
-            content: MessageContent::Text("hello".into()),
-        };
-        let error = seal_to_seller(&[0u8; 32], &plaintext).expect_err("must be refused");
+    fn opening_a_conversation_with_an_all_zero_key_is_refused() {
+        let error = BuyerConversation::open(&[0u8; 32]).expect_err("must be refused");
         assert!(
             error.contains("not usable"),
             "the refusal must say why: {error}"

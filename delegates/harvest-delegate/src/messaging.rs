@@ -31,7 +31,7 @@
 
 use freenet_migrate::SecretStore;
 use harvest_common::delegate::{ConversationKey, HarvestDelegateResponse, RequestId};
-use harvest_common::mailbox::conversation_key_from_dh;
+use harvest_common::mailbox::{conversation_key_from_dh, MessageDirection};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Where this identity's X25519 secret lives.
@@ -147,9 +147,11 @@ pub(crate) fn derive_conversation_keys<S: SecretStore>(
             if !shared.was_contributory() {
                 return None;
             }
+            let shared = shared.to_bytes();
             Some(ConversationKey {
                 peer_public_key: peer.clone(),
-                key: conversation_key_from_dh(&shared.to_bytes()),
+                buyer_to_seller: conversation_key_from_dh(&shared, MessageDirection::BuyerToSeller),
+                seller_to_buyer: conversation_key_from_dh(&shared, MessageDirection::SellerToBuyer),
             })
         })
         .collect();
@@ -271,11 +273,11 @@ mod tests {
         // `conversation_key_from_dh`.
         let buyer_secret = StaticSecret::from([42u8; 32]);
         let buyer_public = PublicKey::from(&buyer_secret);
-        let buyers_key = conversation_key_from_dh(
-            &buyer_secret
-                .diffie_hellman(&PublicKey::from(seller_public))
-                .to_bytes(),
-        );
+        let shared = buyer_secret
+            .diffie_hellman(&PublicKey::from(seller_public))
+            .to_bytes();
+        let buyers_write_key = conversation_key_from_dh(&shared, MessageDirection::BuyerToSeller);
+        let buyers_read_key = conversation_key_from_dh(&shared, MessageDirection::SellerToBuyer);
 
         let derived = keys(&derive_conversation_keys(
             &store,
@@ -291,8 +293,16 @@ mod tests {
             "the answer must echo the key it was derived against"
         );
         assert_eq!(
-            derived[0].key, buyers_key,
-            "the seller and the buyer derived different conversation keys"
+            derived[0].buyer_to_seller, buyers_write_key,
+            "the seller cannot read what the buyer wrote"
+        );
+        assert_eq!(
+            derived[0].seller_to_buyer, buyers_read_key,
+            "the buyer cannot read what the seller replies"
+        );
+        assert_ne!(
+            derived[0].buyer_to_seller, derived[0].seller_to_buyer,
+            "one key for both directions makes a copied message read as a reply"
         );
     }
 
@@ -339,7 +349,11 @@ mod tests {
                 .iter()
                 .find(|k| k.peer_public_key == expected.peer_public_key)
                 .expect("every well-formed peer key must still be answered");
-            assert_eq!(&found.key, &expected.key, "a key moved to another buyer");
+            assert_eq!(
+                &found.buyer_to_seller, &expected.buyer_to_seller,
+                "a key moved to another buyer"
+            );
+            assert_eq!(&found.seller_to_buyer, &expected.seller_to_buyer);
         }
     }
 

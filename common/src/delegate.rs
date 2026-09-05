@@ -255,14 +255,23 @@ pub enum HarvestDelegateResponse {
     },
 }
 
-/// One buyer's ephemeral public key and the conversation key derived from it.
+/// One buyer's ephemeral public key and BOTH conversation keys derived from
+/// it.
+///
+/// Both, because the seller needs both: `buyer_to_seller` to read what
+/// arrived, `seller_to_buyer` to write the reply. Answering only the first
+/// would put the seller a second delegate round trip away from replying, and
+/// answering a single undirected key would let a copy of the buyer's own
+/// message read as a reply -- see [`crate::mailbox::MessageDirection`].
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct ConversationKey {
-    /// The buyer ephemeral public key this was derived against, echoed back
+    /// The buyer ephemeral public key these were derived against, echoed back
     /// so the caller does not have to rely on ordering.
     pub peer_public_key: Vec<u8>,
-    /// AES-256 key, from [`crate::mailbox::conversation_key_from_dh`].
-    pub key: [u8; 32],
+    /// AES-256 key for messages the buyer wrote.
+    pub buyer_to_seller: [u8; 32],
+    /// AES-256 key for the seller's replies.
+    pub seller_to_buyer: [u8; 32],
 }
 
 /// A store's contract IDs, registered with the delegate for notifications.

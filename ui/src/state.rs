@@ -124,7 +124,7 @@ pub struct AppState {
     /// back as `MailboxEntry::Unreadable`, not as wrong plaintext. Buyer
     /// ephemeral keys are freshly random per message in any case, so a
     /// collision needs a deliberate one.
-    pub conversation_keys: HashMap<Vec<u8>, [u8; 32]>,
+    pub conversation_keys: HashMap<Vec<u8>, crate::messaging::ConversationKeys>,
 
     /// `DeriveConversationKeys` requests in flight, as request id -> the
     /// buyer public keys that request asked about.
@@ -822,6 +822,13 @@ pub struct BrowsingStore {
     pub feedback: Vec<FeedbackEntry>,
     /// Encrypted messages from the mailbox contract.
     pub mailbox_messages: Vec<EncryptedMessage>,
+    /// The buyer's half of a conversation with this store, opened on the
+    /// first message and held for the life of the tab.
+    ///
+    /// `None` for a store this browser has never written to, and for the
+    /// seller's own store -- a seller does not open a conversation with
+    /// themselves.
+    pub conversation: Option<crate::messaging::BuyerConversation>,
     /// Messages THIS browser sent to this store, kept locally because there
     /// is nowhere else for them.
     ///
@@ -843,6 +850,10 @@ pub struct BrowsingStore {
 pub struct SentMessage {
     pub text: String,
     pub sent_at: chrono::DateTime<chrono::Utc>,
+    /// The mailbox nonce this message was sealed under, so its appearance in
+    /// the mailbox can be recognised. The only delivery evidence available:
+    /// see [`AppState::unconfirmed_sent`].
+    pub nonce: [u8; 24],
 }
 
 /// GET-and-subscribe a contract we learned about from a delegate
@@ -1485,7 +1496,13 @@ impl AppState {
                     keys.len()
                 );
                 for key in keys {
-                    self.conversation_keys.insert(key.peer_public_key, key.key);
+                    self.conversation_keys.insert(
+                        key.peer_public_key,
+                        crate::messaging::ConversationKeys {
+                            to_seller: key.buyer_to_seller,
+                            from_seller: key.seller_to_buyer,
+                        },
+                    );
                 }
             }
             // Reported rather than swallowed. The visible symptom otherwise
@@ -1533,12 +1550,134 @@ impl AppState {
         let _ = request;
     }
 
+    /// Seal a buyer's message to a store, opening the conversation if this
+    /// is the first one.
+    ///
+    /// One conversation per store per tab. A second message reuses it, which
+    /// is what makes it a thread rather than a series of unrelated notes the
+    /// seller cannot connect -- and what lets a reply to the first message
+    /// still be readable after the second is sent.
+    ///
+    /// Returns the sealed message for the caller to dispatch. Sealing and
+    /// dispatching are separate because the dispatch needs a browser and this
+    /// decides what gets sent.
+    pub fn compose_to_seller(
+        &mut self,
+        store_contract_id: &[u8],
+        seller_encryption_key: &[u8; 32],
+        text: String,
+    ) -> Result<harvest_common::mailbox::EncryptedMessage, String> {
+        let store = self
+            .browsing_stores
+            .entry(store_contract_id.to_vec())
+            .or_default();
+        let conversation = match store.conversation.as_ref() {
+            Some(conversation) => conversation,
+            None => store
+                .conversation
+                .insert(crate::messaging::BuyerConversation::open(
+                    seller_encryption_key,
+                )?),
+        };
+        conversation.seal(text)
+    }
+
+    /// The buyer's thread with this store, oldest first.
+    ///
+    /// Empty for a store this browser has never written to -- there is no
+    /// conversation, so there is nothing in the mailbox that could be theirs.
+    pub fn conversation_thread(
+        &self,
+        store_contract_id: &[u8],
+    ) -> Vec<crate::messaging::ConversationMessage> {
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return Vec::new();
+        };
+        let Some(conversation) = store.conversation.as_ref() else {
+            return Vec::new();
+        };
+        conversation.read(&store.mailbox_messages)
+    }
+
+    /// Messages this browser handed to the node that have not yet turned up
+    /// in the seller's mailbox.
+    ///
+    /// The distinction is the only delivery signal Harvest has. Nothing
+    /// confirms an update was applied -- `UpdateResponse` carries no
+    /// correlation id -- but a message that appears in the mailbox the buyer
+    /// re-reads has demonstrably landed, and one that does not, has not yet.
+    pub fn unconfirmed_sent(&self, store_contract_id: &[u8]) -> Vec<SentMessage> {
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return Vec::new();
+        };
+        let landed: std::collections::HashSet<[u8; 24]> = store
+            .mailbox_messages
+            .iter()
+            .map(|message| message.nonce)
+            .collect();
+        store
+            .sent_messages
+            .iter()
+            .filter(|sent| !landed.contains(&sent.nonce))
+            .cloned()
+            .collect()
+    }
+
+    /// Seal a seller's reply to one conversation in their own mailbox.
+    ///
+    /// # Why this needs a message the seller has already read
+    ///
+    /// A reply must name the conversation id the BUYER chose: the buyer
+    /// refuses one that names anything else, which is what stops an answer
+    /// being spliced from one of their conversations into another. That id
+    /// lives inside the ciphertext, so the only place a seller can learn it
+    /// is a message they decrypted. "Reply without having read" is therefore
+    /// not something that can be done, and refusing is better than sending
+    /// bytes the buyer silently discards.
+    pub fn compose_reply(
+        &self,
+        store_contract_id: &[u8],
+        conversation_tag: &[u8],
+        text: String,
+    ) -> Result<harvest_common::mailbox::EncryptedMessage, String> {
+        if self.store_owner_fingerprint(store_contract_id).is_none() {
+            return Err(
+                "this store is not one of yours -- only the seller can reply into its mailbox"
+                    .to_string(),
+            );
+        }
+        let keys = self
+            .conversation_keys
+            .get(conversation_tag)
+            .ok_or("your delegate has not produced this conversation's key yet")?;
+
+        // The newest message this seller could read in this conversation.
+        // `mailbox_entries` is newest-first, so the first match is it.
+        let conversation_id = self
+            .mailbox_entries(store_contract_id)
+            .into_iter()
+            .find_map(|entry| match entry {
+                crate::messaging::MailboxEntry::Readable {
+                    conversation,
+                    conversation_id,
+                    ..
+                } if conversation == conversation_tag => Some(conversation_id),
+                _ => None,
+            })
+            .ok_or(
+                "no message in this conversation has been read yet, so there is no conversation \
+                 to reply to",
+            )?;
+
+        crate::messaging::seal_reply(keys, conversation_tag, &conversation_id, text)
+    }
+
     /// Record a message this browser sent, so the buyer can see what they
     /// wrote.
     ///
     /// Local to the tab and deliberately so -- see
     /// [`BrowsingStore::sent_messages`].
-    pub fn record_sent_message(&mut self, store_contract_id: &[u8], text: String) {
+    pub fn record_sent_message(&mut self, store_contract_id: &[u8], text: String, nonce: [u8; 24]) {
         self.browsing_stores
             .entry(store_contract_id.to_vec())
             .or_default()
@@ -1546,6 +1685,7 @@ impl AppState {
             .push(SentMessage {
                 text,
                 sent_at: chrono::Utc::now(),
+                nonce,
             });
     }
 
@@ -4329,7 +4469,8 @@ mod tests {
                 ghostkey_fingerprint: "fp".to_string(),
                 result: Ok(vec![harvest_common::ConversationKey {
                     peer_public_key: vec![2u8; 32],
-                    key: [3u8; 32],
+                    buyer_to_seller: [3u8; 32],
+                    seller_to_buyer: [4u8; 32],
                 }]),
             },
             HarvestDelegateResponse::ConversationKeys {
@@ -5207,7 +5348,7 @@ mod authorized_order_tests {
 #[cfg(test)]
 mod mailbox_read_tests {
     use super::*;
-    use harvest_common::mailbox::{conversation_key_from_dh, ConversationId, EncryptedMessage};
+    use harvest_common::mailbox::{conversation_key_from_dh, EncryptedMessage, MessageDirection};
     use harvest_common::ConversationKey;
     use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -5249,14 +5390,11 @@ mod mailbox_read_tests {
 
     fn conversation(text: &str) -> Conversation {
         let seller = StaticSecret::from([21u8; 32]);
-        let message = crate::messaging::seal_to_seller(
-            PublicKey::from(&seller).as_bytes(),
-            &crate::messaging::PlaintextMessage {
-                conversation_id: ConversationId::random(),
-                content: crate::messaging::MessageContent::Text(text.to_string()),
-            },
-        )
-        .expect("seal");
+        let message =
+            crate::messaging::BuyerConversation::open(PublicKey::from(&seller).as_bytes())
+                .expect("open")
+                .seal(text.to_string())
+                .expect("seal");
         Conversation { seller, message }
     }
 
@@ -5269,14 +5407,14 @@ mod mailbox_read_tests {
                 .clone()
                 .try_into()
                 .expect("32 bytes");
+            let shared = self
+                .seller
+                .diffie_hellman(&PublicKey::from(peer))
+                .to_bytes();
             ConversationKey {
                 peer_public_key: self.message.sender_public_key.clone(),
-                key: conversation_key_from_dh(
-                    &self
-                        .seller
-                        .diffie_hellman(&PublicKey::from(peer))
-                        .to_bytes(),
-                ),
+                buyer_to_seller: conversation_key_from_dh(&shared, MessageDirection::BuyerToSeller),
+                seller_to_buyer: conversation_key_from_dh(&shared, MessageDirection::SellerToBuyer),
             }
         }
     }
@@ -5549,5 +5687,262 @@ mod mailbox_read_tests {
             "the seller must be told, or the key silently never appears: {:?}",
             state.notifications
         );
+    }
+}
+
+/// The reply path: a buyer's thread with a store, and the seller's answer,
+/// both carried by the seller's own mailbox.
+///
+/// Every one of these runs on the host. The only wasm-gated part is the
+/// dispatch, which is why the decisions live here.
+#[cfg(test)]
+mod conversation_tests {
+    use super::*;
+    use crate::messaging::MessageContent;
+    use harvest_common::mailbox::{conversation_key_from_dh, EncryptedMessage, MessageDirection};
+    use harvest_common::ConversationKey;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    const STORE: &[u8] = &[1u8; 32];
+    const FINGERPRINT: &str = "fp1";
+
+    fn seller_secret() -> StaticSecret {
+        StaticSecret::from([21u8; 32])
+    }
+
+    fn seller_public() -> [u8; 32] {
+        *PublicKey::from(&seller_secret()).as_bytes()
+    }
+
+    /// A browser that is only browsing: it owns no store.
+    fn buyer_state() -> AppState {
+        let mut state = AppState::default();
+        state.browsing_stores.entry(STORE.to_vec()).or_default();
+        state
+    }
+
+    /// A browser whose connected identity owns the store, so the seller's
+    /// half of the path is reachable.
+    fn seller_state() -> AppState {
+        let mut state = AppState::default();
+        state.my_stores.insert(
+            FINGERPRINT.to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![3u8; 32],
+                mailbox_contract_id: vec![4u8; 32],
+                store_contract_key: None,
+            }],
+        );
+        state.browsing_stores.entry(STORE.to_vec()).or_default();
+        state
+    }
+
+    /// The answer the delegate would give for one conversation tag.
+    fn delegate_answer(tag: &[u8]) -> ConversationKey {
+        let peer: [u8; 32] = tag.try_into().expect("32-byte tag");
+        let shared = seller_secret()
+            .diffie_hellman(&PublicKey::from(peer))
+            .to_bytes();
+        ConversationKey {
+            peer_public_key: tag.to_vec(),
+            buyer_to_seller: conversation_key_from_dh(&shared, MessageDirection::BuyerToSeller),
+            seller_to_buyer: conversation_key_from_dh(&shared, MessageDirection::SellerToBuyer),
+        }
+    }
+
+    /// Put a message into the store's mailbox as the network would.
+    fn deliver(state: &mut AppState, message: EncryptedMessage) {
+        state
+            .browsing_stores
+            .entry(STORE.to_vec())
+            .or_default()
+            .mailbox_messages
+            .push(message);
+    }
+
+    fn text(content: &MessageContent) -> &str {
+        match content {
+            MessageContent::Text(text) => text,
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// One conversation per store, reused.
+    ///
+    /// A second message that opened a NEW conversation would be readable by
+    /// the seller, so nothing would look broken -- but the reply to the first
+    /// message would become unreadable the moment the second was sent, and
+    /// the buyer would see a thread that silently loses its own history.
+    #[test]
+    fn a_second_message_continues_the_same_conversation() {
+        let mut state = buyer_state();
+
+        let first = state
+            .compose_to_seller(STORE, &seller_public(), "hello".into())
+            .expect("compose");
+        let second = state
+            .compose_to_seller(STORE, &seller_public(), "still there?".into())
+            .expect("compose");
+
+        assert_eq!(
+            first.sender_public_key, second.sender_public_key,
+            "a second message must continue the conversation, not open a new one"
+        );
+        assert_ne!(first.nonce, second.nonce);
+    }
+
+    /// **The path the whole next phase rests on**, end to end through
+    /// `AppState`: buyer writes, seller reads, seller replies into their own
+    /// mailbox, buyer reads the reply. No buyer mailbox, no buyer identity.
+    #[test]
+    fn a_seller_replies_into_their_own_mailbox_and_the_buyer_reads_it() {
+        // The buyer's browser.
+        let mut buyer = buyer_state();
+        let question = buyer
+            .compose_to_seller(STORE, &seller_public(), "do you ship to Ireland?".into())
+            .expect("compose");
+
+        // The seller's browser: the same mailbox, and the delegate round
+        // trip driven the way the real one is -- ask, then answer the id that
+        // was asked. An answer to an id nothing asked for is ignored, which
+        // is its own test.
+        let mut seller = seller_state();
+        deliver(&mut seller, question.clone());
+        let asked = seller.conversation_keys_to_request(STORE).expect("asks");
+        let request_id = match &asked {
+            harvest_common::HarvestDelegateRequest::DeriveConversationKeys {
+                request_id, ..
+            } => *request_id,
+            other => panic!("expected DeriveConversationKeys, got {other:?}"),
+        };
+        seller.on_delegate_response(HarvestDelegateResponse::ConversationKeys {
+            request_id,
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            result: Ok(vec![delegate_answer(&question.sender_public_key)]),
+        });
+
+        // The seller can read it, and can answer it.
+        let inbox = seller.mailbox_entries(STORE);
+        assert_eq!(inbox.len(), 1);
+        let reply = seller
+            .compose_reply(
+                STORE,
+                &question.sender_public_key,
+                "yes, ten euro postage".into(),
+            )
+            .expect("the seller must be able to reply");
+
+        // The reply reaches the buyer through the same mailbox.
+        deliver(&mut buyer, question.clone());
+        deliver(&mut buyer, reply);
+
+        let thread = buyer.conversation_thread(STORE);
+        assert_eq!(thread.len(), 2, "the buyer sees both halves");
+        assert!(!thread[0].from_seller);
+        assert!(thread[1].from_seller, "the reply must be the seller's");
+        assert_eq!(text(&thread[1].content), "yes, ten euro postage");
+    }
+
+    /// A seller cannot reply to a conversation they have not read.
+    ///
+    /// The reply has to name the conversation id the buyer chose, and the
+    /// only place that id exists is inside a message the seller decrypted --
+    /// so "reply" without "read" is not a thing that can be done, and saying
+    /// so is better than sending something the buyer silently discards.
+    #[test]
+    fn a_seller_cannot_reply_to_a_conversation_they_have_not_read() {
+        let mut seller = seller_state();
+        // The key is present, so this is not the "no key yet" refusal -- it
+        // is the one about there being no conversation.
+        let tag = {
+            let buyer = crate::messaging::BuyerConversation::open(&seller_public()).expect("open");
+            buyer.buyer_public_key.to_vec()
+        };
+        let answer = delegate_answer(&tag);
+        seller.conversation_keys.insert(
+            tag.clone(),
+            crate::messaging::ConversationKeys {
+                to_seller: answer.buyer_to_seller,
+                from_seller: answer.seller_to_buyer,
+            },
+        );
+
+        let error = seller
+            .compose_reply(STORE, &tag, "hello?".into())
+            .expect_err("must refuse");
+        assert!(
+            error.contains("no message"),
+            "the refusal must say what is missing: {error}"
+        );
+    }
+
+    /// The other refusal, kept separate because it is a different situation
+    /// with a different fix: the delegate has not answered yet, so waiting
+    /// helps.
+    #[test]
+    fn a_seller_without_the_key_is_told_to_wait_rather_than_told_there_is_no_conversation() {
+        let seller = seller_state();
+        let error = seller
+            .compose_reply(STORE, &[9u8; 32], "hello?".into())
+            .expect_err("must refuse");
+        assert!(
+            error.contains("delegate has not produced"),
+            "a missing key must not be reported as a missing conversation: {error}"
+        );
+    }
+
+    /// And a browser that does not own the store cannot reply into its
+    /// mailbox at all -- it holds no key for the conversation and would be
+    /// writing bytes nobody can read.
+    #[test]
+    fn a_buyer_cannot_reply_on_a_sellers_behalf() {
+        let mut buyer = buyer_state();
+        let question = buyer
+            .compose_to_seller(STORE, &seller_public(), "hello".into())
+            .expect("compose");
+        deliver(&mut buyer, question.clone());
+
+        let error = buyer
+            .compose_reply(
+                STORE,
+                &question.sender_public_key,
+                "not mine to send".into(),
+            )
+            .expect_err("must refuse");
+        assert!(error.contains("not one of yours"), "got: {error}");
+    }
+
+    /// A message is unconfirmed until it turns up in the mailbox the buyer
+    /// re-reads. That is the only delivery evidence Harvest has, and the
+    /// distinction is what the UI shows instead of claiming delivery.
+    #[test]
+    fn a_sent_message_is_unconfirmed_until_it_appears_in_the_mailbox() {
+        let mut buyer = buyer_state();
+        let sent = buyer
+            .compose_to_seller(STORE, &seller_public(), "hello".into())
+            .expect("compose");
+        buyer.record_sent_message(STORE, "hello".into(), sent.nonce);
+
+        assert_eq!(
+            buyer.unconfirmed_sent(STORE).len(),
+            1,
+            "nothing has come back from the network yet"
+        );
+
+        deliver(&mut buyer, sent);
+        assert!(
+            buyer.unconfirmed_sent(STORE).is_empty(),
+            "a message visible in the seller's mailbox has demonstrably landed"
+        );
+    }
+
+    /// A store this browser has never written to has no thread, rather than
+    /// a panic or an empty conversation that looks like one.
+    #[test]
+    fn a_store_with_no_conversation_has_no_thread() {
+        let state = buyer_state();
+        assert!(state.conversation_thread(STORE).is_empty());
+        assert!(state.unconfirmed_sent(STORE).is_empty());
     }
 }

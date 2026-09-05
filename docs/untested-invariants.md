@@ -146,7 +146,12 @@ is the only way this file stays a record rather than an archaeology exercise.
 | Where | Claim | Caught? |
 |---|---|---|
 | `ui/src/gateway/mailbox_ops.rs::send_message` | A client GET primes the local node's store, so issuing one before the update gives the node the contract it is about to run. | **No, and it cannot be here.** Nothing in this repository can reach a node. The doc comment says so in those words rather than asserting the send works; the whole path is unexercised against a live node. |
-| same | The GET-then-update race is tolerable. | **No.** Both calls resolve on WebSocket send, so the ordering at the node is not observable from here. Stated as a residual in the comment, not as a property. |
+| same | The GET-then-update race is tolerable. | **No.** Both calls resolve on WebSocket send, so the ordering at the node is not observable from here. The call site now records what is known, what is not, what the failure looks like when the race is lost (message stays permanently in `unconfirmed_sent`, seller never receives it, buyer is not told), and why a sleep or retry must not be added. Characterising it needs `tests/rehearsal/` and a node. |
+| `ui/src/components/message_view.rs::send` | The buyer's subscription to the seller's mailbox actually delivers replies. | **No.** The subscribe is a wasm-gated `register_store_mailbox` and the delivery is the network's. What IS tested is everything either side of it: that a reply the buyer *receives* is read correctly (`a_seller_replies_into_their_own_mailbox_and_the_buyer_reads_it`, at both the `messaging` and `AppState` levels). |
+| `ui/src/gateway/mailbox_ops.rs::reply_to_mailbox` | The seller's reply reaches the same mailbox the buyer is reading. | **Partly.** `the_two_ways_to_address_a_mailbox_agree` pins that the derived key and the rebuilt-from-id key are identical in instance AND code hash -- the second assertion added after the first version of that test survived the mutation, because `ContractKey`'s `PartialEq` ignores the code hash. What is untested is the send itself. |
+| `harvest_common::mailbox::MessageDirection` | A copy of the buyer's own message cannot read as a reply from the seller. | **Yes** -- `a_copy_of_the_buyers_own_message_does_not_read_as_a_reply`, mutated red by deriving both keys under `BuyerToSeller`, which also turned two neighbouring tests red. |
+| `ui/src/messaging.rs::BuyerConversation::read` | A buyer sees their own conversation and nobody else's, and a flood tagged with their key does not hide it. | **Yes** -- `a_buyer_sees_only_their_own_conversation` and `a_full_cap_flood_tagged_with_the_buyers_key_does_not_hide_their_thread`. The COST of that flood is measured rather than asserted (see `docs/messaging-privacy.md`); no timing assertion was added, because a wall-clock bound in CI is a flaky test. |
+| `harvest_common::mailbox` | The mailbox has a size bound. | **It does not, and this is a real open item.** `verify` caps message COUNT only, and `pad_to_bucket` stops padding above 64 KiB rather than refusing, so a single message may be arbitrarily large and the mailbox's state with it. Found while writing the privacy note, NOT fixed here -- it changes contract behaviour and can invalidate existing state, so it needs its own review. Written up in `docs/messaging-privacy.md`. |
 | `ui/src/gateway/store_ops.rs::create_store_contracts` | The store is published carrying the seller's encryption key. | **No.** The function is `#[cfg(target_arch = "wasm32")]`, so `cargo test` never reaches it -- the same blind spot as entry 1 below, and the same reason: it is the counterparty of a derivation, not the derivation itself. What IS tested is that `PendingStoreEdit::store_info` carries the key on the *edit* path, which is the path a seller uses to repair a store. |
 | `ui/src/state.rs::ask_for_conversation_keys` | The request actually reaches the delegate. | **No.** The decision half (`conversation_keys_to_request`) is host-tested to eight assertions; the send is a wasm-gated `spawn_local`. |
 | `ui/src/components/message_view.rs` | Everything the component says on screen. | **No.** There are no component tests in this repository at all. This is the file whose *previous* version claimed "messages are end-to-end encrypted" beside a button that encrypted nothing, so it is worth being explicit: the claims were re-enabled on the strength of the crypto tests below, and nothing checks that the words on screen still match them. A future change that makes messaging conditional again will not fail any test by leaving the reassuring paragraph in place. |
@@ -156,12 +161,16 @@ is the only way this file stays a record rather than an archaeology exercise.
 | `ui/src/state.rs::BrowsingStore::seller_verifying_key` | A store the buyer is told is unverified is never one the compose box is offered for, because both come from one call. | **Yes** -- `an_unverified_store_yields_no_key_to_message_it_with`, mutated red by setting the key unconditionally. It pins the wiring; the check itself is the `ghostkey_cert` row above. |
 | `delegates/harvest-delegate/src/messaging.rs` | Everything the delegate writes is under the exported prefix. | **Yes** -- `everything_this_module_writes_is_under_the_exported_prefix`, which drives the real writer. The pre-existing `every_secret_the_delegate_writes_is_under_the_exported_prefix` stayed GREEN under the same mutation, because it reads a hand-maintained list; that is the gap the new test closes. |
 
-Two things follow that are worth saying plainly rather than leaving as a
-pattern in the table. First, **the seller's read path is fully host-tested and
-the buyer's write path is not**, because the write ends at a node and the read
-ends in a pure function. Second, **the component is the least-covered file in
-the change and is the one that makes claims to users**, which is the exact
-shape of the defect that produced this document.
+Three things follow that are worth saying plainly rather than leaving as a
+pattern in the table. First, **every read path is fully host-tested and every
+write path is not**, because a write ends at a node and a read ends in a pure
+function. Second, **the component is the least-covered file in the change and
+is the one that makes claims to users**, which is the exact shape of the
+defect that produced this document. Third, **the sharpest limitation is not in
+this table at all**, because it is not a claim that could become false: a
+buyer's conversation keys die with the browser tab, so a reply that arrives
+after a reload is unreadable by anyone forever. Anything built on top of the
+reply path has to solve that first.
 
 ---
 
