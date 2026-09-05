@@ -857,6 +857,12 @@ impl AuthorizedOrder {
     /// `store::merge_order`'s tie-break argument rests on: at an equal rank
     /// the only field an attacker may vary is one this table marks as used.
     ///
+    /// This is only HALF the guard, and it is the half that fires on the less
+    /// likely change. A struct grows a field more often than an enum grows a
+    /// variant, and a new FIELD is caught by the `..`-free destructuring in
+    /// [`Self::verify_unused_fields_absent`], not here. Neither half is
+    /// sufficient alone; do not weaken either.
+    ///
     /// A `_ => (false, false)` arm would compile, would silently pin the new
     /// status's own fields to absent, and would break the record it was added
     /// to describe. A `_ => (true, true)` arm would compile, would leave the
@@ -908,19 +914,46 @@ impl AuthorizedOrder {
     /// `orders` did not exist in V1 — the only generation ever published — so
     /// no deployed state contains an order at all.
     fn verify_unused_fields_absent(&self) -> Result<(), String> {
-        let (uses_proof, uses_status_signature) = Self::fields_used(self.status);
-        if !uses_proof && self.payment_proof.is_some() {
+        // Destructured WITHOUT `..`, and that is the point of writing it this
+        // way. `fields_used` makes ADDING A STATUS a compile error; this makes
+        // ADDING A FIELD one. Both are needed, and the second is the more
+        // likely change: a struct grows a field far more often than an enum
+        // grows a variant.
+        //
+        // Every binding below must be accounted for. `order`, `scoped_payload`
+        // and `signature` are pinned by `verify_terms`, which has already run;
+        // `status` selects the rules. The remaining three are the optional
+        // ones this function exists to police. A new optional field arriving
+        // here stops the crate compiling until somebody decides which statuses
+        // consult it -- because if the answer is "none of them", it is an
+        // unchecked field a third party may set on a record that still
+        // verifies, and `store::merge_order` breaks an equal-rank tie on the
+        // full CBOR encoding. That is not a hypothetical: it is exactly the
+        // attack this function was added to close.
+        //
+        // Do NOT silence this with `..`. Doing so compiles, changes no
+        // behaviour today, and quietly removes the only thing that will make
+        // the next field's author think about it.
+        let Self {
+            order: _,
+            scoped_payload: _,
+            signature: _,
+            status,
+            payment_proof,
+            status_scoped_payload,
+            status_signature,
+        } = self;
+
+        let (uses_proof, uses_status_signature) = Self::fields_used(*status);
+        if !uses_proof && payment_proof.is_some() {
             return Err(format!(
-                "{:?} carries payment evidence, which nothing checks for that status",
-                self.status
+                "{status:?} carries payment evidence, which nothing checks for that status"
             ));
         }
-        if !uses_status_signature
-            && (self.status_scoped_payload.is_some() || self.status_signature.is_some())
+        if !uses_status_signature && (status_scoped_payload.is_some() || status_signature.is_some())
         {
             return Err(format!(
-                "{:?} carries a status signature, which nothing checks for that status",
-                self.status
+                "{status:?} carries a status signature, which nothing checks for that status"
             ));
         }
         Ok(())
