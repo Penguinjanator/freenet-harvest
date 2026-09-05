@@ -149,7 +149,19 @@ impl freenet_scaffold::ComposableState for AuthorizedStoreInfoV1 {
     }
 }
 
-/// The set of listings in a store. Grow-only with removal by signed deletion.
+/// The set of listings in a store.
+///
+/// **Grow-only, with no removal path at all** -- not "grow-only with removal
+/// by signed deletion", which this said until it was checked and which
+/// describes a mechanism that has never existed. `apply_delta` only ever
+/// pushes; nothing anywhere removes a listing.
+///
+/// That is load-bearing rather than incidental. `ui/src/migrate.rs`'s
+/// `fold_all_policy` selects `FoldAll`, which resurrects anything deleted by
+/// mere absence, and its soundness argument for this state is precisely that
+/// absence is never a deletion. Adding a removal path here without a
+/// tombstone would make folding an older generation silently reinstate every
+/// listing the seller had removed.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct ListingsV1 {
     pub listings: Vec<AuthorizedListing>,

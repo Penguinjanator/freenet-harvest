@@ -848,9 +848,23 @@ impl AuthorizedOrder {
 
     /// Which of the optional fields each status actually consults.
     ///
-    /// Written as an exhaustive `match` on purpose: a new status stops this
-    /// compiling until somebody decides what it authorizes, which is the
-    /// decision [`Self::verify_unused_fields_absent`] depends on.
+    /// # Do not give this match a wildcard arm
+    ///
+    /// It is exhaustive on purpose, and that is load-bearing rather than
+    /// stylistic. A new status stops this compiling until somebody decides
+    /// what it authorizes, and that decision is what
+    /// [`Self::verify_unused_fields_absent`] enforces and what
+    /// `store::merge_order`'s tie-break argument rests on: at an equal rank
+    /// the only field an attacker may vary is one this table marks as used.
+    ///
+    /// A `_ => (false, false)` arm would compile, would silently pin the new
+    /// status's own fields to absent, and would break the record it was added
+    /// to describe. A `_ => (true, true)` arm would compile, would leave the
+    /// new status's fields unchecked, and would hand the tie-break straight
+    /// back to whoever wanted to win it -- see
+    /// `store::order_tests::a_field_the_status_does_not_use_is_rejected` for
+    /// what that costs. Both failures are silent; the compile error is the
+    /// only thing that is not.
     fn fields_used(status: OrderStatus) -> (bool, bool) {
         match status {
             // Nothing is asserted yet, so nothing may be attached.
