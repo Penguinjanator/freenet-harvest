@@ -48,6 +48,20 @@ blake3 = { workspace = true }
 bs58 = { workspace = true, features = ["check"] }
 x25519-dalek = { workspace = true }
 aes-gcm = { workspace = true }
+# Ghost Key certificate parsing and chain verification.
+#
+# Declared here rather than in `[workspace.dependencies]` on purpose: only the
+# reader needs it. `harvest-common` is compiled into all three contracts and
+# the delegate, so a dependency added there -- even an optional one -- is a
+# dependency four published artifacts have to be rebuilt to be sure of, and
+# rebuilding re-keys them. See `common/src/address.rs`.
+#
+# `ghostkey_lib`, not `ghostkey-common`: the certificate type lives here.
+# `ghostkey-common` is the delegate's wire protocol and carries no certificate
+# type at all -- `GhostkeyRequest`/`GhostkeyResponse` pass certificates around
+# as opaque PEM strings, which is exactly why nothing was verifying them.
+ghostkey_lib = "0.2"
+
 # Bech32/Bech32m decoding for SegWit address parsing (P2WPKH/P2WSH/P2TR).
 # Not a workspace dependency -- only the UI needs to parse user-typed
 # addresses into scriptPubKey bytes; every other crate in this workspace
@@ -70,6 +84,13 @@ freenet-migrate = { workspace = true, features = ["ui"] }
 # migration reuses rather than reimplementing so folding a generation is the
 # same operation the network performs between two peers.
 freenet-scaffold = { workspace = true }
+
+[dev-dependencies]
+# Naming the notary's RSA signing key, so the certificate tests can mint a
+# chain of their own rather than needing one Freenet issued. Pinned to what
+# `ghostkey_lib` itself depends on -- a second version would be a second,
+# incompatible `SecretKey` type.
+blind-rsa-signatures = "=0.15.1"
 
 [build-dependencies]
 chrono = "0.4"

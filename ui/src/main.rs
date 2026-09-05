@@ -5,6 +5,7 @@
 mod components;
 mod document_title;
 mod gateway;
+mod ghostkey_cert;
 mod messaging;
 mod migrate;
 mod state;
