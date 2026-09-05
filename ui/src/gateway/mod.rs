@@ -14,6 +14,11 @@ mod delegate_api;
 // the host.
 #[cfg(target_arch = "wasm32")]
 pub mod migrate_ops;
+// The one decision `migrate_ops` makes that loses data when it is wrong: when
+// a migration may declare itself done. NOT wasm-gated, deliberately -- it is
+// pure, and keeping it here is what makes it reachable from `cargo test`,
+// which nothing inside `migrate_ops` is.
+pub mod migrate_seal;
 pub mod response_handler;
 pub mod store_ops;
 

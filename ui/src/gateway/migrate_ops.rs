@@ -58,6 +58,7 @@ use harvest_common::store::StoreStateV1;
 
 use crate::migrate::{self, Artifact, MailboxOps, ProbeSession, ReputationOps, Seal, StoreOps};
 
+use super::migrate_seal::{self, Disposition, ForwardPut, SuccessorReference};
 use super::store_ops::{MAILBOX_CONTRACT_WASM, REPUTATION_CONTRACT_WASM, STORE_CONTRACT_WASM};
 
 /// One probe's state machine plus the context needed to act on its result.
@@ -66,8 +67,6 @@ struct Probe {
     fingerprint: String,
     /// The durable marker this probe may write, and only if it earns it.
     marker: String,
-    /// The current generation's instance id -- where a recovery is PUT.
-    current: ContractInstanceId,
     params: Parameters<'static>,
     session: Session,
 }
@@ -338,7 +337,6 @@ fn start<F>(
         artifact,
         fingerprint: fingerprint.to_string(),
         marker: marker.clone(),
-        current,
         params: params.clone(),
         session: build(&params),
     };
@@ -553,8 +551,75 @@ fn deliver_unknown(id: ContractInstanceId) {
     pump(probe);
 }
 
-/// A probe reached the end of its lineage: adopt what it found, and seal only
-/// if it earned that.
+/// How long to wait for the node's `PutResponse` before giving up on a forward
+/// PUT.
+///
+/// The same length and the same reasoning as [`PROBE_TIMEOUT_MS`], and the
+/// same direction on expiry: a deadline establishes nothing. An expired
+/// forward is recorded as unconfirmed and seals nothing, so the lineage is
+/// walked again on the next load.
+const FORWARD_TIMEOUT_MS: u32 = PROBE_TIMEOUT_MS;
+
+/// A recovery that has been sent to the successor and is waiting for the node
+/// to say it landed.
+///
+/// Everything the seal needs is carried here rather than left on the `Probe`,
+/// because the probe is finished: its walk is over and the only thing still
+/// outstanding is the write.
+struct Forwarded {
+    artifact: Artifact,
+    fingerprint: String,
+    marker: String,
+    seal: Seal,
+    note: String,
+}
+
+thread_local! {
+    /// Forward PUTs with an outstanding `PutResponse`, keyed by the successor
+    /// instance they were written to.
+    ///
+    /// The same shape as [`PROBES`] and for the same reason: `WebApi` delivers
+    /// every response to one handler, so a request and its answer are not
+    /// connected by anything the language can see. A `PutResponse` for
+    /// anything else is ignored rather than guessed at.
+    static FORWARDS: RefCell<HashMap<ContractInstanceId, Forwarded>> =
+        RefCell::new(HashMap::new());
+}
+
+/// # What must be true before a migration may declare itself done
+///
+/// The durable marker is not a note about what happened. It is a claim that
+/// nothing needs to run again for this lineage, and every later load believes
+/// it without checking. So it may only be written when BOTH of these hold:
+///
+/// 1. **The recovered state reached the successor** -- acknowledged by the
+///    node, not merely handed to the WebSocket. `put_contract` resolves when
+///    the *send* succeeds (`delegate_api.rs`), which says nothing about
+///    whether the contract accepted the state or whether it arrived at all.
+///    This used to be the whole of the check: the PUT was spawned
+///    fire-and-forget and the marker was written on the next line, so a
+///    rejected or lost PUT still sealed and the state was orphaned silently
+///    and permanently. The old comment here described sealing "after the
+///    forward PUT is queued", which was true and was the bug -- it reasoned
+///    only about a probe that could not encode its result, which is a much
+///    narrower failure than the one the ordering actually admitted.
+///
+/// 2. **Every durable pointer a later load follows already names the
+///    successor.** A marker with a stale pointer is worse than no marker: the
+///    next load restores the PREDECESSOR ids from the delegate, finds the
+///    marker present, skips the probe, and quietly goes back to the old
+///    generation -- with the migrated instances sitting unreferenced beside
+///    it. The migration would appear to succeed and then undo itself on
+///    reload.
+///
+/// These are one decision, not two, which is why they are stated in one place.
+/// The seal is the moment the migration stops being repeatable, so both have
+/// to be facts before it, and anything short of a fact resolves the same way
+/// everything else in this module resolves: do not seal, walk again next load.
+/// That is wasteful and correct.
+///
+/// Condition 2 cannot be satisfied today; see
+/// [`successor_reference_is_durable`]. Nothing seals, and the walk repeats.
 fn finish(mut probe: Probe) {
     let (note, seal, forward) = match &mut probe.session {
         Session::Store(s) => match s.take_result() {
@@ -604,40 +669,247 @@ fn finish(mut probe: Probe) {
         probe.fingerprint
     );
 
-    let recovered = forward.is_some();
-    if let Some(forward) = forward {
-        put_forward(probe.artifact, probe.params.clone(), forward);
-        if probe.artifact == Artifact::Store {
-            adopt_recovered_store(&probe.fingerprint, probe.current);
+    let Some(forward) = forward else {
+        // Nothing to carry forward, so there is nothing that could have
+        // reached the successor and condition 1 cannot hold. `Seal` without a
+        // recovery cannot happen today -- only `Recovered` seals, and
+        // `Recovered` always yields state -- but if a future outcome made it
+        // possible, not sealing is the safe half.
+        IN_FLIGHT.with(|f| {
+            f.borrow_mut().remove(&probe.marker);
+        });
+        return;
+    };
+
+    // The in-flight guard is deliberately still held. It covers the write as
+    // well as the walk, so a second `GhostKeyList` arriving while the PUT is
+    // outstanding cannot start a duplicate walk of a lineage this session is
+    // in the middle of carrying forward. It is released on every path out of
+    // `settle_forward`.
+    send_forward(
+        Forwarded {
+            artifact: probe.artifact,
+            fingerprint: probe.fingerprint.clone(),
+            marker: probe.marker.clone(),
+            seal,
+            note,
+        },
+        probe.params.clone(),
+        forward,
+    );
+}
+
+/// PUT a recovered state under the CURRENT generation's key and wait for the
+/// node to acknowledge it.
+///
+/// A PUT rather than an UPDATE because the current instance may not exist on
+/// the network at all -- that is the normal case straight after a re-key, and
+/// an UPDATE to a contract nobody holds has nothing to update. Where it does
+/// exist the node merges rather than replaces (`update_state` merges for all
+/// three contracts), so this is safe to repeat and safe when another client
+/// has already written. Repeating it is exactly what an unsealed migration
+/// does on the next load.
+fn send_forward(forwarded: Forwarded, params: Parameters<'static>, forward: Forward) {
+    let code = std::sync::Arc::new(ContractCode::from(forward.wasm.to_vec()));
+    let wrapped = WrappedContract::new(code, params);
+    let key: ContractKey = *wrapped.key();
+    let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(wrapped));
+    let bytes = forward.bytes;
+
+    // The id the node will name in its `PutResponse`, and the id the recovery
+    // is therefore reachable at. Derived from the contract just built rather
+    // than recomputed alongside it, so the correlation key, the address the
+    // state goes to, and the id this session adopts cannot drift apart.
+    let successor = *key.id();
+    let artifact = forwarded.artifact;
+
+    // Register BEFORE sending, for the reason `pump` documents: the response
+    // can arrive as soon as the send returns, and an answer with nothing
+    // registered is dropped.
+    FORWARDS.with(|f| f.borrow_mut().insert(successor, forwarded));
+
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = super::put_contract(container, WrappedState::new(bytes)).await {
+            warn!(
+                "migration: could not send the recovered {} state forward: {e}",
+                artifact.as_str()
+            );
+            settle_forward(successor, Confirmation::Failed);
         }
-        super::APP_STATE.write().notifications.push(format!(
-            "Recovered your {} from an earlier version of Harvest.",
-            probe.artifact.as_str()
-        ));
-    }
-
-    // The seal comes from `migrate::seal_decision`, which is the only place
-    // that decides it. Sealing is recorded AFTER the forward PUT is queued, so
-    // a probe that could not even encode its result does not mark itself done.
-    match seal {
-        Seal::Seal if recovered => record_marker(&probe.marker, &note),
-        // `Seal` without anything to forward cannot happen today (only
-        // `Recovered` seals, and `Recovered` always yields state), but if a
-        // future outcome made it possible, not sealing is the safe half.
-        Seal::Seal | Seal::Retry => {}
-    }
-
-    IN_FLIGHT.with(|f| {
-        f.borrow_mut().remove(&probe.marker);
     });
+
+    // The deadline. An expired timer is `Unconfirmed`, never a confirmation: a
+    // send that was accepted by the WebSocket and never answered by the node
+    // establishes nothing about whether the state landed, and reading it as
+    // success is precisely what condition 1 exists to stop.
+    gloo_timers::callback::Timeout::new(FORWARD_TIMEOUT_MS, move || {
+        settle_forward(successor, Confirmation::Unconfirmed);
+    })
+    .forget();
+}
+
+/// How a forward PUT ended.
+enum Confirmation {
+    /// The node answered `PutResponse` for the successor. This is the ONE
+    /// signal that satisfies condition 1; every other way the write can end is
+    /// silence about whether the state landed.
+    Acknowledged,
+    /// The send itself failed, so nothing was ever transmitted.
+    Failed,
+    /// The deadline expired with no answer.
+    Unconfirmed,
+}
+
+/// Offer a `PutResponse` to the outstanding forward PUTs. Returns `true` if
+/// one consumed it.
+///
+/// Called from the shared response handler, which otherwise only logs
+/// `PutResponse`. Every other PUT this app makes is fire-and-forget by design
+/// (a store creation, a listing, an order); this is the one that has to know.
+pub fn deliver_put_ack(id: &ContractInstanceId) -> bool {
+    if FORWARDS.with(|f| f.borrow().contains_key(id)) {
+        settle_forward(*id, Confirmation::Acknowledged);
+        return true;
+    }
+    false
+}
+
+/// Finish a forward PUT, whichever way it ended.
+///
+/// Idempotent by construction, the same way [`release_pending`] is: the entry
+/// is removed under one borrow, so of an acknowledgement, a failed send and an
+/// expired deadline exactly one does anything and the rest find nothing.
+///
+/// The decision itself is [`migrate_seal::disposition`] and is made nowhere
+/// else -- it is the part that loses data when it is wrong, and it is the only
+/// part of this module the host can test.
+fn settle_forward(successor: ContractInstanceId, how: Confirmation) {
+    let Some(forwarded) = FORWARDS.with(|f| f.borrow_mut().remove(&successor)) else {
+        return;
+    };
+
+    // Released on every path out, including the ones that seal nothing.
+    // Leaving it set would suppress the retry that not sealing exists to
+    // enable -- for the rest of the session, silently.
+    IN_FLIGHT.with(|f| {
+        f.borrow_mut().remove(&forwarded.marker);
+    });
+
+    let put = match how {
+        Confirmation::Acknowledged => ForwardPut::Acknowledged,
+        // Two different events, one epistemic state: a send that failed and a
+        // deadline that expired both leave this code knowing nothing about
+        // whether the state reached the contract.
+        Confirmation::Failed | Confirmation::Unconfirmed => ForwardPut::Unconfirmed,
+    };
+    let stale = successor_reference_is_durable(forwarded.artifact).err();
+    let reference = match stale {
+        None => SuccessorReference::Durable,
+        Some(_) => SuccessorReference::Stale,
+    };
+
+    match migrate_seal::disposition(put, reference, forwarded.seal) {
+        Disposition::Discard => {
+            warn!(
+                "migration: the recovered {} state for {} was not confirmed written to \
+                 {successor}; nothing adopted and nothing sealed, so the lineage is walked \
+                 again on the next load",
+                forwarded.artifact.as_str(),
+                forwarded.fingerprint
+            );
+        }
+        Disposition::AdoptAndSeal => {
+            adopt_and_announce(&forwarded, successor);
+            record_marker(&forwarded.marker, &forwarded.note);
+        }
+        Disposition::AdoptWithoutSealing => {
+            adopt_and_announce(&forwarded, successor);
+            match stale {
+                Some(reason) => warn!(
+                    "migration: the {} contract for {} was recovered and written to \
+                     {successor}, but the successor reference is not durable ({reason}); not \
+                     sealing, so the lineage is walked again on the next load",
+                    forwarded.artifact.as_str(),
+                    forwarded.fingerprint
+                ),
+                // `migrate::seal_decision` typed the outcome as `Retry` -- an
+                // incomplete walk, which adopts what it found and asks again.
+                None => info!(
+                    "migration: the {} contract for {} was recovered, but the walk was not \
+                     complete enough to seal; it runs again on the next load",
+                    forwarded.artifact.as_str(),
+                    forwarded.fingerprint
+                ),
+            }
+        }
+    }
+}
+
+/// Repoint this session at the successor and tell the seller.
+///
+/// Only ever called once condition 1 holds. Announcing a recovery whose write
+/// was never confirmed would be telling the seller something this code does
+/// not know.
+fn adopt_and_announce(forwarded: &Forwarded, successor: ContractInstanceId) {
+    info!(
+        "migration: PUT recovered {} state forward to {successor}",
+        forwarded.artifact.as_str()
+    );
+    adopt_recovered(forwarded.artifact, &forwarded.fingerprint, successor);
+    super::APP_STATE.write().notifications.push(format!(
+        "Recovered your {} from an earlier version of Harvest.",
+        forwarded.artifact.as_str()
+    ));
+}
+
+/// Whether every durable pointer a later load follows already names the
+/// successor -- condition 2 of the sealing rule in [`finish`].
+///
+/// **It never does, today, and this returns `Err` for every artifact.** That
+/// is a statement about a missing capability, not a placeholder:
+///
+/// * All three successor ids live in one `harvest_common::StoreRegistration`
+///   in the harvest delegate, which is what `ListStores` restores into
+///   `AppState::my_stores` after a reload.
+/// * The delegate has no request that can REPLACE a registration.
+///   `RegisterStore` appends, and is a no-op for a store id it already holds,
+///   so re-registering the successor triple would leave the predecessor's
+///   registration in place and FIRST in the list -- and `stores.first()` is
+///   the entry the listing path uses. It would add a phantom store rather than
+///   repoint anything.
+/// * The one case where there would be nothing stale to repoint -- an identity
+///   with no registration at all, which is the seller whose delegate secrets
+///   did not survive -- cannot be detected either. `merge_store_registrations`
+///   deliberately does not create an entry for an empty answer, so "asked, and
+///   owns none" is indistinguishable from "not asked yet". Reading the second
+///   as the first would be the same mistake as typing a probe timeout as
+///   absence.
+///
+/// So nothing seals. The migration re-runs on every load, re-PUTs a state the
+/// contracts merge idempotently, and re-adopts in memory; the seller's store
+/// works, at the cost of a lineage walk per load.
+///
+/// Closing this needs a delegate request that replaces a `StoreRegistration`
+/// -- `common/src/delegate.rs` plus the delegate's own handler, with the
+/// duplicate handling that `RegisterStore`'s append semantics currently dodge.
+/// When it exists, this function sends it, awaits its acknowledgement, and
+/// returns `Ok` on that acknowledgement alone.
+fn successor_reference_is_durable(_artifact: Artifact) -> Result<(), String> {
+    Err(
+        "the harvest delegate has no request that can replace a StoreRegistration, so the \
+         registry a later load reads still names the predecessor"
+            .to_string(),
+    )
 }
 
 /// Ask the delegate to record a completed migration.
 ///
-/// Fire-and-forget: the reply is only logged. A write the delegate refuses,
-/// or a send that never arrives, leaves the marker unwritten, and an unwritten
-/// marker means the walk runs again on the next load -- wasteful and correct,
-/// which is the same direction every other uncertainty here resolves in.
+/// Fire-and-forget, and that is sound here in a way it was not for the forward
+/// PUT: this is the LAST step, and the direction it fails in is safe. A write
+/// the delegate refuses, or a send that never arrives, leaves the marker
+/// unwritten, and an unwritten marker means the walk runs again on the next
+/// load -- wasteful and correct. An unconfirmed forward PUT failed in the
+/// opposite direction, which is why it is no longer treated this way.
 fn record_marker(marker: &str, note: &str) {
     let request = migrate::marker_write(marker, note);
     let marker = marker.to_string();
@@ -658,64 +930,48 @@ fn encode_forward<T: serde::Serialize>(state: &T, wasm: &'static [u8]) -> Option
     }
 }
 
-/// PUT a recovered state under the CURRENT generation's key.
+/// Point this session's registration at the generation that now holds the
+/// recovered data.
 ///
-/// A PUT rather than an UPDATE because the current instance may not exist on
-/// the network at all -- that is the normal case straight after a re-key, and
-/// an UPDATE to a contract nobody holds has nothing to update. Where it does
-/// exist the node merges rather than replaces (`update_state` merges for all
-/// three contracts), so this is safe to repeat and safe when another client
-/// has already written.
-fn put_forward(artifact: Artifact, params: Parameters<'static>, forward: Forward) {
-    let code = std::sync::Arc::new(ContractCode::from(forward.wasm.to_vec()));
-    let wrapped = WrappedContract::new(code, params);
-    let key: ContractKey = *wrapped.key();
-    let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(wrapped));
-    let bytes = forward.bytes;
-
-    wasm_bindgen_futures::spawn_local(async move {
-        match super::put_contract(container, WrappedState::new(bytes)).await {
-            Ok(()) => info!(
-                "migration: PUT recovered {} state forward to {}",
-                artifact.as_str(),
-                key.id()
-            ),
-            Err(e) => warn!(
-                "migration: could not PUT recovered {} state forward: {e}",
-                artifact.as_str()
-            ),
-        }
-    });
-}
-
-/// Point this session's `my_stores` entry at the generation that now holds the
-/// seller's data.
+/// All three artifacts, not just the store: `StoreRegistration` carries a
+/// mailbox and a reputation id too, and leaving those on the predecessor after
+/// their contracts migrated is what left the migrated instances unreferenced.
 ///
-/// Replaces the predecessor registration rather than adding to it: the
-/// recovered store is the SAME store at a new address, and appending would
-/// show the seller two.
+/// The store's id is REPLACED rather than appended to: the recovered store is
+/// the SAME store at a new address, and appending would show the seller two.
 ///
-/// The delegate's own registry is not rewritten here, and after a reload it
-/// still names the predecessor. Repointing it needs a delegate request that
-/// can REPLACE a registration -- `RegisterStore` only appends, and is a no-op
-/// for a store id it already holds -- which is a separate change with its own
-/// duplicate-handling to reason about. Until then the probe simply runs again
-/// on the next load, which is exactly what the marker rules make safe.
-fn adopt_recovered_store(fingerprint: &str, current: ContractInstanceId) {
-    let current_bytes = current.as_bytes().to_vec();
+/// This is the in-memory half only, and it lasts as long as the session. The
+/// durable half is condition 2 of the sealing rule; see
+/// [`successor_reference_is_durable`] for why it cannot be written yet, and
+/// note that a `ListStores` answer arriving after this runs will overwrite it
+/// -- `AppState::merge_store_registrations` replaces a registration wholesale
+/// when the store id matches.
+fn adopt_recovered(artifact: Artifact, fingerprint: &str, successor: ContractInstanceId) {
+    let successor_bytes = successor.as_bytes().to_vec();
     let mut app = super::APP_STATE.write();
     let Some(stores) = app.my_stores.get_mut(fingerprint) else {
         return;
     };
-    if stores.iter().any(|s| s.store_contract_id == current_bytes) {
+    if artifact == Artifact::Store
+        && stores
+            .iter()
+            .any(|s| s.store_contract_id == successor_bytes)
+    {
         return;
     }
-    if let Some(existing) = stores.first_mut() {
-        existing.store_contract_id = current_bytes;
-        // The recorded key belonged to the predecessor's code hash and is now
-        // wrong. Clearing it makes `store_contract_key` rebuild from the
-        // bundled contract, which is the right answer for the current
-        // generation.
-        existing.store_contract_key = None;
+    let Some(existing) = stores.first_mut() else {
+        return;
+    };
+    match artifact {
+        Artifact::Store => {
+            existing.store_contract_id = successor_bytes;
+            // The recorded key belonged to the predecessor's code hash and is
+            // now wrong. Clearing it makes `store_contract_key` rebuild from
+            // the bundled contract, which is the right answer for the current
+            // generation.
+            existing.store_contract_key = None;
+        }
+        Artifact::Mailbox => existing.mailbox_contract_id = successor_bytes,
+        Artifact::Reputation => existing.reputation_contract_id = successor_bytes,
     }
 }

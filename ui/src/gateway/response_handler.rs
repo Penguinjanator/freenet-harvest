@@ -75,6 +75,15 @@ fn handle_contract_response(response: ContractResponse) {
 
         ContractResponse::PutResponse { key } => {
             info!("PUT response for contract {:?}", key);
+            // Offered to the migration, which is the only thing that acts on
+            // it. Every other PUT this app makes is fire-and-forget by design
+            // -- a store creation, a listing, an order -- but a migration may
+            // not write its durable "already done" marker until the node has
+            // said the recovered state actually landed, and this is the only
+            // signal that says so. `put_contract` resolves when the WebSocket
+            // SEND succeeds, which is a different claim entirely.
+            #[cfg(target_arch = "wasm32")]
+            let _consumed = super::migrate_ops::deliver_put_ack(key.id());
         }
 
         // The node answering, positively, that nothing is stored under this
