@@ -476,6 +476,37 @@ pub fn store_details_gap(info: Option<&StoreInfoV1>) -> Option<StoreDetailsGap> 
     None
 }
 
+/// Which of a store's listings carry a certificate that does not verify.
+///
+/// Every listing in a store normally carries the seller's one certificate, so
+/// the common case is one verification for the whole page and byte-equality
+/// for the rest. The fast path is sound because the verdict is a pure
+/// function of `(pem, contract_id)` and the contract id is fixed here: equal
+/// bytes cannot reach a different answer.
+fn unverified_listings(
+    listings: &[AuthorizedListing],
+    contract_id: &[u8],
+    store_certificate_pem: &str,
+    store_status: &crate::ghostkey_cert::CertificateStatus,
+) -> HashSet<harvest_common::listing::ListingId> {
+    listings
+        .iter()
+        .filter(|authorized| {
+            let verified = if authorized.certificate_pem == store_certificate_pem {
+                store_status.is_verified()
+            } else {
+                crate::ghostkey_cert::verify_store_certificate(
+                    &authorized.certificate_pem,
+                    contract_id,
+                )
+                .is_verified()
+            };
+            !verified
+        })
+        .map(|authorized| authorized.listing.id.clone())
+        .collect()
+}
+
 /// Store details entered by the seller and waiting on the certificate.
 #[derive(Clone, Debug)]
 pub struct PendingStoreEdit {
@@ -651,6 +682,20 @@ pub struct PendingListing {
 pub struct BrowsingStore {
     pub info: Option<StoreInfoV1>,
     pub listings: Vec<AuthorizedListing>,
+    /// Whether the store's published ghostkey certificate actually holds up.
+    ///
+    /// Reached once, in `on_contract_state`, rather than being recomputed
+    /// wherever a certificate happens to be displayed. That is the whole
+    /// point of holding it here: the raw `certificate_pem` never reaches a
+    /// display path, so showing a store without having formed a verdict about
+    /// it requires ignoring a field that says `Invalid`, rather than merely
+    /// forgetting to call something.
+    pub certificate_status: crate::ghostkey_cert::CertificateStatus,
+    /// Listings whose own certificate did not verify against this store.
+    ///
+    /// Keyed by [`ListingId`] rather than by position, so it cannot drift out
+    /// of step with `listings` when a merge reorders them.
+    pub unverified_listings: HashSet<harvest_common::listing::ListingId>,
     /// Orders placed against this store (buyer or seller side -- the store
     /// contract carries both). Payments-first UI groups these by status.
     pub orders: Vec<AuthorizedOrder>,
@@ -964,7 +1009,25 @@ impl AppState {
             // Whatever we concluded from a timeout, the state is here now.
             self.store_state_unavailable.remove(&contract_id);
 
+            // Form the certificate verdicts here, before anything can be
+            // displayed. `verify_store_certificate` needs the contract id,
+            // which is what binds a certificate to THIS store: a genuine
+            // certificate issued to somebody else passes every other check
+            // there is. See `crate::ghostkey_cert`.
+            let certificate_status = crate::ghostkey_cert::verify_store_certificate(
+                &store_state.info.info.certificate_pem,
+                &contract_id,
+            );
+            let unverified_listings = unverified_listings(
+                &store_state.listings.listings,
+                &contract_id,
+                &store_state.info.info.certificate_pem,
+                &certificate_status,
+            );
+
             let store = self.browsing_stores.entry(contract_id.clone()).or_default();
+            store.certificate_status = certificate_status;
+            store.unverified_listings = unverified_listings;
             store.info = Some(store_state.info.info);
             store.listings = store_state.listings.listings;
             store.orders = store_state.orders.orders.into_values().collect();
@@ -3145,6 +3208,166 @@ mod tests {
             state.pending_store_edit.is_none(),
             "and nothing may be left waiting on a certificate either"
         );
+    }
+
+    // --- certificate verdicts ------------------------------------------
+    //
+    // `crate::ghostkey_cert` owns whether a certificate is good; these check
+    // only that the verdict is REACHED, on the right bytes, before anything
+    // can be displayed. A `Verified` outcome cannot be produced here at all:
+    // it needs a certificate Freenet's master key actually signed, and
+    // minting one is exactly what nobody can do. So the store-level tests
+    // work in the failing direction, and `unverified_listings` -- which takes
+    // the store's verdict as an argument -- is exercised in both.
+
+    fn store_state_with(
+        certificate_pem: &str,
+        listings: Vec<AuthorizedListing>,
+    ) -> harvest_common::store::StoreStateV1 {
+        harvest_common::store::StoreStateV1 {
+            info: harvest_common::store::AuthorizedStoreInfoV1 {
+                info: StoreInfoV1 {
+                    certificate_pem: certificate_pem.to_string(),
+                    ..published_info(4, "Bean Shop", REPUTATION_ID)
+                },
+                ..Default::default()
+            },
+            listings: harvest_common::store::ListingsV1 { listings },
+            ..Default::default()
+        }
+    }
+
+    fn listing_with(id: u8, certificate_pem: &str) -> AuthorizedListing {
+        AuthorizedListing {
+            listing: harvest_common::listing::Listing {
+                id: harvest_common::listing::ListingId([id; 16]),
+                title: "Beans".to_string(),
+                description: String::new(),
+                kind: harvest_common::listing::ListingKind::Sale,
+                price: None,
+                created_at: chrono::Utc::now(),
+            },
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            certificate_pem: certificate_pem.to_string(),
+        }
+    }
+
+    fn ingest(state: &mut AppState, store_state: &harvest_common::store::StoreStateV1) {
+        state.on_contract_state(
+            STORE_ID.to_vec(),
+            harvest_common::to_cbor(store_state).expect("store state encodes"),
+        );
+    }
+
+    /// The wiring this exists for. Before it, a store's `certificate_pem` was
+    /// carried to the storefront and displayed without anything ever having
+    /// looked at it.
+    #[test]
+    fn an_ingested_store_carries_a_verdict_about_its_certificate() {
+        let mut state = AppState::default();
+        ingest(
+            &mut state,
+            &store_state_with("-----BEGIN CERT-----", vec![]),
+        );
+
+        let store = state
+            .browsing_stores
+            .get(STORE_ID.as_slice())
+            .expect("the store was ingested");
+        assert!(
+            matches!(
+                store.certificate_status,
+                crate::ghostkey_cert::CertificateStatus::Invalid(_)
+            ),
+            "a certificate that is not a certificate must be marked, got {:?}",
+            store.certificate_status
+        );
+    }
+
+    /// Absent is its own outcome, not a failure. A store that has published
+    /// nothing is not claiming a bond it does not have.
+    #[test]
+    fn an_ingested_store_with_no_certificate_is_absent_rather_than_invalid() {
+        let mut state = AppState::default();
+        ingest(&mut state, &store_state_with("", vec![]));
+
+        assert_eq!(
+            state
+                .browsing_stores
+                .get(STORE_ID.as_slice())
+                .expect("the store was ingested")
+                .certificate_status,
+            crate::ghostkey_cert::CertificateStatus::Absent
+        );
+    }
+
+    /// Listings are verified against the store, not taken on trust from it.
+    #[test]
+    fn an_ingested_stores_listings_are_each_given_a_verdict() {
+        let mut state = AppState::default();
+        ingest(
+            &mut state,
+            &store_state_with(
+                "-----BEGIN CERT-----",
+                vec![listing_with(1, "-----BEGIN CERT-----"), listing_with(2, "")],
+            ),
+        );
+
+        let store = state
+            .browsing_stores
+            .get(STORE_ID.as_slice())
+            .expect("the store was ingested");
+        assert_eq!(
+            store.unverified_listings.len(),
+            2,
+            "neither listing carries a certificate that verifies"
+        );
+    }
+
+    /// The fast path: a listing carrying the store's own certificate inherits
+    /// the store's verdict rather than being re-verified. It is only sound
+    /// because the verdict is a pure function of the bytes and the contract
+    /// id, so this pins both directions -- a matching certificate rides the
+    /// store's `Verified`, a different one does not.
+    #[test]
+    fn a_listing_reusing_the_stores_certificate_inherits_its_verdict() {
+        let sellers = "-----BEGIN SELLER CERT-----";
+        let strangers = "-----BEGIN STRANGER CERT-----";
+        let listings = vec![listing_with(1, sellers), listing_with(2, strangers)];
+
+        let marked = unverified_listings(
+            &listings,
+            &STORE_ID,
+            sellers,
+            &crate::ghostkey_cert::CertificateStatus::Verified,
+        );
+
+        assert!(
+            !marked.contains(&harvest_common::listing::ListingId([1u8; 16])),
+            "a listing carrying the store's own verified certificate is verified"
+        );
+        assert!(
+            marked.contains(&harvest_common::listing::ListingId([2u8; 16])),
+            "a listing carrying somebody else's certificate is not"
+        );
+    }
+
+    /// And when the store's own certificate failed, nothing under it can
+    /// inherit a pass.
+    #[test]
+    fn listings_inherit_a_failed_store_certificate_too() {
+        let sellers = "-----BEGIN SELLER CERT-----";
+        let listings = vec![listing_with(1, sellers)];
+
+        let marked = unverified_listings(
+            &listings,
+            &STORE_ID,
+            sellers,
+            &crate::ghostkey_cert::CertificateStatus::Invalid("nope".to_string()),
+        );
+
+        assert!(marked.contains(&harvest_common::listing::ListingId([1u8; 16])));
     }
 
     /// State arriving after the deadline fired wins. Treating a store that

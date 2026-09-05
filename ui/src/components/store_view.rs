@@ -76,6 +76,20 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                         p { class: "seller-id",
                             "Seller: {truncate_fingerprint(&info.seller_fingerprint)}"
                         }
+                        p {
+                            class: if store.certificate_status.is_verified() { "cert-verified" } else { "cert-unverified" },
+                            "{store.certificate_status.label()}"
+                        }
+                    }
+                }
+
+                // The verdict, spelled out. A badge alone tells a buyer that
+                // something is wrong without telling them what it costs them,
+                // and this is the one line on the page that decides whether
+                // the seller has anything at stake.
+                if !store.certificate_status.is_verified() {
+                    p { class: "text-warning",
+                        "{certificate_warning(&store.certificate_status)}"
                     }
                 }
                 if !info.payment_instructions.is_empty() {
@@ -105,7 +119,16 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
             } else {
                 p { class: "section-count", "{store.listings.len()} listing(s)" }
                 for listing in &store.listings {
-                    ListingCard { listing: listing.clone() }
+                    ListingCard {
+                        listing: listing.clone(),
+                        // Only when it adds something. If the store's own
+                        // certificate failed, the warning above already
+                        // covers everything under it, and repeating it on
+                        // every card is the kind of noise that teaches a
+                        // reader to skip warnings.
+                        certificate_mismatch: store.certificate_status.is_verified()
+                            && store.unverified_listings.contains(&listing.listing.id),
+                    }
                 }
             }
 
@@ -159,8 +182,28 @@ fn StoreInvoices(orders: Vec<harvest_common::payment::AuthorizedOrder>) -> Eleme
     }
 }
 
+/// What an unverified certificate means for the person reading the page.
+///
+/// The two cases are genuinely different and must not be collapsed. A store
+/// with no certificate is claiming nothing; a store whose certificate fails
+/// is claiming a bond it does not have, which is worse than claiming none.
+fn certificate_warning(status: &crate::ghostkey_cert::CertificateStatus) -> String {
+    use crate::ghostkey_cert::CertificateStatus;
+    match status {
+        CertificateStatus::Verified => String::new(),
+        CertificateStatus::Absent => "This store publishes no ghostkey certificate, so nothing \
+             here shows that the seller's identity cost anything to create. They can abandon it \
+             and start again for free."
+            .to_string(),
+        CertificateStatus::Invalid(why) => format!(
+            "This store's ghostkey certificate does not check out ({why}). Treat the seller as \
+             anonymous: nothing here shows they have staked anything they would lose."
+        ),
+    }
+}
+
 #[component]
-fn ListingCard(listing: AuthorizedListing) -> Element {
+fn ListingCard(listing: AuthorizedListing, certificate_mismatch: bool) -> Element {
     let l = &listing.listing;
 
     rsx! {
@@ -169,6 +212,14 @@ fn ListingCard(listing: AuthorizedListing) -> Element {
                 h4 { "{l.title}" }
                 span { class: "badge {kind_badge_class(&l.kind)}",
                     "{kind_label(&l.kind)}"
+                }
+            }
+            // The store verified, and this listing did not: it carries a
+            // certificate that is not the seller's. Worth saying loudly,
+            // precisely because everything around it checks out.
+            if certificate_mismatch {
+                p { class: "text-warning",
+                    "This listing's ghostkey certificate is not this seller's."
                 }
             }
             p { class: "listing-desc", "{l.description}" }

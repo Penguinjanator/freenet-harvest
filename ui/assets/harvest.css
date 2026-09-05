@@ -362,6 +362,21 @@ h4 {
   font-size: 0.9rem;
 }
 
+/* The ghostkey verdict, beside the reputation line. Deliberately quiet when
+   it passes and coloured only when it does not: a badge that is always
+   shouting is one a reader stops seeing. */
+.cert-verified {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.cert-unverified {
+  font-family: var(--font-display);
+  font-weight: 700;
+  color: #b44;
+  font-size: 0.8rem;
+}
+
 .seller-id {
   font-size: 0.75rem;
   color: var(--text-muted);

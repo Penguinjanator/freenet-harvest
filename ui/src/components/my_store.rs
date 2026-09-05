@@ -22,6 +22,14 @@ struct StoreCard {
     /// submitted from it could not be given a version the contract accepts.
     /// See `state::AppState::store_details_are_resolved`.
     details_resolved: bool,
+    /// The verdict a BUYER reaches about this store's ghostkey certificate.
+    ///
+    /// Shown to the seller because it is the one thing about their own store
+    /// they cannot otherwise see. Nothing in the publishing path fails when
+    /// the certificate is unusable -- the store publishes, the listings
+    /// publish, and only the buyer's storefront says the identity is
+    /// unbacked. Reading the same verdict here is what closes that gap.
+    certificate: crate::ghostkey_cert::CertificateStatus,
 }
 
 #[component]
@@ -209,10 +217,8 @@ fn IdentityCard(
                     );
                     return None;
                 }
-                let info = app_state
-                    .browsing_stores
-                    .get(&store.store_contract_id)
-                    .and_then(|browsing| browsing.info.as_ref());
+                let browsing = app_state.browsing_stores.get(&store.store_contract_id);
+                let info = browsing.and_then(|browsing| browsing.info.as_ref());
                 let name = info.map(|info| info.store_name.clone());
                 Some(StoreCard {
                     label: crate::store_link::store_label(
@@ -230,6 +236,9 @@ fn IdentityCard(
                     },
                     details_resolved: app_state
                         .store_details_are_resolved(&store.store_contract_id),
+                    certificate: browsing
+                        .map(|browsing| browsing.certificate_status.clone())
+                        .unwrap_or_default(),
                     contract_id: store.store_contract_id.clone(),
                 })
             })
@@ -301,6 +310,21 @@ fn IdentityCard(
                             // and leaving the seller to guess why it is there.
                             if let Some(gap) = card.gap {
                                 p { class: "text-warning", "{gap.message()}" }
+                            }
+
+                            // Editing the details will not fix this, so it is
+                            // deliberately not phrased as a repair prompt: a
+                            // certificate that does not verify is either an
+                            // identity this build cannot read or one that is
+                            // not the seller's, and both need looking at
+                            // rather than republishing.
+                            if !card.certificate.is_verified() {
+                                p { class: "text-warning",
+                                    "Buyers see this store as unbacked: {card.certificate.label()}."
+                                    if let Some(why) = card.certificate.detail() {
+                                        " ({why})"
+                                    }
+                                }
                             }
 
                             button {
