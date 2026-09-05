@@ -971,107 +971,142 @@ impl AppState {
         // small single-field composables and could in principle both fail
         // to deserialize as each other only by luck of field naming.
         if let Some(&network) = self.bitcoin.tip_contract_network.get(&contract_id) {
-            if let Ok(tip_state) = freenet_bitcoin_common::from_cbor::<
-                freenet_bitcoin_common::BitcoinTipStateV1,
-            >(&state_bytes)
-            {
-                self.apply_tip_state(network, &tip_state);
-                return;
+            match freenet_bitcoin_common::from_cbor::<freenet_bitcoin_common::BitcoinTipStateV1>(
+                &state_bytes,
+            ) {
+                Ok(tip_state) => {
+                    self.apply_tip_state(network, &tip_state);
+                    return;
+                }
+                // This id was registered as a tip contract when we subscribed,
+                // so there is no ambiguity to fall through for: the bytes are
+                // this contract's and they did not parse.
+                Err(e) => warn!(
+                    "{} bytes of tip state for {:?} did not decode -- the chain tip will not \
+                     advance from this response. serde: {e}",
+                    state_bytes.len(),
+                    &contract_id[..8.min(contract_id.len())]
+                ),
             }
         }
         if let Some(&network) = self.bitcoin.address_contract_network.get(&contract_id) {
-            if let Ok(addr_state) = freenet_bitcoin_common::from_cbor::<
-                freenet_bitcoin_common::BitcoinAddressStateV1,
-            >(&state_bytes)
-            {
-                self.apply_address_state(contract_id, network, &addr_state);
-                return;
+            match freenet_bitcoin_common::from_cbor::<freenet_bitcoin_common::BitcoinAddressStateV1>(
+                &state_bytes,
+            ) {
+                Ok(addr_state) => {
+                    self.apply_address_state(contract_id, network, &addr_state);
+                    return;
+                }
+                Err(e) => warn!(
+                    "{} bytes of Bitcoin address state for {:?} did not decode -- payments to \
+                     this address will not be seen. serde: {e}",
+                    state_bytes.len(),
+                    &contract_id[..8.min(contract_id.len())]
+                ),
             }
         }
 
-        // Try store contract first
-        if let Ok(store_state) =
-            harvest_common::from_cbor::<harvest_common::store::StoreStateV1>(&state_bytes)
-        {
-            info!(
-                "Received store state for {:?}",
-                &contract_id[..8.min(contract_id.len())]
-            );
-            let reputation_id = store_state.info.info.reputation_contract_id.to_vec();
+        // Try store contract first.
+        //
+        // Which contract these bytes belong to is a guess here -- unlike the
+        // tip and address cases above, nothing registered this id -- so a
+        // failure to decode as a store is expected whenever the bytes are a
+        // reputation or mailbox state. What is NOT expected is failing all
+        // three, so each error is kept and reported together at the bottom.
+        // Discarding them made "these are real bytes I cannot parse"
+        // indistinguishable from "there is nothing here", which is how a
+        // store state that failed to decode looked exactly like an empty
+        // store.
+        let store_err =
+            match harvest_common::from_cbor::<harvest_common::store::StoreStateV1>(&state_bytes) {
+                Err(e) => e,
+                Ok(store_state) => {
+                    info!(
+                        "Received store state for {:?}",
+                        &contract_id[..8.min(contract_id.len())]
+                    );
+                    let reputation_id = store_state.info.info.reputation_contract_id.to_vec();
 
-            // A store the seller just created, or one they own, arrives
-            // without anyone having followed a link. Show it, unless a link
-            // has already named the store this tab is for.
-            if self.active_store_id.is_none() {
-                self.active_store_id = Some(contract_id.clone());
-            }
+                    // A store the seller just created, or one they own, arrives
+                    // without anyone having followed a link. Show it, unless a link
+                    // has already named the store this tab is for.
+                    if self.active_store_id.is_none() {
+                        self.active_store_id = Some(contract_id.clone());
+                    }
 
-            // Whatever we concluded from a timeout, the state is here now.
-            self.store_state_unavailable.remove(&contract_id);
+                    // Whatever we concluded from a timeout, the state is here now.
+                    self.store_state_unavailable.remove(&contract_id);
 
-            // Form the certificate verdicts here, before anything can be
-            // displayed. `verify_store_certificate` needs the contract id,
-            // which is what binds a certificate to THIS store: a genuine
-            // certificate issued to somebody else passes every other check
-            // there is. See `crate::ghostkey_cert`.
-            let certificate_status = crate::ghostkey_cert::verify_store_certificate(
-                &store_state.info.info.certificate_pem,
-                &contract_id,
-            );
-            let unverified_listings = unverified_listings(
-                &store_state.listings.listings,
-                &contract_id,
-                &store_state.info.info.certificate_pem,
-                &certificate_status,
-            );
+                    // Form the certificate verdicts here, before anything can be
+                    // displayed. `verify_store_certificate` needs the contract id,
+                    // which is what binds a certificate to THIS store: a genuine
+                    // certificate issued to somebody else passes every other check
+                    // there is. See `crate::ghostkey_cert`.
+                    let certificate_status = crate::ghostkey_cert::verify_store_certificate(
+                        &store_state.info.info.certificate_pem,
+                        &contract_id,
+                    );
+                    let unverified_listings = unverified_listings(
+                        &store_state.listings.listings,
+                        &contract_id,
+                        &store_state.info.info.certificate_pem,
+                        &certificate_status,
+                    );
 
-            let store = self.browsing_stores.entry(contract_id.clone()).or_default();
-            store.certificate_status = certificate_status;
-            store.unverified_listings = unverified_listings;
-            store.info = Some(store_state.info.info);
-            store.listings = store_state.listings.listings;
-            store.orders = store_state.orders.orders.into_values().collect();
-            store.reputation_contract_id = Some(reputation_id.clone());
+                    let store = self.browsing_stores.entry(contract_id.clone()).or_default();
+                    store.certificate_status = certificate_status;
+                    store.unverified_listings = unverified_listings;
+                    store.info = Some(store_state.info.info);
+                    store.listings = store_state.listings.listings;
+                    store.orders = store_state.orders.orders.into_values().collect();
+                    store.reputation_contract_id = Some(reputation_id.clone());
 
-            // Register the reverse mapping so incoming reputation state
-            // can be matched to this store
-            self.reputation_to_store.insert(reputation_id, contract_id);
-            return;
-        }
+                    // Register the reverse mapping so incoming reputation state
+                    // can be matched to this store
+                    self.reputation_to_store.insert(reputation_id, contract_id);
+                    return;
+                }
+            };
 
         // Try reputation contract
-        if let Ok(reputation_state) =
-            harvest_common::from_cbor::<harvest_common::reputation::ReputationStateV1>(&state_bytes)
+        let reputation_err = match harvest_common::from_cbor::<
+            harvest_common::reputation::ReputationStateV1,
+        >(&state_bytes)
         {
-            info!(
-                "Received reputation state ({} entries)",
-                reputation_state.feedback.len()
-            );
+            Err(e) => e,
+            Ok(reputation_state) => {
+                info!(
+                    "Received reputation state ({} entries)",
+                    reputation_state.feedback.len()
+                );
 
-            // Look up which store this reputation belongs to
-            if let Some(store_id) = self.reputation_to_store.get(&contract_id).cloned() {
-                if let Some(store) = self.browsing_stores.get_mut(&store_id) {
+                // Look up which store this reputation belongs to
+                if let Some(store_id) = self.reputation_to_store.get(&contract_id).cloned() {
+                    if let Some(store) = self.browsing_stores.get_mut(&store_id) {
+                        store.feedback = reputation_state.feedback;
+                    }
+                } else {
+                    info!("Reputation state for unknown store -- caching by contract ID");
+                    // Cache it; will be linked when the store state arrives
+                    let store = self.browsing_stores.entry(contract_id).or_default();
                     store.feedback = reputation_state.feedback;
                 }
-            } else {
-                info!("Reputation state for unknown store -- caching by contract ID");
-                // Cache it; will be linked when the store state arrives
-                let store = self.browsing_stores.entry(contract_id).or_default();
-                store.feedback = reputation_state.feedback;
+                return;
             }
-            return;
-        }
+        };
 
         // Try mailbox contract
-        if let Ok(mailbox_state) =
-            harvest_common::from_cbor::<harvest_common::mailbox::MailboxStateV1>(&state_bytes)
-        {
-            info!(
-                "Received mailbox state ({} messages)",
-                mailbox_state.messages.len()
-            );
+        let mailbox_err = match harvest_common::from_cbor::<harvest_common::mailbox::MailboxStateV1>(
+            &state_bytes,
+        ) {
+            Err(e) => e,
+            Ok(mailbox_state) => {
+                info!(
+                    "Received mailbox state ({} messages)",
+                    mailbox_state.messages.len()
+                );
 
-            match self.mailbox_to_store.get(&contract_id).cloned() {
+                match self.mailbox_to_store.get(&contract_id).cloned() {
                 Some(store_id) => match self.browsing_stores.get_mut(&store_id) {
                     Some(store) => store.mailbox_messages = mailbox_state.messages,
                     None => warn!(
@@ -1090,12 +1125,22 @@ impl AppState {
                     mailbox_state.messages.len()
                 ),
             }
-            return;
-        }
+                return;
+            }
+        };
 
-        info!(
-            "Received unknown contract state ({} bytes)",
-            state_bytes.len()
+        // Nothing claimed these bytes. They are NOT nothing: `state_bytes` was
+        // checked non-empty at the top of this function, so the node returned
+        // real state for a contract we asked about and none of our types could
+        // read it. Naming each decoder's error is the difference between "an
+        // app we do not know" and "our own wire format has moved underneath
+        // us"; the latter is silent everywhere else.
+        warn!(
+            "Received {} bytes of contract state for {:?} that decode as NOTHING we know -- \
+             this is not an empty contract, the bytes are here and unreadable. \
+             store: {store_err} | reputation: {reputation_err} | mailbox: {mailbox_err}",
+            state_bytes.len(),
+            &contract_id[..8.min(contract_id.len())]
         );
     }
 

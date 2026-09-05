@@ -395,6 +395,44 @@ pub fn current_id(code_hash: &[u8; 32], params: &Parameters<'_>) -> ContractInst
 /// The control flow is unchanged (an unreadable state is still not a
 /// migration candidate: there is nothing useful to do with bytes we cannot
 /// parse), but it no longer happens silently.
+/// Say something the operator needs to hear, from a file that is compiled
+/// twice.
+///
+/// This module is built into the Dioxus web app AND, by `#[path]`, into
+/// `tests/rehearsal` -- a plain native binary that deliberately does not
+/// depend on dioxus (see its `Cargo.toml`: it is its own workspace so that
+/// building it can never move a dependency version and re-key an artifact).
+/// So the file cannot name `dioxus` unconditionally. The wasm build is the
+/// browser one and has the logger; every other build has a stderr.
+fn probe_warn(message: &str) {
+    #[cfg(target_arch = "wasm32")]
+    dioxus::logger::tracing::warn!("{message}");
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("{message}");
+}
+
+fn decode_probed_state<T>(artifact: &str, bytes: &[u8]) -> Option<T>
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
+    if bytes.is_empty() {
+        // Genuinely absent. Not a decode failure, and not worth a line.
+        return None;
+    }
+    match harvest_common::from_cbor::<T>(bytes) {
+        Ok(state) => Some(state),
+        Err(e) => {
+            probe_warn(&format!(
+                "migration probe: {} bytes of {artifact} state are present but did NOT decode \
+                 -- treating as no candidate, which is NOT the same as an empty address. \
+                 This is how a recoverable generation goes missing silently. serde: {e}",
+                bytes.len()
+            ));
+            None
+        }
+    }
+}
+
 /// Merge rules for a store's state.
 ///
 /// The merge is the contract's own `ComposableState::merge`, reused rather
@@ -409,7 +447,7 @@ impl ProbeStateOps for StoreOps {
     type State = StoreStateV1;
 
     fn decode(&self, bytes: &[u8]) -> Option<Self::State> {
-        harvest_common::from_cbor(bytes).ok()
+        decode_probed_state("store", bytes)
     }
 
     /// "Real" means the seller actually did something with this store.
@@ -461,7 +499,7 @@ impl ProbeStateOps for ReputationOps {
     type State = ReputationStateV1;
 
     fn decode(&self, bytes: &[u8]) -> Option<Self::State> {
-        harvest_common::from_cbor(bytes).ok()
+        decode_probed_state("reputation", bytes)
     }
 
     /// Feedback is what a reputation contract is for. A state holding only a
@@ -517,7 +555,7 @@ impl ProbeStateOps for MailboxOps {
     type State = MailboxStateV1;
 
     fn decode(&self, bytes: &[u8]) -> Option<Self::State> {
-        harvest_common::from_cbor(bytes).ok()
+        decode_probed_state("mailbox", bytes)
     }
 
     fn is_real(&self, state: &Self::State) -> bool {
