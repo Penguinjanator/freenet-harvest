@@ -503,6 +503,97 @@ mod retention_security_tests {
         );
     }
 
+    /// A message whose nonce is derived from `i`, so a flood can be built out
+    /// of more than 256 distinct messages.
+    fn indexed(i: u32, secs: i64) -> EncryptedMessage {
+        let mut nonce = [0u8; 24];
+        nonce[..4].copy_from_slice(&i.to_be_bytes());
+        EncryptedMessage {
+            nonce,
+            ..msg(0, secs)
+        }
+    }
+
+    /// **THIS TEST PINS A KNOWN GAP. IF IT FAILS, THAT IS GOOD NEWS.**
+    ///
+    /// It asserts what the mailbox does TODAY, which is the wrong thing: a
+    /// funded attacker still evicts every honest message. It exists so that
+    /// closing the gap cannot happen quietly -- whoever closes it will see
+    /// this go red, and the correct response is to invert the assertions and
+    /// rewrite this comment, not to make the test pass again.
+    ///
+    /// The gap: `enforce_message_cap` ranks by `(timestamp, nonce)`, and both
+    /// are chosen by whoever wrote the message. Nothing authenticates who may
+    /// occupy space in an open-write mailbox, so an attacker who pays for
+    /// [`MAX_MESSAGES`] contract updates, each dated later than the honest
+    /// traffic, holds every slot. `MailboxStateV1::apply_delta` documents this
+    /// in prose; this is the executable half.
+    ///
+    /// What would close it, and so break this test: admission control on
+    /// writes (payment or proof-of-work), a per-sender quota, or an
+    /// owner-authenticated notion of which messages are protected. Note that
+    /// an owner-signed *retention checkpoint* alone would NOT break it -- that
+    /// closes the separate question of reintroducing time-based retention
+    /// safely, and a flood still fills the cap underneath it. Any of these
+    /// needs something `apply_delta` does not currently receive, which is why
+    /// the gap is open rather than merely unfixed: neither `verify` nor
+    /// `apply_delta` is given `MailboxParameters`, so the owner's verifying
+    /// key -- the only authenticated identity this contract has -- is not
+    /// reachable from the code that would have to use it.
+    ///
+    /// The second half of the test is the PRICE, and it is the part that
+    /// silently rots if the cap is retuned: one message short of the cap
+    /// evicts nothing. That is the whole difference from the timestamp defect
+    /// this replaced, where the price was one message.
+    #[test]
+    fn known_gap_a_funded_flood_still_evicts_every_honest_message() {
+        let base = 1_700_000_000;
+        let honest = || {
+            vec![
+                indexed(1, base),
+                indexed(2, base + 60),
+                indexed(3, base + 120),
+            ]
+        };
+        // Dated after the honest traffic, which is free: nothing signs a
+        // timestamp. Ranking highest-first is what makes these the survivors.
+        let flood = |count: u32| -> Vec<EncryptedMessage> {
+            (0..count)
+                .map(|i| indexed(1_000 + i, base + 1_000_000 + i as i64))
+                .collect()
+        };
+
+        // The price. One short of filling the cap, and every honest message
+        // is still there -- an attacker gets nothing for a partial spend.
+        let mut under = MailboxStateV1::default();
+        under.apply_delta(&Some(honest())).unwrap();
+        under
+            .apply_delta(&Some(flood(MAX_MESSAGES as u32 - 3)))
+            .unwrap();
+        assert_eq!(under.messages.len(), MAX_MESSAGES);
+        for honest_nonce in honest().iter().map(|m| m.nonce) {
+            assert!(
+                under.messages.iter().any(|m| m.nonce == honest_nonce),
+                "a flood that does not fill the cap must evict nothing"
+            );
+        }
+
+        // The gap. Pay for a full cap's worth and the honest messages are
+        // gone. THIS IS THE ASSERTION TO INVERT when the gap closes.
+        let mut over = MailboxStateV1::default();
+        over.apply_delta(&Some(honest())).unwrap();
+        over.apply_delta(&Some(flood(MAX_MESSAGES as u32))).unwrap();
+        assert_eq!(over.messages.len(), MAX_MESSAGES);
+        for honest_nonce in honest().iter().map(|m| m.nonce) {
+            assert!(
+                !over.messages.iter().any(|m| m.nonce == honest_nonce),
+                "KNOWN GAP no longer reproduces: an honest message survived a \
+                 full-cap flood. If you just made that happen, invert this \
+                 assertion -- the mailbox now resists a funded flood."
+            );
+        }
+    }
+
     /// Retention has to bound the state, because that is the only thing it was
     /// ever for. With time-based pruning gone, a count cap is what does it.
     #[test]
