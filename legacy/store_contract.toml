@@ -9,15 +9,36 @@
 # ghostkey ALONE -- the probe does not need the delegate to have survived to
 # find an old store.
 #
-# CAREFUL: `cbor(StoreParameters)` is NOT the same bytes for every row here.
-# V1-V5 were published when `StoreParameters` still carried
-# `trusted_bitcoin_bridges` and `bitcoin_address_code_hash` (as `[]` and
-# `null`); today it holds only the seller's key, which is 56 bytes rather than
-# 109. `ui/src/migrate.rs::store_candidates` derives each generation under the
+# CAREFUL: `cbor(StoreParameters)` is NOT the same bytes for every row here,
+# and the odd ones out are in the MIDDLE, not at the start.
+#
+# The encoding went 56 -> 109 -> 56 bytes:
+#
+#   V1     (built ded0e3a)             56 B -- seller key only
+#   V2-V5  (built 78d1020..9e3e1fb)   109 B -- plus trusted_bitcoin_bridges
+#                                             ([]) and bitcoin_address_code_hash
+#                                             (null)
+#   V6+    (built ea94a33 onwards)     56 B -- seller key only again
+#
+# `7c192d2` added the two Bitcoin fields to `StoreParameters` (first shipped in
+# the V2 artifact); `fc760ed` moved them onto `Order` (first shipped in V6).
+# Each "built" commit is the one whose committed
+# `ui/public/contracts/store_contract.wasm` hashes to that row's `code_hash`.
+#
+# So V1 is derived under TODAY's encoding, not the legacy one. An earlier
+# version of this comment said "V1-V5 were published when StoreParameters still
+# carried" the two fields, which is wrong about V1 -- and V1 is the ONLY
+# generation ever published to the network, so the probe derived the one store
+# that exists at an address it never had.
+#
+# `ui/src/migrate.rs::store_candidates` derives each generation under the
 # encoding it was published with, keyed on
-# `LAST_LEGACY_STORE_PARAM_GENERATION`. A row added from here on is published
-# under the current shape. Getting this wrong is silent -- the probe walks
-# addresses that never existed and reports a clean migration.
+# `published_under_legacy_store_params`, which is a BAND
+# (`FIRST_LEGACY_STORE_PARAM_GENERATION..=LAST_LEGACY_STORE_PARAM_GENERATION`)
+# and not a threshold, for exactly that reason. A row added from here on is
+# published under the current shape and falls outside the band on its own.
+# Getting this wrong is silent -- the probe walks addresses that never existed
+# and reports a clean migration.
 #
 # The state is a `#[composable]` CRDT merged by the contract's own
 # `update_state`, so folding an old generation forward is the same operation

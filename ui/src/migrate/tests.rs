@@ -550,14 +550,18 @@ fn superseded_store_generations_are_probed_under_their_own_parameter_encoding() 
     );
 
     // Newest-first, each generation derived under the encoding IT was
-    // published with: the legacy shape at or below the split, today's above.
+    // published with. Which side each generation falls on is asserted against
+    // the artifacts in
+    // `each_store_generation_is_derived_under_the_encoding_it_shipped_with`;
+    // this test is about the ordering and completeness of the walk, so it is
+    // entitled to ask the predicate.
     let mut newest_first: Vec<_> = store_lineage().iter().collect();
     newest_first.sort_by_key(|e| std::cmp::Reverse(e.generation));
 
     let mut seen_legacy = false;
     let mut seen_current = false;
     for (entry, got) in newest_first.iter().zip(&candidates) {
-        let legacy_side = entry.generation <= LAST_LEGACY_STORE_PARAM_GENERATION;
+        let legacy_side = published_under_legacy_store_params(entry.generation);
         let (expected, wrong) = if legacy_side {
             seen_legacy = true;
             (
@@ -590,6 +594,107 @@ fn superseded_store_generations_are_probed_under_their_own_parameter_encoding() 
         "the lineage must span the parameter split for this test to mean anything \
          (legacy seen: {seen_legacy}, current seen: {seen_current})"
     );
+}
+
+/// Which encoding each store generation was ACTUALLY published under, taken
+/// from the artifacts rather than from the code under test.
+///
+/// The store's parameter encoding did not change once, it changed twice and
+/// came back:
+///
+/// | generation | built at  | `StoreParameters` | cbor |
+/// |------------|-----------|-------------------|------|
+/// | V1         | `ded0e3a` | 1 field           | 56 B |
+/// | V2         | `78d1020` | 3 fields          | 109 B|
+/// | V3         | `ca57d8f` | 3 fields          | 109 B|
+/// | V4         | `47b67aa` | 3 fields          | 109 B|
+/// | V5         | `9e3e1fb` | 3 fields          | 109 B|
+/// | V6         | `ea94a33` | 1 field           | 56 B |
+///
+/// The two Bitcoin fields were added by `7c192d2` (first shipped in the V2
+/// artifact) and removed again by `fc760ed` (first shipped in the V6
+/// artifact). Each "built at" commit is the one whose committed
+/// `ui/public/contracts/store_contract.wasm` hashes to that generation's
+/// `code_hash` in `legacy/store_contract.toml`, so the mapping is checkable
+/// with `git show <commit>:ui/public/contracts/store_contract.wasm | b3sum`.
+///
+/// Written out per generation on purpose. Deriving the expectation from
+/// `published_under_legacy_store_params` -- as the test below this one does,
+/// for the ordering property it is actually about -- cannot catch the
+/// boundary being wrong, because it asks the code under test what the answer
+/// is. V1 sat on the wrong side of that boundary for exactly that reason.
+const PUBLISHED_UNDER_LEGACY_PARAMS: &[(u32, bool)] = &[
+    (1, false),
+    (2, true),
+    (3, true),
+    (4, true),
+    (5, true),
+    (6, false),
+];
+
+/// V1 is derived under TODAY's parameter encoding, not the legacy one.
+///
+/// V1 predates the Bitcoin payments work entirely: its `StoreParameters` had
+/// one field, exactly as today's does. It is also the only generation ever
+/// published to the network (`git show origin/main:ui/public/contracts/\
+/// store_contract.wasm | b3sum` is `4d7ad3c3...`, the registry's first row),
+/// so getting it wrong means the migration probe cannot find the one store
+/// that exists -- and reports a clean "nothing to migrate" while doing it.
+///
+/// Mutated red by restoring the single threshold this replaced
+/// (`generation <= LAST_LEGACY_STORE_PARAM_GENERATION`), which buckets V1 as
+/// legacy because generations are 1-based.
+#[test]
+fn each_store_generation_is_derived_under_the_encoding_it_shipped_with() {
+    let vk = seller_vk();
+    let legacy = Parameters::from(legacy_store_param_bytes(&vk));
+    let current = encode_params(&store_params(&vk)).expect("encode");
+
+    // The sizes named in `legacy/store_contract.toml` and in
+    // `harvest_common::address`. If either moves, the table above is about
+    // something else.
+    assert_eq!(legacy.as_ref().len(), 109, "legacy StoreParameters cbor");
+    assert_eq!(current.as_ref().len(), 56, "current StoreParameters cbor");
+
+    assert_eq!(
+        PUBLISHED_UNDER_LEGACY_PARAMS.len(),
+        store_lineage().len(),
+        "the table must cover every recorded generation, and only those"
+    );
+
+    let candidates = store_candidate_ids(&vk).expect("candidates");
+    let mut newest_first: Vec<_> = store_lineage().iter().collect();
+    newest_first.sort_by_key(|e| std::cmp::Reverse(e.generation));
+
+    for (entry, got) in newest_first.iter().zip(&candidates) {
+        let (_, legacy_side) = PUBLISHED_UNDER_LEGACY_PARAMS
+            .iter()
+            .find(|(g, _)| *g == entry.generation)
+            .unwrap_or_else(|| panic!("generation {} is not in the table", entry.generation));
+
+        let expected = if *legacy_side {
+            current_id(&entry.code_hash, &legacy)
+        } else {
+            current_id(&entry.code_hash, &current)
+        };
+        assert_eq!(
+            *got,
+            expected,
+            "generation {} was published under the {} parameter encoding",
+            entry.generation,
+            if *legacy_side { "legacy" } else { "current" }
+        );
+
+        // And the predicate the derivation actually consults has to agree
+        // with the table, so a future edit to one of them cannot drift from
+        // the other unnoticed.
+        assert_eq!(
+            published_under_legacy_store_params(entry.generation),
+            *legacy_side,
+            "the generation band disagrees with the artifacts for V{}",
+            entry.generation
+        );
+    }
 }
 
 // --- sealing ------------------------------------------------------------

@@ -37,13 +37,14 @@
 //!
 //! `freenet_migrate` derives every predecessor id from one set of parameter
 //! bytes, which is right only while the parameter encoding is stable. The
-//! store's is not: `StoreParameters` shed two fields when the Bitcoin bridge
-//! list moved onto `Order`, so generations V1-V5 live at addresses no
-//! encoding this build produces can reproduce. [`store_candidates`] derives
-//! each generation under the encoding it was actually published with, and
-//! [`LAST_LEGACY_STORE_PARAM_GENERATION`] is the boundary. Any future change
-//! to a contract's parameters needs the same treatment, and its absence is
-//! silent: the probe finds nothing at every address and reports success.
+//! store's is not: `StoreParameters` GAINED two fields when the Bitcoin bridge
+//! list arrived and then shed them again when it moved onto `Order`, so
+//! generations V2-V5 -- and only those -- live at addresses no encoding this
+//! build produces can reproduce. [`store_candidates`] derives each generation
+//! under the encoding it was actually published with, and
+//! [`published_under_legacy_store_params`] is the band. Any future change to a
+//! contract's parameters needs the same treatment, and its absence is silent:
+//! the probe finds nothing at every address and reports success.
 //!
 //! # The ordering constraint
 //!
@@ -192,7 +193,17 @@ pub fn store_params(seller_verifying_key: &ed25519_dalek::VerifyingKey) -> Store
     }
 }
 
-/// The last store generation published under the OLD `StoreParameters` shape.
+/// The FIRST store generation published under the old `StoreParameters` shape.
+///
+/// See [`published_under_legacy_store_params`] for why the band has a lower
+/// end at all.
+pub const FIRST_LEGACY_STORE_PARAM_GENERATION: u32 = 2;
+
+/// The last store generation published under the old `StoreParameters` shape.
+pub const LAST_LEGACY_STORE_PARAM_GENERATION: u32 = 5;
+
+/// Whether generation `generation` was published under
+/// [`legacy_store_params_cbor`] rather than under today's encoding.
 ///
 /// # Why a generation split exists at all
 ///
@@ -204,19 +215,37 @@ pub fn store_params(seller_verifying_key: &ed25519_dalek::VerifyingKey) -> Store
 /// list of addresses that never existed, finds nothing at every one, and
 /// reports a clean "nothing to migrate".
 ///
-/// `StoreParameters` used to carry `trusted_bitcoin_bridges` and
-/// `bitcoin_address_code_hash` alongside the seller's key. Moving them onto
-/// `Order` cut its CBOR from 109 bytes to 56, so every store ever published --
-/// generations V1 through V5 -- lives at an address derived from the longer
-/// encoding, and nothing this build encodes will ever reproduce it.
+/// # Why it is a band and not a threshold
 ///
-/// So this constant is the boundary: at or below it, derive with
-/// [`legacy_store_params_cbor`]; above it, with today's encoding. It is a
-/// fixed historical fact, not a thing to bump on the next re-key -- a
-/// generation added later is published under the current shape.
-pub const LAST_LEGACY_STORE_PARAM_GENERATION: u32 = 5;
+/// The encoding did not change once. It changed and then changed back:
+///
+/// | generation | built at  | `StoreParameters` | cbor  |
+/// |------------|-----------|-------------------|-------|
+/// | V1         | `ded0e3a` | 1 field           | 56 B  |
+/// | V2..=V5    | `78d1020`..`9e3e1fb` | 3 fields | 109 B |
+/// | V6..       | `ea94a33` | 1 field           | 56 B  |
+///
+/// `7c192d2` added `trusted_bitcoin_bridges` and `bitcoin_address_code_hash`
+/// (first shipped in the V2 artifact); `fc760ed` moved them onto `Order`
+/// again (first shipped in the V6 artifact). So the legacy encoding is a
+/// middle band, which a single "at or below" threshold cannot express: as one,
+/// it bucketed V1 as legacy, because generations are 1-based.
+///
+/// That was the whole of the bug worth naming here. **V1 is the only
+/// generation ever published to the network** -- its code hash `4d7ad3c3...`
+/// is what `git show origin/main:ui/public/contracts/store_contract.wasm`
+/// hashes to -- so deriving it under the wrong encoding meant the probe could
+/// not find the one store that exists, and said "nothing to migrate" about it.
+///
+/// These are fixed historical facts, not things to bump on the next re-key: a
+/// generation added from here on is published under the current shape, so it
+/// falls outside the band on its own.
+pub fn published_under_legacy_store_params(generation: u32) -> bool {
+    (FIRST_LEGACY_STORE_PARAM_GENERATION..=LAST_LEGACY_STORE_PARAM_GENERATION).contains(&generation)
+}
 
-/// The parameter bytes generations V1..=[`LAST_LEGACY_STORE_PARAM_GENERATION`]
+/// The parameter bytes generations
+/// [`FIRST_LEGACY_STORE_PARAM_GENERATION`]..=[`LAST_LEGACY_STORE_PARAM_GENERATION`]
 /// were actually published under.
 ///
 /// Mirrors the old `StoreParameters` exactly, including the values
@@ -246,7 +275,7 @@ fn legacy_store_params_cbor(
 ///
 /// This is what `freenet_migrate::NewestFirst::from_lineage` would do if the
 /// encoding had never changed; it exists only because it did. See
-/// [`LAST_LEGACY_STORE_PARAM_GENERATION`].
+/// [`published_under_legacy_store_params`].
 pub fn store_candidate_ids(
     seller_verifying_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<Vec<ContractInstanceId>, String> {
@@ -256,7 +285,7 @@ pub fn store_candidate_ids(
     let mut by_generation: Vec<(u32, ContractInstanceId)> = store_lineage()
         .iter()
         .map(|e| {
-            let params = if e.generation <= LAST_LEGACY_STORE_PARAM_GENERATION {
+            let params = if published_under_legacy_store_params(e.generation) {
                 &legacy
             } else {
                 &current
@@ -352,6 +381,20 @@ pub fn current_id(code_hash: &[u8; 32], params: &Parameters<'_>) -> ContractInst
 
 // --- state semantics ----------------------------------------------------
 
+/// Decode a probed state, saying out loud when bytes that ARE there cannot be
+/// read.
+///
+/// `ProbeStateOps::decode` returns an `Option`, so on its own it collapses two
+/// completely different situations into `None`: "this address holds nothing"
+/// and "this address holds a state I could not parse". The probe treats the
+/// second as the first, walks on, and can go on to report a clean "nothing to
+/// migrate" over a store it actually found and read off the network.
+///
+/// That is not hypothetical -- it is exactly what hid `StoreStateV1::orders`
+/// having no `#[serde(default)]`, which made every real V1 state undecodable.
+/// The control flow is unchanged (an unreadable state is still not a
+/// migration candidate: there is nothing useful to do with bytes we cannot
+/// parse), but it no longer happens silently.
 /// Merge rules for a store's state.
 ///
 /// The merge is the contract's own `ComposableState::merge`, reused rather
