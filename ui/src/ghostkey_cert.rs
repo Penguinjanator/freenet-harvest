@@ -162,10 +162,18 @@ fn store_code_hash() -> [u8; 32] {
 /// build's, plus every superseded generation.
 ///
 /// The legacy ids come from [`crate::migrate::store_candidate_ids`], which
-/// already knows that generations at or below
-/// `LAST_LEGACY_STORE_PARAM_GENERATION` were published under a *different*
-/// `StoreParameters` encoding. Re-deriving them here would be a second copy
-/// of that fact, and the first one was got wrong once already.
+/// already knows which generations were published under a *different*
+/// `StoreParameters` encoding -- a middle BAND, V2..=V5, not everything below
+/// a threshold: V1 predates the two Bitcoin fields and V6 onwards postdates
+/// them, so both sit on the current encoding. See
+/// `migrate::published_under_legacy_store_params`.
+///
+/// Re-deriving them here would be a second copy of that fact, and the first
+/// one was got wrong once already -- twice, in fact. The comment this replaced
+/// said "at or below `LAST_LEGACY_STORE_PARAM_GENERATION`", which was the
+/// same off-by-one that made the probe derive V1 -- the only generation ever
+/// published -- at an address it never had. Delegating rather than
+/// re-deriving is what kept that bug out of this file.
 fn store_instance_ids(key: &VerifyingKey) -> Result<Vec<ContractInstanceId>, String> {
     let params = crate::migrate::encode_params(&crate::migrate::store_params(key))?;
     let mut ids = vec![crate::migrate::current_id(&store_code_hash(), &params)];
