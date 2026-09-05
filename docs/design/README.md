@@ -22,6 +22,15 @@ because each still contains material the explainer cut for length:
   it is what makes the exit-scam protection work, so it cannot be optimised away
   without giving up the protection.
 
+## Engineering notes
+
+These are about the code rather than the mechanism.
+
+- **[migrate-ops-testability.md](migrate-ops-testability.md)** — why nothing
+  automated executes `ui/src/gateway/migrate_ops.rs`, what that has cost in
+  found-by-hand defects, and a staged plan to fix it. Deferred deliberately,
+  with the reasoning recorded.
+
 ## Relationship to the older documents
 
 `../design.md` describes Harvest's overall shape — stores, listings, reputation,

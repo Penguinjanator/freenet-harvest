@@ -84,10 +84,26 @@ impl SessionWalks {
     /// was -- recovered and sealed, recovered and unsealed, nothing found, or
     /// a forward PUT that was never confirmed.
     ///
-    /// Every one of those is terminal FOR THIS SESSION. A walk that failed
-    /// transiently is retried by reloading, not by reconnecting, because
-    /// "retry on reconnect" has no bound and the vault reconnects on its own
-    /// schedule.
+    /// Every one of those is terminal FOR THIS SESSION.
+    ///
+    /// # Retry is by reload, and that is deliberate
+    ///
+    /// A walk that failed transiently -- an unconfirmed forward put, an
+    /// unreachable node -- is retried by reloading the page, not by
+    /// reconnecting. **Do not "fix" this by releasing the claim here.** That
+    /// is what this code used to do, and with the seal withheld it left
+    /// nothing holding the gate at all: every reconnect re-walked the whole
+    /// lineage and re-PUT the full state, once per connect, for the life of
+    /// the tab.
+    ///
+    /// Bounded in-session retries (allow two, then stop) were considered and
+    /// rejected on review. They would be a second bound, whose behaviour under
+    /// connection churn someone then has to reason about, to buy something a
+    /// reload already provides -- and a seller whose migration failed is
+    /// reloading anyway, because that is what people do when an app looks
+    /// wrong. The simpler bound is worth more here than the extra recovery.
+    ///
+    /// This is an accepted trade, not an oversight.
     pub fn settled(&mut self, marker: &str) {
         self.walks.insert(marker.to_string(), WalkState::Settled);
     }
