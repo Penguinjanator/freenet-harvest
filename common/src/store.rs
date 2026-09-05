@@ -206,16 +206,29 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
         if let Some(new_listings) = delta {
-            let existing_ids: std::collections::HashSet<ListingId> =
+            let mut known_ids: std::collections::HashSet<ListingId> =
                 self.listings.iter().map(|l| l.listing.id.clone()).collect();
 
+            // Collect first, push after. Verifying and pushing in one pass
+            // left a delta of [valid, invalid] with the valid listing already
+            // in `self` when the error returned -- see `OrdersV1::apply_delta`
+            // for the same defect and why the call site's habit of discarding
+            // the state on error is not a substitute for this.
+            let mut to_add = Vec::new();
             for listing in new_listings {
-                if existing_ids.contains(&listing.listing.id) {
+                // `insert` is false for a listing already held -- including
+                // one added by an EARLIER entry of this same delta, which the
+                // snapshot this used to take before the loop could not see, so
+                // a delta naming one listing twice stored it twice. `listings`
+                // is a plain `Vec` with no uniqueness invariant of its own, so
+                // that duplicate then survived every later merge and sort.
+                if !known_ids.insert(listing.listing.id.clone()) {
                     continue; // already have this listing
                 }
                 listing.verify(&parameters.seller_verifying_key)?;
-                self.listings.push(listing.clone());
+                to_add.push(listing.clone());
             }
+            self.listings.extend(to_add);
 
             // Sort deterministically for CRDT convergence
             self.listings
@@ -505,10 +518,19 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
         let Some(incoming) = delta else {
             return Ok(());
         };
+        // Verify the WHOLE delta before merging any of it. Verifying and
+        // merging in one pass left a delta of [valid, invalid] with the valid
+        // record already folded into `self` when the error returned, so a
+        // caller that kept the state it passed in would silently take on
+        // records from a delta it had been told to reject. The contract's
+        // `update_state` happens to discard the mutated value on error, but
+        // that is a property of that call site, not of this function.
         for record in incoming {
             record
                 .verify(&parameters.seller_verifying_key)
                 .map_err(|e| format!("order {} delta invalid: {e}", record.order.id))?;
+        }
+        for record in incoming {
             merge_order(&mut self.orders, record.clone());
         }
         enforce_order_cap(&mut self.orders);
@@ -1733,6 +1755,166 @@ mod order_tests {
             crate::to_cbor(&padded_then_honest.orders[&order.id]).unwrap(),
             honest_bytes,
             "and it must not survive merely by having arrived first"
+        );
+    }
+
+    /// A delta is all-or-nothing.
+    ///
+    /// `apply_delta` used to verify and merge in one pass, so a delta of
+    /// `[valid, invalid]` left the valid record merged into `self` and *then*
+    /// returned `Err`. Today the contract's `update_state` happens to throw
+    /// the mutated value away on error, so nothing observes the half-applied
+    /// state -- but that is a property of the call site, not of this function,
+    /// and no test asserted it at either end. Anything that keeps the state it
+    /// passed in (a retry, a merge helper, the migration fold) would silently
+    /// take on records from a delta it was told to reject.
+    #[test]
+    fn a_delta_holding_one_invalid_record_applies_none_of_it() {
+        use freenet_scaffold::ComposableState;
+
+        let seller = seller_key();
+        let impostor = SigningKey::from_bytes(&[44u8; 32]);
+        let bridge = bridge_key();
+        let p = params(&seller);
+
+        let good_order = make_order("buyer-good", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+        let good = make_authorized_order(
+            &seller,
+            good_order.clone(),
+            OrderStatus::Paid,
+            Some(make_payment_proof(&good_order, &bridge, 5)),
+        );
+
+        // Signed by somebody who is not the seller, so `verify_terms` refuses
+        // it. Any rejection would do; this is the cheapest to state.
+        let bad_order = make_order("buyer-bad", 1_700_000_100, &[0x00, 0x14, 0xcc, 0xdd]);
+        let bad = make_authorized_order(
+            &impostor,
+            bad_order.clone(),
+            OrderStatus::AwaitingPayment,
+            None,
+        );
+
+        let mut state = OrdersV1::default();
+        let err = state
+            .apply_delta(
+                &StoreStateV1::default(),
+                &p,
+                &Some(vec![good.clone(), bad.clone()]),
+            )
+            .expect_err("a delta carrying an invalid record must be rejected");
+        assert!(
+            err.contains(&bad_order.id.to_string()) || err.contains("invalid"),
+            "the error should name the record that failed: {err}"
+        );
+        assert!(
+            state.orders.is_empty(),
+            "a rejected delta must leave nothing behind -- found {:?}",
+            state.orders.keys().collect::<Vec<_>>()
+        );
+
+        // The valid record on its own is genuinely applicable, so the
+        // assertion above is about atomicity and not about `good` being
+        // unmergeable for some other reason.
+        let mut state = OrdersV1::default();
+        state
+            .apply_delta(&StoreStateV1::default(), &p, &Some(vec![good.clone()]))
+            .expect("the valid record alone must apply");
+        assert_eq!(
+            state.orders.keys().collect::<Vec<_>>(),
+            vec![&good_order.id]
+        );
+
+        // Order within the delta must not matter either.
+        let mut state = OrdersV1::default();
+        state
+            .apply_delta(&StoreStateV1::default(), &p, &Some(vec![bad, good]))
+            .expect_err("a delta carrying an invalid record must be rejected");
+        assert!(state.orders.is_empty());
+    }
+
+    /// A seller-signed listing, built the same way `make_authorized_order`
+    /// builds order terms.
+    fn make_listing(signer: &SigningKey, title: &str) -> AuthorizedListing {
+        let ts = timestamp(1_700_000_000);
+        let listing = crate::listing::Listing {
+            id: ListingId::new("seller-fingerprint", &ts, title),
+            title: title.into(),
+            description: String::new(),
+            kind: crate::listing::ListingKind::Sale,
+            price: None,
+            created_at: ts,
+        };
+        let (scoped_payload, signature) = sign_scoped(signer, &listing);
+        AuthorizedListing {
+            listing,
+            scoped_payload,
+            signature,
+            certificate_pem: String::new(),
+        }
+    }
+
+    /// `ListingsV1::apply_delta` had the same half-applied shape as
+    /// `OrdersV1`'s, found while fixing that one: it pushed each listing as
+    /// it verified it, so a delta of `[valid, invalid]` left the valid
+    /// listing in `self` and then returned `Err`.
+    #[test]
+    fn a_listing_delta_holding_one_invalid_entry_applies_none_of_it() {
+        use freenet_scaffold::ComposableState;
+
+        let seller = seller_key();
+        let impostor = SigningKey::from_bytes(&[44u8; 32]);
+        let p = params(&seller);
+
+        let good = make_listing(&seller, "Widget");
+        let bad = make_listing(&impostor, "Fake");
+
+        let mut state = ListingsV1::default();
+        state
+            .apply_delta(
+                &StoreStateV1::default(),
+                &p,
+                &Some(vec![good.clone(), bad.clone()]),
+            )
+            .expect_err("a listing delta carrying an unsigned entry must be rejected");
+        assert!(
+            state.listings.is_empty(),
+            "a rejected listing delta must leave nothing behind"
+        );
+
+        let mut state = ListingsV1::default();
+        state
+            .apply_delta(&StoreStateV1::default(), &p, &Some(vec![good.clone()]))
+            .expect("the valid listing alone must apply");
+        assert_eq!(state.listings.len(), 1);
+    }
+
+    /// A delta naming the same listing twice must not store it twice.
+    ///
+    /// The duplicate check reads a set snapshotted BEFORE the loop, so a
+    /// self-duplicating delta used to push both copies. `listings` is a `Vec`
+    /// with no uniqueness invariant of its own, and merge is supposed to be
+    /// idempotent, so the duplicate survived every subsequent merge and sort.
+    #[test]
+    fn a_listing_delta_repeating_one_listing_stores_it_once() {
+        use freenet_scaffold::ComposableState;
+
+        let seller = seller_key();
+        let p = params(&seller);
+        let listing = make_listing(&seller, "Widget");
+
+        let mut state = ListingsV1::default();
+        state
+            .apply_delta(
+                &StoreStateV1::default(),
+                &p,
+                &Some(vec![listing.clone(), listing.clone()]),
+            )
+            .expect("a repeated-but-valid listing is not an error, just a duplicate");
+        assert_eq!(
+            state.listings.len(),
+            1,
+            "the same listing twice in one delta must be stored once"
         );
     }
 }
