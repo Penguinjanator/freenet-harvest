@@ -58,6 +58,33 @@
 //! because a store published under an older contract build lives at a
 //! different address and is not therefore fraudulent.
 //!
+//! # The limitation this approach has, and cannot fix
+//!
+//! Running the derivation forwards means enumerating the code hashes this
+//! build knows about: today's, and every one in `legacy/store_contract.toml`.
+//! A store published by a *newer* build of Harvest than the one reading it
+//! lives at an address derived from a code hash this build has never heard
+//! of, and is indistinguishable here from a certificate issued to somebody
+//! else. Both are "no id matches".
+//!
+//! That is not hypothetical -- the store contract has already been through
+//! several generations, and a rustc or stdlib bump is enough to move it. So
+//! `CertificateStatus::Invalid` names the benign explanation alongside the
+//! hostile one, and the storefront's wording declines to credit the seller
+//! rather than accusing them, which is the right response either way: a
+//! reader that cannot verify a bond should not act as though it had.
+//!
+//! Removing it means reading the contract's PARAMETERS instead of deriving
+//! its address. The node's GET response carries them, and
+//! `gateway::response_handler` currently discards the container; recovering
+//! them would let the check be `certificate.verifying_key ==
+//! parameters.seller_verifying_key` with no dependence on any code hash. The
+//! cost is that it no longer establishes, in the same step, that the code at
+//! that address is the real Harvest store contract -- that becomes a separate
+//! check against the same list of known hashes, and so carries the same
+//! staleness, but as a weaker and separately-reportable signal rather than as
+//! a false accusation.
+//!
 //! # What is deliberately NOT read here
 //!
 //! The donation *amount*. `GhostkeyCertificateV1::verify` returns the notary
@@ -196,9 +223,12 @@ fn verify_store_certificate_against(
     match store_instance_ids(&key) {
         Ok(ids) if ids.contains(&id) => CertificateStatus::Verified,
         // The attack this whole module is for: a genuine certificate, issued
-        // to somebody else, pasted onto this store.
+        // to somebody else, pasted onto this store. The other explanation is
+        // benign and is named too -- see the module docs.
         Ok(_) => CertificateStatus::Invalid(
-            "genuine, but issued to a different identity than this store's".to_string(),
+            "genuine, but not this store's identity; or this store was published by a \
+             newer build of Harvest than yours"
+                .to_string(),
         ),
         Err(e) => CertificateStatus::Invalid(e),
     }
@@ -323,6 +353,28 @@ mod tests {
                 "a store at a superseded generation must still verify"
             );
         }
+    }
+
+    /// The known limitation, pinned so it stays visible. A store at an
+    /// address this build cannot derive -- a future contract generation --
+    /// reads exactly like a stolen certificate, because in both cases no
+    /// known code hash produces the id. See the module docs for what fixing
+    /// it would take.
+    #[test]
+    fn a_store_at_an_unknown_contract_generation_cannot_be_verified() {
+        let (key, pem) = issue_ghostkey();
+        let params = crate::migrate::encode_params(&crate::migrate::store_params(&key))
+            .expect("encode store parameters");
+        // The seller's own key, under a code hash this build knows nothing of.
+        let future = crate::migrate::current_id(&[0xAB; 32], &params);
+
+        assert!(
+            matches!(
+                verify_store_certificate_against(&pem, future.as_bytes(), &test_master()),
+                CertificateStatus::Invalid(_)
+            ),
+            "a generation this build cannot derive cannot be verified either"
+        );
     }
 
     #[test]
