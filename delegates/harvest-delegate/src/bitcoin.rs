@@ -6,8 +6,18 @@
 //! because a contract is reachable by anyone who knows the key and is
 //! replicated indefinitely -- turning "who is watching which Bitcoin
 //! address" into a permanent, globally enumerable index. Every value this
-//! file persists goes through `DelegateCtx::{get,set}_secret`, which is
-//! per-user, encrypted, and never leaves this machine.
+//! file persists goes through the delegate host's secret store
+//! ([`crate::secrets::CtxSecrets`] over `DelegateCtx::{get,set}_secret`),
+//! which is per-user, encrypted, and never leaves this machine.
+//!
+//! # Every request here is gated on the caller
+//!
+//! The store is per-USER, not per-app: any web app the user has ever opened on
+//! this node can address this delegate (its key is the hash of WASM that is
+//! committed in this repository, under empty parameters), and the host does not
+//! slice the secret namespace by origin. So the only thing separating a hostile
+//! page from the seller's payment key is [`crate::origin::authorize`], which
+//! [`handle`] applies before it looks at the request at all. See that module.
 //!
 //! # Manual watches and order-driven watches are the same watch
 //!
@@ -32,7 +42,8 @@
 //! to a bridge is the UI's job: it reads the `BridgeEndpoint` back from
 //! `GetBridge`/`ConfigureBridge` and speaks to that URL directly.
 
-use freenet_stdlib::prelude::{DelegateCtx, DelegateError};
+use freenet_migrate::SecretStore;
+use freenet_stdlib::prelude::{DelegateError, MessageOrigin};
 
 use harvest_common::bitcoin_delegate::{
     BitcoinDelegateRequest, BitcoinDelegateResponse, BridgeEndpoint, DerivedAddress,
@@ -84,32 +95,35 @@ pub(crate) const BITCOIN_BRIDGE_KEY: &[u8] = b"harvest:bitcoin:bridge:v1";
 /// already carry live invoices.
 pub(crate) const BITCOIN_PAYMENT_XPUB_KEY: &[u8] = b"harvest:bitcoin:payment-xpub:v1";
 
-fn load_watches(ctx: &DelegateCtx) -> Vec<WatchedPayment> {
-    ctx.get_secret(BITCOIN_WATCHES_KEY)
+fn load_watches<S: SecretStore>(store: &S) -> Vec<WatchedPayment> {
+    store
+        .get_secret(BITCOIN_WATCHES_KEY)
         .and_then(|bytes| from_cbor(&bytes).ok())
         .unwrap_or_default()
 }
 
-fn save_watches(ctx: &mut DelegateCtx, watches: &[WatchedPayment]) {
+fn save_watches<S: SecretStore>(store: &mut S, watches: &[WatchedPayment]) {
     if let Ok(bytes) = to_cbor(&watches) {
-        ctx.set_secret(BITCOIN_WATCHES_KEY, &bytes);
+        store.set_secret(BITCOIN_WATCHES_KEY, &bytes);
     }
 }
 
-fn load_bridge(ctx: &DelegateCtx) -> Option<BridgeEndpoint> {
-    ctx.get_secret(BITCOIN_BRIDGE_KEY)
+fn load_bridge<S: SecretStore>(store: &S) -> Option<BridgeEndpoint> {
+    store
+        .get_secret(BITCOIN_BRIDGE_KEY)
         .and_then(|bytes| from_cbor::<Option<BridgeEndpoint>>(&bytes).ok())
         .flatten()
 }
 
-fn save_bridge(ctx: &mut DelegateCtx, endpoint: &BridgeEndpoint) {
+fn save_bridge<S: SecretStore>(store: &mut S, endpoint: &BridgeEndpoint) {
     if let Ok(bytes) = to_cbor(&Some(endpoint.clone())) {
-        ctx.set_secret(BITCOIN_BRIDGE_KEY, &bytes);
+        store.set_secret(BITCOIN_BRIDGE_KEY, &bytes);
     }
 }
 
-fn load_payment_xpub(ctx: &DelegateCtx) -> Option<PaymentXpubStatus> {
-    ctx.get_secret(BITCOIN_PAYMENT_XPUB_KEY)
+fn load_payment_xpub<S: SecretStore>(store: &S) -> Option<PaymentXpubStatus> {
+    store
+        .get_secret(BITCOIN_PAYMENT_XPUB_KEY)
         .and_then(|bytes| from_cbor::<Option<PaymentXpubStatus>>(&bytes).ok())
         .flatten()
 }
@@ -124,14 +138,18 @@ fn load_payment_xpub(ctx: &DelegateCtx) -> Option<PaymentXpubStatus> {
 /// turns into a failed derivation rather than an address the caller believes is
 /// fresh.
 ///
-/// `DelegateCtx::set_secret` reports whether the host accepted the write; this
-/// crate already depends on that in `markers::set_marker`. Off-target it always
-/// answers `false` (the `#[cfg(not(target_family = "wasm"))]` stub), which is
-/// why the tests below drive the pure `apply_*` functions rather than `handle`.
-fn save_payment_xpub(ctx: &mut DelegateCtx, status: &PaymentXpubStatus) -> Result<(), String> {
+/// `SecretStore::set_secret` reports whether the host accepted the write; this
+/// crate already depends on that in `markers::set_marker`. The real host's
+/// `set_secret` always answers `false` off the `wasm32` target, which is why
+/// these handlers take a store rather than a `DelegateCtx` -- see
+/// [`crate::secrets`].
+fn save_payment_xpub<S: SecretStore>(
+    store: &mut S,
+    status: &PaymentXpubStatus,
+) -> Result<(), String> {
     let bytes = to_cbor(&Some(status.clone()))
         .map_err(|e| format!("could not encode the payment key record: {e}"))?;
-    if !ctx.set_secret(BITCOIN_PAYMENT_XPUB_KEY, &bytes) {
+    if !store.set_secret(BITCOIN_PAYMENT_XPUB_KEY, &bytes) {
         return Err(
             "the node refused to store the payment key record, so no address was issued -- \
              issuing one anyway would hand out an index the delegate still believes is unused"
@@ -144,13 +162,11 @@ fn save_payment_xpub(ctx: &mut DelegateCtx, status: &PaymentXpubStatus) -> Resul
 // ---------------------------------------------------------------------------
 // Pure watch-list logic.
 //
-// Kept free of `DelegateCtx` on purpose: outside a real WASM delegate host,
-// `DelegateCtx::get_secret`/`set_secret` are no-op stubs (see
-// freenet-stdlib's `delegate_host.rs`, `#[cfg(not(target_family = "wasm"))]`
-// branch), so a test that round-trips through `ctx` would silently observe
-// nothing being stored. Separating "how the watch list changes" from "where
-// it's persisted" lets the interesting logic run -- and be asserted on --
-// under plain `cargo test`.
+// Kept free of any store on purpose: separating "how the watch list changes"
+// from "where it's persisted" lets the interesting logic be asserted on
+// directly. (The handlers around them are testable too, since they take an
+// `impl SecretStore` rather than the host's `DelegateCtx` -- see
+// `crate::secrets` for why that distinction exists at all.)
 // ---------------------------------------------------------------------------
 
 /// Insert `watch`, replacing any existing entry with the same
@@ -299,8 +315,8 @@ fn apply_derive_order_address(status: &mut PaymentXpubStatus) -> Result<DerivedA
 /// watch-list's, and lands in a separate change. `#[allow(dead_code)]` is
 /// deliberate here rather than a signal to remove the function.
 #[allow(dead_code)]
-pub fn watch_order_payment(
-    ctx: &mut DelegateCtx,
+pub fn watch_order_payment<S: SecretStore>(
+    store: &mut S,
     network: BitcoinNetwork,
     script_pubkey: Vec<u8>,
     address: String,
@@ -308,7 +324,7 @@ pub fn watch_order_payment(
     expected_amount_sats: u64,
     added_at_ms: u64,
 ) -> WatchedPayment {
-    let mut watches = load_watches(ctx);
+    let mut watches = load_watches(store);
     let watch = apply_watch(
         &mut watches,
         WatchedPayment {
@@ -324,19 +340,60 @@ pub fn watch_order_payment(
             last_error: None,
         },
     );
-    save_watches(ctx, &watches);
+    save_watches(store, &watches);
     watch
 }
 
-pub fn handle(
-    ctx: &mut DelegateCtx,
+/// Answer one Bitcoin request, for the Harvest web app only.
+///
+/// # Why every variant below is behind the gate, reads included
+///
+/// The obvious one is [`BitcoinDelegateRequest::SetPaymentXpub`]: it decides
+/// which wallet every invoice this store ever issues pays into. An ungated
+/// write there is not a leak, it is a redirection of the seller's income to
+/// whoever asked last -- silently, since the buyer's checks all still pass
+/// (the seller's own signature and ghostkey certificate are genuine; only the
+/// destination changed). `ConfigureBridge`, `Watch`, `Unwatch`,
+/// `AssociateOrder` and `DeriveOrderAddress` are gated for the same reason in
+/// milder form: each writes state the seller relies on, and `DeriveOrderAddress`
+/// additionally burns an address index per call.
+///
+/// The reads are gated too, and that is a deliberate decision rather than
+/// caution by default. Each answers with something whose whole value is that it
+/// is private:
+///
+/// * `ListWatched` is the address-watch list -- the exact "who is watching
+///   which Bitcoin address" index this module's header says must never become
+///   enumerable. Handing it to a page that merely asked is the same disclosure
+///   by a shorter route.
+/// * `GetPaymentXpub` is worse than it looks: an account xpub derives EVERY
+///   address the store will ever issue, so one read links the seller's whole
+///   present and future payment history, and it cannot be undone by rotating
+///   anything after the fact.
+/// * `GetBridge` names the endpoint this user's node talks to, which is a
+///   network-location fact about the seller.
+///
+/// The cost of gating reads is that a legitimate non-Harvest caller would
+/// break, so: there is none. This delegate is published by, and only by, the
+/// Harvest web app; no other app has a reason to hold Harvest's watch list, and
+/// the sibling `harvest_common::bitcoin_delegate` types are not a public
+/// integration surface. If one ever should exist, it wants an explicit
+/// consent-carrying request, not a hole left open on the chance somebody turns
+/// up.
+pub fn handle<S: SecretStore>(
+    store: &mut S,
+    origin: Option<&MessageOrigin>,
     request: BitcoinDelegateRequest,
 ) -> Result<BitcoinDelegateResponse, DelegateError> {
+    // Before the request is even looked at: a refused caller learns nothing
+    // about which variants exist or which of them this build supports.
+    crate::origin::authorize(origin)?;
+
     Ok(match request {
         BitcoinDelegateRequest::Watch { request_id, watch } => {
-            let mut watches = load_watches(ctx);
+            let mut watches = load_watches(store);
             let watch = apply_watch(&mut watches, watch);
-            save_watches(ctx, &watches);
+            save_watches(store, &watches);
             BitcoinDelegateResponse::Watched {
                 request_id,
                 result: Ok(watch),
@@ -348,9 +405,9 @@ pub fn handle(
             network,
             script_pubkey,
         } => {
-            let mut watches = load_watches(ctx);
+            let mut watches = load_watches(store);
             if apply_unwatch(&mut watches, network, &script_pubkey) {
-                save_watches(ctx, &watches);
+                save_watches(store, &watches);
             }
             BitcoinDelegateResponse::Unwatched {
                 request_id,
@@ -359,7 +416,7 @@ pub fn handle(
         }
 
         BitcoinDelegateRequest::ListWatched => BitcoinDelegateResponse::WatchList {
-            watches: load_watches(ctx),
+            watches: load_watches(store),
         },
 
         BitcoinDelegateRequest::AssociateOrder {
@@ -369,7 +426,7 @@ pub fn handle(
             order_id,
             expected_amount_sats,
         } => {
-            let mut watches = load_watches(ctx);
+            let mut watches = load_watches(store);
             let result = apply_associate_order(
                 &mut watches,
                 network,
@@ -378,7 +435,7 @@ pub fn handle(
                 expected_amount_sats,
             );
             if result.is_ok() {
-                save_watches(ctx, &watches);
+                save_watches(store, &watches);
             }
             BitcoinDelegateResponse::OrderAssociated { request_id, result }
         }
@@ -387,7 +444,7 @@ pub fn handle(
             request_id,
             endpoint,
         } => {
-            save_bridge(ctx, &endpoint);
+            save_bridge(store, &endpoint);
             BitcoinDelegateResponse::BridgeConfigured {
                 request_id,
                 result: Ok(()),
@@ -395,7 +452,7 @@ pub fn handle(
         }
 
         BitcoinDelegateRequest::GetBridge => BitcoinDelegateResponse::Bridge {
-            endpoint: load_bridge(ctx),
+            endpoint: load_bridge(store),
         },
 
         BitcoinDelegateRequest::SetPaymentXpub {
@@ -403,21 +460,21 @@ pub fn handle(
             xpub,
             network,
         } => {
-            let existing = load_payment_xpub(ctx);
+            let existing = load_payment_xpub(store);
             let result =
                 apply_set_payment_xpub(&xpub, network, existing.as_ref()).and_then(|status| {
-                    save_payment_xpub(ctx, &status)?;
+                    save_payment_xpub(store, &status)?;
                     Ok(status)
                 });
             BitcoinDelegateResponse::PaymentXpubSet { request_id, result }
         }
 
         BitcoinDelegateRequest::GetPaymentXpub => BitcoinDelegateResponse::PaymentXpub {
-            status: load_payment_xpub(ctx),
+            status: load_payment_xpub(store),
         },
 
         BitcoinDelegateRequest::DeriveOrderAddress { request_id } => {
-            let result = match load_payment_xpub(ctx) {
+            let result = match load_payment_xpub(store) {
                 None => Err(
                     "no payment key is set for this store yet. Add your wallet's native \
                      SegWit account key before issuing an invoice."
@@ -429,7 +486,7 @@ pub fn handle(
                     // rather than returned, because a caller that received it
                     // may show it to a buyer while the delegate still believes
                     // the index is unused.
-                    save_payment_xpub(ctx, &status)?;
+                    save_payment_xpub(store, &status)?;
                     Ok(derived)
                 }),
             };
@@ -453,7 +510,11 @@ pub fn handle(
 mod tests {
     use super::*;
 
-    fn watch(network: BitcoinNetwork, script: u8, label: Option<&str>) -> WatchedPayment {
+    pub(super) fn watch(
+        network: BitcoinNetwork,
+        script: u8,
+        label: Option<&str>,
+    ) -> WatchedPayment {
         WatchedPayment {
             network,
             script_pubkey: vec![0x00, 0x14, script],
@@ -764,6 +825,245 @@ mod tests {
         assert!(
             !haystack.contains("secret rent label"),
             "a private label reached the bridge wire format"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Origin gating.
+//
+// These drive `handle` against a real (in-memory) secret store rather than the
+// `apply_*` functions, because the property under test is not "what does the
+// watch list do" but "whose request was allowed to touch it". A test that
+// called `apply_set_payment_xpub` directly would pass no matter what the gate
+// did.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod origin_gating_tests {
+    use super::tests::watch;
+    use super::*;
+    use crate::origin::test_origins::{a_different_web_app, harvest};
+    use crate::secrets::MemSecrets;
+    use freenet_bitcoin_common::BridgeId;
+    use harvest_common::bitcoin_delegate::BridgeAuthMode;
+
+    /// The BIP-84 specification's account key, as the seller's own.
+    const SELLERS_KEY: &str = "zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs";
+
+    /// A DIFFERENT, equally valid account key, standing in for the attacker's
+    /// own wallet.
+    ///
+    /// Built by replacing only the chain code, which leaves the version, the
+    /// depth and the public point untouched -- so it parses and derives exactly
+    /// as well as the seller's, while deriving entirely different addresses.
+    /// That difference is the whole point of the fixture: it is what makes the
+    /// assertions below able to fail. A test that "set a new key" by passing
+    /// the SAME key twice asserts nothing, because the after-state matches the
+    /// before-state whether the write happened or not.
+    fn attackers_key() -> String {
+        let mut bytes = bs58::decode(SELLERS_KEY)
+            .with_check(None)
+            .into_vec()
+            .expect("the fixture key decodes");
+        bytes[13..45].copy_from_slice(&[0xab; 32]);
+        bs58::encode(bytes).with_check().into_string()
+    }
+
+    fn set_xpub(key: &str) -> BitcoinDelegateRequest {
+        BitcoinDelegateRequest::SetPaymentXpub {
+            request_id: 1,
+            xpub: key.to_string(),
+            network: BitcoinNetwork::Bitcoin,
+        }
+    }
+
+    /// The stored key, read straight out of the secret store rather than
+    /// through a request -- so a gate on the read path cannot mask what a write
+    /// did or did not do.
+    fn stored_key(store: &MemSecrets) -> Option<String> {
+        load_payment_xpub(store).map(|status| status.xpub)
+    }
+
+    fn seller_sets(store: &mut MemSecrets, key: &str) {
+        let response = handle(store, Some(&harvest()), set_xpub(key))
+            .expect("the Harvest web app is authorized");
+        match response {
+            BitcoinDelegateResponse::PaymentXpubSet { result, .. } => {
+                result.expect("the seller's own key must be accepted");
+            }
+            other => panic!("expected PaymentXpubSet, got {other:?}"),
+        }
+    }
+
+    /// **The security property.** Another web app cannot redirect the seller's
+    /// income.
+    ///
+    /// This is not a leak but a payment-destination hijack: every invoice
+    /// issued afterwards would derive its address from the attacker's account
+    /// key, while the buyer's checks all still pass -- the seller's signature
+    /// and ghostkey certificate are genuine, and only the destination changed.
+    /// The delegate's address is publicly derivable, so any web app the seller
+    /// has ever opened on this node could send this request.
+    ///
+    /// Mutated red by removing the `authorize` call from `handle`.
+    #[test]
+    fn another_web_app_cannot_redirect_the_sellers_payments() {
+        let mut store = MemSecrets::default();
+        seller_sets(&mut store, SELLERS_KEY);
+
+        let refusal = handle(
+            &mut store,
+            Some(&a_different_web_app()),
+            set_xpub(&attackers_key()),
+        )
+        .expect_err("a foreign web app must be refused");
+        let DelegateError::Other(message) = refusal else {
+            panic!("expected a refusal message");
+        };
+        assert!(
+            message.contains("Harvest web app"),
+            "the refusal must say why: {message}"
+        );
+
+        assert_eq!(
+            stored_key(&store).as_deref(),
+            Some(SELLERS_KEY),
+            "the seller's payment key was overwritten by another web app"
+        );
+        assert_ne!(
+            stored_key(&store).as_deref(),
+            Some(attackers_key().as_str()),
+            "invoices would now pay the attacker"
+        );
+    }
+
+    /// The other half, without which the test above could pass on a delegate
+    /// that refuses everyone: the genuine caller still gets through, and the
+    /// value that changes is the one that matters.
+    #[test]
+    fn the_harvest_web_app_can_still_set_the_payment_key() {
+        let mut store = MemSecrets::default();
+        seller_sets(&mut store, SELLERS_KEY);
+        assert_eq!(stored_key(&store).as_deref(), Some(SELLERS_KEY));
+
+        // A genuinely DIFFERENT key, so the assertion below fails if the write
+        // silently did nothing.
+        let replacement = attackers_key();
+        seller_sets(&mut store, &replacement);
+        assert_eq!(
+            stored_key(&store).as_deref(),
+            Some(replacement.as_str()),
+            "the seller could not change their own payment key"
+        );
+    }
+
+    /// A caller the node could not attest is refused too. `origin: None` is
+    /// what the runtime supplies when it cannot say who is asking, and it must
+    /// not be read as "probably the app".
+    #[test]
+    fn an_unattested_caller_cannot_set_the_payment_key() {
+        let mut store = MemSecrets::default();
+        seller_sets(&mut store, SELLERS_KEY);
+
+        handle(&mut store, None, set_xpub(&attackers_key()))
+            .expect_err("an unattested caller must be refused");
+        assert_eq!(
+            stored_key(&store).as_deref(),
+            Some(SELLERS_KEY),
+            "an unattested caller overwrote the seller's payment key"
+        );
+    }
+
+    /// The reads are gated as well. An account xpub derives every address the
+    /// store will ever issue, so one successful read links the seller's whole
+    /// payment history, past and future.
+    #[test]
+    fn another_web_app_cannot_read_the_payment_key_or_the_watch_list() {
+        let mut store = MemSecrets::default();
+        seller_sets(&mut store, SELLERS_KEY);
+        handle(
+            &mut store,
+            Some(&harvest()),
+            BitcoinDelegateRequest::Watch {
+                request_id: 2,
+                watch: watch(BitcoinNetwork::Signet, 1, Some("rent")),
+            },
+        )
+        .expect("the seller may watch an address");
+
+        for request in [
+            BitcoinDelegateRequest::GetPaymentXpub,
+            BitcoinDelegateRequest::ListWatched,
+            BitcoinDelegateRequest::GetBridge,
+        ] {
+            handle(&mut store, Some(&a_different_web_app()), request)
+                .expect_err("a foreign web app must not read Harvest's private state");
+        }
+
+        // ...and the seller can still read their own.
+        match handle(
+            &mut store,
+            Some(&harvest()),
+            BitcoinDelegateRequest::ListWatched,
+        )
+        .expect("the seller may list their own watches")
+        {
+            BitcoinDelegateResponse::WatchList { watches } => assert_eq!(watches.len(), 1),
+            other => panic!("expected a WatchList, got {other:?}"),
+        }
+    }
+
+    /// The remaining mutating requests are gated too, so the fix is not
+    /// specific to the one variant that prompted it.
+    #[test]
+    fn no_mutating_request_survives_a_foreign_origin() {
+        let mut store = MemSecrets::default();
+        seller_sets(&mut store, SELLERS_KEY);
+
+        let mutations = vec![
+            BitcoinDelegateRequest::Watch {
+                request_id: 3,
+                watch: watch(BitcoinNetwork::Signet, 2, Some("attacker")),
+            },
+            BitcoinDelegateRequest::Unwatch {
+                request_id: 4,
+                network: BitcoinNetwork::Signet,
+                script_pubkey: vec![0x00, 0x14, 0x01],
+            },
+            BitcoinDelegateRequest::AssociateOrder {
+                request_id: 5,
+                network: BitcoinNetwork::Signet,
+                script_pubkey: vec![0x00, 0x14, 0x01],
+                order_id: OrderId([1u8; 16]),
+                expected_amount_sats: 1,
+            },
+            BitcoinDelegateRequest::ConfigureBridge {
+                request_id: 6,
+                endpoint: BridgeEndpoint {
+                    url: "https://attacker.example/bridge".into(),
+                    bridge_id: BridgeId([0xcd; 32]),
+                    network: BitcoinNetwork::Bitcoin,
+                    auth: BridgeAuthMode::Open,
+                },
+            },
+            BitcoinDelegateRequest::DeriveOrderAddress { request_id: 7 },
+        ];
+
+        let before = load_watches(&store);
+        let before_bridge = load_bridge(&store);
+        let before_index = load_payment_xpub(&store).map(|s| s.next_index);
+
+        for request in mutations {
+            handle(&mut store, Some(&a_different_web_app()), request)
+                .expect_err("a foreign web app must not mutate Harvest's private state");
+        }
+
+        assert_eq!(load_watches(&store), before, "the watch list was changed");
+        assert_eq!(load_bridge(&store), before_bridge, "the bridge was changed");
+        assert_eq!(
+            load_payment_xpub(&store).map(|s| s.next_index),
+            before_index,
+            "an address index was consumed by a caller that had no business asking"
         );
     }
 }

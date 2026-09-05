@@ -66,16 +66,13 @@ impl SecretStore for CtxStore<'_> {
 
 /// Who this delegate will export to.
 ///
-/// `SameWebApp` pinned to the Harvest container's contract id: the successor
-/// generation is a different DELEGATE, but it is driven by the same web app,
-/// and the container id is what the runtime attests. Any other origin --
-/// another web app the user has granted access to, another delegate, or a
-/// caller the runtime could not attest at all -- is refused.
+/// The crate-wide policy from [`crate::origin`], unchanged: `SameWebApp` pinned
+/// to the Harvest container's contract id. It lives there rather than here
+/// because it is no longer this module's alone -- every request family is
+/// gated on it now -- and two copies of an authorization rule are two rules
+/// that can drift apart.
 fn origin_policy() -> Result<OriginPolicy, DelegateError> {
-    harvest_common::HARVEST_WEBAPP_CONTRACT_ID
-        .parse()
-        .map(OriginPolicy::SameWebApp)
-        .map_err(|e| DelegateError::Other(format!("canonical webapp contract id is invalid: {e}")))
+    crate::origin::harvest_webapp_policy()
 }
 
 /// How much of the secret store an export covers.
@@ -165,13 +162,7 @@ mod tests {
         s
     }
 
-    fn harvest_origin() -> MessageOrigin {
-        MessageOrigin::WebApp(
-            harvest_common::HARVEST_WEBAPP_CONTRACT_ID
-                .parse::<ContractInstanceId>()
-                .expect("canonical webapp id"),
-        )
-    }
+    use crate::origin::test_origins::harvest as harvest_origin;
 
     fn exported(msgs: &[OutboundDelegateMsg]) -> freenet_migrate::ExportedSecrets {
         let payload = match &msgs[0] {

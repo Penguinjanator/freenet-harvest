@@ -50,7 +50,6 @@
 //! secrets moved too, so re-probing is the honest thing to do.
 
 use freenet_migrate::SecretStore;
-use freenet_stdlib::prelude::DelegateCtx;
 use harvest_common::HarvestDelegateResponse;
 
 /// The namespace every migration marker is stored under.
@@ -105,31 +104,6 @@ pub(crate) fn set_marker<S: SecretStore>(
     HarvestDelegateResponse::MigrationMarkerRecorded {
         marker: marker.to_string(),
         recorded,
-    }
-}
-
-/// The host's secret store as `freenet-migrate` sees it, with writes enabled.
-///
-/// Distinct from `migration::CtxStore`, whose `set_secret` is deliberately
-/// inert because an export must never write. This one exists to write exactly
-/// one namespace.
-pub(crate) struct CtxMarkers<'a>(pub(crate) &'a mut DelegateCtx);
-
-impl SecretStore for CtxMarkers<'_> {
-    fn list_secrets(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
-        self.0.list_secrets(prefix)
-    }
-
-    fn get_secret(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.0.get_secret(key)
-    }
-
-    fn has_secret(&self, key: &[u8]) -> bool {
-        self.0.has_secret(key)
-    }
-
-    fn set_secret(&mut self, key: &[u8], value: &[u8]) -> bool {
-        self.0.set_secret(key, value)
     }
 }
 

@@ -1,4 +1,5 @@
-use freenet_stdlib::prelude::DelegateCtx;
+use freenet_migrate::SecretStore;
+use freenet_stdlib::prelude::MessageOrigin;
 use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey, EncodeRsaPublicKey};
 use rsa::pss::BlindedSigningKey;
 use rsa::signature::{RandomizedSigner, SignatureEncoding};
@@ -50,33 +51,75 @@ pub(crate) fn all_secret_key_shapes(fp: &str, tx_id: &str) -> Vec<Vec<u8>> {
     ]
 }
 
-fn load_tx_index(ctx: &DelegateCtx) -> Vec<String> {
-    ctx.get_secret(TX_INDEX_KEY)
+fn load_tx_index<S: SecretStore>(store: &S) -> Vec<String> {
+    store
+        .get_secret(TX_INDEX_KEY)
         .and_then(|bytes| from_cbor(&bytes).ok())
         .unwrap_or_default()
 }
 
-fn save_tx_index(ctx: &mut DelegateCtx, index: &[String]) {
+fn save_tx_index<S: SecretStore>(store: &mut S, index: &[String]) {
     if let Ok(bytes) = to_cbor(&index) {
-        ctx.set_secret(TX_INDEX_KEY, &bytes);
+        store.set_secret(TX_INDEX_KEY, &bytes);
     }
 }
 
-pub fn handle(ctx: &mut DelegateCtx, request: HarvestDelegateRequest) -> HarvestDelegateResponse {
+/// Answer one Harvest request, for the Harvest web app only.
+///
+/// # Why every variant below is behind the gate, reads included
+///
+/// The writes are the obvious half. `InitReputationKeys` mints an RSA key the
+/// store's whole reputation identity then rests on; `BeginTransaction` and
+/// `RecordBlindSignature` write the transaction ledger; `RegisterStore` decides
+/// which contracts the seller's UI will treat as their own stores;
+/// `SetMigrationMarker` can seal a migration as done that never ran, which
+/// loses data silently rather than loudly (see [`crate::markers`]).
+/// `BlindSignFeedbackToken` is the sharpest of them: it signs caller-supplied
+/// bytes with the seller's reputation key, so an ungated caller gets a signing
+/// oracle for an identity that is not theirs.
+///
+/// The reads are gated for the same reason as `crate::bitcoin`'s: each hands
+/// back something whose value is that it is private. `ListStores` and
+/// `ListTransactions` are the seller's commercial history -- which stores are
+/// theirs, who they have traded with -- and `GetRsaPublicKey` plus
+/// `GetMigrationMarker` let a caller confirm which pseudonymous ghostkey
+/// fingerprints and which store generations belong to this one user, which is
+/// exactly the linkage a pseudonymous marketplace exists to avoid.
+///
+/// No caller outside the Harvest web app is broken by this, because none
+/// exists: this delegate is Harvest's own, and nothing else is expected to
+/// speak `HarvestDelegateRequest`.
+pub fn handle<S: SecretStore>(
+    store: &mut S,
+    origin: Option<&MessageOrigin>,
+    request: HarvestDelegateRequest,
+) -> HarvestDelegateResponse {
+    // A refusal is reported rather than swallowed: a caller that got a
+    // plausible-looking empty answer would be indistinguishable, to whoever is
+    // reading the node's log later, from one that legitimately had no data.
+    if let Err(refusal) = crate::origin::authorize(origin) {
+        return HarvestDelegateResponse::Error {
+            message: match refusal {
+                freenet_stdlib::prelude::DelegateError::Other(message) => message,
+                other => format!("{other:?}"),
+            },
+        };
+    }
+
     match request {
         HarvestDelegateRequest::InitReputationKeys {
             ghostkey_fingerprint,
-        } => handle_init_reputation_keys(ctx, &ghostkey_fingerprint),
+        } => handle_init_reputation_keys(store, &ghostkey_fingerprint),
 
         HarvestDelegateRequest::GetRsaPublicKey {
             ghostkey_fingerprint,
-        } => handle_get_rsa_public_key(ctx, &ghostkey_fingerprint),
+        } => handle_get_rsa_public_key(store, &ghostkey_fingerprint),
 
         HarvestDelegateRequest::BlindSignFeedbackToken {
             request_id,
             ghostkey_fingerprint,
             blinded_token,
-        } => handle_blind_sign(ctx, request_id, &ghostkey_fingerprint, &blinded_token),
+        } => handle_blind_sign(store, request_id, &ghostkey_fingerprint, &blinded_token),
 
         HarvestDelegateRequest::CreateListing { request_id, .. } => {
             // Listing creation requires calling the ghostkey delegate for signing.
@@ -94,7 +137,7 @@ pub fn handle(ctx: &mut DelegateCtx, request: HarvestDelegateRequest) -> Harvest
             our_token,
             our_blinded_token,
         } => handle_begin_transaction(
-            ctx,
+            store,
             request_id,
             &transaction_id,
             our_token,
@@ -105,9 +148,9 @@ pub fn handle(ctx: &mut DelegateCtx, request: HarvestDelegateRequest) -> Harvest
             request_id,
             transaction_id,
             blind_signature,
-        } => handle_record_blind_signature(ctx, request_id, &transaction_id, blind_signature),
+        } => handle_record_blind_signature(store, request_id, &transaction_id, blind_signature),
 
-        HarvestDelegateRequest::ListTransactions => handle_list_transactions(ctx),
+        HarvestDelegateRequest::ListTransactions => handle_list_transactions(store),
 
         HarvestDelegateRequest::RegisterStore {
             ghostkey_fingerprint,
@@ -115,7 +158,7 @@ pub fn handle(ctx: &mut DelegateCtx, request: HarvestDelegateRequest) -> Harvest
             reputation_contract_id,
             mailbox_contract_id,
         } => handle_register_store(
-            ctx,
+            store,
             &ghostkey_fingerprint,
             store_contract_id,
             reputation_contract_id,
@@ -124,16 +167,16 @@ pub fn handle(ctx: &mut DelegateCtx, request: HarvestDelegateRequest) -> Harvest
 
         HarvestDelegateRequest::ListStores {
             ghostkey_fingerprint,
-        } => handle_list_stores(ctx, &ghostkey_fingerprint),
+        } => handle_list_stores(store, &ghostkey_fingerprint),
 
         // The migration repeat-gate. `markers` owns both the namespace and the
         // fail-safe direction; this is only the routing.
         HarvestDelegateRequest::GetMigrationMarker { marker } => {
-            crate::markers::get_marker(&crate::markers::CtxMarkers(ctx), &marker)
+            crate::markers::get_marker(store, &marker)
         }
 
         HarvestDelegateRequest::SetMigrationMarker { marker, note } => {
-            crate::markers::set_marker(&mut crate::markers::CtxMarkers(ctx), &marker, &note)
+            crate::markers::set_marker(store, &marker, &note)
         }
 
         _ => HarvestDelegateResponse::Error {
@@ -142,14 +185,17 @@ pub fn handle(ctx: &mut DelegateCtx, request: HarvestDelegateRequest) -> Harvest
     }
 }
 
-fn handle_init_reputation_keys(
-    ctx: &mut DelegateCtx,
+fn handle_init_reputation_keys<S: SecretStore>(
+    store: &mut S,
     ghostkey_fingerprint: &str,
 ) -> HarvestDelegateResponse {
     // Check if keys already exist
-    if ctx.get_secret(&rsa_pk_key(ghostkey_fingerprint)).is_some() {
+    if store
+        .get_secret(&rsa_pk_key(ghostkey_fingerprint))
+        .is_some()
+    {
         // Return existing public key
-        return match ctx.get_secret(&rsa_pk_key(ghostkey_fingerprint)) {
+        return match store.get_secret(&rsa_pk_key(ghostkey_fingerprint)) {
             Some(pk_der) => HarvestDelegateResponse::ReputationKeysInitialized {
                 ghostkey_fingerprint: ghostkey_fingerprint.to_string(),
                 rsa_public_key_der: pk_der,
@@ -194,8 +240,8 @@ fn handle_init_reputation_keys(
     };
 
     // Store both keys
-    ctx.set_secret(&rsa_sk_key(ghostkey_fingerprint), &sk_der);
-    ctx.set_secret(&rsa_pk_key(ghostkey_fingerprint), &pk_der);
+    store.set_secret(&rsa_sk_key(ghostkey_fingerprint), &sk_der);
+    store.set_secret(&rsa_pk_key(ghostkey_fingerprint), &pk_der);
 
     HarvestDelegateResponse::ReputationKeysInitialized {
         ghostkey_fingerprint: ghostkey_fingerprint.to_string(),
@@ -203,11 +249,11 @@ fn handle_init_reputation_keys(
     }
 }
 
-fn handle_get_rsa_public_key(
-    ctx: &DelegateCtx,
+fn handle_get_rsa_public_key<S: SecretStore>(
+    store: &S,
     ghostkey_fingerprint: &str,
 ) -> HarvestDelegateResponse {
-    match ctx.get_secret(&rsa_pk_key(ghostkey_fingerprint)) {
+    match store.get_secret(&rsa_pk_key(ghostkey_fingerprint)) {
         Some(pk_der) => HarvestDelegateResponse::RsaPublicKey {
             ghostkey_fingerprint: ghostkey_fingerprint.to_string(),
             rsa_public_key_der: pk_der,
@@ -220,14 +266,14 @@ fn handle_get_rsa_public_key(
     }
 }
 
-fn handle_blind_sign(
-    ctx: &DelegateCtx,
+fn handle_blind_sign<S: SecretStore>(
+    store: &S,
     request_id: u64,
     ghostkey_fingerprint: &str,
     blinded_token: &[u8],
 ) -> HarvestDelegateResponse {
     // Load RSA private key
-    let sk_der = match ctx.get_secret(&rsa_sk_key(ghostkey_fingerprint)) {
+    let sk_der = match store.get_secret(&rsa_sk_key(ghostkey_fingerprint)) {
         Some(b) => b,
         None => {
             return HarvestDelegateResponse::BlindSignatureResult {
@@ -267,8 +313,8 @@ fn handle_blind_sign(
     }
 }
 
-fn handle_begin_transaction(
-    ctx: &mut DelegateCtx,
+fn handle_begin_transaction<S: SecretStore>(
+    store: &mut S,
     request_id: u64,
     transaction_id: &str,
     our_token: harvest_common::FeedbackToken,
@@ -296,13 +342,13 @@ fn handle_begin_transaction(
         }
     };
 
-    ctx.set_secret(&tx_key(transaction_id), &record_bytes);
+    store.set_secret(&tx_key(transaction_id), &record_bytes);
 
     // Update index
-    let mut index = load_tx_index(ctx);
+    let mut index = load_tx_index(store);
     if !index.contains(&transaction_id.to_string()) {
         index.push(transaction_id.to_string());
-        save_tx_index(ctx, &index);
+        save_tx_index(store, &index);
     }
 
     HarvestDelegateResponse::TransactionRecorded {
@@ -311,13 +357,13 @@ fn handle_begin_transaction(
     }
 }
 
-fn handle_record_blind_signature(
-    ctx: &mut DelegateCtx,
+fn handle_record_blind_signature<S: SecretStore>(
+    store: &mut S,
     request_id: u64,
     transaction_id: &str,
     blind_signature: Vec<u8>,
 ) -> HarvestDelegateResponse {
-    let record_bytes = match ctx.get_secret(&tx_key(transaction_id)) {
+    let record_bytes = match store.get_secret(&tx_key(transaction_id)) {
         Some(b) => b,
         None => {
             return HarvestDelegateResponse::BlindSignatureRecorded {
@@ -349,7 +395,7 @@ fn handle_record_blind_signature(
         }
     };
 
-    ctx.set_secret(&tx_key(transaction_id), &updated_bytes);
+    store.set_secret(&tx_key(transaction_id), &updated_bytes);
 
     HarvestDelegateResponse::BlindSignatureRecorded {
         request_id,
@@ -357,12 +403,12 @@ fn handle_record_blind_signature(
     }
 }
 
-fn handle_list_transactions(ctx: &DelegateCtx) -> HarvestDelegateResponse {
-    let index = load_tx_index(ctx);
+fn handle_list_transactions<S: SecretStore>(store: &S) -> HarvestDelegateResponse {
+    let index = load_tx_index(store);
     let mut transactions = Vec::new();
 
     for tx_id in &index {
-        if let Some(bytes) = ctx.get_secret(&tx_key(tx_id)) {
+        if let Some(bytes) = store.get_secret(&tx_key(tx_id)) {
             if let Ok(record) = from_cbor::<TransactionRecord>(&bytes) {
                 transactions.push(record);
             }
@@ -372,26 +418,31 @@ fn handle_list_transactions(ctx: &DelegateCtx) -> HarvestDelegateResponse {
     HarvestDelegateResponse::TransactionList { transactions }
 }
 
-fn load_stores(ctx: &DelegateCtx, ghostkey_fingerprint: &str) -> Vec<StoreRegistration> {
-    ctx.get_secret(&stores_key(ghostkey_fingerprint))
+fn load_stores<S: SecretStore>(store: &S, ghostkey_fingerprint: &str) -> Vec<StoreRegistration> {
+    store
+        .get_secret(&stores_key(ghostkey_fingerprint))
         .and_then(|bytes| from_cbor(&bytes).ok())
         .unwrap_or_default()
 }
 
-fn save_stores(ctx: &mut DelegateCtx, ghostkey_fingerprint: &str, stores: &[StoreRegistration]) {
+fn save_stores<S: SecretStore>(
+    store: &mut S,
+    ghostkey_fingerprint: &str,
+    stores: &[StoreRegistration],
+) {
     if let Ok(bytes) = to_cbor(&stores) {
-        ctx.set_secret(&stores_key(ghostkey_fingerprint), &bytes);
+        store.set_secret(&stores_key(ghostkey_fingerprint), &bytes);
     }
 }
 
-fn handle_register_store(
-    ctx: &mut DelegateCtx,
+fn handle_register_store<S: SecretStore>(
+    store: &mut S,
     ghostkey_fingerprint: &str,
     store_contract_id: Vec<u8>,
     reputation_contract_id: Vec<u8>,
     mailbox_contract_id: Vec<u8>,
 ) -> HarvestDelegateResponse {
-    let mut stores = load_stores(ctx, ghostkey_fingerprint);
+    let mut stores = load_stores(store, ghostkey_fingerprint);
 
     // Check for duplicate (same store contract)
     if stores
@@ -409,17 +460,167 @@ fn handle_register_store(
         mailbox_contract_id,
         store_contract_key: None,
     });
-    save_stores(ctx, ghostkey_fingerprint, &stores);
+    save_stores(store, ghostkey_fingerprint, &stores);
 
     HarvestDelegateResponse::StoreRegistered {
         ghostkey_fingerprint: ghostkey_fingerprint.to_string(),
     }
 }
 
-fn handle_list_stores(ctx: &DelegateCtx, ghostkey_fingerprint: &str) -> HarvestDelegateResponse {
-    let stores = load_stores(ctx, ghostkey_fingerprint);
+fn handle_list_stores<S: SecretStore>(
+    store: &S,
+    ghostkey_fingerprint: &str,
+) -> HarvestDelegateResponse {
+    let stores = load_stores(store, ghostkey_fingerprint);
     HarvestDelegateResponse::StoreList {
         ghostkey_fingerprint: ghostkey_fingerprint.to_string(),
         stores,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Origin gating.
+//
+// Driven through `handle` against a real in-memory store, so the assertions
+// are about what is left in the store afterwards rather than merely about what
+// was returned.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod origin_gating_tests {
+    use super::*;
+    use crate::origin::test_origins::{a_different_web_app, harvest};
+    use crate::secrets::MemSecrets;
+
+    const FINGERPRINT: &str = "fp1";
+
+    /// The store the attacker would like registered under the seller's
+    /// fingerprint, and the seller's own. They differ, so an assertion that
+    /// only one of them is present can actually fail.
+    const ATTACKERS_STORE: [u8; 4] = [0xaa, 0xaa, 0xaa, 0xaa];
+    const SELLERS_STORE: [u8; 4] = [0xbb, 0xbb, 0xbb, 0xbb];
+
+    fn register(store_contract_id: [u8; 4]) -> HarvestDelegateRequest {
+        HarvestDelegateRequest::RegisterStore {
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            store_contract_id: store_contract_id.to_vec(),
+            reputation_contract_id: vec![1],
+            mailbox_contract_id: vec![2],
+        }
+    }
+
+    fn refusal_message(response: &HarvestDelegateResponse) -> &str {
+        match response {
+            HarvestDelegateResponse::Error { message } => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// The registry decides which contracts the seller's own UI will treat as
+    /// their stores, so a foreign write here is a way to put an attacker's
+    /// contract in front of the seller as if it were their own.
+    ///
+    /// Mutated red by removing the `authorize` call from `handle`.
+    #[test]
+    fn another_web_app_cannot_register_a_store() {
+        let mut store = MemSecrets::default();
+
+        let response = handle(
+            &mut store,
+            Some(&a_different_web_app()),
+            register(ATTACKERS_STORE),
+        );
+        assert!(
+            refusal_message(&response).contains("Harvest web app"),
+            "the refusal must say why: {}",
+            refusal_message(&response)
+        );
+        assert!(
+            store.is_empty(),
+            "a foreign web app wrote to the delegate's secret store"
+        );
+
+        // The genuine caller still works, and registers a DIFFERENT store --
+        // so this half would fail if the write had silently done nothing.
+        match handle(&mut store, Some(&harvest()), register(SELLERS_STORE)) {
+            HarvestDelegateResponse::StoreRegistered { .. } => {}
+            other => panic!("the Harvest web app must be able to register: {other:?}"),
+        }
+        match handle(
+            &mut store,
+            Some(&harvest()),
+            HarvestDelegateRequest::ListStores {
+                ghostkey_fingerprint: FINGERPRINT.to_string(),
+            },
+        ) {
+            HarvestDelegateResponse::StoreList { stores, .. } => {
+                let ids: Vec<Vec<u8>> =
+                    stores.iter().map(|s| s.store_contract_id.clone()).collect();
+                assert_eq!(ids, vec![SELLERS_STORE.to_vec()], "wrong registry contents");
+            }
+            other => panic!("expected a StoreList, got {other:?}"),
+        }
+    }
+
+    /// An unattested caller is refused as well.
+    #[test]
+    fn an_unattested_caller_cannot_register_a_store() {
+        let mut store = MemSecrets::default();
+        let response = handle(&mut store, None, register(ATTACKERS_STORE));
+        assert!(refusal_message(&response).contains("could not attest"));
+        assert!(store.is_empty(), "an unattested caller wrote a secret");
+    }
+
+    /// Reads are gated too: which stores and which transactions are this
+    /// user's is the linkage a pseudonymous marketplace exists to withhold.
+    #[test]
+    fn another_web_app_cannot_read_the_sellers_registry_or_ledger() {
+        let mut store = MemSecrets::default();
+        handle(&mut store, Some(&harvest()), register(SELLERS_STORE));
+
+        for request in [
+            HarvestDelegateRequest::ListStores {
+                ghostkey_fingerprint: FINGERPRINT.to_string(),
+            },
+            HarvestDelegateRequest::ListTransactions,
+            HarvestDelegateRequest::GetRsaPublicKey {
+                ghostkey_fingerprint: FINGERPRINT.to_string(),
+            },
+        ] {
+            let response = handle(&mut store, Some(&a_different_web_app()), request);
+            assert!(
+                refusal_message(&response).contains("Harvest web app"),
+                "a foreign web app read Harvest's private state"
+            );
+        }
+    }
+
+    /// A marker sealed by a foreign caller would report a migration as already
+    /// done that never ran, which loses the seller's data silently.
+    #[test]
+    fn another_web_app_cannot_seal_a_migration_marker() {
+        let mut store = MemSecrets::default();
+        let marker = "v1.store.aabb.ccdd";
+
+        handle(
+            &mut store,
+            Some(&a_different_web_app()),
+            HarvestDelegateRequest::SetMigrationMarker {
+                marker: marker.to_string(),
+                note: "sealed by nobody".into(),
+            },
+        );
+        assert!(store.is_empty(), "a foreign web app sealed a marker");
+
+        // Sealing it for real does write, so the assertion above is not
+        // passing because the request is inert.
+        handle(
+            &mut store,
+            Some(&harvest()),
+            HarvestDelegateRequest::SetMigrationMarker {
+                marker: marker.to_string(),
+                note: "recovered".into(),
+            },
+        );
+        assert!(!store.is_empty(), "the seller could not seal their marker");
     }
 }
