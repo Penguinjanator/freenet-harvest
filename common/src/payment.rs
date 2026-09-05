@@ -691,10 +691,16 @@ fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u
     }
 
     // Re-run exactly the fold the address contract would: group by outpoint,
-    // highest as_of wins. Note what this does and does not establish: given
-    // the full history it reaches the address contract's own answer, but the
-    // history is whatever the submitter supplied, and a withheld retraction is
-    // invisible here. See `OnChainPaymentProof`'s doc comment.
+    // then defer to `fold_outpoint_status` itself rather than restating its
+    // rule here. Broadly it is "highest `as_of` wins", but how it settles a
+    // tie at equal height is upstream's to decide and has changed there, and a
+    // second copy of the rule in this comment is a copy that goes stale
+    // without anything failing.
+    //
+    // Note what this does and does not establish: given the full history it
+    // reaches the address contract's own answer, but the history is whatever
+    // the submitter supplied, and a withheld retraction is invisible here. See
+    // `OnChainPaymentProof`'s doc comment.
     let mut by_outpoint: std::collections::BTreeMap<_, Vec<_>> = std::collections::BTreeMap::new();
     for b in &bodies {
         if let Some(op) = b.claim.outpoint() {

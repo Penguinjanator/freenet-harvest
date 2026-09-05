@@ -572,13 +572,24 @@ impl ProbeStateOps for MailboxOps {
 }
 
 /// The mailbox contract's own merge: add messages we do not hold, then let
-/// `apply_delta` re-run its deterministic TTL prune.
+/// `apply_delta` re-apply its message cap.
 ///
-/// Folding an older generation can re-admit a message the successor had
-/// already pruned. That is harmless and self-correcting: the prune is measured
-/// against the newest timestamp present after the merge and is re-applied on
-/// every `apply_delta`, so the fold result is pruned again by the same rule
-/// every peer would apply to the same bytes.
+/// Folding an older generation can push the mailbox over
+/// `harvest_common::mailbox::MAX_MESSAGES`. `apply_delta` runs
+/// `enforce_message_cap` on every call, which keeps the highest-ranked
+/// `MAX_MESSAGES` by `(timestamp, nonce)` -- a total order and a pure function
+/// of message content, so the fold result is trimmed to exactly the subset any
+/// peer would keep from the same bytes.
+///
+/// What that does NOT give you is a guarantee the older generation's messages
+/// survive the fold: a mailbox at the cap drops whatever ranks lowest, and both
+/// ranking fields are chosen by whoever wrote the message. See
+/// `MailboxStateV1::apply_delta` for what the cap does and does not buy.
+///
+/// This described a 30-day TTL prune until `ecbec18` deleted it -- retention
+/// keyed on timestamps an unauthenticated sender controls let one message
+/// dated far in the future evict every legitimate one. There is no age rule
+/// here any more, and nothing in this module should imply one.
 fn merge_mailbox(mut base: MailboxStateV1, other: &MailboxStateV1) -> MailboxStateV1 {
     let snapshot = base.clone();
     let delta: Vec<_> = other
@@ -608,12 +619,16 @@ fn merge_mailbox(mut base: MailboxStateV1, other: &MailboxStateV1) -> MailboxSta
 ///   is pruned again identically.
 /// * **Reputation** -- a grow-only set keyed by nonce with no removal path
 ///   whatsoever. Nothing can be resurrected because nothing is ever deleted.
-/// * **Mailbox** -- messages are keyed by nonce and pruned by a TTL measured
-///   against the newest message present, re-applied on every `apply_delta`.
-///   Same argument as the order cap.
+/// * **Mailbox** -- messages are keyed by nonce and capacity-pruned by
+///   `enforce_message_cap`, re-applied on every `apply_delta`. Same argument
+///   as the order cap. (This said "pruned by a TTL measured against the newest
+///   message present" until `ecbec18` deleted that rule; the soundness
+///   argument is unchanged, because it never depended on WHICH deterministic
+///   prune ran, only on there being one.)
 ///
 /// Fold-all matters here rather than being a free upgrade: Harvest has re-keyed
-/// four times, so a seller who used it across generations has listings at
+/// repeatedly -- `legacy/store_contract.toml` records five superseded store
+/// generations -- so a seller who used it across generations has listings at
 /// several DIFFERENT instances, none of which was ever carried forward.
 /// `NewestFirstWins` would stop at the newest populated one and leave the rest.
 ///
