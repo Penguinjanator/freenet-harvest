@@ -72,8 +72,8 @@
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
 use freenet_bitcoin_common::{
-    fold_outpoint_status, BitcoinAddressParameters, BitcoinNetwork, BridgeId, OutpointStatus,
-    SignedClaim, SignedTipEntry,
+    fold_outpoint_status, BitcoinAddressParameters, BitcoinNetwork, BridgeId, Claim,
+    OutpointStatus, SignedClaim, SignedTipEntry,
 };
 use serde::{Deserialize, Serialize};
 
@@ -288,6 +288,20 @@ impl Order {
 /// genuinely signed, genuinely about this script, and genuinely deep enough
 /// against the supplied tip. The fold has nothing to fold it against, so the
 /// order validates as `Paid` on a payment that is no longer on the chain.
+///
+/// The same omission runs in the other direction, and that one is worse
+/// because `PaymentReversed` is permanent under merge. If a payment was
+/// confirmed, reorged out, and then re-confirmed on the new chain, the bridge
+/// has published three claims for that outpoint; a submitter can present the
+/// first two and withhold the re-confirmation, and the fold then reads a live
+/// payment as reversed. `verify_on_chain_proof` requires a reversal to show
+/// confirmations covering the order that were themselves retracted, so this
+/// is no longer reachable for an order that was never paid -- but for one
+/// that WAS paid and survived a reorg, it still is. **That residual is real
+/// and is not closed here**; see `verify_on_chain_proof` for exactly what the
+/// precondition does and does not buy, and
+/// `store::order_tests::a_withheld_reconfirmation_still_reads_as_a_reversal`
+/// for the case pinned as a known gap.
 ///
 /// ## Why it cannot be fixed inside this function
 ///
@@ -690,36 +704,88 @@ fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u
 
     let mut confirmed_total: u64 = 0;
     let mut shallowest: Option<u32> = None;
-    let mut saw_retraction = false;
+    // Value this proof shows was confirmed at SOME point, whether or not it
+    // still is. This is what distinguishes a reversal from an order that was
+    // simply never paid: see the `Reversed` test below.
+    let mut ever_confirmed_total: u64 = 0;
+    // Whether any outpoint this proof shows as retracted was also shown
+    // CONFIRMED by it. A retraction of something never confirmed -- a dust
+    // sighting, an evicted mempool transaction -- reverses nothing.
+    let mut retracted_a_confirmed_outpoint = false;
 
     for claims in by_outpoint.values() {
+        // The value the proof attests this outpoint once held, if it holds a
+        // confirmation for it at all. Taking the minimum across duplicates is
+        // the conservative direction for a value that will be used to ADMIT a
+        // reversal; in practice the choice is moot, because `SignedClaim::
+        // verify` checks each `ConfirmedOutput` against an SPV proof binding
+        // `value_sats` to that exact txid and vout, so two verified
+        // confirmations of one outpoint cannot disagree about the value.
+        let ever_confirmed: Option<u64> = claims
+            .iter()
+            .filter_map(|b| match &b.claim {
+                Claim::ConfirmedOutput { value_sats, .. } => Some(*value_sats),
+                _ => None,
+            })
+            .min();
+        if let Some(v) = ever_confirmed {
+            ever_confirmed_total = ever_confirmed_total.saturating_add(v);
+        }
+
         match fold_outpoint_status(claims.iter()) {
             Some(OutpointStatus::Confirmed { value_sats, anchor }) => {
                 let confs = freenet_bitcoin_common::confirmations(&anchor, tip_height);
                 confirmed_total = confirmed_total.saturating_add(value_sats);
                 shallowest = Some(shallowest.map_or(confs, |s: u32| s.min(confs)));
             }
-            Some(OutpointStatus::Retracted) => saw_retraction = true,
+            Some(OutpointStatus::Retracted) => {
+                if ever_confirmed.is_some() {
+                    retracted_a_confirmed_outpoint = true;
+                }
+            }
             // Mempool-only outputs never count toward a paid order.
             Some(OutpointStatus::Unconfirmed { .. }) | None => {}
         }
     }
 
-    // What makes a reversal a reversal is a bridge-signed `Retracted` claim
-    // PLUS a remaining total that no longer covers what the order is owed.
+    // A reversal is a reversal OF something, and all three of these have to
+    // hold:
     //
-    // Testing only for a total of zero was too narrow. An order paid across
-    // two outpoints, one of which is later reorged out, is genuinely reversed
-    // while the other outpoint's value is still confirmed -- and that case
-    // used to surface as `InsufficientValue`. Which is precisely why
-    // `AuthorizedOrder::verify` accepted `InsufficientValue` as evidence of a
-    // reversal, and why an empty claim set (`InsufficientValue { have: 0 }`,
-    // no bridge involved at all) could poison any order in the store. Report
-    // the reversal here, so that arm can require the reversal error itself.
+    //   1. the proof shows this order was AT SOME POINT covered;
+    //   2. a bridge has retracted one of the very outpoints that covered it;
+    //   3. what is still confirmed no longer covers the order.
     //
-    // The `== 0` limb only covers the degenerate zero-sats order, which
-    // reached `Reversed` before this change and still does.
-    if saw_retraction && (confirmed_total < order.amount_sats || confirmed_total == 0) {
+    // (3) alone was the original test, and (3) alone is trivially true of
+    // every order nobody has paid yet -- the current total is zero. Combined
+    // with (2) in its weaker "any retraction at all" form, that made a
+    // retraction of ANY output on this script sufficient evidence that a
+    // payment which never happened had been undone. The order's payment
+    // address is public in the store state, so an attacker could send dust to
+    // it, or broadcast a low-fee transaction and let it be evicted, and
+    // submit the resulting retraction. `PaymentReversed` outranks `Paid` and
+    // merge is monotonic, so the order would then be poisoned permanently.
+    //
+    // (1) is measured over `ConfirmedOutput` claims only. A `MempoolOutput`
+    // sighting is not a payment, and it is the cheap attacker-controlled
+    // path: causing a confirmed output to be retracted needs a reorg, while
+    // causing a mempool one to be retracted needs only a low fee.
+    //
+    // Testing (3) only for a total of zero was too narrow: an order paid
+    // across two outpoints, one of which is later reorged out, is genuinely
+    // reversed while the other outpoint's value is still confirmed -- and
+    // that case used to surface as `InsufficientValue`. Which is precisely
+    // why `AuthorizedOrder::verify` accepted `InsufficientValue` as evidence
+    // of a reversal, and why an empty claim set (`InsufficientValue
+    // { have: 0 }`, no bridge involved at all) could poison any order in the
+    // store. Report the reversal here, so that arm can require the reversal
+    // error itself.
+    //
+    // The `== 0` limb covers the degenerate zero-sats order. It no longer
+    // admits a reversal on its own, because (1) and (2) still have to hold,
+    // and (2) needs a genuine confirmed-then-retracted outpoint.
+    let was_ever_covered = ever_confirmed_total >= order.amount_sats;
+    let no_longer_covered = confirmed_total < order.amount_sats || confirmed_total == 0;
+    if retracted_a_confirmed_outpoint && was_ever_covered && no_longer_covered {
         return Err(ProofError::Reversed);
     }
     if confirmed_total < order.amount_sats {
@@ -816,17 +882,26 @@ impl AuthorizedOrder {
                 // any order in any store. Absence of proof is not proof of
                 // absence.
                 //
-                // `Reversed` is reachable only via `fold_outpoint_status`
-                // returning `Retracted` for an outpoint, which requires a
-                // claim signed by one of this store's trusted bridges.
+                // `Reversed` requires the proof to show confirmations
+                // covering the order that a trusted bridge has since
+                // retracted -- see `verify_on_chain_proof`. A retraction on
+                // its own is not enough, and neither is a retraction of dust
+                // or of an evicted mempool sighting, because a reversal has
+                // to be a reversal OF something.
                 //
-                // Residual, tracked as the selective-omission gap in the
-                // `OnChainPaymentProof` doc comment: the submitter still picks
-                // which claims to show, so once a bridge has ever published a
-                // retraction for this script, a submitter can exhibit that
-                // claim while withholding a later re-confirmation. Closing
-                // that needs a bridge-signed commitment to the complete claim
-                // set, not a change here.
+                // Residual, and it is NOT small -- tracked as the
+                // selective-omission gap in the `OnChainPaymentProof` doc
+                // comment. The submitter still picks which claims to show. So
+                // for an order whose payment WAS confirmed, reorged out, and
+                // re-confirmed on the new chain, a submitter can exhibit the
+                // confirmation and the retraction while withholding the
+                // re-confirmation; the precondition above is then satisfied
+                // by genuine claims, and a live payment reads as reversed.
+                // What the precondition removes is the case where no payment
+                // ever happened at all, which needed no reorg and no
+                // cooperation from anyone. Closing the rest needs a
+                // bridge-signed commitment to the complete claim set, not a
+                // change here.
                 let proof = self
                     .payment_proof
                     .as_ref()

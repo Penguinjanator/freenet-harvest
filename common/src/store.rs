@@ -1139,6 +1139,177 @@ mod order_tests {
         );
     }
 
+    /// A bridge-signed observation of an output the bridge has only ever seen
+    /// in the mempool. Carries no SPV proof, because there is no block to
+    /// prove inclusion in.
+    fn mempool_claim(
+        order: &Order,
+        bridge: &SigningKey,
+        outpoint: OutPoint,
+        value_sats: u64,
+        as_of_height: u32,
+    ) -> SignedClaim {
+        let addr_params = order.bitcoin_params();
+        let body = ClaimBody {
+            script_id: addr_params.script_id(),
+            network: order.network,
+            as_of: BlockAnchor {
+                height: as_of_height,
+                hash: BlockHash([6u8; 32]),
+            },
+            claim: Claim::MempoolOutput {
+                outpoint,
+                value_sats,
+            },
+        };
+        SignedClaim::sign(bridge, &body).unwrap()
+    }
+
+    /// A reversal has to be a reversal OF something.
+    ///
+    /// `PaymentReversed` outranks `Paid` and merge is a monotonic maximum, so
+    /// a reversal a peer accepts is permanent: no later proof of payment can
+    /// displace it. The status is unsigned by design, and the order's payment
+    /// address is public in the store state, so anyone at all can submit one.
+    /// The evidence test is therefore the only thing between a public order
+    /// and permanent poisoning, and it must establish that the order was AT
+    /// SOME POINT actually covered before it reads a retraction as a reversal.
+    ///
+    /// Without that it was enough to show any bridge-signed retraction for
+    /// this script while the current total fell short -- which for an order
+    /// that was never paid is trivially true, since the current total is zero.
+    /// Three ways to get such a retraction, all cheap, all covered below.
+    #[test]
+    fn a_retraction_of_an_unpaid_amount_is_not_a_reversal() {
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let p = params(&seller);
+        let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+        assert_eq!(order.amount_sats, 50_000);
+
+        let tip = signed_tip(&order, &bridge, 101);
+        let (dust, dust_outpoint) = confirmed_claim(&order, &bridge, 1, 100);
+        let dust_retracted = retraction_claim(&order, &bridge, dust_outpoint, 101);
+
+        // (1) A bare retraction. Nothing in the proof ever says this order was
+        //     paid, and "the current total is short" is true of every order
+        //     that has not been paid yet.
+        let bare = OrderPaymentProof::on_chain(vec![dust_retracted.clone()], tip.clone());
+        assert_ne!(
+            crate::payment::verify_payment_proof(&order, &bare),
+            Err(crate::payment::ProofError::Reversed),
+            "a retraction on its own says nothing about whether the order was ever paid"
+        );
+
+        // (2) Dust, confirmed and then retracted. Now the proof does contain a
+        //     confirmation -- for 1 sat of a 50_000 sat order. An attacker can
+        //     send dust to the public payment address themselves.
+        let dusted = OrderPaymentProof::on_chain(vec![dust, dust_retracted.clone()], tip.clone());
+        assert_ne!(
+            crate::payment::verify_payment_proof(&order, &dusted),
+            Err(crate::payment::ProofError::Reversed),
+            "1 sat retracted is not the reversal of a 50_000 sat payment"
+        );
+
+        // (3) A full-value output the bridge only ever saw in the mempool,
+        //     then evicted. This is the cheapest of the three and the only one
+        //     an attacker fully controls -- no reorg needed, just a low-fee
+        //     transaction they let drop out -- so it is the one that most has
+        //     to be refused. A mempool sighting is not a payment.
+        let (_, full_outpoint) = confirmed_claim(&order, &bridge, order.amount_sats, 100);
+        let evicted = OrderPaymentProof::on_chain(
+            vec![
+                mempool_claim(&order, &bridge, full_outpoint, order.amount_sats, 99),
+                retraction_claim(&order, &bridge, full_outpoint, 101),
+            ],
+            tip.clone(),
+        );
+        assert_ne!(
+            crate::payment::verify_payment_proof(&order, &evicted),
+            Err(crate::payment::ProofError::Reversed),
+            "an evicted mempool transaction was never a confirmed payment"
+        );
+
+        // And the contract must refuse the record, not merely the proof --
+        // `AuthorizedOrder::verify` accepts `Reversed` and nothing else, so
+        // these have to come back as some other error.
+        for (name, proof) in [("bare", bare), ("dusted", dusted), ("evicted", evicted)] {
+            let record = make_authorized_order(
+                &seller,
+                order.clone(),
+                OrderStatus::PaymentReversed,
+                Some(proof),
+            );
+            let state = orders_of([(order.id.clone(), record)]);
+            let err = state
+                .verify(&StoreStateV1::default(), &p)
+                .expect_err("a reversal of a payment that never happened must be rejected");
+            assert!(
+                err.contains("reversal evidence invalid"),
+                "{name}: expected the reversal-evidence rejection, got: {err}"
+            );
+        }
+    }
+
+    /// **Pins a KNOWN GAP, not desired behaviour.** Invert this test when the
+    /// gap closes.
+    ///
+    /// The mirror image of `a_withheld_retraction_is_not_currently_detected`,
+    /// and the more damaging direction of the two, because `PaymentReversed`
+    /// is permanent under merge while `Paid` can still be superseded.
+    ///
+    /// Requiring a reversal to show confirmations that were themselves
+    /// retracted stops an order that was NEVER paid from being reversed. It
+    /// does not stop a genuine payment that survived a reorg from being
+    /// reported as reversed: the bridge published three claims for that
+    /// outpoint, and a submitter who shows the first two and withholds the
+    /// third satisfies the precondition with entirely genuine evidence.
+    ///
+    /// See `OnChainPaymentProof`'s doc comment for the bridge-signed
+    /// claim-set commitment that would close this, and why it belongs
+    /// upstream in `freenet-bitcoin` rather than here.
+    #[test]
+    fn a_withheld_reconfirmation_still_reads_as_a_reversal() {
+        let bridge = bridge_key();
+        let order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+
+        // The real history of a payment that was reorged and re-confirmed:
+        // confirmed at 100, retracted at 101, confirmed again at 102. Same
+        // outpoint throughout -- the transaction was re-mined, not replaced.
+        let (confirmed, outpoint) = confirmed_claim(&order, &bridge, order.amount_sats, 100);
+        let retracted = retraction_claim(&order, &bridge, outpoint, 101);
+        let (reconfirmed, reconfirmed_outpoint) =
+            confirmed_claim(&order, &bridge, order.amount_sats, 102);
+        assert_eq!(
+            outpoint, reconfirmed_outpoint,
+            "the re-confirmation must be about the same outpoint, or this is a different scenario"
+        );
+        let tip = signed_tip(&order, &bridge, 102);
+
+        // Complete history: the payment stands.
+        assert_eq!(
+            crate::payment::verify_payment_proof(
+                &order,
+                &OrderPaymentProof::on_chain(
+                    vec![confirmed.clone(), retracted.clone(), reconfirmed],
+                    tip.clone(),
+                ),
+            ),
+            Ok(order.amount_sats),
+            "with the whole history the payment is current",
+        );
+
+        // The re-confirmation withheld, and nothing else changed.
+        assert_eq!(
+            crate::payment::verify_payment_proof(
+                &order,
+                &OrderPaymentProof::on_chain(vec![confirmed, retracted], tip),
+            ),
+            Err(crate::payment::ProofError::Reversed),
+            "KNOWN GAP: omitting the re-confirmation still reads as a reversal",
+        );
+    }
+
     /// Evidence that still proves payment is not evidence of a reversal.
     ///
     /// This is what stops the whole `PaymentReversed` arm being replaced by an
