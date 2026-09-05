@@ -56,6 +56,22 @@ document should know were once true:
 None of these needed a key or any relationship with either party, because
 anybody can read the mailbox and anybody can write to it.
 
+## Authorship is NOT established by anything here
+
+Direction separation stops a third party reflecting a copied message. It does
+not, and cannot, stop the counterparty: both parties derive both direction
+keys from the same symmetric Diffie-Hellman secret, because the buyer needs
+the seller-to-buyer key in order to read replies at all. So either party can
+encrypt in either direction, and a buyer can place a message in the seller's
+mailbox that authenticates exactly as the seller's own reply would.
+
+Only a per-message signature could distinguish two holders of one secret, and
+that is a different mechanism from this one. **Anything whose authenticity
+matters must carry its own signature and must not rest on which key decrypted
+it.** The UI reports which direction a message was addressed, names only what
+the current tab sent as authored, and says on screen that direction is not
+proof of authorship.
+
 ## NOT visible
 
 * **What was said.** AES-256-GCM under a key derived from an X25519 exchange

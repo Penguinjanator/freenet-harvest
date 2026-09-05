@@ -238,6 +238,30 @@ pub fn unpad_from_bucket(padded: &[u8]) -> Result<Vec<u8>, String> {
 /// buyer-to-seller ciphertext simply does not authenticate under the
 /// seller-to-buyer key. It costs one BLAKE3 invocation and no wire bytes.
 ///
+/// # What it does NOT defend against, and why nothing here can
+///
+/// **The counterparty.** Both parties derive BOTH keys from the same
+/// symmetric Diffie-Hellman secret -- the buyer needs the seller-to-buyer key
+/// in order to read replies at all -- so either of them can encrypt in either
+/// direction. A buyer can place a message in the seller's mailbox that
+/// authenticates under the seller-to-buyer key, and the seller's own client
+/// cannot tell it from something the seller wrote.
+///
+/// This is not a gap to close with more crypto at this layer: a symmetric DH
+/// secret cannot distinguish its two holders, and only a per-message
+/// signature could. So the rule is:
+///
+/// **Direction is a property of the CHANNEL, never evidence of authorship.
+/// Anything whose authenticity matters must carry its own signature.**
+///
+/// That sentence is load-bearing rather than decorative. The seller's
+/// pre-signed statement that a buyer needs in order to complain is Ed25519
+/// signed by the seller precisely so its authenticity rests on the signature
+/// and not on which key decrypted it; a future change that decided the
+/// channel was enough would silently make it forgeable by the buyer it
+/// protects. `harvest-ui`'s `messaging::Addressing` carries the same warning
+/// at the type the UI actually reads.
+///
 /// Replay is separately impossible, but NOT for the reason this comment gave
 /// until 2026-09-05. It said that changing the nonce to evade dedup changes
 /// the AES nonce with it -- true only of the first 12 of the 24 bytes. Bytes

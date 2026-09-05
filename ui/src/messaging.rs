@@ -199,29 +199,49 @@ impl BuyerConversation {
     /// fails to authenticate. What the tag bounds is WORK: without it a buyer
     /// would attempt decryption against every entry in the mailbox.
     pub fn read(&self, messages: &[EncryptedMessage]) -> Vec<ConversationMessage> {
+        self.read_with_cost(messages).0
+    }
+
+    /// [`Self::read`], and what reading cost.
+    ///
+    /// The cost is returned because the tag filter is a performance guard
+    /// that no assertion about the OUTPUT can pin -- the AEAD refuses
+    /// everything the filter would have, so deleting the filter changes only
+    /// how much work happens. See
+    /// `reading_a_thread_costs_the_thread_and_not_the_mailbox`.
+    pub fn read_with_cost(
+        &self,
+        messages: &[EncryptedMessage],
+    ) -> (Vec<ConversationMessage>, ReadCost) {
+        let mut cost = ReadCost {
+            examined: messages.len(),
+            attempted: 0,
+        };
+
         let mut thread: Vec<ConversationMessage> = messages
             .iter()
             .filter(|message| message.sender_public_key == self.buyer_public_key)
             .filter_map(|message| {
-                // The seller's reply first: it is the one the buyer is
+                // Addressed-to-the-buyer first: it is the one the buyer is
                 // waiting for, and the common case for an entry they did not
                 // write themselves.
-                for (key, from_seller) in [
-                    (&self.keys.from_seller, true),
-                    (&self.keys.to_seller, false),
+                for (key, addressing) in [
+                    (&self.keys.from_seller, Addressing::ToBuyer),
+                    (&self.keys.to_seller, Addressing::ToSeller),
                 ] {
+                    cost.attempted += 1;
                     let Ok(plaintext) = decrypt_message(message, key) else {
                         continue;
                     };
                     // The conversation id is inside the ciphertext, so only
-                    // someone holding the key could have set it -- which is
-                    // the seller. Checking it stops a reply being spliced
-                    // from one of this buyer's conversations into another.
+                    // someone holding the key could have set it. Checking it
+                    // stops a reply being spliced from one of this buyer's
+                    // conversations into another.
                     if plaintext.conversation_id != self.conversation_id {
                         continue;
                     }
                     return Some(ConversationMessage {
-                        from_seller,
+                        addressing,
                         timestamp: message.timestamp,
                         nonce: message.nonce,
                         content: plaintext.content,
@@ -233,16 +253,49 @@ impl BuyerConversation {
         // Oldest first: a conversation reads top to bottom, unlike the
         // seller's inbox, which is a queue and reads newest first.
         thread.sort_by_key(|message| (message.timestamp, message.nonce));
-        thread
+        (thread, cost)
     }
+}
+
+/// What reading a mailbox cost, so the routing-tag filter can be pinned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ReadCost {
+    /// Entries in the mailbox.
+    pub examined: usize,
+    /// AEAD attempts made -- at most two per entry the tag admitted, and
+    /// zero for every entry it did not.
+    pub attempted: usize,
+}
+
+/// Which way along a conversation a message was ADDRESSED.
+///
+/// # This is not authorship, and must never be shown as authorship
+///
+/// It says which of the two direction keys authenticated the ciphertext, and
+/// nothing more. Both parties hold both keys -- the buyer needs
+/// `seller_to_buyer` to read replies at all -- so either can encrypt in
+/// either direction. A buyer can write a message that arrives in the seller's
+/// mailbox addressed as though the seller had written it, and the reverse.
+///
+/// That is not fixable with more crypto here: a symmetric Diffie-Hellman
+/// secret cannot distinguish its two holders, and only a per-message
+/// signature could. See [`harvest_common::mailbox::MessageDirection`] for
+/// what direction separation does and does not defend, and
+/// `components::message_view` for the wording that does not overclaim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Addressing {
+    /// Encrypted under the buyer-to-seller key.
+    ToSeller,
+    /// Encrypted under the seller-to-buyer key.
+    ToBuyer,
 }
 
 /// One message of a conversation, as the buyer sees it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConversationMessage {
-    /// Whether the seller wrote it. Decided by WHICH key authenticated the
-    /// ciphertext, not by anything the message claims about itself.
-    pub from_seller: bool,
+    /// Which direction key authenticated it -- **not** who wrote it. See
+    /// [`Addressing`].
+    pub addressing: Addressing,
     pub timestamp: chrono::DateTime<chrono::Utc>,
     /// The mailbox nonce, so a caller can tell whether a message it sent has
     /// actually appeared in the mailbox.
@@ -342,16 +395,21 @@ pub enum MailboxEntry {
         /// (`a_reply_naming_another_conversation_is_not_shown`), so the only
         /// place a seller can learn the right one is a message they decrypted.
         conversation_id: ConversationId,
-        /// Whether the seller wrote it. Decided by WHICH direction key
-        /// authenticated the ciphertext, so it cannot be spoofed by a copy of
-        /// somebody else's message.
-        from_seller: bool,
+        /// The mailbox nonce, which is the message's identity -- the only way
+        /// a client can recognise one it sent itself, and so the only
+        /// authorship anything here can establish.
+        nonce: [u8; 24],
+        /// Which direction key authenticated it -- **not** who wrote it. See
+        /// [`Addressing`]. A third party cannot produce either direction; the
+        /// COUNTERPARTY can produce both.
+        addressing: Addressing,
         timestamp: chrono::DateTime<chrono::Utc>,
         content: MessageContent,
     },
     /// Present and not readable, with the reason.
     Unreadable {
         conversation: Vec<u8>,
+        nonce: [u8; 24],
         timestamp: chrono::DateTime<chrono::Utc>,
         why: String,
     },
@@ -370,6 +428,13 @@ impl MailboxEntry {
         match self {
             MailboxEntry::Readable { conversation, .. }
             | MailboxEntry::Unreadable { conversation, .. } => conversation,
+        }
+    }
+
+    /// The message's identity in the mailbox.
+    pub fn nonce(&self) -> [u8; 24] {
+        match self {
+            MailboxEntry::Readable { nonce, .. } | MailboxEntry::Unreadable { nonce, .. } => *nonce,
         }
     }
 }
@@ -399,6 +464,7 @@ pub fn read_mailbox(
             let Some(pair) = keys.get(&conversation) else {
                 return MailboxEntry::Unreadable {
                     conversation,
+                    nonce: message.nonce,
                     timestamp: message.timestamp,
                     why: "waiting for the key from your delegate".to_string(),
                 };
@@ -406,13 +472,17 @@ pub fn read_mailbox(
             // Inbound first: it is what a seller opens their mailbox for, and
             // their own replies are the smaller half.
             let mut last_error = String::new();
-            for (key, from_seller) in [(&pair.to_seller, false), (&pair.from_seller, true)] {
+            for (key, addressing) in [
+                (&pair.to_seller, Addressing::ToSeller),
+                (&pair.from_seller, Addressing::ToBuyer),
+            ] {
                 match decrypt_message(message, key) {
                     Ok(plaintext) => {
                         return MailboxEntry::Readable {
                             conversation,
                             conversation_id: plaintext.conversation_id,
-                            from_seller,
+                            nonce: message.nonce,
+                            addressing,
                             timestamp: message.timestamp,
                             content: plaintext.content,
                         }
@@ -422,6 +492,7 @@ pub fn read_mailbox(
             }
             MailboxEntry::Unreadable {
                 conversation,
+                nonce: message.nonce,
                 timestamp: message.timestamp,
                 why: last_error,
             }
@@ -623,9 +694,11 @@ mod tests {
         let inbox = seller.inbox(&[sealed]);
         assert_eq!(text(&inbox[0]), "is the blue one still available?");
         match &inbox[0] {
-            MailboxEntry::Readable { from_seller, .. } => {
-                assert!(!from_seller, "an inbound message is not the seller's own")
-            }
+            MailboxEntry::Readable { addressing, .. } => assert_eq!(
+                addressing,
+                &Addressing::ToSeller,
+                "an inbound message is addressed to the seller"
+            ),
             other => panic!("expected readable: {other:?}"),
         }
     }
@@ -653,8 +726,16 @@ mod tests {
         let thread = buyer.read(&mailbox);
 
         assert_eq!(thread.len(), 2, "the buyer sees both halves");
-        assert!(!thread[0].from_seller, "oldest first: the buyer's question");
-        assert!(thread[1].from_seller, "then the seller's reply");
+        assert_eq!(
+            thread[0].addressing,
+            Addressing::ToSeller,
+            "oldest first: the buyer's question"
+        );
+        assert_eq!(
+            thread[1].addressing,
+            Addressing::ToBuyer,
+            "then the seller's reply"
+        );
         assert_eq!(
             thread[1].content,
             MessageContent::Text("yes, ten euro postage".into())
@@ -698,7 +779,9 @@ mod tests {
         let thread = buyer.read(&[original.clone(), forged]);
 
         assert!(
-            thread.iter().all(|message| !message.from_seller),
+            thread
+                .iter()
+                .all(|message| message.addressing == Addressing::ToSeller),
             "a copy of the buyer's own message was presented as a reply from the seller"
         );
         // And the original is still readable, so the assertion above is not
@@ -1003,13 +1086,14 @@ mod tests {
         }
         match by_nonce(own_reply.nonce) {
             MailboxEntry::Readable {
-                from_seller,
+                addressing,
                 content,
                 ..
             } => {
-                assert!(
-                    from_seller,
-                    "the seller's own reply must be labelled as theirs"
+                assert_eq!(
+                    addressing,
+                    &Addressing::ToBuyer,
+                    "the seller's own reply is addressed to the buyer"
                 );
                 assert_eq!(content, &MessageContent::Text("answered".into()));
             }
@@ -1090,6 +1174,140 @@ mod tests {
         )
         .expect_err("must be refused");
         assert!(error.contains("too long"), "got: {error}");
+    }
+
+    /// **The routing-tag filter is a performance guard, and this pins it as
+    /// one.**
+    ///
+    /// Correctness does not depend on it: the AEAD refuses anything not for
+    /// this buyer either way, and since the envelope binding the tag is
+    /// authenticated too. So no assertion about WHAT comes back can fail when
+    /// the filter is deleted -- verified, 214 tests stayed green with it
+    /// removed.
+    ///
+    /// What the filter buys is that a buyer's read costs their own thread
+    /// rather than the whole mailbox. Deleting it silently turns an O(thread)
+    /// read into a full trial-decrypt on every fetch, which at the byte
+    /// budget is the 20.7 ms worst case in `docs/messaging-privacy.md` on
+    /// every update notification. That is not a property any output can
+    /// express, so the cost is measured directly instead.
+    ///
+    /// Observed red by deleting the `sender_public_key` filter: attempted
+    /// went from 2 to 512.
+    #[test]
+    fn reading_a_thread_costs_the_thread_and_not_the_mailbox() {
+        use harvest_common::mailbox::MAX_MESSAGES;
+
+        let seller = Seller::new(71);
+        let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+        let stranger = BuyerConversation::open(&seller.public_key()).expect("open");
+
+        let mut mailbox = vec![
+            buyer.seal("mine".into()).expect("seal"),
+            seal_reply(
+                &seller.keys_for(&buyer.buyer_public_key),
+                &buyer.buyer_public_key,
+                &buyer.conversation_id,
+                "answered".into(),
+            )
+            .expect("reply"),
+        ];
+        // Everyone else's traffic, which this buyer must not pay to examine.
+        let noise = stranger.seal("not yours".into()).expect("seal");
+        for i in 0..(MAX_MESSAGES - mailbox.len()) {
+            let mut other = noise.clone();
+            other.nonce = {
+                let mut n = [0u8; 24];
+                n[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                n
+            };
+            mailbox.push(other);
+        }
+        assert_eq!(mailbox.len(), MAX_MESSAGES);
+
+        let (thread, cost) = buyer.read_with_cost(&mailbox);
+
+        assert_eq!(thread.len(), 2, "the buyer still sees their own thread");
+        assert_eq!(cost.examined, MAX_MESSAGES);
+
+        // Three, not two: the reply key is tried first, so the buyer's OWN
+        // message costs two attempts and the reply costs one. What matters is
+        // the shape rather than the constant -- attempts are bounded by the
+        // thread, at most two per entry the tag admitted, and do not grow with
+        // the mailbox.
+        assert_eq!(
+            cost.attempted, 3,
+            "a buyer paid to attempt decryption on somebody else's traffic: {} of {} entries",
+            cost.attempted, cost.examined
+        );
+        assert!(
+            cost.attempted <= 2 * thread.len(),
+            "attempts must be bounded by the thread"
+        );
+        assert!(
+            cost.attempted * 100 < cost.examined,
+            "attempts scaled with the mailbox rather than the thread"
+        );
+    }
+
+    /// **THIS TEST PINS A LIMITATION, NOT A DEFENCE.**
+    ///
+    /// Direction separation stops a THIRD PARTY reflecting a copied message.
+    /// It cannot stop the COUNTERPARTY, because both parties derive both keys
+    /// from the same symmetric Diffie-Hellman secret -- the buyer needs the
+    /// seller-to-buyer key in order to read replies at all. So a buyer can
+    /// place a message in the seller's mailbox that authenticates under the
+    /// seller-to-buyer key, and the seller's client cannot tell it from
+    /// something the seller wrote.
+    ///
+    /// Verified before this was written: a seller's inbox displayed
+    /// "as agreed, I confess" as the seller's own reply, written by the
+    /// buyer.
+    ///
+    /// It is not fixable with more crypto at this layer -- a symmetric secret
+    /// cannot distinguish its two holders, and only a per-message signature
+    /// could. So the fix is that [`Addressing`] means direction and the UI
+    /// says direction, and anything whose authenticity matters carries its
+    /// own signature.
+    ///
+    /// **If this test ever goes red, do not make it pass.** It would mean
+    /// something now distinguishes the two holders, which is a real
+    /// improvement -- invert the assertion and delete this comment.
+    #[test]
+    fn known_limit_the_counterparty_can_write_in_either_direction() {
+        let seller = Seller::new(73);
+        let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+
+        // The keys the BUYER holds -- the same pair the seller's delegate
+        // derives, which is the whole point.
+        let both_keys = seller.keys_for(&buyer.buyer_public_key);
+
+        let forged = seal_reply(
+            &both_keys,
+            &buyer.buyer_public_key,
+            &buyer.conversation_id,
+            "as agreed, I confess".into(),
+        )
+        .expect("the buyer can seal in the seller's direction");
+
+        match &seller.inbox(&[forged])[0] {
+            MailboxEntry::Readable {
+                addressing,
+                content,
+                ..
+            } => {
+                assert_eq!(
+                    addressing,
+                    &Addressing::ToBuyer,
+                    "the channel cannot tell this was not the seller's own message"
+                );
+                assert_eq!(
+                    content,
+                    &MessageContent::Text("as agreed, I confess".into())
+                );
+            }
+            other => panic!("expected a readable entry: {other:?}"),
+        }
     }
 
     /// A low-order "public key" is refused rather than encrypted to under a

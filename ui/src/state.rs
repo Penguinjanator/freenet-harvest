@@ -1672,6 +1672,31 @@ impl AppState {
         crate::messaging::seal_reply(keys, conversation_tag, &conversation_id, text)
     }
 
+    /// Whether THIS browser wrote the message with this nonce.
+    ///
+    /// # Why authorship is answered from local records and not from the
+    /// message
+    ///
+    /// Nothing in a message establishes who wrote it. Both parties hold both
+    /// direction keys, so either can encrypt in either direction, and
+    /// `messaging::Addressing` says which way a message was addressed rather
+    /// than who addressed it -- see
+    /// [`harvest_common::mailbox::MessageDirection`].
+    ///
+    /// The one thing a client can know first-hand is what it sent itself.
+    /// That is this. Everything else is unattributed, and
+    /// `components::message_view` says so rather than labelling a
+    /// counterparty-written message with the counterparty's name.
+    ///
+    /// It is per-tab, like everything else about a conversation: a reload
+    /// loses it, and messages this browser really did send then read as
+    /// unattributed, which is the honest direction to be wrong in.
+    pub fn authored_here(&self, store_contract_id: &[u8], nonce: &[u8; 24]) -> bool {
+        self.browsing_stores
+            .get(store_contract_id)
+            .is_some_and(|store| store.sent_messages.iter().any(|sent| &sent.nonce == nonce))
+    }
+
     /// Record a message this browser sent, so the buyer can see what they
     /// wrote.
     ///
@@ -5839,8 +5864,12 @@ mod conversation_tests {
 
         let thread = buyer.conversation_thread(STORE);
         assert_eq!(thread.len(), 2, "the buyer sees both halves");
-        assert!(!thread[0].from_seller);
-        assert!(thread[1].from_seller, "the reply must be the seller's");
+        assert_eq!(thread[0].addressing, crate::messaging::Addressing::ToSeller);
+        assert_eq!(
+            thread[1].addressing,
+            crate::messaging::Addressing::ToBuyer,
+            "the reply is addressed to the buyer"
+        );
         assert_eq!(text(&thread[1].content), "yes, ten euro postage");
     }
 

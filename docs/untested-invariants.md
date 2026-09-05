@@ -158,6 +158,7 @@ is the only way this file stays a record rather than an archaeology exercise.
 | same | Pruning cannot empty a mailbox. | **Yes**, structurally and behaviourally: a `const _: () = assert!(...)` beside the constants makes the corner a BUILD failure, and `an_oversized_message_is_refused_rather_than_emptying_the_mailbox` drives it through `apply_delta` with a message dated past the honest traffic. |
 | `harvest_common::mailbox::message_bytes` | The byte charge is a bound and not a proxy. | **Yes** -- `the_byte_charge_is_never_less_than_the_encoded_size`, checked against real CBOR across empty, small, top-bucket, long-timestamp and empty-tag shapes. |
 | `harvest_common::mailbox::MailboxStateV1::verify` | It deliberately does NOT check the byte budget, so a mailbox that was legal when written is never stranded. | **Yes** -- `verify_accepts_an_over_budget_state_so_an_existing_mailbox_is_never_stranded`. Worth having as a test rather than a comment precisely because adding the check looks like an improvement. Residual: a peer may hold an over-budget state until its next merge; only the node's maximum state size bounds that. |
+| `harvest_common::mailbox::MessageDirection` (second entry) | Direction separation defends against a third party and **NOT** against the counterparty. | **Pinned as a LIMITATION** -- `known_limit_the_counterparty_can_write_in_either_direction`. Both parties derive both keys from one symmetric secret, so either can encrypt in either direction; a buyer's message was verified appearing in a seller's inbox addressed as the seller's own. Not fixable at this layer: only a per-message signature distinguishes two holders of one secret. The UI therefore reports direction, and names only what this browser sent itself as authored. |
 | `ui/src/messaging.rs::seal` | A message the compose box accepts is one a mailbox accepts. | **Yes** -- `a_message_too_large_for_a_mailbox_is_refused_at_the_compose_box`. Found by accident: a measurement fixture had every message silently dropped by `apply_delta`, which from the sender's side is indistinguishable from the write race and never resolves. |
 | `ui/src/gateway/store_ops.rs::create_store_contracts` | The store is published carrying the seller's encryption key. | **No.** The function is `#[cfg(target_arch = "wasm32")]`, so `cargo test` never reaches it -- the same blind spot as entry 1 below, and the same reason: it is the counterparty of a derivation, not the derivation itself. What IS tested is that `PendingStoreEdit::store_info` carries the key on the *edit* path, which is the path a seller uses to repair a store. |
 | `ui/src/state.rs::ask_for_conversation_keys` | The request actually reaches the delegate. | **No.** The decision half (`conversation_keys_to_request`) is host-tested to eight assertions; the send is a wasm-gated `spawn_local`. |
@@ -167,6 +168,32 @@ is the only way this file stays a record rather than an archaeology exercise.
 | `ui/src/ghostkey_cert.rs::store_verifying_key` | A stolen certificate yields no key, so a buyer cannot be routed to the victim's mailbox. | **Yes** -- `a_stolen_certificate_yields_no_key_to_derive_a_mailbox_from`, mutated red by trusting any certificate that parses and chains. |
 | `ui/src/state.rs::BrowsingStore::seller_verifying_key` | A store the buyer is told is unverified is never one the compose box is offered for, because both come from one call. | **Yes** -- `an_unverified_store_yields_no_key_to_message_it_with`, mutated red by setting the key unconditionally. It pins the wiring; the check itself is the `ghostkey_cert` row above. |
 | `delegates/harvest-delegate/src/messaging.rs` | Everything the delegate writes is under the exported prefix. | **Yes** -- `everything_this_module_writes_is_under_the_exported_prefix`, which drives the real writer. The pre-existing `every_secret_the_delegate_writes_is_under_the_exported_prefix` stayed GREEN under the same mutation, because it reads a hand-maintained list; that is the gap the new test closes. |
+
+### The guard sweep, 2026-09-05
+
+Every guard this change touched or added was deleted, one at a time, and the
+suite re-run. A guard whose removal leaves the suite green is one a future
+refactor removes silently, and this branch had already produced two of them
+(the routing-tag filter, and a `ContractKey` comparison that ignored the code
+hash because `PartialEq` does).
+
+**Pinned (16):** the mailbox's oversize refusal, byte budget, `verify`
+over-count guard and `verify` duplicate-nonce guard; `ListingsV1`'s delta
+dedup and `reputation`'s intra-delta dedup; the buyer's `conversation_id`
+check, low-order refusal and compose-time size check; the delegate's low-order
+refusal; `compose_reply`'s ownership check; `conversation_keys_to_request`'s
+ownership gate and in-flight dedup; `EncryptionKeyReady`'s length check; and
+the two `mailbox_ops` key derivations.
+
+**Unpinned (2):** both `OrdersV1::verify` guards, which entry 3 below already
+named. The sweep did not find anything entry 3 had missed, which is the useful
+result -- it says the document was accurate rather than optimistic.
+
+**Newly pinned during the sweep (1):** the routing-tag filter, which no
+assertion about output could catch, because correctness genuinely does not
+depend on it. It is pinned by measuring the work instead
+(`reading_a_thread_costs_the_thread_and_not_the_mailbox`): removing it takes a
+buyer's read from 3 decryption attempts to 1023.
 
 Three things follow that are worth saying plainly rather than leaving as a
 pattern in the table. First, **every read path is fully host-tested and every
@@ -262,6 +289,7 @@ that point the contract appears to hold evidence of a problem. The comment says
 loudly not to, and a comment is currently the whole enforcement.
 
 ### 3. `common/src/store.rs:470` and `:476` — the `OrdersV1::verify` guards
+### **CONFIRMED BY EXECUTION 2026-09-05, still open**
 
 **Money, then resource exhaustion.** These two guards are the only thing
 standing between a hostile peer's hand-built state and the rest of the order
@@ -271,7 +299,12 @@ constructed state, and downstream code looks orders up by map key while
 verifying the record inside — so a record filed under someone else's id is
 checked as itself but found as another order.
 
-Both can be deleted today with `cargo test --workspace` green. `MAX_ORDERS`
+Both were deleted, one at a time, on 2026-09-05, and `cargo test -p
+harvest-common` stayed green for each -- so this entry is now a measurement
+rather than a reading. They were the ONLY two hits in a sweep of every guard
+this branch touched or added; the sixteen others all failed at least one test
+when removed. The sweep is summarised at the end of the messaging section
+above. `MAX_ORDERS`
 (`:470`) additionally carries the bound that three other comments cite as
 established, so one deletion silently falsifies four claims. The equivalent
 guard in `mailbox.rs` is tested; this is the same guard, in the state that

@@ -69,9 +69,19 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
 
     if owned {
         let entries = app_state.mailbox_entries(&store_contract_id);
+        // The only authorship this client can establish: what it sent itself.
+        let authored: Vec<[u8; 24]> = entries
+            .iter()
+            .map(|entry| entry.nonce())
+            .filter(|nonce| app_state.authored_here(&store_contract_id, nonce))
+            .collect();
         drop(app_state);
         return rsx! {
-            Inbox { store_contract_id: store_contract_id.clone(), entries: entries }
+            Inbox {
+                store_contract_id: store_contract_id.clone(),
+                entries: entries,
+                authored: authored,
+            }
         };
     }
 
@@ -83,6 +93,11 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
     let seller_identity = store.and_then(|s| s.seller_verifying_key);
     let thread = app_state.conversation_thread(&store_contract_id);
     let unconfirmed = app_state.unconfirmed_sent(&store_contract_id);
+    let authored_here: Vec<[u8; 24]> = thread
+        .iter()
+        .map(|message| message.nonce)
+        .filter(|nonce| app_state.authored_here(&store_contract_id, nonce))
+        .collect();
     let loaded = info.is_some();
     drop(app_state);
 
@@ -127,7 +142,11 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
             }
 
             if !thread.is_empty() || !unconfirmed.is_empty() {
-                Thread { thread: thread, unconfirmed: unconfirmed }
+                Thread {
+                    thread: thread,
+                    unconfirmed: unconfirmed,
+                    authored_here: authored_here,
+                }
             }
         }
     }
@@ -139,6 +158,9 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
 fn Thread(
     thread: Vec<crate::messaging::ConversationMessage>,
     unconfirmed: Vec<crate::state::SentMessage>,
+    /// Nonces this browser wrote. The ONLY authorship anything here can
+    /// establish -- see `state::AppState::authored_here`.
+    authored_here: Vec<[u8; 24]>,
 ) -> Element {
     rsx! {
         div { style: "margin-top: 1.5rem;",
@@ -149,11 +171,21 @@ fn Thread(
                 "lives in this tab and nowhere else. A reply that arrives after a reload "
                 "cannot be read by anyone, including you."
             }
+            p { class: "text-muted",
+                style: "font-size: 0.85rem;",
+                "Only messages this tab sent are marked as yours. Everything else is shown "
+                "by which direction it was encrypted for, which is not proof of who wrote "
+                "it -- both sides of a conversation hold both keys."
+            }
 
             for message in thread.iter() {
                 {
                     let when = message.timestamp.format("%Y-%m-%d %H:%M UTC").to_string();
-                    let who = if message.from_seller { "Seller" } else { "You" };
+                    let who = attribution(
+                        authored_here.contains(&message.nonce),
+                        message.addressing,
+                        Role::Buyer,
+                    );
                     rsx! {
                         div { class: "card",
                             style: "margin-top: 0.5rem;",
@@ -337,7 +369,11 @@ fn Unavailable(why: String) -> Element {
 /// the readable ones could not tell "nobody wrote" from "I cannot read what
 /// they wrote".
 #[component]
-fn Inbox(store_contract_id: Vec<u8>, entries: Vec<MailboxEntry>) -> Element {
+fn Inbox(
+    store_contract_id: Vec<u8>,
+    entries: Vec<MailboxEntry>,
+    authored: Vec<[u8; 24]>,
+) -> Element {
     if entries.is_empty() {
         return rsx! {
             div { class: "card",
@@ -386,6 +422,7 @@ fn Inbox(store_contract_id: Vec<u8>, entries: Vec<MailboxEntry>) -> Element {
                     store_contract_id: store_contract_id.clone(),
                     tag: tag.clone(),
                     entries: group.clone(),
+                    authored: authored.clone(),
                 }
             }
         }
@@ -394,7 +431,12 @@ fn Inbox(store_contract_id: Vec<u8>, entries: Vec<MailboxEntry>) -> Element {
 
 /// One exchange with one buyer, and the box to answer it.
 #[component]
-fn Conversation(store_contract_id: Vec<u8>, tag: Vec<u8>, entries: Vec<MailboxEntry>) -> Element {
+fn Conversation(
+    store_contract_id: Vec<u8>,
+    tag: Vec<u8>,
+    entries: Vec<MailboxEntry>,
+    authored: Vec<[u8; 24]>,
+) -> Element {
     let mut draft = use_signal(String::new);
     let mut problem = use_signal(|| Option::<String>::None);
 
@@ -411,8 +453,16 @@ fn Conversation(store_contract_id: Vec<u8>, tag: Vec<u8>, entries: Vec<MailboxEn
             p { class: "text-muted", style: "font-size: 0.8rem;",
                 "Conversation {short_tag(&tag)}"
             }
+            p { class: "text-muted", style: "font-size: 0.8rem;",
+                "Only messages this tab sent are marked as yours. Everything else is shown by "
+                "the direction it was encrypted for, which is not proof of who wrote it -- "
+                "both sides of a conversation hold both keys."
+            }
             for entry in entries.iter() {
-                MessageCard { entry: entry.clone() }
+                MessageCard {
+                    entry: entry.clone(),
+                    authored_here: authored.contains(&entry.nonce()),
+                }
             }
 
             if readable {
@@ -462,6 +512,50 @@ fn Conversation(store_contract_id: Vec<u8>, tag: Vec<u8>, entries: Vec<MailboxEn
     }
 }
 
+/// Which side of a conversation this browser is on. Decides how an
+/// unattributed message is described, and nothing else.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Buyer,
+    Seller,
+}
+
+/// What to put above a message, given what is actually known about it.
+///
+/// # Why this is not "Seller" and "You"
+///
+/// It was, and it was wrong. `Addressing` says which direction key
+/// authenticated a message, and BOTH parties hold both keys -- the buyer
+/// needs the seller-to-buyer key to read replies at all. So a buyer can place
+/// a message in the seller's mailbox that authenticates as though the seller
+/// wrote it, and the seller's own screen would have shown it as their own
+/// words. Verified: a seller's inbox displayed "as agreed, I confess" as the
+/// seller's own reply, written by the buyer.
+///
+/// Only one thing here is knowable: what this browser sent itself. That gets
+/// a name. Everything else is described by direction, in words that say
+/// direction -- "addressed to", not "from" -- and the surrounding notice says
+/// plainly that direction is not authorship.
+///
+/// Anything whose authenticity actually matters must carry its own signature;
+/// see [`harvest_common::mailbox::MessageDirection`].
+fn attribution(
+    authored_here: bool,
+    addressing: crate::messaging::Addressing,
+    role: Role,
+) -> &'static str {
+    use crate::messaging::Addressing;
+    if authored_here {
+        return "You, from this tab";
+    }
+    match (role, addressing) {
+        (Role::Buyer, Addressing::ToBuyer) => "Addressed to you",
+        (Role::Buyer, Addressing::ToSeller) => "Addressed to the seller",
+        (Role::Seller, Addressing::ToSeller) => "Addressed to you",
+        (Role::Seller, Addressing::ToBuyer) => "Addressed to this buyer",
+    }
+}
+
 /// Enough of a conversation tag to tell two apart on screen, and no more --
 /// the whole thing is 44 characters of base58 that means nothing to a reader.
 fn short_tag(tag: &[u8]) -> String {
@@ -471,6 +565,7 @@ fn short_tag(tag: &[u8]) -> String {
 
 /// Seal a seller's reply and hand it to the node.
 fn reply(store_contract_id: &[u8], tag: &[u8], text: String) -> Result<(), String> {
+    let text_for_record = text.clone();
     let (sealed, mailbox) = {
         let state = APP_STATE.read();
         let sealed = state.compose_reply(store_contract_id, tag, text)?;
@@ -481,7 +576,15 @@ fn reply(store_contract_id: &[u8], tag: &[u8], text: String) -> Result<(), Strin
             .ok_or("this store's mailbox id is not known, so there is nowhere to reply into")?;
         (sealed, mailbox)
     };
-    dispatch_reply(mailbox, sealed);
+    dispatch_reply(mailbox, sealed.clone());
+
+    // Recorded for the same reason the buyer's messages are: it is the only
+    // thing this browser can know about authorship. Without it the seller's
+    // own reply comes back from the mailbox indistinguishable from one a
+    // buyer wrote in that direction.
+    APP_STATE
+        .write()
+        .record_sent_message(store_contract_id, text_for_record, sealed.nonce);
     Ok(())
 }
 
@@ -501,10 +604,19 @@ fn dispatch_reply(_mailbox: Vec<u8>, _sealed: harvest_common::mailbox::Encrypted
 }
 
 #[component]
-fn MessageCard(entry: MailboxEntry) -> Element {
+fn MessageCard(entry: MailboxEntry, authored_here: bool) -> Element {
     let when = entry.timestamp().format("%Y-%m-%d %H:%M UTC").to_string();
+    let who = match &entry {
+        MailboxEntry::Readable { addressing, .. } => {
+            Some(attribution(authored_here, *addressing, Role::Seller))
+        }
+        MailboxEntry::Unreadable { .. } => None,
+    };
     rsx! {
         div { class: "card", style: "margin-top: 0.5rem;",
+            if let Some(who) = who {
+                p { class: "text-muted", style: "font-size: 0.8rem;", "{who}" }
+            }
             match &entry {
                 MailboxEntry::Readable { content, .. } => rsx! {
                     p { style: "white-space: pre-wrap;", "{describe(content)}" }
