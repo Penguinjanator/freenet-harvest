@@ -8,6 +8,9 @@ pub mod bitcoin_config;
 pub mod bitcoin_ops;
 mod connection;
 mod delegate_api;
+// Buyer -> seller messaging. The address derivation and the delta shape are
+// pure and host-testable; only the send itself needs a browser.
+pub mod mailbox_ops;
 // The migration probe's I/O half. wasm-only: it exists to drive the gateway's
 // shared response handler, which has no native counterpart. Every decision it
 // makes lives in `crate::migrate`, which is target-independent and tested on

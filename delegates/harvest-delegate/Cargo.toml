@@ -40,6 +40,13 @@ hmac = { version = "0.12", default-features = false }
 ripemd = { version = "0.1", default-features = false }
 # "check" for the Base58Check envelope every extended key is wrapped in.
 bs58 = { workspace = true, features = ["check"] }
+# Buyer-to-seller messaging: the seller's long-term X25519 secret lives here
+# and never leaves, so the Diffie-Hellman has to happen here too. `alloc` and
+# `static_secrets` only -- no `getrandom` feature, because the secret is
+# generated from the delegate host's own RNG through this crate's registered
+# `getrandom` implementation rather than through `rand_core::OsRng`, so there
+# is one entropy source rather than two.
+x25519-dalek = { version = "2.0", default-features = false, features = ["alloc", "static_secrets"] }
 # Bech32 encoding for the P2WPKH addresses derivation produces. The address
 # string and the scriptPubKey are derived together here, in one place, because
 # an Order carries both and they must denote the same output.

@@ -48,6 +48,16 @@ pub fn App() -> Element {
                         dioxus::logger::tracing::info!("Harvest delegate registered: {:?}", key);
                         crate::gateway::APP_STATE.write().harvest_delegate_key = Some(key);
 
+                        // A store link opened above may already have brought
+                        // its state back, and a store whose state arrived
+                        // before this point was deliberately not asked about
+                        // -- see `AppState::buyer_conversations_to_recall`.
+                        // Without this a returning buyer holds keys, on this
+                        // machine, to a reply they never fetch.
+                        crate::gateway::APP_STATE
+                            .write()
+                            .recall_conversations_for_known_stores();
+
                         // Kick off the Bitcoin surface: bridge config (needed
                         // for the first-run status panel, no credential
                         // required) and the private watch list. Each of

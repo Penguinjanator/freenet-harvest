@@ -4,6 +4,7 @@ mod bip32;
 mod bitcoin;
 mod handlers;
 mod markers;
+mod messaging;
 mod migration;
 mod origin;
 mod secrets;
@@ -314,6 +315,12 @@ mod boundary_tests {
 
     /// Every family is refused at the same point, including the migration
     /// export, which is the one that was already checked.
+    ///
+    /// **Every** means every one: a family missing from this list is one this
+    /// test silently stops covering, which is the shape of the payment-hijack
+    /// hole it was written for. Add to it whenever a variant is added to
+    /// `HarvestDelegateRequest`, `BitcoinDelegateRequest` or
+    /// `HarvestMigrationRequest`.
     #[test]
     fn every_request_family_is_refused_for_a_foreign_web_app() {
         let payloads = [
@@ -323,6 +330,64 @@ mod boundary_tests {
             .expect("cbor"),
             to_cbor(&HarvestDelegateRequest::ListTransactions).expect("cbor"),
             to_cbor(&BtcReq::ListWatched).expect("cbor"),
+            // The messaging family. `InitEncryptionKey` decides which key
+            // buyers will encrypt to, and `DeriveConversationKeys` is a
+            // Diffie-Hellman oracle against the seller's long-term secret --
+            // which is to say, a read of their private correspondence.
+            to_cbor(&HarvestDelegateRequest::InitEncryptionKey {
+                ghostkey_fingerprint: "fp".into(),
+            })
+            .expect("cbor"),
+            to_cbor(&HarvestDelegateRequest::DeriveConversationKeys {
+                request_id: 1,
+                ghostkey_fingerprint: "fp".into(),
+                peer_public_keys: vec![vec![1u8; 32]],
+            })
+            .expect("cbor"),
+            // The buyer's half. `ListBuyerConversations` answers the keys
+            // that read this node's own side of a public mailbox;
+            // `ForgetBuyerConversation` destroys a capability that exists
+            // nowhere else; `ExportBuyerConversations` answers the secrets
+            // themselves; and `MarkConversationsBackedUp` silences the
+            // warning that one of them exists in a single place, which is the
+            // one that reads as harmless and is not.
+            to_cbor(&HarvestDelegateRequest::StoreBuyerConversation {
+                request_id: 1,
+                store_contract_id: vec![3u8; 32],
+                secret: harvest_common::ConversationSecret([4u8; 32]),
+                seller_public_key: [5u8; 32],
+                conversation_id: [6u8; 32],
+                created_at: 1_700_000_000,
+            })
+            .expect("cbor"),
+            to_cbor(&HarvestDelegateRequest::ListBuyerConversations {
+                request_id: 1,
+                store_contract_id: vec![3u8; 32],
+            })
+            .expect("cbor"),
+            to_cbor(&HarvestDelegateRequest::ForgetBuyerConversation {
+                request_id: 1,
+                store_contract_id: vec![3u8; 32],
+                buyer_public_key: [7u8; 32],
+            })
+            .expect("cbor"),
+            to_cbor(&HarvestDelegateRequest::ExportBuyerConversation {
+                request_id: 1,
+                store_contract_id: vec![3u8; 32],
+                buyer_public_key: [7u8; 32],
+            })
+            .expect("cbor"),
+            to_cbor(&HarvestDelegateRequest::ImportBuyerConversation {
+                request_id: 1,
+                backup: "harvest-conv-backup-v2:whatever".into(),
+            })
+            .expect("cbor"),
+            to_cbor(&HarvestDelegateRequest::MarkConversationBackedUp {
+                request_id: 1,
+                store_contract_id: vec![3u8; 32],
+                buyer_public_key: [7u8; 32],
+            })
+            .expect("cbor"),
         ];
         for payload in payloads {
             assert!(refusal(&payload, Some(&a_different_web_app())).contains("Harvest web app"));

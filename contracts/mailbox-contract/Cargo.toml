@@ -14,6 +14,13 @@ serde = { workspace = true }
 chrono = { workspace = true }
 getrandom = { workspace = true }
 
+[dev-dependencies]
+# The contract's own entry points take `MailboxParameters`, which can only be
+# built from a real `VerifyingKey` -- `MailboxParameters::new` is the single
+# construction site on purpose, because the field set is hashed into the
+# mailbox's address. A test therefore needs a key, and only a test does.
+ed25519-dalek = { workspace = true }
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

@@ -106,6 +106,110 @@ pub struct AppState {
     /// RSA public keys for our identities (fingerprint -> DER bytes).
     pub rsa_public_keys: HashMap<String, Vec<u8>>,
 
+    /// Long-term X25519 public keys the harvest delegate holds for our own
+    /// identities (fingerprint -> 32 bytes).
+    ///
+    /// The public half only. The private half never leaves the delegate; see
+    /// `harvest-delegate`'s `messaging`. This is what gets published in
+    /// `StoreInfoV1::encryption_public_key` so buyers have something to
+    /// encrypt to.
+    pub encryption_public_keys: HashMap<String, [u8; 32]>,
+
+    /// Conversation keys the delegate has derived, keyed by the buyer
+    /// ephemeral public key each was derived against.
+    ///
+    /// Not keyed by identity as well, and that is safe rather than sloppy: a
+    /// key that belonged to a different identity cannot silently decrypt the
+    /// wrong message, because AES-GCM authenticates -- the message would come
+    /// back as `MailboxEntry::Unreadable`, not as wrong plaintext. Buyer
+    /// ephemeral keys are freshly random per message in any case, so a
+    /// collision needs a deliberate one.
+    pub conversation_keys: HashMap<Vec<u8>, crate::messaging::ConversationKeys>,
+
+    /// `DeriveConversationKeys` requests in flight, as request id -> the
+    /// buyer public keys that request asked about.
+    ///
+    /// Needed so a mailbox update that arrives while a request is out does
+    /// not ask again for the same keys -- mailbox state re-arrives on every
+    /// update notification, so without this a busy store issues one delegate
+    /// request per message per notification. Also what makes a failure
+    /// recoverable: an error answer un-asks its keys, so the next mailbox
+    /// update retries them.
+    pub pending_conversation_key_requests: std::collections::BTreeMap<u64, Vec<Vec<u8>>>,
+
+    /// Routing tags the delegate was asked about and declined to answer.
+    ///
+    /// Its omissions are PERMANENT, not transient: it drops a peer key only
+    /// when the key is malformed or low-order, and both are deterministic
+    /// properties of the bytes. Without remembering them, one message
+    /// carrying an unusable tag puts the tab into an unbounded loop, because
+    /// mailbox state re-arrives on every update notification and each arrival
+    /// would ask again.
+    ///
+    /// A transient failure is the `Err` answer instead, where nothing was
+    /// derived and nothing is recorded here, so those retry.
+    pub declined_conversation_tags: HashSet<Vec<u8>>,
+
+    /// Stores whose kept buyer conversations have already been asked for.
+    ///
+    /// Store state re-arrives on every update notification, so without this a
+    /// buyer browsing a busy store issues one recall per notification.
+    pub buyer_conversations_recalled: HashSet<Vec<u8>>,
+
+    /// `ExportBuyerConversation` and `MarkConversationBackedUp` requests in
+    /// flight, as request id -> the store AND conversation THIS browser asked
+    /// about.
+    ///
+    /// One map for two families because both answer about a store and
+    /// neither can be outstanding for the same request id. The reason they
+    /// are correlated at all is the one stated on
+    /// [`Self::pending_conversation_recalls`]: this file says in three places
+    /// that an answer is filed where the QUESTION says it belongs, and a
+    /// principle followed in three places out of five is one the next reader
+    /// concludes is optional.
+    pub pending_conversation_backups: std::collections::BTreeMap<u64, (Vec<u8>, [u8; 32])>,
+
+    /// `ListBuyerConversations` requests in flight, as request id -> the
+    /// store THIS browser asked about.
+    ///
+    /// The answer echoes a store id too, and this is the one that is used.
+    /// Same lesson as the echoed conversation tag on the seller's side: a
+    /// consumer that files an answer where the ANSWER says it belongs will,
+    /// the first time the two disagree, put one store's conversation keys
+    /// against another store's mailbox -- and a buyer reading a thread with
+    /// the wrong store is the shape of mistake nothing downstream can catch.
+    pub pending_conversation_recalls: std::collections::BTreeMap<u64, Vec<u8>>,
+
+    /// `StoreBuyerConversation` requests in flight, as request id -> the
+    /// store the conversation is with.
+    ///
+    /// Kept so a refusal can be reported against the store it belongs to. A
+    /// refusal matters: the buyer has already been told their message was
+    /// sent, and a conversation the delegate did not keep becomes unreadable
+    /// the moment the tab closes.
+    pub pending_conversation_persists: std::collections::BTreeMap<u64, Vec<u8>>,
+
+    /// `ForgetBuyerConversation` requests in flight, as request id -> the
+    /// store and routing tag asked about.
+    ///
+    /// The conversation is dropped from this browser only when the delegate
+    /// says the record is gone, so a refused removal leaves the thread on
+    /// screen rather than hiding a record that is still on disk.
+    pub pending_conversation_forgets: std::collections::BTreeMap<u64, (Vec<u8>, [u8; 32])>,
+
+    /// The backup string the buyer asked for and has not dismissed, if any.
+    ///
+    /// Held here rather than in the component because it arrives
+    /// asynchronously, from a delegate answer, long after the click that
+    /// asked for it.
+    pub conversation_backup_on_screen: Option<ConversationBackup>,
+
+    /// Request ids for the messaging requests above. A separate counter from
+    /// `BitcoinState::next_request_id` because they are different request
+    /// enums answered by different response enums; sharing one would imply a
+    /// correlation that does not exist.
+    pub next_messaging_request_id: u64,
+
     /// Store creation pending RSA key response. When InitReputationKeys
     /// is sent, the store details are stored here. When ReputationKeysInitialized
     /// arrives, the response handler picks this up and creates the contracts.
@@ -185,6 +289,20 @@ pub struct PendingStoreCreation {
     /// Filled by the harvest delegate's `ReputationKeysInitialized` response.
     /// `None` until it arrives.
     pub rsa_public_key_der: Option<Vec<u8>>,
+    /// Filled by the harvest delegate's `EncryptionKeyReady` response.
+    ///
+    /// **Not** part of the readiness gate, unlike the two above. Creation
+    /// waits on the certificate and the RSA key because a store without
+    /// either is broken in ways only a fresh signature can repair; a store
+    /// without an encryption key is one buyers cannot message, which
+    /// `store_details_gap` reports and re-publishing fixes. Adding a third
+    /// thing to wait on would add a third way for a creation to hang
+    /// forever, and this one has a recovery path that those do not.
+    ///
+    /// In practice it is nearly always present: `InitEncryptionKey` goes out
+    /// alongside `InitReputationKeys`, and generating a 2048-bit RSA key
+    /// takes far longer than 32 random bytes. Nothing here relies on that.
+    pub encryption_public_key: Option<[u8; 32]>,
 }
 
 /// Publish the three contracts of a store whose inputs are all present.
@@ -201,6 +319,7 @@ fn spawn_store_creation(pending: PendingStoreCreation) {
         description,
         payment_instructions,
         rsa_public_key_der,
+        encryption_public_key,
     } = pending;
     // The gate only releases once this is `Some`; treat it as a no-op rather
     // than a panic if that ever stops being true.
@@ -214,9 +333,12 @@ fn spawn_store_creation(pending: PendingStoreCreation) {
             seller_verifying_key_bytes,
             rsa_public_key_der,
             certificate_pem,
-            store_name,
-            description,
-            payment_instructions,
+            StoreDetails {
+                store_name,
+                description,
+                payment_instructions,
+            },
+            encryption_public_key,
         )
         .await
         {
@@ -438,6 +560,14 @@ pub enum StoreDetailsGap {
     /// Published, but naming no reputation contract, so the seller's
     /// feedback history cannot be reached from the store.
     NoReputationLink,
+    /// Published, but carrying no encryption key, so no buyer can send this
+    /// seller a message.
+    ///
+    /// Reported only when the delegate has actually produced a key -- see
+    /// [`store_details_gap`]. A seller whose delegate has not answered has
+    /// nothing to publish, and prompting them to fix it would be a prompt
+    /// that publishing does not satisfy.
+    NoEncryptionKey,
 }
 
 impl StoreDetailsGap {
@@ -458,6 +588,11 @@ impl StoreDetailsGap {
                 "This store does not name your reputation contract, so buyers cannot reach your \
                  feedback history from it. Publishing the details below restores the link."
             }
+            StoreDetailsGap::NoEncryptionKey => {
+                "This store publishes no encryption key, so buyers who open it are told they \
+                 cannot message you. Publishing the details below adds the key your delegate \
+                 already holds; nothing else about the store changes."
+            }
         }
     }
 }
@@ -467,7 +602,14 @@ impl StoreDetailsGap {
 /// `None` for a store whose state has not arrived yet: absence of information
 /// is not evidence of a gap, and reporting one here would flash a repair
 /// prompt at every seller on every load.
-pub fn store_details_gap(info: Option<&StoreInfoV1>) -> Option<StoreDetailsGap> {
+/// `encryption_key_ready` says whether the harvest delegate has produced this
+/// seller's X25519 public key. A missing key is only reported as a gap when
+/// there is one to publish: otherwise the prompt would name a repair that
+/// publishing does not perform, and would sit there permanently.
+pub fn store_details_gap(
+    info: Option<&StoreInfoV1>,
+    encryption_key_ready: bool,
+) -> Option<StoreDetailsGap> {
     let info = info?;
     if info.version == 0 {
         // Version 0 is the default state, which `AuthorizedStoreInfoV1::verify`
@@ -479,6 +621,11 @@ pub fn store_details_gap(info: Option<&StoreInfoV1>) -> Option<StoreDetailsGap> 
     }
     if info.reputation_contract_id == [0u8; 32] {
         return Some(StoreDetailsGap::NoReputationLink);
+    }
+    // Last of the four: a store nobody can find the name of is worse than one
+    // nobody can message, and only one prompt is shown at a time.
+    if info.encryption_public_key.is_none() && encryption_key_ready {
+        return Some(StoreDetailsGap::NoEncryptionKey);
     }
     None
 }
@@ -531,7 +678,19 @@ pub struct PendingStoreEdit {
 
 impl PendingStoreEdit {
     /// The record to sign and publish, once the certificate is known.
-    fn store_info(&self, certificate_pem: String) -> StoreInfoV1 {
+    ///
+    /// `encryption_public_key` is attached when the delegate has produced
+    /// one and left `None` when it has not. Unlike the certificate, it does
+    /// NOT gate publication: a store with no key is a store buyers cannot
+    /// message, which is bad, whereas a store whose details never publish at
+    /// all has no name, no description and no reputation link, which is
+    /// worse. `store_details_gap` reports the missing key afterwards so the
+    /// seller has a route back to it.
+    fn store_info(
+        &self,
+        certificate_pem: String,
+        encryption_public_key: Option<[u8; 32]>,
+    ) -> StoreInfoV1 {
         StoreInfoV1 {
             version: self.next_version,
             certificate_pem,
@@ -540,6 +699,7 @@ impl PendingStoreEdit {
             store_name: self.details.store_name.clone(),
             description: self.details.description.clone(),
             payment_instructions: self.details.payment_instructions.clone(),
+            encryption_public_key,
         }
     }
 }
@@ -698,9 +858,25 @@ pub struct BrowsingStore {
     /// it requires ignoring a field that says `Invalid`, rather than merely
     /// forgetting to call something.
     pub certificate_status: crate::ghostkey_cert::CertificateStatus,
+    /// The seller's Ed25519 verifying key, when the store's certificate
+    /// verifies against this store -- and `None` otherwise, for all three
+    /// reasons `ghostkey_cert::store_verifying_key` collapses together.
+    ///
+    /// Held here for the same reason [`Self::certificate_status`] is, and
+    /// with more force: recovering it re-parses a PEM and verifies a
+    /// certificate chain including a blind-RSA notary signature, so a
+    /// component that recomputed it would pay for that on every render. It is
+    /// also what the mailbox address is derived from, so having exactly one
+    /// place that decides it keeps "can this store be messaged" and "does
+    /// this store's certificate hold up" from ever answering differently.
+    ///
+    /// Stored as bytes rather than a `VerifyingKey` because `BrowsingStore`
+    /// derives `Default`, and there is no meaningful default curve point.
+    pub seller_verifying_key: Option<[u8; 32]>,
     /// Listings whose own certificate did not verify against this store.
     ///
-    /// Keyed by [`ListingId`] rather than by position, so it cannot drift out
+    /// Keyed by [`harvest_common::listing::ListingId`] rather than by position,
+    /// so it cannot drift out
     /// of step with `listings` when a merge reorders them.
     pub unverified_listings: HashSet<harvest_common::listing::ListingId>,
     /// Orders placed against this store (buyer or seller side -- the store
@@ -714,6 +890,99 @@ pub struct BrowsingStore {
     pub feedback: Vec<FeedbackEntry>,
     /// Encrypted messages from the mailbox contract.
     pub mailbox_messages: Vec<EncryptedMessage>,
+    /// The buyer's conversations with this store, oldest first.
+    ///
+    /// Empty for a store this browser's node has never written to, and for
+    /// the seller's own store -- a seller does not open a conversation with
+    /// themselves.
+    ///
+    /// A `Vec` rather than one conversation because a returning buyer has
+    /// both: whatever the harvest delegate kept from earlier visits, and
+    /// possibly one opened in this tab. Every one of them is read, so a reply
+    /// to a question asked last week is still readable; the LAST is the one a
+    /// new message continues, so a thread resumes rather than forking beside
+    /// itself. See `docs/buyer-conversation-persistence.md`.
+    pub conversations: Vec<crate::messaging::BuyerConversation>,
+    /// Messages THIS browser sent to this store, kept locally because there
+    /// is nowhere else for them.
+    ///
+    /// This is the AUTHORSHIP record, not the message record: what this tab
+    /// wrote is the only authorship anything here can establish (see
+    /// [`AppState::authored_here`]). It lives for the life of the tab and no
+    /// longer, and it is deliberately not persisted alongside the
+    /// conversation secret -- it is not part of what a buyer loses by closing
+    /// a tab, since the messages themselves come back out of the mailbox
+    /// after a reload. What is lost is only the "You, from this tab" label,
+    /// so a recalled thread describes its own messages by direction. Both are
+    /// truthful; the second is less specific.
+    pub sent_messages: Vec<SentMessage>,
+}
+
+/// A message this browser sealed and handed to the local node.
+///
+/// `sent_at` is when the send was attempted, not when anything was
+/// delivered: nothing confirms delivery (see
+/// `gateway::mailbox_ops::send_message`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SentMessage {
+    pub text: String,
+    pub sent_at: chrono::DateTime<chrono::Utc>,
+    /// [`harvest_common::mailbox::entry_digest`] of the exact entry that was
+    /// sealed and dispatched.
+    ///
+    /// **This is the authorship record.** It is first-hand knowledge -- the
+    /// bytes this client produced -- and the counterparty cannot reproduce it
+    /// without sending the identical message, which would not be a
+    /// substitution. See [`AppState::authored_here`].
+    pub digest: [u8; 32],
+}
+
+/// Enough of a conversation's routing tag to tell two apart on screen.
+///
+/// The whole thing is 44 characters of base58 that means nothing to a reader;
+/// what a buyer needs is to match one line against another.
+pub fn short_conversation_tag(tag: &[u8]) -> String {
+    bs58::encode(tag).into_string().chars().take(8).collect()
+}
+
+/// One store's conversation secrets, in the form the buyer can save.
+///
+/// # What holding this means
+///
+/// It contains the secrets themselves, which is what lets it restore the
+/// conversation on another machine -- and what makes it worth exactly as much
+/// as the conversation it restores. Anyone holding it can read that
+/// conversation and, once a seller's reply carries a pre-signed statement,
+/// file the complaint it authorizes. The UI says that beside the string
+/// rather than in a tooltip.
+#[derive(Clone, PartialEq)]
+pub struct ConversationBackup {
+    pub store_contract_id: Vec<u8>,
+    /// Which conversation this string covers. One conversation, so the panel
+    /// shows it under that conversation and a buyer saving several can tell
+    /// them apart.
+    pub buyer_public_key: [u8; 32],
+    /// The pasteable string. Kept out of `Debug` for the same reason
+    /// `ConversationKeys` is: this is the one value in the app that must not
+    /// reach a console log a user pastes into a bug report.
+    backup: String,
+}
+
+impl ConversationBackup {
+    pub fn text(&self) -> &str {
+        &self.backup
+    }
+}
+
+/// Deliberately opaque. A `Debug` that printed this would put every
+/// conversation secret for a store into a browser console, and from there
+/// into any log a user pastes into a bug report -- the same reasoning as
+/// [`crate::messaging::ConversationKeys`], with more at stake, because this
+/// one is a complete portable copy.
+impl std::fmt::Debug for ConversationBackup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConversationBackup(redacted)")
+    }
 }
 
 /// GET-and-subscribe a contract we learned about from a delegate
@@ -1145,6 +1414,15 @@ impl AppState {
                         &store_state.info.info.certificate_pem,
                         &contract_id,
                     );
+                    // The same check, kept for the mailbox address rather
+                    // than for display -- see `BrowsingStore::
+                    // seller_verifying_key` for why it is not recomputed
+                    // where it is used.
+                    let seller_verifying_key = crate::ghostkey_cert::store_verifying_key(
+                        &store_state.info.info.certificate_pem,
+                        &contract_id,
+                    )
+                    .map(|key| key.to_bytes());
                     let unverified_listings = unverified_listings(
                         &store_state.listings.listings,
                         &contract_id,
@@ -1154,6 +1432,7 @@ impl AppState {
 
                     let store = self.browsing_stores.entry(contract_id.clone()).or_default();
                     store.certificate_status = certificate_status;
+                    store.seller_verifying_key = seller_verifying_key;
                     store.unverified_listings = unverified_listings;
                     store.info = Some(store_state.info.info);
                     store.listings = store_state.listings.listings;
@@ -1162,7 +1441,16 @@ impl AppState {
 
                     // Register the reverse mapping so incoming reputation state
                     // can be matched to this store
-                    self.reputation_to_store.insert(reputation_id, contract_id);
+                    self.reputation_to_store
+                        .insert(reputation_id, contract_id.clone());
+
+                    // Ask the delegate for whatever conversations this node
+                    // has had with this store. Here rather than on the
+                    // messaging tab, because the answer decides whether the
+                    // seller's mailbox is subscribed at all, and a reply the
+                    // buyer never fetches is the same to them as one that
+                    // was never sent.
+                    self.recall_buyer_conversations(&contract_id);
                     return;
                 }
             };
@@ -1207,7 +1495,15 @@ impl AppState {
 
                 match self.mailbox_to_store.get(&contract_id).cloned() {
                 Some(store_id) => match self.browsing_stores.get_mut(&store_id) {
-                    Some(store) => store.mailbox_messages = mailbox_state.messages,
+                    Some(store) => {
+                        store.mailbox_messages = mailbox_state.messages;
+                        // The messages are ciphertext until the delegate
+                        // hands over the keys, and this is the only moment we
+                        // know which senders they came from. Asking again on
+                        // every update is cheap: `conversation_keys_to_request`
+                        // answers `None` once everything is held or in flight.
+                        self.ask_for_conversation_keys(&store_id);
+                    }
                     None => warn!(
                         "Mailbox {:?} maps to a store we have no state for -- dropping messages",
                         &contract_id[..8.min(contract_id.len())]
@@ -1241,6 +1537,920 @@ impl AppState {
             state_bytes.len(),
             &contract_id[..8.min(contract_id.len())]
         );
+    }
+
+    /// Allocate the next id for a messaging request.
+    fn next_messaging_request_id(&mut self) -> u64 {
+        self.next_messaging_request_id += 1;
+        self.next_messaging_request_id
+    }
+
+    /// What the delegate must be asked so this store's mailbox can be read,
+    /// or `None` when nothing is needed.
+    ///
+    /// # Why a store we do not own asks for nothing
+    ///
+    /// The request names one of OUR ghostkey fingerprints, and the delegate
+    /// answers keys derived from THAT identity's secret. Pointed at somebody
+    /// else's mailbox it would produce a full set of perfectly well-formed
+    /// keys that decrypt nothing -- a screen full of "cannot be read", one
+    /// delegate round trip per message, for every store the user browses.
+    /// So ownership is the gate, and `my_stores` is the only source of it.
+    ///
+    /// # Why in-flight requests are remembered
+    ///
+    /// Mailbox state re-arrives on every update notification (see
+    /// `gateway::response_handler`'s `UpdateNotification` arm, which re-GETs
+    /// the whole state). Without tracking what is already asked, a store with
+    /// 50 messages would issue 50 keys' worth of request on every single
+    /// update, forever.
+    pub fn conversation_keys_to_request(
+        &mut self,
+        store_contract_id: &[u8],
+    ) -> Option<harvest_common::HarvestDelegateRequest> {
+        let ghostkey_fingerprint = self.store_owner_fingerprint(store_contract_id)?;
+        let store = self.browsing_stores.get(store_contract_id)?;
+
+        let mut wanted: Vec<Vec<u8>> = Vec::new();
+        for message in &store.mailbox_messages {
+            let peer = &message.sender_public_key;
+            // An X25519 public key is 32 bytes. Anything else the delegate
+            // would decline, so the round trip buys nothing -- and the tag is
+            // bounded only by `MAX_MESSAGE_BYTES`, so it is a round trip an
+            // attacker can make tens of kilobytes wide.
+            if peer.len() != harvest_common::mailbox::SENDER_KEY_BYTES {
+                continue;
+            }
+            if self.conversation_keys.contains_key(peer)
+                || self.declined_conversation_tags.contains(peer)
+                || wanted.contains(peer)
+                || self
+                    .pending_conversation_key_requests
+                    .values()
+                    .any(|asked| asked.contains(peer))
+            {
+                continue;
+            }
+            wanted.push(peer.clone());
+        }
+        if wanted.is_empty() {
+            return None;
+        }
+
+        let request_id = self.next_messaging_request_id();
+        self.pending_conversation_key_requests
+            .insert(request_id, wanted.clone());
+        Some(
+            harvest_common::HarvestDelegateRequest::DeriveConversationKeys {
+                request_id,
+                ghostkey_fingerprint,
+                peer_public_keys: wanted,
+            },
+        )
+    }
+
+    /// Fold the delegate's answer into the cached conversation keys.
+    ///
+    /// # Two kinds of "not answered", and they are not the same
+    ///
+    /// A tag present in the request and absent from an `Ok` answer was
+    /// **declined**, and the delegate's decisions are deterministic: it drops
+    /// a peer key only when the key is malformed or low-order. Asking again
+    /// gets the same answer forever, and since mailbox state re-arrives on
+    /// every update notification, "ask again" means an unbounded loop for one
+    /// attacker-supplied message. Those tags are recorded and never re-asked.
+    ///
+    /// An `Err` answer is the transient case -- nothing was derived, usually
+    /// because the identity has no encryption key yet -- and it records
+    /// nothing, so the next mailbox update tries the whole set again.
+    ///
+    /// This comment said the opposite until 2026-09-05, justifying re-asking
+    /// by transient failure while the delegate's actual omissions were
+    /// permanent.
+    fn on_conversation_keys(
+        &mut self,
+        request_id: u64,
+        ghostkey_fingerprint: String,
+        result: Result<Vec<harvest_common::ConversationKey>, String>,
+    ) {
+        // Dropping the pending entry is what un-asks everything in it. An
+        // answer to a request we are not waiting on takes nothing with it and
+        // contributes nothing -- see `an_answer_to_an_unknown_request_is_ignored`.
+        let Some(asked) = self.pending_conversation_key_requests.remove(&request_id) else {
+            warn!("Conversation keys arrived for request {request_id}, which nothing asked for");
+            return;
+        };
+
+        match result {
+            Ok(keys) => {
+                info!(
+                    "Delegate derived {} conversation key(s) of {} asked, for {ghostkey_fingerprint}",
+                    keys.len(),
+                    asked.len()
+                );
+                // Whatever was asked about and not answered was declined, and
+                // will be declined again. `asked` is used ONLY for this --
+                // never to pair answers with questions, which is what the
+                // echoed `peer_public_key` is for. Pairing positionally here
+                // would hand one buyer's key to another buyer's messages the
+                // first time an answer came back short, which is the ordinary
+                // case rather than an exotic one.
+                for tag in asked {
+                    if !keys.iter().any(|key| key.peer_public_key == tag) {
+                        self.declined_conversation_tags.insert(tag);
+                    }
+                }
+                for key in keys {
+                    self.conversation_keys.insert(
+                        key.peer_public_key,
+                        crate::messaging::ConversationKeys {
+                            to_seller: key.buyer_to_seller,
+                            from_seller: key.seller_to_buyer,
+                        },
+                    );
+                }
+            }
+            // Reported rather than swallowed. The visible symptom otherwise
+            // is a mailbox that stays unreadable with nothing anywhere saying
+            // why, which reads to a seller as "these messages are corrupt".
+            Err(why) => {
+                warn!("Could not derive conversation keys for {ghostkey_fingerprint}: {why}");
+                self.notifications
+                    .push(format!("Could not read your messages: {why}"));
+            }
+        }
+    }
+
+    /// Ask the delegate for whatever conversation keys this store's mailbox
+    /// still needs, if any.
+    ///
+    /// Safe to call on every mailbox arrival:
+    /// [`Self::conversation_keys_to_request`] answers `None` when there is
+    /// nothing to ask, which is the common case after the first round trip.
+    pub fn ask_for_conversation_keys(&mut self, store_contract_id: &[u8]) {
+        let Some(request) = self.conversation_keys_to_request(store_contract_id) else {
+            return;
+        };
+        self.send_to_harvest_delegate("read this store's messages", &request);
+    }
+
+    /// Seal a buyer's message to a store, opening a conversation if this
+    /// node has none with it.
+    ///
+    /// A second message continues the LAST conversation rather than opening
+    /// another, which is what makes it a thread rather than a series of
+    /// unrelated notes the seller cannot connect -- and what lets a reply to
+    /// the first message still be readable after the second is sent. After a
+    /// reload that last conversation is one the delegate handed back, so a
+    /// returning buyer resumes their thread instead of forking a second one
+    /// beside it (`a_new_message_continues_the_recalled_conversation`).
+    ///
+    /// Returns the sealed message for the caller to dispatch. Sealing and
+    /// dispatching are separate because the dispatch needs a browser and this
+    /// decides what gets sent.
+    pub fn compose_to_seller(
+        &mut self,
+        store_contract_id: &[u8],
+        seller_encryption_key: &[u8; 32],
+        text: String,
+    ) -> Result<harvest_common::mailbox::EncryptedMessage, String> {
+        let store = self
+            .browsing_stores
+            .entry(store_contract_id.to_vec())
+            .or_default();
+        if store.conversations.is_empty() {
+            store
+                .conversations
+                .push(crate::messaging::BuyerConversation::open(
+                    seller_encryption_key,
+                )?);
+        }
+        let sealed = store
+            .conversations
+            .last()
+            .expect("just pushed if it was empty")
+            .seal(text)?;
+
+        // Ask the delegate to keep it, before the caller dispatches anything.
+        // A conversation the delegate is not keeping dies with the tab, and
+        // the seller's reply dies with it -- so the request is issued on the
+        // path that opens the conversation rather than left to a caller to
+        // remember.
+        self.keep_this_conversation(store_contract_id, seller_encryption_key);
+        Ok(sealed)
+    }
+
+    /// Ask the harvest delegate to keep this store's active conversation, if
+    /// it is one this browser opened and has not already had kept.
+    ///
+    /// Returns the request, so what is sent is testable without a browser;
+    /// [`Self::keep_this_conversation`] is the half that needs one.
+    pub fn conversation_to_keep(
+        &mut self,
+        store_contract_id: &[u8],
+        seller_encryption_key: &[u8; 32],
+    ) -> Option<harvest_common::HarvestDelegateRequest> {
+        // Issued on every message rather than once per conversation. The
+        // repeat costs one delegate write, and is otherwise inert: the
+        // delegate overwrites its own record and evicts nothing
+        // (`re_storing_a_held_conversation_evicts_nothing`). Tracking
+        // "already kept" here would save that write and risk the opposite
+        // mistake -- skipping a conversation that was never actually kept,
+        // which is the silent failure this whole mechanism exists to
+        // prevent.
+        let request_id = self.next_messaging_request_id();
+        let request = self
+            .browsing_stores
+            .get(store_contract_id)?
+            .conversations
+            .last()?
+            .to_persist(store_contract_id, seller_encryption_key, request_id)?;
+        self.pending_conversation_persists
+            .insert(request_id, store_contract_id.to_vec());
+        Some(request)
+    }
+
+    /// [`Self::conversation_to_keep`], dispatched.
+    pub fn keep_this_conversation(
+        &mut self,
+        store_contract_id: &[u8],
+        seller_encryption_key: &[u8; 32],
+    ) {
+        let Some(request) = self.conversation_to_keep(store_contract_id, seller_encryption_key)
+        else {
+            return;
+        };
+        self.send_to_harvest_delegate("keep this conversation", &request);
+    }
+
+    /// What the delegate must be asked so this store's earlier conversations
+    /// come back, or `None` when it has already been asked.
+    ///
+    /// Asked once per store per tab: store state re-arrives on every update
+    /// notification, and the answer cannot change between two of them.
+    pub fn buyer_conversations_to_recall(
+        &mut self,
+        store_contract_id: &[u8],
+    ) -> Option<harvest_common::HarvestDelegateRequest> {
+        // Nothing to ask if there is nobody to ask yet, and crucially the
+        // store is NOT marked as asked in that case. The connect path opens a
+        // store link BEFORE it registers the harvest delegate
+        // (`components::app`), so a store's state routinely arrives first --
+        // and a store marked asked on a request that was never sent is a
+        // buyer whose kept conversations are never recalled, with the reply
+        // sitting unread in the mailbox and nothing anywhere saying why.
+        // `recall_conversations_for_known_stores` covers the other order.
+        self.harvest_delegate_key.as_ref()?;
+        if !self
+            .buyer_conversations_recalled
+            .insert(store_contract_id.to_vec())
+        {
+            return None;
+        }
+        let request_id = self.next_messaging_request_id();
+        self.pending_conversation_recalls
+            .insert(request_id, store_contract_id.to_vec());
+        Some(
+            harvest_common::HarvestDelegateRequest::ListBuyerConversations {
+                request_id,
+                store_contract_id: store_contract_id.to_vec(),
+            },
+        )
+    }
+
+    /// [`Self::buyer_conversations_to_recall`], dispatched.
+    pub fn recall_buyer_conversations(&mut self, store_contract_id: &[u8]) {
+        let Some(request) = self.buyer_conversations_to_recall(store_contract_id) else {
+            return;
+        };
+        self.send_to_harvest_delegate("recall this store's conversations", &request);
+    }
+
+    /// Ask for the kept conversations of every store already on screen.
+    ///
+    /// The other half of the ordering above: a store whose state arrived
+    /// before the delegate was registered was deliberately not asked about,
+    /// so it is asked here, once the delegate exists.
+    pub fn recall_conversations_for_known_stores(&mut self) {
+        for store_contract_id in self.browsing_stores.keys().cloned().collect::<Vec<_>>() {
+            self.recall_buyer_conversations(&store_contract_id);
+        }
+    }
+
+    /// Fold the delegate's kept conversations into this store's view.
+    ///
+    /// # Why this also subscribes to the mailbox
+    ///
+    /// Opening a storefront deliberately does NOT subscribe to the seller's
+    /// mailbox: a subscription advertises a standing interest in it, so a
+    /// reader who never messages anyone advertises nothing. A non-empty
+    /// answer here is exactly the evidence that this node HAS messaged this
+    /// store, so re-subscribing tells the network nothing it was not already
+    /// told -- and without it a returning buyer holds the keys to a reply
+    /// they never fetch.
+    pub fn on_buyer_conversations(
+        &mut self,
+        request_id: u64,
+        echoed_store_contract_id: &[u8],
+        conversations: Vec<harvest_common::RecalledConversation>,
+    ) {
+        // Dropping the pending entry is what un-asks it. An answer nothing
+        // asked for takes nothing with it and contributes nothing.
+        let Some(store_contract_id) = self.pending_conversation_recalls.remove(&request_id) else {
+            warn!("Conversations arrived for request {request_id}, which nothing asked for");
+            return;
+        };
+        // Filed under the store THIS browser asked about. If the delegate
+        // echoed a different one, that is a fault worth saying out loud --
+        // and filing by the echo would put one store's conversation keys
+        // against another store's mailbox.
+        if echoed_store_contract_id != store_contract_id {
+            warn!(
+                "The delegate answered conversations for a different store than was asked \
+                 about; filing them under the store that was asked about"
+            );
+        }
+        let store_contract_id = store_contract_id.as_slice();
+        if conversations.is_empty() {
+            return;
+        }
+        info!(
+            "The delegate kept {} conversation(s) with this store",
+            conversations.len()
+        );
+        let store = self
+            .browsing_stores
+            .entry(store_contract_id.to_vec())
+            .or_default();
+        for recalled in conversations {
+            // A conversation this browser already holds keeps its keys and
+            // its secret -- but takes the delegate's word on whether a backup
+            // exists, because the delegate is the only thing that knows. A
+            // recall that only ADDED would leave the warning on screen after
+            // the buyer had cleared it.
+            if let Some(held) = store
+                .conversations
+                .iter_mut()
+                .find(|held| held.buyer_public_key == recalled.buyer_public_key)
+            {
+                held.backed_up = recalled.backed_up;
+                continue;
+            }
+            store
+                .conversations
+                .push(crate::messaging::BuyerConversation::recalled(&recalled));
+        }
+        // Oldest first, so the LAST is the one a new message continues.
+        // `buyer_public_key` breaks a tie rather than leaving the order
+        // dependent on which answer arrived first.
+        store
+            .conversations
+            .sort_by_key(|held| (held.created_at, held.buyer_public_key));
+
+        let seller = store.seller_verifying_key;
+        let Some(seller) =
+            seller.and_then(|key| ed25519_dalek::VerifyingKey::from_bytes(&key).ok())
+        else {
+            warn!(
+                "This store's conversations came back, but its identity key has not been \
+                 verified, so there is no mailbox address to read the replies out of"
+            );
+            return;
+        };
+        match crate::gateway::mailbox_ops::mailbox_contract_key(&seller) {
+            Ok(mailbox) => self.register_store_mailbox(store_contract_id, mailbox.id().as_bytes()),
+            Err(e) => warn!("Could not work out this store's mailbox address: {e}"),
+        }
+    }
+
+    /// Ask the delegate for ONE conversation as a saveable string.
+    ///
+    /// One at a time, because a store-wide string is silently incomplete the
+    /// moment the next conversation is opened and nothing about the artefact
+    /// says so. See `docs/buyer-conversation-persistence.md`.
+    pub fn conversation_to_export(
+        &mut self,
+        store_contract_id: &[u8],
+        buyer_public_key: &[u8; 32],
+    ) -> harvest_common::HarvestDelegateRequest {
+        let request_id = self.next_messaging_request_id();
+        self.pending_conversation_backups
+            .insert(request_id, (store_contract_id.to_vec(), *buyer_public_key));
+        harvest_common::HarvestDelegateRequest::ExportBuyerConversation {
+            request_id,
+            store_contract_id: store_contract_id.to_vec(),
+            buyer_public_key: *buyer_public_key,
+        }
+    }
+
+    /// [`Self::conversation_to_export`], dispatched.
+    pub fn export_conversation(&mut self, store_contract_id: &[u8], buyer_public_key: &[u8; 32]) {
+        let request = self.conversation_to_export(store_contract_id, buyer_public_key);
+        self.send_to_harvest_delegate("back up this conversation", &request);
+    }
+
+    /// Put a backup on screen, or say why there is none.
+    ///
+    /// It is held rather than shown-and-forgotten because the buyer has to
+    /// copy it somewhere, and a string that vanished on the next render would
+    /// be a backup they believe they have.
+    pub fn on_conversation_exported(&mut self, request_id: u64, result: Result<String, String>) {
+        // Filed under the conversation this browser asked about, and an
+        // answer nothing asked for is ignored. A backup is the strongest
+        // thing in this protocol -- putting one on screen under the wrong
+        // heading would invite the buyer to save it as that conversation's.
+        let Some((store_contract_id, buyer_public_key)) =
+            self.pending_conversation_backups.remove(&request_id)
+        else {
+            warn!("A backup arrived for request {request_id}, which nothing asked for");
+            return;
+        };
+        match result {
+            Ok(backup) => {
+                self.conversation_backup_on_screen = Some(ConversationBackup {
+                    store_contract_id,
+                    buyer_public_key,
+                    backup,
+                })
+            }
+            // Reported rather than logged: the buyer pressed a button and
+            // nothing appeared, and the reason is usually actionable ("this
+            // node does not hold that conversation").
+            Err(why) => {
+                warn!("Could not export this conversation: {why}");
+                self.notifications
+                    .push(format!("That backup could not be made: {why}"));
+            }
+        }
+    }
+
+    /// Take the buyer's word that they have saved THIS conversation's backup.
+    ///
+    /// One conversation, matching the export. Marking every conversation with
+    /// the store would clear the warning on ones the saved string does not
+    /// contain, which is the granularity form of silencing a warning about a
+    /// key nobody has a backup of.
+    pub fn conversation_to_mark_backed_up(
+        &mut self,
+        store_contract_id: &[u8],
+        buyer_public_key: &[u8; 32],
+    ) -> harvest_common::HarvestDelegateRequest {
+        let request_id = self.next_messaging_request_id();
+        self.pending_conversation_backups
+            .insert(request_id, (store_contract_id.to_vec(), *buyer_public_key));
+        harvest_common::HarvestDelegateRequest::MarkConversationBackedUp {
+            request_id,
+            store_contract_id: store_contract_id.to_vec(),
+            buyer_public_key: *buyer_public_key,
+        }
+    }
+
+    /// [`Self::conversation_to_mark_backed_up`], dispatched.
+    pub fn mark_conversation_backed_up(
+        &mut self,
+        store_contract_id: &[u8],
+        buyer_public_key: &[u8; 32],
+    ) {
+        let request = self.conversation_to_mark_backed_up(store_contract_id, buyer_public_key);
+        self.send_to_harvest_delegate("record that you have saved this", &request);
+    }
+
+    /// Fold in what marking did, by asking the delegate rather than assuming.
+    ///
+    /// The delegate is the only thing that knows whether the record was
+    /// actually written; a refused write leaves the warning in place, which
+    /// is the safe direction and is exactly what a local guess would get
+    /// wrong. So this re-asks and lets the answer decide what the screen
+    /// says.
+    pub fn on_conversation_marked_backed_up(
+        &mut self,
+        request_id: u64,
+        result: Result<bool, String>,
+    ) {
+        let Some((store_contract_id, _)) = self.pending_conversation_backups.remove(&request_id)
+        else {
+            warn!("A backup marking arrived for request {request_id}, which nothing asked for");
+            return;
+        };
+        match result {
+            Ok(marked) => {
+                info!("conversation recorded as saved: {marked}");
+                self.re_recall_buyer_conversations(&store_contract_id);
+            }
+            Err(why) => self.notifications.push(format!(
+                "This node could not record that you have saved that backup, so it will keep \
+                 warning you about it: {why}"
+            )),
+        }
+    }
+
+    /// Hand a pasted backup to the delegate.
+    ///
+    /// One string carries one conversation; a buyer restoring a machine
+    /// pastes several in a row, and nothing here is stateful between them.
+    pub fn conversation_to_import(
+        &mut self,
+        backup: String,
+    ) -> harvest_common::HarvestDelegateRequest {
+        harvest_common::HarvestDelegateRequest::ImportBuyerConversation {
+            request_id: self.next_messaging_request_id(),
+            backup,
+        }
+    }
+
+    /// [`Self::conversation_to_import`], dispatched.
+    pub fn import_conversation(&mut self, backup: String) {
+        let request = self.conversation_to_import(backup);
+        self.send_to_harvest_delegate("restore this conversation", &request);
+    }
+
+    /// Fold in what a pasted backup did, and say it in full.
+    ///
+    /// One string carries one conversation, so exactly one thing happened and
+    /// it is named: a refused conversation is one the buyer still cannot
+    /// read, and the reason is what tells them what to do about it.
+    pub fn on_conversation_imported(
+        &mut self,
+        result: Result<harvest_common::ImportedConversation, String>,
+    ) {
+        use harvest_common::ImportedConversation;
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(why) => {
+                self.notifications
+                    .push(format!("That backup could not be restored: {why}"));
+                return;
+            }
+        };
+
+        let tag = short_conversation_tag(&outcome.buyer_public_key());
+        self.notifications.push(match &outcome {
+            // Said whenever something IS restored, because the restored
+            // conversation may now be the one a new message continues -- and
+            // its secret is known to whoever produced the string. Nothing
+            // here can tell an honest backup from one the buyer was handed,
+            // so the buyer is the one who has to know. See
+            // `docs/buyer-conversation-persistence.md`.
+            ImportedConversation::Imported { .. } => format!(
+                "Conversation {tag} was restored from that backup. Messages you send to this \
+                 store from now on may continue it, and if you did not make that backup \
+                 yourself, whoever gave it to you can read them."
+            ),
+            ImportedConversation::AlreadyHeld { .. } => format!(
+                "Conversation {tag} was already on this device, and was left exactly as it was."
+            ),
+            ImportedConversation::Refused { why, .. } => {
+                format!("Conversation {tag} could NOT be restored: {why}")
+            }
+        });
+
+        // The import wrote into the DELEGATE, not into this browser. Without
+        // asking again the buyer is told it worked and sees nothing.
+        let store_contract_id = outcome.store_contract_id().to_vec();
+        self.re_recall_buyer_conversations(&store_contract_id);
+    }
+
+    /// Ask again for a store's conversations, after something changed them.
+    pub fn re_recall_buyer_conversations(&mut self, store_contract_id: &[u8]) {
+        self.buyer_conversations_recalled.remove(store_contract_id);
+        self.recall_buyer_conversations(store_contract_id);
+    }
+
+    /// Ask the delegate to forget one conversation, permanently.
+    ///
+    /// The conversation stays on screen until the delegate says the record is
+    /// gone -- see [`Self::on_buyer_conversation_forgotten`].
+    pub fn conversation_to_forget(
+        &mut self,
+        store_contract_id: &[u8],
+        buyer_public_key: &[u8; 32],
+    ) -> harvest_common::HarvestDelegateRequest {
+        let request_id = self.next_messaging_request_id();
+        self.pending_conversation_forgets
+            .insert(request_id, (store_contract_id.to_vec(), *buyer_public_key));
+        harvest_common::HarvestDelegateRequest::ForgetBuyerConversation {
+            request_id,
+            store_contract_id: store_contract_id.to_vec(),
+            buyer_public_key: *buyer_public_key,
+        }
+    }
+
+    /// [`Self::conversation_to_forget`], dispatched.
+    pub fn forget_conversation(&mut self, store_contract_id: &[u8], buyer_public_key: &[u8; 32]) {
+        let request = self.conversation_to_forget(store_contract_id, buyer_public_key);
+        self.send_to_harvest_delegate("forget this conversation", &request);
+    }
+
+    /// Say what keeping a conversation cost, when it cost anything.
+    ///
+    /// # Why the two cases read differently
+    ///
+    /// A discarded conversation the buyer holds a backup of is recoverable,
+    /// and saying "you can no longer read it" would be false. One they do not
+    /// hold a backup of is unreadable forever, and saying anything softer
+    /// would be the silence the whole mechanism exists to avoid. The delegate
+    /// reports which, because it is the only place that knows.
+    ///
+    /// Empty on almost every message sent, so a notice here is evidence
+    /// rather than noise.
+    fn report_evicted_conversations(&mut self, evicted: Vec<harvest_common::EvictedConversation>) {
+        for gone in evicted {
+            let tag = short_conversation_tag(&gone.buyer_public_key);
+            warn!("Conversation {tag} was discarded to stay under this node's cap");
+            self.notifications.push(if gone.was_backed_up {
+                format!(
+                    "This node was full, so conversation {tag} was discarded to make room. You \
+                     have a backup of it, so you can restore it -- but not while this node is \
+                     still full."
+                )
+            } else {
+                format!(
+                    "This node was full, so conversation {tag} was discarded to make room. It \
+                     was not backed up anywhere, so it can no longer be read by anyone, \
+                     including you."
+                )
+            });
+        }
+    }
+
+    /// Drop a conversation this browser holds, once the delegate has said the
+    /// record is gone.
+    ///
+    /// # Why the local drop waits for the answer
+    ///
+    /// Dropping it on the click would show the buyer a thread that had
+    /// vanished while the record was still on their disk -- the exact
+    /// dishonesty the delete-rather-than-empty design exists to avoid. A
+    /// refusal is reported and the thread stays, which is recoverable.
+    pub fn on_buyer_conversation_forgotten(&mut self, request_id: u64, result: Result<(), String>) {
+        let Some((store_contract_id, buyer_public_key)) =
+            self.pending_conversation_forgets.remove(&request_id)
+        else {
+            warn!("A conversation was forgotten for request {request_id}, which nothing asked for");
+            return;
+        };
+        match result {
+            Ok(()) => {
+                if let Some(store) = self.browsing_stores.get_mut(&store_contract_id) {
+                    store
+                        .conversations
+                        .retain(|held| held.buyer_public_key != buyer_public_key);
+                }
+                self.notifications.push(
+                    "That conversation is forgotten. Its messages are still in the seller's \
+                     mailbox and can no longer be read by anyone, including you."
+                        .to_string(),
+                );
+            }
+            Err(why) => self.notifications.push(format!(
+                "That conversation could NOT be forgotten, so it is still stored on this node: \
+                 {why}"
+            )),
+        }
+    }
+
+    /// Send one request to the harvest delegate, reporting a failure to even
+    /// reach it.
+    ///
+    /// The `what` is what the buyer was trying to do, so a failure can say so
+    /// rather than naming a request variant.
+    fn send_to_harvest_delegate(
+        &mut self,
+        _what: &'static str,
+        _request: &harvest_common::HarvestDelegateRequest,
+    ) {
+        let Some(_delegate_key) = self.harvest_delegate_key.clone() else {
+            warn!("Harvest delegate not registered -- cannot {_what}");
+            return;
+        };
+        #[cfg(target_arch = "wasm32")]
+        {
+            let payload = match harvest_common::to_cbor(_request) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    warn!("Failed to serialize a request to {_what}: {e}");
+                    return;
+                }
+            };
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(e) = crate::gateway::send_delegate_message(&_delegate_key, payload).await
+                {
+                    dioxus::logger::tracing::error!("Failed to {_what}: {e}");
+                }
+            });
+        }
+    }
+
+    /// The buyer's thread with this store, oldest first.
+    ///
+    /// Empty for a store this browser has never written to -- there is no
+    /// conversation, so there is nothing in the mailbox that could be theirs.
+    pub fn conversation_thread(
+        &self,
+        store_contract_id: &[u8],
+    ) -> Vec<crate::messaging::ConversationMessage> {
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return Vec::new();
+        };
+        // Every conversation this node has had with the store, not just the
+        // one this tab opened: a reply to a question asked before the last
+        // reload is the whole reason the secrets are kept at all. The reads
+        // cannot overlap -- each filters the mailbox by its own routing tag,
+        // and the tags are distinct -- so this concatenates rather than
+        // merging.
+        let mut thread: Vec<crate::messaging::ConversationMessage> = store
+            .conversations
+            .iter()
+            .flat_map(|conversation| conversation.read(&store.mailbox_messages))
+            .collect();
+        thread.sort_by_key(|message| (message.timestamp, message.nonce));
+        thread
+    }
+
+    /// Messages this browser handed to the node that have not yet turned up
+    /// in the seller's mailbox.
+    ///
+    /// The distinction is the only delivery signal Harvest has. Nothing
+    /// confirms an update was applied -- `UpdateResponse` carries no
+    /// correlation id -- but a message that appears in the mailbox the buyer
+    /// re-reads has demonstrably landed, and one that does not, has not yet.
+    pub fn unconfirmed_sent(&self, store_contract_id: &[u8]) -> Vec<SentMessage> {
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return Vec::new();
+        };
+        // Landed means THIS message is there, not that its nonce is: an entry
+        // with the same nonce and different bytes is somebody else's message,
+        // and since 2026-09-05 it sits beside this one rather than in place
+        // of it -- the contract keys identity on `entry_digest`.
+        //
+        // There used to be a second category, `replaced_sent`, for a message
+        // whose nonce was present under different bytes: it had arrived and
+        // then been displaced by the contract's dedup. That state can no
+        // longer arise, so it was deleted rather than left rendering a case
+        // that cannot happen. It was not repointed at "an entry shares your
+        // nonce" either, because that signal is FORGEABLE: the mailbox is
+        // open-write and the nonce is public, so any third party can plant an
+        // unreadable entry under it, and a "somebody tampered with your
+        // message" notice driven by that would be one an outsider could
+        // trigger against a seller they have never dealt with.
+        let landed: std::collections::HashSet<[u8; 32]> = store
+            .mailbox_messages
+            .iter()
+            .map(harvest_common::mailbox::entry_digest)
+            .collect();
+        store
+            .sent_messages
+            .iter()
+            .filter(|sent| !landed.contains(&sent.digest))
+            .cloned()
+            .collect()
+    }
+
+    /// Seal a seller's reply to one conversation in their own mailbox.
+    ///
+    /// # Why this needs a message the seller has already read
+    ///
+    /// A reply must name the conversation id the BUYER chose: the buyer
+    /// refuses one that names anything else, which is what stops an answer
+    /// being spliced from one of their conversations into another. That id
+    /// lives inside the ciphertext, so the only place a seller can learn it
+    /// is a message they decrypted. "Reply without having read" is therefore
+    /// not something that can be done, and refusing is better than sending
+    /// bytes the buyer silently discards.
+    pub fn compose_reply(
+        &self,
+        store_contract_id: &[u8],
+        conversation_tag: &[u8],
+        text: String,
+    ) -> Result<harvest_common::mailbox::EncryptedMessage, String> {
+        if self.store_owner_fingerprint(store_contract_id).is_none() {
+            return Err(
+                "this store is not one of yours -- only the seller can reply into its mailbox"
+                    .to_string(),
+            );
+        }
+        let keys = self
+            .conversation_keys
+            .get(conversation_tag)
+            .ok_or("your delegate has not produced this conversation's key yet")?;
+
+        // The newest message this seller could read in this conversation.
+        // `mailbox_entries` is newest-first, so the first match is it.
+        let conversation_id = self
+            .mailbox_entries(store_contract_id)
+            .into_iter()
+            .find_map(|entry| match entry {
+                crate::messaging::MailboxEntry::Readable {
+                    conversation,
+                    conversation_id,
+                    ..
+                } if conversation == conversation_tag => Some(conversation_id),
+                _ => None,
+            })
+            .ok_or(
+                "no message in this conversation has been read yet, so there is no conversation \
+                 to reply to",
+            )?;
+
+        crate::messaging::seal_reply(keys, conversation_tag, &conversation_id, text)
+    }
+
+    /// Whether THIS browser wrote the message with this digest.
+    ///
+    /// # Why authorship is answered from local records and not from the
+    /// message
+    ///
+    /// Nothing in a message establishes who wrote it. Both parties hold both
+    /// direction keys, so either can encrypt in either direction, and
+    /// `messaging::Addressing` says which way a message was addressed rather
+    /// than who addressed it -- see
+    /// [`harvest_common::mailbox::MessageDirection`].
+    ///
+    /// The one thing a client can know first-hand is what it sent itself.
+    /// That is this. Everything else is unattributed, and
+    /// `components::message_view` says so rather than labelling a
+    /// counterparty-written message with the counterparty's name.
+    ///
+    /// # The identity compared here is the DIGEST, not the nonce
+    ///
+    /// This matched on the mailbox nonce until it was reviewed, and that was
+    /// wrong in the way that matters: the nonce is public, the mailbox is
+    /// open-write, and the counterparty holds the conversation key. So they
+    /// could seal different words under a nonce this client had used, let the
+    /// contract's tiebreak keep theirs, and have this browser label their
+    /// words "You, from this tab". Verified by execution before the fix; the
+    /// same substitution works in both directions, so a buyer could put a
+    /// confession in a seller's own inbox under the seller's label.
+    ///
+    /// [`harvest_common::mailbox::entry_digest`] covers every field, so a
+    /// substitute -- which must differ in the ciphertext or it is not a
+    /// substitute -- does not match. Pinned by
+    /// `a_substituted_message_is_not_shown_as_the_buyers_own` and
+    /// `a_seller_is_not_credited_with_a_substituted_reply`.
+    ///
+    /// **This does not stop the counterparty writing**, and nothing at this
+    /// layer could: the conversation key is symmetric, so they can always
+    /// produce anything this client could. What it stops is their words being
+    /// labelled as the buyer's. They can no longer DELETE a message either,
+    /// but that is the contract's doing rather than this one's -- identity is
+    /// `entry_digest`, so a substitute sits beside the original. See
+    /// `docs/messaging-privacy.md`.
+    ///
+    /// It is per-tab, like everything else about a conversation: a reload
+    /// loses it, and messages this browser really did send then read as
+    /// unattributed, which is the honest direction to be wrong in.
+    pub fn authored_here(&self, store_contract_id: &[u8], digest: &[u8; 32]) -> bool {
+        self.browsing_stores
+            .get(store_contract_id)
+            .is_some_and(|store| {
+                store
+                    .sent_messages
+                    .iter()
+                    .any(|sent| &sent.digest == digest)
+            })
+    }
+
+    /// Record a message this browser sent, so the buyer can see what they
+    /// wrote.
+    ///
+    /// Local to the tab and deliberately so -- see
+    /// [`BrowsingStore::sent_messages`].
+    pub fn record_sent_message(
+        &mut self,
+        store_contract_id: &[u8],
+        text: String,
+        sealed: &harvest_common::mailbox::EncryptedMessage,
+    ) {
+        // The sealed message rather than its nonce, so the digest cannot be
+        // computed from anything but the bytes that were actually dispatched.
+        self.browsing_stores
+            .entry(store_contract_id.to_vec())
+            .or_default()
+            .sent_messages
+            .push(SentMessage {
+                text,
+                sent_at: chrono::Utc::now(),
+                digest: harvest_common::mailbox::entry_digest(sealed),
+            });
+    }
+
+    /// One store's mailbox, read with whatever keys are on hand.
+    pub fn mailbox_entries(&self, store_contract_id: &[u8]) -> Vec<crate::messaging::MailboxEntry> {
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return Vec::new();
+        };
+        crate::messaging::read_mailbox(&store.mailbox_messages, &self.conversation_keys)
+    }
+
+    /// Whether this store is one of the connected identities', and if so
+    /// which identity owns it.
+    pub fn store_owner_fingerprint(&self, store_contract_id: &[u8]) -> Option<String> {
+        self.my_stores.iter().find_map(|(fingerprint, stores)| {
+            stores
+                .iter()
+                .any(|store| store.store_contract_id == store_contract_id)
+                .then(|| fingerprint.clone())
+        })
     }
 
     /// Drop a queued signature request that nothing will ever answer.
@@ -1383,7 +2593,18 @@ impl AppState {
             return false;
         };
 
-        let info = edit.store_info(certificate_pem);
+        let encryption_public_key = self
+            .encryption_public_keys
+            .get(&edit.ghostkey_fingerprint)
+            .copied();
+        if encryption_public_key.is_none() {
+            info!(
+                "Publishing store details for {} with no encryption key -- buyers will be told \
+                 they cannot message this seller",
+                edit.ghostkey_fingerprint
+            );
+        }
+        let info = edit.store_info(certificate_pem, encryption_public_key);
         info!(
             "Publishing details for store {:?} at version {}",
             &edit.store_contract_id[..8.min(edit.store_contract_id.len())],
@@ -1540,7 +2761,7 @@ impl AppState {
         spawn_order_signature(pending);
     }
 
-    /// A creation time whose resulting [`OrderId`] is not one we already hold.
+    /// A creation time whose resulting `OrderId` is not one we already hold.
     ///
     /// # Why this is needed at all
     ///
@@ -1699,6 +2920,95 @@ impl AppState {
                 self.start_reputation_migration(&ghostkey_fingerprint);
             }
 
+            HarvestDelegateResponse::EncryptionKeyReady {
+                ghostkey_fingerprint,
+                x25519_public_key,
+            } => match <[u8; 32]>::try_from(x25519_public_key.as_slice()) {
+                Ok(key) => {
+                    info!("Encryption key ready for {ghostkey_fingerprint}");
+                    self.encryption_public_keys
+                        .insert(ghostkey_fingerprint.clone(), key);
+                    if let Some(pending) = self.pending_store_creation.as_mut() {
+                        if pending.ghostkey_fingerprint == ghostkey_fingerprint {
+                            pending.encryption_public_key = Some(key);
+                        }
+                    }
+                }
+                // Refused rather than padded or truncated into something the
+                // seller would sign into a permanent record and no buyer
+                // could use. Said out loud because the only other symptom is
+                // buyers being told, on the seller's own storefront, that
+                // this store cannot be messaged.
+                Err(_) => {
+                    let message = format!(
+                        "The delegate returned a {}-byte encryption key for {ghostkey_fingerprint}, \
+                         not 32. Buyers will not be able to message this store.",
+                        x25519_public_key.len()
+                    );
+                    warn!("{message}");
+                    self.notifications.push(message);
+                }
+            },
+
+            HarvestDelegateResponse::ConversationKeys {
+                request_id,
+                ghostkey_fingerprint,
+                result,
+            } => self.on_conversation_keys(request_id, ghostkey_fingerprint, result),
+
+            HarvestDelegateResponse::BuyerConversationList {
+                request_id,
+                store_contract_id,
+                conversations,
+            } => self.on_buyer_conversations(request_id, &store_contract_id, conversations),
+
+            // A conversation the delegate did not keep dies with the tab, and
+            // the buyer has already been told their message was sent -- so
+            // this is said out loud rather than logged. After orders exist it
+            // is the difference between having recourse against the seller
+            // and silently having none.
+            HarvestDelegateResponse::BuyerConversationStored {
+                request_id,
+                result,
+                evicted,
+            } => {
+                let store_contract_id = self.pending_conversation_persists.remove(&request_id);
+                // Said before the write's own outcome: what was discarded is
+                // gone either way, and it is the sharper of the two.
+                self.report_evicted_conversations(evicted);
+                if let Err(why) = result {
+                    let store = store_contract_id
+                        .as_deref()
+                        .and_then(|id| self.browsing_stores.get(id))
+                        .and_then(|store| store.info.as_ref())
+                        .map(|info| info.store_name.clone())
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or_else(|| "this store".to_string());
+                    warn!("A buyer conversation was not kept: {why}");
+                    self.notifications.push(format!(
+                        "Your message to {store} was sent, but this node could not keep the key \
+                         that reads the reply: {why}. If you close or reload this tab, any \
+                         answer will be unreadable."
+                    ));
+                }
+            }
+
+            HarvestDelegateResponse::BuyerConversationForgotten { request_id, result } => {
+                self.on_buyer_conversation_forgotten(request_id, result)
+            }
+
+            HarvestDelegateResponse::BuyerConversationExported {
+                request_id, result, ..
+            } => self.on_conversation_exported(request_id, result),
+
+            HarvestDelegateResponse::BuyerConversationImported { result, .. } => {
+                self.on_conversation_imported(result)
+            }
+
+            HarvestDelegateResponse::BuyerConversationMarkedBackedUp {
+                request_id, result, ..
+            } => self.on_conversation_marked_backed_up(request_id, result),
+
             HarvestDelegateResponse::StoreRegistered {
                 ghostkey_fingerprint,
             } => {
@@ -1830,6 +3140,18 @@ impl AppState {
                 for key in &keys {
                     if let Some(vk) = key.verifying_key_bytes.as_ref() {
                         crate::gateway::migrate_ops::start_identity_migration(&key.fingerprint, vk);
+                    }
+                }
+
+                // And the messaging key. Idempotent at the delegate, so a
+                // reconnect costs one round trip and cannot mint a second key
+                // -- which would strand every message already encrypted to
+                // the first. Asked for unconditionally rather than only at
+                // store creation, because a seller whose store predates the
+                // key needs one before they can repair it.
+                for fingerprint in keys.iter().map(|k| k.fingerprint.clone()) {
+                    if !self.encryption_public_keys.contains_key(&fingerprint) {
+                        crate::components::ensure_encryption_key(fingerprint);
                     }
                 }
                 // If any ghostkey has verifying_key_bytes and we have a pending
@@ -2941,6 +4263,7 @@ mod tests {
                 store_name: name.to_string(),
                 description: String::new(),
                 payment_instructions: String::new(),
+                encryption_public_key: None,
             }),
             ..Default::default()
         }
@@ -3135,6 +4458,7 @@ mod tests {
             description: String::new(),
             payment_instructions: String::new(),
             rsa_public_key_der: None,
+            encryption_public_key: None,
         }
     }
 
@@ -3248,6 +4572,7 @@ mod tests {
             store_name: name.to_string(),
             description: String::new(),
             payment_instructions: String::new(),
+            encryption_public_key: None,
         }
     }
 
@@ -3293,7 +4618,7 @@ mod tests {
     #[test]
     fn a_store_at_version_zero_needs_publishing() {
         assert_eq!(
-            store_details_gap(Some(&published_info(0, "", [0u8; 32]))),
+            store_details_gap(Some(&published_info(0, "", [0u8; 32])), false),
             Some(StoreDetailsGap::NeverPublished)
         );
     }
@@ -3301,7 +4626,7 @@ mod tests {
     #[test]
     fn a_published_store_without_a_name_needs_repair() {
         assert_eq!(
-            store_details_gap(Some(&published_info(1, "   ", REPUTATION_ID))),
+            store_details_gap(Some(&published_info(1, "   ", REPUTATION_ID)), false),
             Some(StoreDetailsGap::NoName)
         );
     }
@@ -3312,7 +4637,7 @@ mod tests {
     #[test]
     fn a_published_store_without_a_reputation_link_needs_repair() {
         assert_eq!(
-            store_details_gap(Some(&published_info(1, "Bean Shop", [0u8; 32]))),
+            store_details_gap(Some(&published_info(1, "Bean Shop", [0u8; 32])), false),
             Some(StoreDetailsGap::NoReputationLink)
         );
     }
@@ -3322,16 +4647,47 @@ mod tests {
     #[test]
     fn a_healthy_store_needs_nothing() {
         assert_eq!(
-            store_details_gap(Some(&published_info(1, "Bean Shop", REPUTATION_ID))),
+            store_details_gap(Some(&published_info(1, "Bean Shop", REPUTATION_ID)), false),
             None
         );
+    }
+
+    /// A store with no published encryption key is a store no buyer can
+    /// message, and the seller has no other way to find that out: nothing in
+    /// the publishing path fails, and the notice appears only on the BUYER's
+    /// side of the storefront.
+    #[test]
+    fn a_published_store_without_an_encryption_key_needs_repair() {
+        assert_eq!(
+            store_details_gap(Some(&published_info(1, "Bean Shop", REPUTATION_ID)), true),
+            Some(StoreDetailsGap::NoEncryptionKey)
+        );
+    }
+
+    /// ...but only when there is a key to publish. Prompting a seller whose
+    /// delegate has produced nothing would name a repair that publishing does
+    /// not perform, and the prompt would never clear.
+    #[test]
+    fn no_key_to_publish_means_no_prompt_to_publish_one() {
+        assert_eq!(
+            store_details_gap(Some(&published_info(1, "Bean Shop", REPUTATION_ID)), false),
+            None
+        );
+    }
+
+    /// A store that already publishes one needs nothing.
+    #[test]
+    fn a_store_that_already_publishes_a_key_needs_nothing() {
+        let mut info = published_info(1, "Bean Shop", REPUTATION_ID);
+        info.encryption_public_key = Some([8u8; 32]);
+        assert_eq!(store_details_gap(Some(&info), true), None);
     }
 
     /// A store whose state has not arrived yet is not a store with a gap.
     /// Reporting one here would flash the repair prompt on every load.
     #[test]
     fn a_store_that_has_not_loaded_yet_needs_nothing() {
-        assert_eq!(store_details_gap(None), None);
+        assert_eq!(store_details_gap(None, true), None);
     }
 
     /// The reputation contract id must come from the seller's own
@@ -3885,6 +5241,59 @@ mod tests {
         ));
     }
 
+    /// The harvest delegate speaks two response enums over ONE key, so those
+    /// two are still separated by a trial decode -- and that only works while
+    /// no payload decodes as both.
+    ///
+    /// The messaging responses are the first variants added to that enum
+    /// since the rule was written down. This checks them against it rather
+    /// than trusting the comment, because the failure is silent: a
+    /// `ConversationKeys` misread as a Bitcoin response would go to
+    /// `on_bitcoin_delegate_response`, do nothing, and leave the seller's
+    /// mailbox unreadable with no error anywhere.
+    #[test]
+    fn the_messaging_responses_are_not_mistakable_for_bitcoin_ones() {
+        use crate::gateway::response_handler::{
+            decode_delegate_message, DelegateResponse, DelegateSender,
+        };
+
+        for response in [
+            HarvestDelegateResponse::EncryptionKeyReady {
+                ghostkey_fingerprint: "fp".to_string(),
+                x25519_public_key: vec![1u8; 32],
+            },
+            HarvestDelegateResponse::ConversationKeys {
+                request_id: 1,
+                ghostkey_fingerprint: "fp".to_string(),
+                result: Ok(vec![harvest_common::ConversationKey {
+                    peer_public_key: vec![2u8; 32],
+                    buyer_to_seller: [3u8; 32],
+                    seller_to_buyer: [4u8; 32],
+                }]),
+            },
+            HarvestDelegateResponse::ConversationKeys {
+                request_id: 2,
+                ghostkey_fingerprint: "fp".to_string(),
+                result: Err("nope".to_string()),
+            },
+        ] {
+            let bytes = harvest_common::to_cbor(&response).unwrap();
+            assert!(
+                matches!(
+                    decode_delegate_message(DelegateSender::Harvest, &bytes),
+                    Ok(DelegateResponse::Harvest(_))
+                ),
+                "a messaging response must decode as a harvest one: {response:?}"
+            );
+            assert!(
+                harvest_common::from_cbor::<harvest_common::BitcoinDelegateResponse>(&bytes)
+                    .is_err(),
+                "a messaging response also decoded as a Bitcoin one, so the trial decode \
+                 that separates them is no longer sound: {response:?}"
+            );
+        }
+    }
+
     /// A key belonging to neither delegate is not guessed at. Guessing is
     /// what produced the misrouting in the first place.
     #[test]
@@ -3924,6 +5333,7 @@ mod tests {
             description: String::new(),
             payment_instructions: String::new(),
             rsa_public_key_der: None,
+            encryption_public_key: None,
         });
 
         from_ghostkey(
@@ -3957,6 +5367,7 @@ mod tests {
             description: String::new(),
             payment_instructions: String::new(),
             rsa_public_key_der: None,
+            encryption_public_key: None,
         });
         state.pending_signatures.push_back(pending_store_info());
         state.request_any_access_in_flight = true;
@@ -4036,6 +5447,7 @@ mod tests {
             store_name: "Loaded".to_string(),
             description: String::new(),
             payment_instructions: String::new(),
+            encryption_public_key: None,
         });
 
         assert!(!state.note_store_link_failed(&[9u8; 32], "didn't load"));
@@ -4722,5 +6134,2444 @@ mod authorized_order_tests {
         assert_eq!(authorized.scoped_payload, vec![1, 2, 3]);
         assert_eq!(authorized.signature, vec![4, 5, 6]);
         assert_eq!(authorized.order, order());
+    }
+}
+
+/// The seller's side of buyer-to-seller messaging: asking the delegate for
+/// the conversation keys, and reading the mailbox with them.
+///
+/// Every one of these runs on the host. The only wasm-gated part of the path
+/// is the delegate send itself, which is why the decisions live here rather
+/// than in `gateway`.
+#[cfg(test)]
+mod mailbox_read_tests {
+    use super::*;
+    use harvest_common::mailbox::{conversation_key_from_dh, EncryptedMessage, MessageDirection};
+    use harvest_common::ConversationKey;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    const OURS: &[u8] = &[1u8; 32];
+    const A_STRANGERS: &[u8] = &[2u8; 32];
+    const FINGERPRINT: &str = "fp1";
+
+    fn registration(store_contract_id: &[u8]) -> StoreRegistration {
+        StoreRegistration {
+            store_contract_id: store_contract_id.to_vec(),
+            reputation_contract_id: vec![3u8; 32],
+            mailbox_contract_id: vec![4u8; 32],
+            store_contract_key: None,
+        }
+    }
+
+    /// A store the connected identity owns, plus a stranger's store, both
+    /// holding `messages`.
+    fn state_with(messages: Vec<EncryptedMessage>) -> AppState {
+        let mut state = AppState::default();
+        state
+            .my_stores
+            .insert(FINGERPRINT.to_string(), vec![registration(OURS)]);
+        for id in [OURS, A_STRANGERS] {
+            state
+                .browsing_stores
+                .entry(id.to_vec())
+                .or_default()
+                .mailbox_messages = messages.clone();
+        }
+        state
+    }
+
+    /// The seller, and a buyer who wrote to them.
+    struct Conversation {
+        seller: StaticSecret,
+        message: EncryptedMessage,
+    }
+
+    fn conversation(text: &str) -> Conversation {
+        // One seller, distinct buyers: each call opens a fresh
+        // `BuyerConversation`, so the routing tags differ.
+        let seller = StaticSecret::from([21u8; 32]);
+        let message =
+            crate::messaging::BuyerConversation::open(PublicKey::from(&seller).as_bytes())
+                .expect("open")
+                .seal(text.to_string())
+                .expect("seal");
+        Conversation { seller, message }
+    }
+
+    impl Conversation {
+        /// The answer the delegate would give for this buyer's key.
+        fn answer(&self) -> ConversationKey {
+            let peer: [u8; 32] = self
+                .message
+                .sender_public_key
+                .clone()
+                .try_into()
+                .expect("32 bytes");
+            let shared = self
+                .seller
+                .diffie_hellman(&PublicKey::from(peer))
+                .to_bytes();
+            ConversationKey {
+                peer_public_key: self.message.sender_public_key.clone(),
+                buyer_to_seller: conversation_key_from_dh(&shared, MessageDirection::BuyerToSeller),
+                seller_to_buyer: conversation_key_from_dh(&shared, MessageDirection::SellerToBuyer),
+            }
+        }
+    }
+
+    fn peer_keys(request: &harvest_common::HarvestDelegateRequest) -> Vec<Vec<u8>> {
+        match request {
+            harvest_common::HarvestDelegateRequest::DeriveConversationKeys {
+                peer_public_keys,
+                ..
+            } => peer_public_keys.clone(),
+            other => panic!("expected DeriveConversationKeys, got {other:?}"),
+        }
+    }
+
+    fn request_id(request: &harvest_common::HarvestDelegateRequest) -> u64 {
+        match request {
+            harvest_common::HarvestDelegateRequest::DeriveConversationKeys {
+                request_id, ..
+            } => *request_id,
+            other => panic!("expected DeriveConversationKeys, got {other:?}"),
+        }
+    }
+
+    /// The whole seller path: a message arrives, keys are asked for, the
+    /// answer comes back, and the message becomes readable.
+    #[test]
+    fn the_delegates_answer_makes_the_mailbox_readable() {
+        let conversation = conversation("is the blue one still available?");
+        let mut state = state_with(vec![conversation.message.clone()]);
+
+        // Before the keys arrive, the message is present and unreadable --
+        // not missing, which is what a seller would otherwise see as "nobody
+        // has written to me".
+        let before = state.mailbox_entries(OURS);
+        assert_eq!(before.len(), 1);
+        assert!(matches!(
+            before[0],
+            crate::messaging::MailboxEntry::Unreadable { .. }
+        ));
+
+        let request = state
+            .conversation_keys_to_request(OURS)
+            .expect("the seller must ask for the key");
+        assert_eq!(
+            peer_keys(&request),
+            vec![conversation.message.sender_public_key.clone()]
+        );
+
+        state.on_delegate_response(HarvestDelegateResponse::ConversationKeys {
+            request_id: request_id(&request),
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            result: Ok(vec![conversation.answer()]),
+        });
+
+        match &state.mailbox_entries(OURS)[..] {
+            [crate::messaging::MailboxEntry::Readable { content, .. }] => assert_eq!(
+                content,
+                &crate::messaging::MessageContent::Text(
+                    "is the blue one still available?".to_string()
+                )
+            ),
+            other => panic!("the seller should be able to read it now: {other:?}"),
+        }
+    }
+
+    /// **A buyer must not ask for keys against a stranger's mailbox.**
+    ///
+    /// The request names one of OUR identities, so the delegate would answer
+    /// keys derived from our secret -- well-formed, and useless against
+    /// somebody else's messages. Every message would report "cannot be read",
+    /// after one delegate round trip per message per update notification, for
+    /// every store the user opens.
+    #[test]
+    fn a_store_we_do_not_own_asks_for_nothing() {
+        let conversation = conversation("hello");
+        let mut state = state_with(vec![conversation.message]);
+
+        assert!(
+            state.conversation_keys_to_request(A_STRANGERS).is_none(),
+            "browsing a store must not send the delegate a key request"
+        );
+        // Ours does ask, so the assertion above is about ownership rather
+        // than about the fixture having no messages.
+        assert!(state.conversation_keys_to_request(OURS).is_some());
+    }
+
+    /// Mailbox state re-arrives on every update notification, so asking again
+    /// for a key already held would mean one delegate request per message per
+    /// notification, forever.
+    #[test]
+    fn a_key_already_held_is_not_asked_for_again() {
+        let conversation = conversation("hello");
+        let mut state = state_with(vec![conversation.message.clone()]);
+
+        let request = state.conversation_keys_to_request(OURS).expect("asks once");
+        state.on_delegate_response(HarvestDelegateResponse::ConversationKeys {
+            request_id: request_id(&request),
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            result: Ok(vec![conversation.answer()]),
+        });
+
+        assert!(
+            state.conversation_keys_to_request(OURS).is_none(),
+            "the key is already held; asking again is pure churn"
+        );
+    }
+
+    /// The same, for a request that has gone out and not yet been answered.
+    #[test]
+    fn a_key_already_in_flight_is_not_asked_for_twice() {
+        let conversation = conversation("hello");
+        let mut state = state_with(vec![conversation.message]);
+
+        assert!(state.conversation_keys_to_request(OURS).is_some());
+        assert!(
+            state.conversation_keys_to_request(OURS).is_none(),
+            "a second update notification must not re-ask for a key already in flight"
+        );
+    }
+
+    /// An error answer un-asks its keys, so the next mailbox update tries
+    /// again.
+    ///
+    /// Without this the failure is permanent for the life of the tab: the
+    /// keys stay recorded as in-flight against a request that will never be
+    /// answered, and the seller's mailbox reads as unreadable forever with no
+    /// way to retry short of a reload.
+    #[test]
+    fn an_error_answer_lets_the_next_update_retry() {
+        let conversation = conversation("hello");
+        let mut state = state_with(vec![conversation.message]);
+
+        let request = state.conversation_keys_to_request(OURS).expect("asks once");
+        state.on_delegate_response(HarvestDelegateResponse::ConversationKeys {
+            request_id: request_id(&request),
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            result: Err("no encryption key for ghostkey fp1".to_string()),
+        });
+
+        assert!(
+            state.conversation_keys_to_request(OURS).is_some(),
+            "a failed derivation must be retryable"
+        );
+    }
+
+    /// **A tag the delegate declined is never asked about again.**
+    ///
+    /// This test asserted the OPPOSITE when it was written, and the reasoning
+    /// behind that was wrong. I justified re-asking by transient failure --
+    /// but the delegate's omissions are not transient. It drops a peer key
+    /// only when the key is malformed or low-order (`harvest-delegate`'s
+    /// `messaging::derive_conversation_keys`), and both are deterministic
+    /// properties of the bytes: the same tag will be dropped every time.
+    ///
+    /// Because mailbox state re-arrives on every update notification, that
+    /// made ONE message carrying an unusable tag enough to put the seller's
+    /// tab into an unbounded loop -- a fresh `DeriveConversationKeys` on
+    /// every update, for the life of the tab, never answered.
+    ///
+    /// Transient failure is a different case and still retries: it is the
+    /// `Err` answer, where nothing was derived, covered by
+    /// `an_error_answer_lets_the_next_update_retry`.
+    ///
+    /// Observed red against the "stays askable" behaviour this replaces.
+    #[test]
+    fn a_tag_the_delegate_declined_is_not_asked_about_again() {
+        let answered = conversation("answered");
+        let declined = conversation("declined");
+        let mut state = state_with(vec![answered.message.clone(), declined.message.clone()]);
+
+        let request = state.conversation_keys_to_request(OURS).expect("asks");
+        assert_eq!(peer_keys(&request).len(), 2);
+
+        state.on_delegate_response(HarvestDelegateResponse::ConversationKeys {
+            request_id: request_id(&request),
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            result: Ok(vec![answered.answer()]),
+        });
+
+        assert!(
+            state.conversation_keys_to_request(OURS).is_none(),
+            "a tag the delegate will never answer was asked about again"
+        );
+        // And it stays that way however many update notifications arrive.
+        for _ in 0..5 {
+            assert!(state.conversation_keys_to_request(OURS).is_none());
+        }
+    }
+
+    /// A tag that could not possibly be a public key is not sent to the
+    /// delegate at all.
+    ///
+    /// The delegate would drop it, so the round trip buys nothing -- and the
+    /// tag is bounded only by `MAX_MESSAGE_BYTES`, so it is a round trip that
+    /// can carry tens of kilobytes of an attacker's choosing.
+    #[test]
+    fn a_tag_that_cannot_be_a_public_key_is_never_asked_about() {
+        let good = conversation("good");
+        let mut junk = good.message.clone();
+        junk.nonce = [0xEE; 24];
+        junk.sender_public_key = vec![0u8; 60_000];
+
+        let mut state = state_with(vec![good.message.clone(), junk]);
+
+        let request = state.conversation_keys_to_request(OURS).expect("asks");
+        assert_eq!(
+            peer_keys(&request),
+            vec![good.message.sender_public_key.clone()],
+            "an impossible tag was sent to the delegate"
+        );
+    }
+
+    /// Two messages from one buyer share a sender key, so the delegate is
+    /// asked about it once.
+    #[test]
+    fn one_buyer_is_asked_about_once() {
+        let conversation = conversation("first");
+        let mut twice = conversation.message.clone();
+        twice.nonce = [99u8; 24];
+        let mut state = state_with(vec![conversation.message.clone(), twice]);
+
+        let request = state.conversation_keys_to_request(OURS).expect("asks");
+        assert_eq!(peer_keys(&request).len(), 1);
+    }
+
+    /// An answer to a request id we are not waiting on is ignored rather than
+    /// folded in.
+    #[test]
+    fn an_answer_to_an_unknown_request_is_ignored() {
+        let conversation = conversation("hello");
+        let mut state = state_with(vec![conversation.message.clone()]);
+
+        state.on_delegate_response(HarvestDelegateResponse::ConversationKeys {
+            request_id: 4242,
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            result: Ok(vec![conversation.answer()]),
+        });
+
+        assert!(
+            state.conversation_keys.is_empty(),
+            "a key nothing asked for must not be adopted"
+        );
+    }
+
+    /// The certificate verdict and the key the mailbox address is derived
+    /// from are formed together, from the same call, when a store's state
+    /// arrives -- so a store the buyer is told is unverified can never also
+    /// be one the compose box is offered for.
+    ///
+    /// This is the wiring rather than the check; the check is
+    /// `ghostkey_cert::a_stolen_certificate_yields_no_key_to_derive_a_mailbox_from`.
+    /// What it catches is `on_contract_state` setting one and not the other,
+    /// which was the shape of the whole class of defect this repository keeps
+    /// finding: two facts about the same thing, decided in two places.
+    ///
+    /// Observed red on 2026-09-05 by leaving `seller_verifying_key` unset.
+    #[test]
+    fn an_unverified_store_yields_no_key_to_message_it_with() {
+        let mut state = AppState::default();
+        let store_state = harvest_common::store::StoreStateV1::default();
+
+        state.on_contract_state(
+            vec![5u8; 32],
+            harvest_common::to_cbor(&store_state).expect("cbor"),
+        );
+
+        let store = state
+            .browsing_stores
+            .get(&vec![5u8; 32])
+            .expect("the store state should have been adopted");
+        assert!(
+            !store.certificate_status.is_verified(),
+            "precondition: a default store carries no certificate"
+        );
+        assert_eq!(
+            store.seller_verifying_key, None,
+            "a store whose certificate does not verify must name no mailbox"
+        );
+    }
+
+    /// **The answer is paired by echoed tag, not by position.**
+    ///
+    /// The delegate drops peer keys it cannot use -- malformed, or low-order
+    /// -- so a SHORT answer is ordinary rather than exceptional, and the
+    /// delegate's own test calls the positional case "the mutation that
+    /// matters". But that test proves the DELEGATE echoes the tag. It cannot
+    /// prove the consumer uses it, and the consumer is the only side that
+    /// could correlate positionally, because it is the side holding the list
+    /// of what was asked.
+    ///
+    /// So the guard lived on one side of the boundary and the thing it
+    /// guarded on the other. Verified: replacing the echo with
+    /// `asked.into_iter().zip(keys)` passed all 216 tests.
+    ///
+    /// Observed red on 2026-09-05 with exactly that mutation.
+    #[test]
+    fn a_short_answer_does_not_hand_one_buyers_key_to_another() {
+        let first = conversation("first");
+        let second = conversation("second");
+        let mut state = state_with(vec![first.message.clone(), second.message.clone()]);
+
+        let request = state.conversation_keys_to_request(OURS).expect("asks");
+        let asked = peer_keys(&request);
+        assert_eq!(asked.len(), 2, "precondition: both tags were asked about");
+        assert_eq!(
+            asked[0], first.message.sender_public_key,
+            "precondition: the FIRST tag asked about is the one left unanswered below, \
+             so a positional pairing would misfile the answer rather than drop it"
+        );
+
+        // The delegate answers only the SECOND. Positional correlation would
+        // file that key under the first tag.
+        state.on_delegate_response(HarvestDelegateResponse::ConversationKeys {
+            request_id: request_id(&request),
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            result: Ok(vec![second.answer()]),
+        });
+
+        assert!(
+            !state
+                .conversation_keys
+                .contains_key(&first.message.sender_public_key),
+            "a key was filed under a tag the delegate did not answer"
+        );
+        let filed = state
+            .conversation_keys
+            .get(&second.message.sender_public_key)
+            .expect("the answered tag must have its key");
+        assert_eq!(filed.to_seller, second.answer().buyer_to_seller);
+        assert_eq!(filed.from_seller, second.answer().seller_to_buyer);
+    }
+
+    /// The same, end to end: with the answer REORDERED, both buyers'
+    /// messages still decrypt.
+    ///
+    /// A positional pairing survives the test above only by luck of which tag
+    /// was dropped; it cannot survive this one at all, because every key is
+    /// present and simply in the wrong order.
+    #[test]
+    fn a_reordered_answer_still_decrypts_both_buyers() {
+        let first = conversation("from the first buyer");
+        let second = conversation("from the second buyer");
+        let mut state = state_with(vec![first.message.clone(), second.message.clone()]);
+
+        let request = state.conversation_keys_to_request(OURS).expect("asks");
+        state.on_delegate_response(HarvestDelegateResponse::ConversationKeys {
+            request_id: request_id(&request),
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            // Reversed relative to the order they were asked in.
+            result: Ok(vec![second.answer(), first.answer()]),
+        });
+
+        let readable: Vec<String> = state
+            .mailbox_entries(OURS)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                crate::messaging::MailboxEntry::Readable {
+                    content: crate::messaging::MessageContent::Text(text),
+                    ..
+                } => Some(text),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            readable.len(),
+            2,
+            "both buyers' messages must decrypt regardless of the answer's order: {readable:?}"
+        );
+        assert!(readable.contains(&"from the first buyer".to_string()));
+        assert!(readable.contains(&"from the second buyer".to_string()));
+    }
+
+    /// The delegate's `EncryptionKeyReady` lands where publishing reads it.
+    #[test]
+    fn the_encryption_key_is_recorded_for_publishing() {
+        let mut state = AppState::default();
+        state.on_delegate_response(HarvestDelegateResponse::EncryptionKeyReady {
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            x25519_public_key: vec![7u8; 32],
+        });
+        assert_eq!(
+            state.encryption_public_keys.get(FINGERPRINT),
+            Some(&[7u8; 32])
+        );
+    }
+
+    /// **The encryption key is filed under the fingerprint the DELEGATE
+    /// named**, not under whichever identity happens to be in flight.
+    ///
+    /// The same producer/consumer split as
+    /// `a_short_answer_does_not_hand_one_buyers_key_to_another`: the delegate
+    /// has a test proving two identities get different keys, and that test
+    /// cannot say anything about where the consumer files them. A key filed
+    /// under the wrong identity is published in that identity's signed store
+    /// details, so every buyer encrypts to a key the seller cannot read --
+    /// permanently, in a record they cannot retract.
+    ///
+    /// Observed red by filing under `pending_store_creation`'s fingerprint
+    /// instead of the response's.
+    #[test]
+    fn an_encryption_key_is_filed_under_the_identity_the_delegate_named() {
+        // An unrelated creation in flight, which is the value a consumer
+        // reaching for the wrong fingerprint would most naturally pick up.
+        let mut state = AppState {
+            pending_store_creation: Some(PendingStoreCreation {
+                ghostkey_fingerprint: "someone-else".to_string(),
+                seller_verifying_key_bytes: [0u8; 32],
+                certificate_pem: String::new(),
+                store_name: String::new(),
+                description: String::new(),
+                payment_instructions: String::new(),
+                rsa_public_key_der: None,
+                encryption_public_key: None,
+            }),
+            ..AppState::default()
+        };
+
+        state.on_delegate_response(HarvestDelegateResponse::EncryptionKeyReady {
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            x25519_public_key: vec![7u8; 32],
+        });
+
+        assert_eq!(
+            state.encryption_public_keys.get(FINGERPRINT),
+            Some(&[7u8; 32]),
+            "the key must be filed under the identity the delegate answered about"
+        );
+        assert!(
+            !state.encryption_public_keys.contains_key("someone-else"),
+            "a key was filed under an identity the delegate said nothing about"
+        );
+        assert_eq!(
+            state
+                .pending_store_creation
+                .as_ref()
+                .and_then(|p| p.encryption_public_key),
+            None,
+            "a creation for a different identity must not adopt this key"
+        );
+    }
+
+    /// A key of the wrong length is refused rather than truncated or padded
+    /// into something the seller would publish and no buyer could use.
+    #[test]
+    fn a_wrong_length_encryption_key_is_refused() {
+        let mut state = AppState::default();
+        state.on_delegate_response(HarvestDelegateResponse::EncryptionKeyReady {
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            x25519_public_key: vec![7u8; 31],
+        });
+        assert!(state.encryption_public_keys.is_empty());
+        assert!(
+            state.notifications.iter().any(|n| n.contains("encryption")),
+            "the seller must be told, or the key silently never appears: {:?}",
+            state.notifications
+        );
+    }
+}
+
+/// The reply path: a buyer's thread with a store, and the seller's answer,
+/// both carried by the seller's own mailbox.
+///
+/// Every one of these runs on the host. The only wasm-gated part is the
+/// dispatch, which is why the decisions live here.
+#[cfg(test)]
+mod conversation_tests {
+    use super::*;
+    use crate::messaging::MessageContent;
+    use harvest_common::mailbox::{conversation_key_from_dh, EncryptedMessage, MessageDirection};
+    use harvest_common::ConversationKey;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    const STORE: &[u8] = &[1u8; 32];
+    const FINGERPRINT: &str = "fp1";
+
+    fn seller_secret() -> StaticSecret {
+        StaticSecret::from([21u8; 32])
+    }
+
+    fn seller_public() -> [u8; 32] {
+        *PublicKey::from(&seller_secret()).as_bytes()
+    }
+
+    /// A browser that is only browsing: it owns no store.
+    fn buyer_state() -> AppState {
+        let mut state = AppState::default();
+        state.browsing_stores.entry(STORE.to_vec()).or_default();
+        state
+    }
+
+    /// A browser whose connected identity owns the store, so the seller's
+    /// half of the path is reachable.
+    fn seller_state() -> AppState {
+        let mut state = AppState::default();
+        state.my_stores.insert(
+            FINGERPRINT.to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![3u8; 32],
+                mailbox_contract_id: vec![4u8; 32],
+                store_contract_key: None,
+            }],
+        );
+        state.browsing_stores.entry(STORE.to_vec()).or_default();
+        state
+    }
+
+    /// The answer the delegate would give for one conversation tag.
+    fn delegate_answer(tag: &[u8]) -> ConversationKey {
+        let peer: [u8; 32] = tag.try_into().expect("32-byte tag");
+        let shared = seller_secret()
+            .diffie_hellman(&PublicKey::from(peer))
+            .to_bytes();
+        ConversationKey {
+            peer_public_key: tag.to_vec(),
+            buyer_to_seller: conversation_key_from_dh(&shared, MessageDirection::BuyerToSeller),
+            seller_to_buyer: conversation_key_from_dh(&shared, MessageDirection::SellerToBuyer),
+        }
+    }
+
+    /// Put a message into the store's mailbox as the network would.
+    fn deliver(state: &mut AppState, message: EncryptedMessage) {
+        state
+            .browsing_stores
+            .entry(STORE.to_vec())
+            .or_default()
+            .mailbox_messages
+            .push(message);
+    }
+
+    fn text(content: &MessageContent) -> &str {
+        match content {
+            MessageContent::Text(text) => text,
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// One conversation per store, reused.
+    ///
+    /// A second message that opened a NEW conversation would be readable by
+    /// the seller, so nothing would look broken -- but the reply to the first
+    /// message would become unreadable the moment the second was sent, and
+    /// the buyer would see a thread that silently loses its own history.
+    #[test]
+    fn a_second_message_continues_the_same_conversation() {
+        let mut state = buyer_state();
+
+        let first = state
+            .compose_to_seller(STORE, &seller_public(), "hello".into())
+            .expect("compose");
+        let second = state
+            .compose_to_seller(STORE, &seller_public(), "still there?".into())
+            .expect("compose");
+
+        assert_eq!(
+            first.sender_public_key, second.sender_public_key,
+            "a second message must continue the conversation, not open a new one"
+        );
+        assert_ne!(first.nonce, second.nonce);
+    }
+
+    /// **The path the whole next phase rests on**, end to end through
+    /// `AppState`: buyer writes, seller reads, seller replies into their own
+    /// mailbox, buyer reads the reply. No buyer mailbox, no buyer identity.
+    #[test]
+    fn a_seller_replies_into_their_own_mailbox_and_the_buyer_reads_it() {
+        // The buyer's browser.
+        let mut buyer = buyer_state();
+        let question = buyer
+            .compose_to_seller(STORE, &seller_public(), "do you ship to Ireland?".into())
+            .expect("compose");
+
+        // The seller's browser: the same mailbox, and the delegate round
+        // trip driven the way the real one is -- ask, then answer the id that
+        // was asked. An answer to an id nothing asked for is ignored, which
+        // is its own test.
+        let mut seller = seller_state();
+        deliver(&mut seller, question.clone());
+        let asked = seller.conversation_keys_to_request(STORE).expect("asks");
+        let request_id = match &asked {
+            harvest_common::HarvestDelegateRequest::DeriveConversationKeys {
+                request_id, ..
+            } => *request_id,
+            other => panic!("expected DeriveConversationKeys, got {other:?}"),
+        };
+        seller.on_delegate_response(HarvestDelegateResponse::ConversationKeys {
+            request_id,
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            result: Ok(vec![delegate_answer(&question.sender_public_key)]),
+        });
+
+        // The seller can read it, and can answer it.
+        let inbox = seller.mailbox_entries(STORE);
+        assert_eq!(inbox.len(), 1);
+        let reply = seller
+            .compose_reply(
+                STORE,
+                &question.sender_public_key,
+                "yes, ten euro postage".into(),
+            )
+            .expect("the seller must be able to reply");
+
+        // The reply reaches the buyer through the same mailbox.
+        deliver(&mut buyer, question.clone());
+        deliver(&mut buyer, reply);
+
+        let thread = buyer.conversation_thread(STORE);
+        assert_eq!(thread.len(), 2, "the buyer sees both halves");
+        assert_eq!(thread[0].addressing, crate::messaging::Addressing::ToSeller);
+        assert_eq!(
+            thread[1].addressing,
+            crate::messaging::Addressing::ToBuyer,
+            "the reply is addressed to the buyer"
+        );
+        assert_eq!(text(&thread[1].content), "yes, ten euro postage");
+    }
+
+    /// A seller cannot reply to a conversation they have not read.
+    ///
+    /// The reply has to name the conversation id the buyer chose, and the
+    /// only place that id exists is inside a message the seller decrypted --
+    /// so "reply" without "read" is not a thing that can be done, and saying
+    /// so is better than sending something the buyer silently discards.
+    #[test]
+    fn a_seller_cannot_reply_to_a_conversation_they_have_not_read() {
+        let mut seller = seller_state();
+        // The key is present, so this is not the "no key yet" refusal -- it
+        // is the one about there being no conversation.
+        let tag = {
+            let buyer = crate::messaging::BuyerConversation::open(&seller_public()).expect("open");
+            buyer.buyer_public_key.to_vec()
+        };
+        let answer = delegate_answer(&tag);
+        seller.conversation_keys.insert(
+            tag.clone(),
+            crate::messaging::ConversationKeys {
+                to_seller: answer.buyer_to_seller,
+                from_seller: answer.seller_to_buyer,
+            },
+        );
+
+        let error = seller
+            .compose_reply(STORE, &tag, "hello?".into())
+            .expect_err("must refuse");
+        assert!(
+            error.contains("no message"),
+            "the refusal must say what is missing: {error}"
+        );
+    }
+
+    /// The other refusal, kept separate because it is a different situation
+    /// with a different fix: the delegate has not answered yet, so waiting
+    /// helps.
+    #[test]
+    fn a_seller_without_the_key_is_told_to_wait_rather_than_told_there_is_no_conversation() {
+        let seller = seller_state();
+        let error = seller
+            .compose_reply(STORE, &[9u8; 32], "hello?".into())
+            .expect_err("must refuse");
+        assert!(
+            error.contains("delegate has not produced"),
+            "a missing key must not be reported as a missing conversation: {error}"
+        );
+    }
+
+    /// And a browser that does not own the store cannot reply into its
+    /// mailbox at all -- it holds no key for the conversation and would be
+    /// writing bytes nobody can read.
+    #[test]
+    fn a_buyer_cannot_reply_on_a_sellers_behalf() {
+        let mut buyer = buyer_state();
+        let question = buyer
+            .compose_to_seller(STORE, &seller_public(), "hello".into())
+            .expect("compose");
+        deliver(&mut buyer, question.clone());
+
+        let error = buyer
+            .compose_reply(
+                STORE,
+                &question.sender_public_key,
+                "not mine to send".into(),
+            )
+            .expect_err("must refuse");
+        assert!(error.contains("not one of yours"), "got: {error}");
+    }
+
+    /// A message is unconfirmed until it turns up in the mailbox the buyer
+    /// re-reads. That is the only delivery evidence Harvest has, and the
+    /// distinction is what the UI shows instead of claiming delivery.
+    #[test]
+    fn a_sent_message_is_unconfirmed_until_it_appears_in_the_mailbox() {
+        let mut buyer = buyer_state();
+        let sent = buyer
+            .compose_to_seller(STORE, &seller_public(), "hello".into())
+            .expect("compose");
+        buyer.record_sent_message(STORE, "hello".into(), &sent);
+
+        assert_eq!(
+            buyer.unconfirmed_sent(STORE).len(),
+            1,
+            "nothing has come back from the network yet"
+        );
+
+        deliver(&mut buyer, sent);
+        assert!(
+            buyer.unconfirmed_sent(STORE).is_empty(),
+            "a message visible in the seller's mailbox has demonstrably landed"
+        );
+    }
+
+    /// A store this browser has never written to has no thread, rather than
+    /// a panic or an empty conversation that looks like one.
+    #[test]
+    fn a_store_with_no_conversation_has_no_thread() {
+        let state = buyer_state();
+        assert!(state.conversation_thread(STORE).is_empty());
+        assert!(state.unconfirmed_sent(STORE).is_empty());
+    }
+}
+
+/// The delegate/UI boundary: every answer is filed against the identity the
+/// DELEGATE named, never against whatever this client had in flight.
+///
+/// # Why these are a group
+///
+/// Each of these responses carries an identity, and the consumer is the only
+/// side that could file it under a different one. A delegate test proving it
+/// answers about the right identity cannot say anything about that, because
+/// the consumer is the side holding the local state a wrong answer would be
+/// filed against. The same gap in `on_conversation_keys` passed all 216 tests
+/// (`a_short_answer_does_not_hand_one_buyers_key_to_another`), so these are
+/// the rest of the boundary rather than a hypothetical.
+///
+/// The Bitcoin surface already had its consumer-side test
+/// (`invoice_tests::...` on `pending_invoices`), and its comment is worth
+/// reading beside these: it records that with a `HashMap` instead of a
+/// `BTreeMap` the positional shortcut passes "about half the time", which is
+/// why a correlation test that happens to pass is not evidence of a
+/// correlation.
+#[cfg(test)]
+mod delegate_correlation_tests {
+    use super::*;
+
+    const OURS: &str = "fp-ours";
+    const THEIRS: &str = "fp-theirs";
+
+    /// A creation in flight for a DIFFERENT identity -- the value a consumer
+    /// reaching for the wrong fingerprint would most naturally pick up.
+    fn with_another_creation_in_flight() -> AppState {
+        AppState {
+            pending_store_creation: Some(PendingStoreCreation {
+                ghostkey_fingerprint: THEIRS.to_string(),
+                seller_verifying_key_bytes: [0u8; 32],
+                // Empty on purpose: `start_store_creation_if_ready` gates on
+                // the certificate, so the creation cannot complete and be
+                // taken out from under these tests. They are about where an
+                // answer is FILED, not about the creation gate.
+                certificate_pem: String::new(),
+                store_name: "Theirs".to_string(),
+                description: String::new(),
+                payment_instructions: String::new(),
+                rsa_public_key_der: None,
+                encryption_public_key: None,
+            }),
+            ..AppState::default()
+        }
+    }
+
+    /// **The RSA key decides where the reputation contract LIVES.**
+    ///
+    /// `ReputationParameters` carries the RSA public key, and a contract's
+    /// address is `BLAKE3(code_hash || cbor(parameters))` -- so a key filed
+    /// under the wrong identity puts that identity's reputation contract at an
+    /// address derived from somebody else's key. The store then publishes a
+    /// reputation link pointing at a contract nobody owns, inside a signed
+    /// record, and every buyer follows it to nothing.
+    ///
+    /// Observed red by filing under `pending_store_creation`'s fingerprint.
+    #[test]
+    fn an_rsa_key_is_filed_under_the_identity_the_delegate_named() {
+        let mut state = with_another_creation_in_flight();
+
+        state.on_delegate_response(HarvestDelegateResponse::ReputationKeysInitialized {
+            ghostkey_fingerprint: OURS.to_string(),
+            rsa_public_key_der: vec![7u8; 16],
+        });
+
+        assert_eq!(
+            state.rsa_public_keys.get(OURS),
+            Some(&vec![7u8; 16]),
+            "the key must be filed under the identity the delegate answered about"
+        );
+        assert!(
+            !state.rsa_public_keys.contains_key(THEIRS),
+            "a key was filed under an identity the delegate said nothing about"
+        );
+    }
+
+    /// And the creation waiting on a DIFFERENT identity must not adopt it.
+    ///
+    /// This is the sharper half: adopting it would let the creation proceed
+    /// (`start_store_creation_if_ready` gates on this field being `Some`) and
+    /// publish a store whose reputation contract is addressed by another
+    /// seller's key. The guard is the `pending.ghostkey_fingerprint ==
+    /// ghostkey_fingerprint` check.
+    ///
+    /// Observed red by removing that check.
+    #[test]
+    fn a_creation_does_not_adopt_another_identitys_rsa_key() {
+        let mut state = with_another_creation_in_flight();
+
+        state.on_delegate_response(HarvestDelegateResponse::ReputationKeysInitialized {
+            ghostkey_fingerprint: OURS.to_string(),
+            rsa_public_key_der: vec![7u8; 16],
+        });
+
+        assert_eq!(
+            state
+                .pending_store_creation
+                .as_ref()
+                .and_then(|p| p.rsa_public_key_der.clone()),
+            None,
+            "a creation adopted an RSA key answered about a different identity"
+        );
+
+        // The matching answer IS adopted, so the assertion above is not
+        // passing because the field is never filled.
+        state.on_delegate_response(HarvestDelegateResponse::ReputationKeysInitialized {
+            ghostkey_fingerprint: THEIRS.to_string(),
+            rsa_public_key_der: vec![8u8; 16],
+        });
+        assert_eq!(
+            state
+                .pending_store_creation
+                .as_ref()
+                .and_then(|p| p.rsa_public_key_der.clone()),
+            Some(vec![8u8; 16])
+        );
+    }
+
+    /// `RsaPublicKey` is the other response carrying the same value, for an
+    /// identity that already had keys, and files it the same way.
+    #[test]
+    fn a_recalled_rsa_key_is_filed_under_the_identity_the_delegate_named() {
+        let mut state = with_another_creation_in_flight();
+
+        state.on_delegate_response(HarvestDelegateResponse::RsaPublicKey {
+            ghostkey_fingerprint: OURS.to_string(),
+            rsa_public_key_der: vec![5u8; 16],
+        });
+
+        assert_eq!(state.rsa_public_keys.get(OURS), Some(&vec![5u8; 16]));
+        assert!(!state.rsa_public_keys.contains_key(THEIRS));
+    }
+
+    /// **A store registry filed under the wrong identity makes somebody
+    /// else's stores look like yours.**
+    ///
+    /// `my_stores` is what decides which stores this client will publish
+    /// details for, issue invoices on, and treat as owned when reading a
+    /// mailbox (`store_owner_fingerprint`). Filing another identity's
+    /// registrations under this one offers the seller controls over contracts
+    /// they cannot sign for.
+    ///
+    /// Observed red by filing under `pending_store_creation`'s fingerprint.
+    #[test]
+    fn a_store_list_is_filed_under_the_identity_the_delegate_named() {
+        let mut state = with_another_creation_in_flight();
+
+        state.on_delegate_response(HarvestDelegateResponse::StoreList {
+            ghostkey_fingerprint: OURS.to_string(),
+            stores: vec![StoreRegistration {
+                store_contract_id: vec![1u8; 32],
+                reputation_contract_id: vec![2u8; 32],
+                mailbox_contract_id: vec![3u8; 32],
+                store_contract_key: None,
+            }],
+        });
+
+        assert_eq!(
+            state.my_stores.get(OURS).map(|s| s.len()),
+            Some(1),
+            "the registry must be filed under the identity the delegate answered about"
+        );
+        assert!(
+            !state.my_stores.contains_key(THEIRS),
+            "another identity was given stores it does not own"
+        );
+    }
+}
+
+/// The buyer's conversation outliving the tab that opened it.
+///
+/// This is the half the whole mechanism exists for: the seller's reply is
+/// readable after a reload, because the delegate kept the secret that reads
+/// it. The delegate's own half is tested in `harvest-delegate`'s
+/// `messaging::buyer_conversation_tests`; what these pin is what this browser
+/// SENDS it and what it does with the answer.
+#[cfg(test)]
+mod buyer_persistence_tests {
+    use super::*;
+    use crate::messaging::MessageContent;
+    use harvest_common::mailbox::{conversation_key_from_dh, EncryptedMessage, MessageDirection};
+    use harvest_common::{HarvestDelegateRequest, RecalledConversation};
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    const STORE: &[u8] = &[1u8; 32];
+
+    fn seller_secret() -> StaticSecret {
+        StaticSecret::from([21u8; 32])
+    }
+
+    fn seller_public() -> [u8; 32] {
+        *PublicKey::from(&seller_secret()).as_bytes()
+    }
+
+    /// A registered harvest delegate, which every request here needs
+    /// somewhere to go.
+    fn a_delegate_key() -> freenet_stdlib::prelude::DelegateKey {
+        freenet_stdlib::prelude::DelegateKey::new(
+            [0xA1; 32],
+            freenet_stdlib::prelude::CodeHash::new([0xA1; 32]),
+        )
+    }
+
+    /// The seller's Ed25519 identity, which is what the mailbox address is
+    /// derived from.
+    fn seller_identity() -> [u8; 32] {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+            .verifying_key()
+            .to_bytes()
+    }
+
+    /// A browser that is only browsing, with the store's details in hand and
+    /// the harvest delegate registered.
+    fn buyer_state() -> AppState {
+        let mut state = AppState {
+            harvest_delegate_key: Some(a_delegate_key()),
+            ..AppState::default()
+        };
+        let store = state.browsing_stores.entry(STORE.to_vec()).or_default();
+        store.seller_verifying_key = Some(seller_identity());
+        state
+    }
+
+    fn deliver(state: &mut AppState, message: EncryptedMessage) {
+        state
+            .browsing_stores
+            .entry(STORE.to_vec())
+            .or_default()
+            .mailbox_messages
+            .push(message);
+    }
+
+    /// Answer the recall this state actually issued.
+    ///
+    /// Driven as the round trip rather than by handing `AppState` a
+    /// fabricated answer: an answer nothing asked for is ignored, so a test
+    /// that skipped the question would be asserting against a path the app
+    /// never takes.
+    fn deliver_recall(state: &mut AppState, conversations: Vec<RecalledConversation>) {
+        let request_id = match state.buyer_conversations_to_recall(STORE) {
+            Some(HarvestDelegateRequest::ListBuyerConversations { request_id, .. }) => request_id,
+            other => panic!("expected a recall to be asked for, got {other:?}"),
+        };
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationList {
+            request_id,
+            store_contract_id: STORE.to_vec(),
+            conversations,
+        });
+    }
+
+    fn text(content: &MessageContent) -> &str {
+        match content {
+            MessageContent::Text(text) => text,
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// What the delegate was asked to keep.
+    fn kept(request: &HarvestDelegateRequest) -> ([u8; 32], [u8; 32], [u8; 32], i64) {
+        match request {
+            HarvestDelegateRequest::StoreBuyerConversation {
+                store_contract_id,
+                secret,
+                seller_public_key,
+                conversation_id,
+                created_at,
+                ..
+            } => {
+                assert_eq!(store_contract_id, STORE, "kept against the wrong store");
+                (secret.0, *seller_public_key, *conversation_id, *created_at)
+            }
+            other => panic!("expected StoreBuyerConversation, got {other:?}"),
+        }
+    }
+
+    /// **What the delegate answers on the next page load**, computed the way
+    /// the delegate computes it -- from the secret it was given and the
+    /// seller key it was given, with `harvest_common`'s own derivation, which
+    /// is the one function both sides share.
+    fn delegate_recalls(request: &HarvestDelegateRequest) -> RecalledConversation {
+        let (secret, seller_public_key, conversation_id, created_at) = kept(request);
+        let secret = StaticSecret::from(secret);
+        let shared = secret
+            .diffie_hellman(&PublicKey::from(seller_public_key))
+            .to_bytes();
+        RecalledConversation {
+            buyer_public_key: *PublicKey::from(&secret).as_bytes(),
+            conversation_id,
+            buyer_to_seller: conversation_key_from_dh(&shared, MessageDirection::BuyerToSeller),
+            seller_to_buyer: conversation_key_from_dh(&shared, MessageDirection::SellerToBuyer),
+            created_at,
+            // A conversation just handed to the delegate has not been saved
+            // anywhere by the buyer, and was opened here rather than
+            // restored.
+            imported: false,
+            backed_up: false,
+        }
+    }
+
+    /// **The reply survives the tab.**
+    ///
+    /// A buyer asks a question, closes the tab, and comes back. The seller's
+    /// answer is in the mailbox and this browser has never seen the key that
+    /// reads it -- only the delegate has. Without this the answer is
+    /// ciphertext nobody can read, including the buyer who asked.
+    #[test]
+    fn a_reply_is_readable_after_the_tab_that_asked_is_gone() {
+        // The tab that asks.
+        let mut first_tab = buyer_state();
+        let question = first_tab
+            .compose_to_seller(STORE, &seller_public(), "do you ship to Ireland?".into())
+            .expect("compose");
+        let keep = first_tab
+            .conversation_to_keep(STORE, &seller_public())
+            .expect("the delegate must be asked to keep this conversation");
+
+        // The seller answers, into their own mailbox, encrypted under the
+        // conversation the buyer opened.
+        let shared = seller_secret()
+            .diffie_hellman(&PublicKey::from(
+                <[u8; 32]>::try_from(question.sender_public_key.as_slice()).expect("32 bytes"),
+            ))
+            .to_bytes();
+        let reply = crate::messaging::seal_reply(
+            &crate::messaging::ConversationKeys::from_shared_secret(&shared),
+            &question.sender_public_key,
+            &question.conversation_id,
+            "yes, ten euro postage".into(),
+        )
+        .expect("seal reply");
+
+        // A new tab: nothing carried over but what the node kept.
+        let mut second_tab = buyer_state();
+        deliver(&mut second_tab, question.clone());
+        deliver(&mut second_tab, reply);
+        assert!(
+            second_tab.conversation_thread(STORE).is_empty(),
+            "precondition: a fresh tab holds no conversation of its own"
+        );
+
+        deliver_recall(&mut second_tab, vec![delegate_recalls(&keep)]);
+
+        let thread = second_tab.conversation_thread(STORE);
+        assert_eq!(
+            thread.len(),
+            2,
+            "the recalled conversation reads its thread"
+        );
+        assert_eq!(text(&thread[0].content), "do you ship to Ireland?");
+        assert_eq!(text(&thread[1].content), "yes, ten euro postage");
+        assert_eq!(
+            thread[1].addressing,
+            crate::messaging::Addressing::ToBuyer,
+            "the reply is addressed to the buyer"
+        );
+    }
+
+    /// **Sending a message is what asks the node to keep the key.**
+    ///
+    /// The tests around this one call `conversation_to_keep` directly, so
+    /// every one of them would still pass if the send path never asked. This
+    /// is the one that pins the real path: a buyer who never opens a second
+    /// tab must not have to do anything extra for the reply to survive.
+    #[test]
+    fn sending_a_message_asks_the_node_to_keep_the_conversation() {
+        let mut state = buyer_state();
+        state
+            .compose_to_seller(STORE, &seller_public(), "hello".into())
+            .expect("compose");
+        let asked: Vec<&Vec<u8>> = state.pending_conversation_persists.values().collect();
+        assert_eq!(
+            asked,
+            vec![&STORE.to_vec()],
+            "sending a message did not ask this node to keep the key that reads the reply"
+        );
+    }
+
+    /// **The delegate files the conversation under the tag the mailbox
+    /// carries.**
+    ///
+    /// This is the seam between the two crates. The delegate derives the
+    /// routing tag from the secret it is sent rather than being told it, so
+    /// what this browser sends decides the tag a later recall comes back
+    /// under -- and if that were not the tag on the messages, recall would
+    /// answer a conversation that reads an empty thread, with nothing
+    /// anywhere reporting a fault.
+    #[test]
+    fn the_delegate_files_a_conversation_under_the_tag_the_mailbox_carries() {
+        let mut state = buyer_state();
+        let message = state
+            .compose_to_seller(STORE, &seller_public(), "hello".into())
+            .expect("compose");
+        let keep = state
+            .conversation_to_keep(STORE, &seller_public())
+            .expect("must ask");
+        let (secret, seller_public_key, conversation_id, _) = kept(&keep);
+
+        assert_eq!(
+            PublicKey::from(&StaticSecret::from(secret))
+                .as_bytes()
+                .to_vec(),
+            message.sender_public_key,
+            "the delegate would file this under a tag no message in the mailbox carries"
+        );
+        assert_eq!(
+            seller_public_key,
+            seller_public(),
+            "recall derives against the stored seller key, so a wrong one is unreadable keys"
+        );
+        assert_eq!(conversation_id, message.conversation_id.0);
+    }
+
+    /// A recalled conversation is the one a new message continues, so a
+    /// returning buyer writes into their existing thread rather than opening
+    /// a second one beside it.
+    #[test]
+    fn a_new_message_continues_the_recalled_conversation() {
+        let mut first_tab = buyer_state();
+        let first = first_tab
+            .compose_to_seller(STORE, &seller_public(), "hello".into())
+            .expect("compose");
+        let keep = first_tab
+            .conversation_to_keep(STORE, &seller_public())
+            .expect("must ask");
+
+        let mut second_tab = buyer_state();
+        deliver_recall(&mut second_tab, vec![delegate_recalls(&keep)]);
+        let second = second_tab
+            .compose_to_seller(STORE, &seller_public(), "still there?".into())
+            .expect("compose");
+
+        assert_eq!(
+            first.sender_public_key, second.sender_public_key,
+            "the returning buyer opened a new conversation instead of continuing theirs"
+        );
+        assert_eq!(first.conversation_id, second.conversation_id);
+    }
+
+    /// **Recall re-subscribes to the seller's mailbox.**
+    ///
+    /// Browsing a storefront deliberately does not subscribe -- that would
+    /// advertise a standing interest in a seller's mailbox for a reader who
+    /// never wrote to them. A non-empty recall is the evidence that this node
+    /// HAS written, and without re-subscribing the buyer holds the key to a
+    /// reply they never fetch.
+    #[test]
+    fn recalling_conversations_subscribes_to_the_sellers_mailbox() {
+        let mut state = buyer_state();
+        let keep = {
+            let mut first_tab = buyer_state();
+            first_tab
+                .compose_to_seller(STORE, &seller_public(), "hello".into())
+                .expect("compose");
+            first_tab
+                .conversation_to_keep(STORE, &seller_public())
+                .expect("must ask")
+        };
+        assert!(
+            state.browsing_stores[STORE].mailbox_contract_id.is_none(),
+            "precondition: browsing alone subscribes to nothing"
+        );
+
+        deliver_recall(&mut state, vec![delegate_recalls(&keep)]);
+
+        let mailbox = state.browsing_stores[STORE]
+            .mailbox_contract_id
+            .clone()
+            .expect("the seller's mailbox must be subscribed to, or no reply is ever fetched");
+        let expected = crate::gateway::mailbox_ops::mailbox_contract_key(
+            &ed25519_dalek::VerifyingKey::from_bytes(&seller_identity()).expect("key"),
+        )
+        .expect("mailbox address");
+        assert_eq!(mailbox, expected.id().as_bytes().to_vec());
+    }
+
+    /// An empty answer subscribes to nothing: a reader who has never written
+    /// to this seller must not advertise an interest in their mailbox.
+    #[test]
+    fn recalling_nothing_subscribes_to_nothing() {
+        let mut state = buyer_state();
+        deliver_recall(&mut state, Vec::new());
+        assert!(state.browsing_stores[STORE].mailbox_contract_id.is_none());
+        assert!(state.mailbox_to_store.is_empty());
+    }
+
+    /// A store is asked once. Store state re-arrives on every update
+    /// notification, and the answer cannot change between two of them.
+    #[test]
+    fn a_store_is_asked_for_its_kept_conversations_once() {
+        let mut state = buyer_state();
+        match state.buyer_conversations_to_recall(STORE) {
+            Some(HarvestDelegateRequest::ListBuyerConversations {
+                store_contract_id, ..
+            }) => assert_eq!(store_contract_id, STORE),
+            other => panic!("expected a recall, got {other:?}"),
+        }
+        assert!(
+            state.buyer_conversations_to_recall(STORE).is_none(),
+            "a second arrival of the same store state asked again"
+        );
+    }
+
+    /// **Every conversation with the store is read, not just the newest.**
+    ///
+    /// A buyer who wrote last week and writes again today has two, and the
+    /// older thread is where the reply they are waiting for is. Reading only
+    /// the active one would lose it silently -- the messages stay visibly in
+    /// the mailbox and simply never appear.
+    #[test]
+    fn every_conversation_with_a_store_is_read() {
+        let mut old_tab = buyer_state();
+        let old_question = old_tab
+            .compose_to_seller(STORE, &seller_public(), "asked last week".into())
+            .expect("compose");
+        let kept_last_week = old_tab
+            .conversation_to_keep(STORE, &seller_public())
+            .expect("must ask");
+
+        // Today: the buyer writes before the recall answer arrives, which is
+        // the documented race -- so they open a SECOND conversation with the
+        // same store. The older one must still be readable.
+        let mut today = buyer_state();
+        let new_question = today
+            .compose_to_seller(STORE, &seller_public(), "asked today".into())
+            .expect("compose");
+        deliver_recall(
+            &mut today,
+            vec![RecalledConversation {
+                // Older than anything opened in this tab, so it sorts first
+                // and a further message still continues today's.
+                created_at: 0,
+                ..delegate_recalls(&kept_last_week)
+            }],
+        );
+        assert_ne!(
+            old_question.sender_public_key, new_question.sender_public_key,
+            "precondition: these are two different conversations"
+        );
+
+        deliver(&mut today, old_question);
+        deliver(&mut today, new_question);
+
+        let thread = today.conversation_thread(STORE);
+        let said: Vec<&str> = thread.iter().map(|m| text(&m.content)).collect();
+        assert!(
+            said.contains(&"asked last week") && said.contains(&"asked today"),
+            "an older conversation with this store went unread: {said:?}"
+        );
+    }
+
+    /// An answer nothing asked for contributes nothing.
+    ///
+    /// The same rule as the seller's `on_conversation_keys`: acting on an
+    /// unrequested answer would let a stray or replayed message put
+    /// conversations on screen that this browser never asked about.
+    #[test]
+    fn a_recall_answer_nothing_asked_for_is_ignored() {
+        let mut state = buyer_state();
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationList {
+            request_id: 9999,
+            store_contract_id: STORE.to_vec(),
+            conversations: vec![delegate_recalls(&{
+                let mut tab = buyer_state();
+                tab.compose_to_seller(STORE, &seller_public(), "hello".into())
+                    .expect("compose");
+                tab.conversation_to_keep(STORE, &seller_public())
+                    .expect("must ask")
+            })],
+        });
+        assert!(
+            state.browsing_stores[STORE].conversations.is_empty(),
+            "an answer nothing asked for put a conversation on screen"
+        );
+    }
+
+    /// **Conversations are filed under the store this browser ASKED about,
+    /// not the one the answer names.**
+    ///
+    /// The two can only disagree through a fault, and the consequence of
+    /// trusting the echo is the sharp one: a buyer reading a thread, and
+    /// composing into it, against the wrong seller's mailbox. Same lesson as
+    /// the echoed conversation tag on the seller's side, where trusting
+    /// position instead of the echo handed one buyer's key to another
+    /// buyer's messages.
+    #[test]
+    fn conversations_are_filed_under_the_store_that_was_asked_about() {
+        const ANOTHER_STORE: &[u8] = &[2u8; 32];
+        let mut state = buyer_state();
+        let keep = {
+            let mut tab = buyer_state();
+            tab.compose_to_seller(STORE, &seller_public(), "hello".into())
+                .expect("compose");
+            tab.conversation_to_keep(STORE, &seller_public())
+                .expect("must ask")
+        };
+
+        let request_id = match state.buyer_conversations_to_recall(STORE) {
+            Some(HarvestDelegateRequest::ListBuyerConversations { request_id, .. }) => request_id,
+            other => panic!("expected a recall, got {other:?}"),
+        };
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationList {
+            request_id,
+            // The delegate naming a store that was not asked about.
+            store_contract_id: ANOTHER_STORE.to_vec(),
+            conversations: vec![delegate_recalls(&keep)],
+        });
+
+        assert_eq!(
+            state.browsing_stores[STORE].conversations.len(),
+            1,
+            "the conversation was not filed under the store that was asked about"
+        );
+        assert!(
+            state
+                .browsing_stores
+                .get(ANOTHER_STORE)
+                .is_none_or(|store| store.conversations.is_empty()),
+            "a conversation was filed against a store this browser never asked about"
+        );
+    }
+
+    /// **The NEWEST recalled conversation is the one a new message
+    /// continues.**
+    ///
+    /// The sort that decides this had no test until it was reviewed:
+    /// `a_new_message_continues_the_recalled_conversation` uses one recalled
+    /// conversation, and `every_conversation_with_a_store_is_read` has two
+    /// but only asserts both are readable. Deleting the sort left the suite
+    /// green, and a returning buyer would then resume whichever the node
+    /// happened to list last -- silently writing into an old thread while
+    /// believing they had continued the current one.
+    #[test]
+    fn a_new_message_continues_the_newest_of_several_recalled_conversations() {
+        let mut state = buyer_state();
+        let keeps: Vec<HarvestDelegateRequest> = (0..2)
+            .map(|_| {
+                let mut tab = buyer_state();
+                tab.compose_to_seller(STORE, &seller_public(), "hello".into())
+                    .expect("compose");
+                tab.conversation_to_keep(STORE, &seller_public())
+                    .expect("must ask")
+            })
+            .collect();
+
+        // Answered oldest-LAST, so a browser that kept the delegate's order
+        // would continue the older one.
+        let newer = RecalledConversation {
+            created_at: 2_000,
+            ..delegate_recalls(&keeps[0])
+        };
+        let older = RecalledConversation {
+            created_at: 1_000,
+            ..delegate_recalls(&keeps[1])
+        };
+        deliver_recall(&mut state, vec![newer.clone(), older.clone()]);
+
+        let next = state
+            .compose_to_seller(STORE, &seller_public(), "still there?".into())
+            .expect("compose");
+        assert_eq!(
+            next.sender_public_key, newer.buyer_public_key,
+            "a returning buyer resumed a thread that is not their most recent one"
+        );
+    }
+
+    /// **A store is not marked as asked before there is anyone to ask.**
+    ///
+    /// `components::app` opens a store link BEFORE registering the harvest
+    /// delegate, so a store's state routinely arrives first. Marking it asked
+    /// on a request that was never sent would leave the buyer's kept
+    /// conversations unrecalled for the life of the tab -- the reply sitting
+    /// unread in the mailbox, with the key on the same machine, and nothing
+    /// anywhere saying why.
+    #[test]
+    fn a_store_is_not_marked_asked_before_the_delegate_is_registered() {
+        let mut state = buyer_state();
+        state.harvest_delegate_key = None;
+        assert!(
+            state.buyer_conversations_to_recall(STORE).is_none(),
+            "there is nobody to ask yet"
+        );
+
+        state.harvest_delegate_key = Some(a_delegate_key());
+        assert!(
+            state.buyer_conversations_to_recall(STORE).is_some(),
+            "the store was marked as asked while the request could not be sent"
+        );
+    }
+
+    /// And the sweep that covers that ordering asks for the stores already on
+    /// screen.
+    #[test]
+    fn registering_the_delegate_asks_about_stores_already_on_screen() {
+        let mut state = buyer_state();
+        state.harvest_delegate_key = None;
+        state.recall_conversations_for_known_stores();
+        assert!(
+            state.buyer_conversations_recalled.is_empty(),
+            "precondition: nothing was asked, so nothing is marked"
+        );
+
+        state.harvest_delegate_key = Some(a_delegate_key());
+        state.recall_conversations_for_known_stores();
+        assert!(
+            state.buyer_conversations_recalled.contains(STORE),
+            "a store already on screen was never asked about"
+        );
+    }
+
+    /// **A conversation the node could not keep is said out loud.**
+    ///
+    /// The buyer has already been told their message was sent. If the secret
+    /// was not kept then the reply is unreadable after a reload -- which is
+    /// exactly the failure this mechanism exists to prevent, so it must not
+    /// happen quietly.
+    #[test]
+    fn a_conversation_the_node_could_not_keep_is_reported() {
+        let mut state = buyer_state();
+        state
+            .compose_to_seller(STORE, &seller_public(), "hello".into())
+            .expect("compose");
+        let request_id = match state
+            .conversation_to_keep(STORE, &seller_public())
+            .expect("must ask")
+        {
+            HarvestDelegateRequest::StoreBuyerConversation { request_id, .. } => request_id,
+            other => panic!("expected StoreBuyerConversation, got {other:?}"),
+        };
+
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationStored {
+            request_id,
+            result: Err("the node refused the write".to_string()),
+            evicted: Vec::new(),
+        });
+
+        let notice = state
+            .notifications
+            .last()
+            .expect("a refusal must reach the buyer");
+        assert!(
+            notice.contains("unreadable"),
+            "the notice must say what the buyer loses: {notice}"
+        );
+    }
+
+    /// **A conversation discarded to make room is said out loud.**
+    ///
+    /// The cap is global across every store, so keeping a new conversation
+    /// can cost an old one -- and the design doc names silence here as the
+    /// expensive direction: "the confession becomes unreadable and the buyer
+    /// has no recourse, with no error at any layer".
+    #[test]
+    fn a_conversation_discarded_to_make_room_is_reported() {
+        let mut state = buyer_state();
+        let lost = [0x5Au8; 32];
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationStored {
+            request_id: 1,
+            result: Ok(()),
+            evicted: vec![harvest_common::EvictedConversation {
+                buyer_public_key: lost,
+                was_backed_up: false,
+            }],
+        });
+
+        let notice = state
+            .notifications
+            .last()
+            .expect("a discarded conversation must reach the buyer")
+            .clone();
+        assert!(
+            notice.contains(&crate::state::short_conversation_tag(&lost)),
+            "the discarded conversation must be named: {notice}"
+        );
+        assert!(
+            notice.contains("no longer be read"),
+            "the buyer must be told it is gone for good, not merely tidied away: {notice}"
+        );
+    }
+
+    /// One the buyer has a backup of is a different message: recoverable, so
+    /// it must not read like the loss above.
+    #[test]
+    fn discarding_a_backed_up_conversation_says_it_can_be_restored() {
+        let mut state = buyer_state();
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationStored {
+            request_id: 1,
+            result: Ok(()),
+            evicted: vec![harvest_common::EvictedConversation {
+                buyer_public_key: [0x77u8; 32],
+                was_backed_up: true,
+            }],
+        });
+        let notice = state.notifications.last().expect("must say something");
+        assert!(notice.contains("restore"), "{notice}");
+        assert!(
+            !notice.contains("no longer be read"),
+            "a recoverable loss must not be reported as a permanent one: {notice}"
+        );
+    }
+
+    /// **A forgotten conversation leaves this browser only once the node says
+    /// the record is gone.**
+    ///
+    /// Dropping it on the click would show a buyer a thread that had vanished
+    /// while the record was still on their disk, which is the dishonesty the
+    /// delete-rather-than-empty design exists to avoid.
+    #[test]
+    fn a_conversation_is_dropped_only_when_the_node_says_it_is_gone() {
+        let mut state = buyer_state();
+        let message = state
+            .compose_to_seller(STORE, &seller_public(), "hello".into())
+            .expect("compose");
+        deliver(&mut state, message.clone());
+        let tag: [u8; 32] = message
+            .sender_public_key
+            .clone()
+            .try_into()
+            .expect("32-byte tag");
+        assert_eq!(state.conversation_thread(STORE).len(), 1, "precondition");
+
+        // Refused: the record is still there, so the thread must be too.
+        let request = state.conversation_to_forget(STORE, &tag);
+        let request_id = match request {
+            HarvestDelegateRequest::ForgetBuyerConversation { request_id, .. } => request_id,
+            other => panic!("expected ForgetBuyerConversation, got {other:?}"),
+        };
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationForgotten {
+            request_id,
+            result: Err("the node refused to remove it".to_string()),
+        });
+        assert_eq!(
+            state.conversation_thread(STORE).len(),
+            1,
+            "a refused removal hid a conversation that is still stored"
+        );
+        assert!(state
+            .notifications
+            .last()
+            .expect("a refusal must reach the buyer")
+            .contains("still stored"));
+
+        // Accepted: now it goes.
+        let request_id = match state.conversation_to_forget(STORE, &tag) {
+            HarvestDelegateRequest::ForgetBuyerConversation { request_id, .. } => request_id,
+            other => panic!("expected ForgetBuyerConversation, got {other:?}"),
+        };
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationForgotten {
+            request_id,
+            result: Ok(()),
+        });
+        assert!(
+            state.conversation_thread(STORE).is_empty(),
+            "a forgotten conversation was still on screen"
+        );
+    }
+
+    /// An answer to a forget nothing asked for changes nothing.
+    ///
+    /// The same shape as `an_answer_to_an_unknown_request_is_ignored` on the
+    /// seller's side: acting on it would drop a conversation this browser
+    /// never asked to forget.
+    #[test]
+    fn an_unasked_forget_answer_drops_nothing() {
+        let mut state = buyer_state();
+        let message = state
+            .compose_to_seller(STORE, &seller_public(), "hello".into())
+            .expect("compose");
+        deliver(&mut state, message);
+
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationForgotten {
+            request_id: 4321,
+            result: Ok(()),
+        });
+        assert_eq!(
+            state.conversation_thread(STORE).len(),
+            1,
+            "an answer nothing asked for dropped a conversation"
+        );
+    }
+}
+
+/// Backup: the buyer carrying ONE conversation to another machine, and being
+/// told when it exists in only one place.
+#[cfg(test)]
+mod buyer_backup_tests {
+    use super::*;
+    use harvest_common::{HarvestDelegateRequest, ImportedConversation, RecalledConversation};
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    const STORE: &[u8] = &[1u8; 32];
+
+    fn a_delegate_key() -> freenet_stdlib::prelude::DelegateKey {
+        freenet_stdlib::prelude::DelegateKey::new(
+            [0xA1; 32],
+            freenet_stdlib::prelude::CodeHash::new([0xA1; 32]),
+        )
+    }
+
+    fn buyer_state() -> AppState {
+        let mut state = AppState {
+            harvest_delegate_key: Some(a_delegate_key()),
+            ..AppState::default()
+        };
+        state.browsing_stores.entry(STORE.to_vec()).or_default();
+        state
+    }
+
+    /// One recalled conversation, as the delegate would answer it.
+    fn recalled(seed: u8, backed_up: bool) -> RecalledConversation {
+        let secret = StaticSecret::from([seed; 32]);
+        RecalledConversation {
+            buyer_public_key: *PublicKey::from(&secret).as_bytes(),
+            conversation_id: [seed; 32],
+            buyer_to_seller: [seed; 32],
+            seller_to_buyer: [seed; 32],
+            created_at: 1_700_000_000 + seed as i64,
+            imported: false,
+            backed_up,
+        }
+    }
+
+    /// The request id of a question this state actually asked.
+    fn asked(request: &HarvestDelegateRequest) -> u64 {
+        match request {
+            HarvestDelegateRequest::ExportBuyerConversation { request_id, .. }
+            | HarvestDelegateRequest::MarkConversationBackedUp { request_id, .. } => *request_id,
+            other => panic!("expected a backup request, got {other:?}"),
+        }
+    }
+
+    /// Answer the recall this state actually issued.
+    fn deliver_recall(state: &mut AppState, conversations: Vec<RecalledConversation>) {
+        match state.buyer_conversations_to_recall(STORE) {
+            Some(HarvestDelegateRequest::ListBuyerConversations { .. }) => {}
+            other => panic!("expected a recall to be asked for, got {other:?}"),
+        }
+        answer_outstanding_recall(state, conversations);
+    }
+
+    /// Answer whichever recall is in flight, whoever asked for it -- which is
+    /// how a re-ask issued by the app itself gets answered.
+    fn answer_outstanding_recall(state: &mut AppState, conversations: Vec<RecalledConversation>) {
+        let request_id = *state
+            .pending_conversation_recalls
+            .keys()
+            .next_back()
+            .expect("a recall must be in flight");
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationList {
+            request_id,
+            store_contract_id: STORE.to_vec(),
+            conversations,
+        });
+    }
+
+    /// **A backup the buyer asked for reaches the screen, under the
+    /// conversation they asked about.**
+    ///
+    /// It arrives from a delegate answer long after the click, so it has to
+    /// be held somewhere the component can render from -- and one string
+    /// covers ONE conversation, so it must not appear under another.
+    #[test]
+    fn an_exported_backup_reaches_the_screen_under_its_own_conversation() {
+        let mut state = buyer_state();
+        let tag = recalled(5, false).buyer_public_key;
+        let request = state.conversation_to_export(STORE, &tag);
+        match &request {
+            HarvestDelegateRequest::ExportBuyerConversation {
+                store_contract_id,
+                buyer_public_key,
+                ..
+            } => {
+                assert_eq!(store_contract_id, STORE);
+                assert_eq!(buyer_public_key, &tag);
+            }
+            other => panic!("expected ExportBuyerConversation, got {other:?}"),
+        }
+
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationExported {
+            request_id: asked(&request),
+            store_contract_id: STORE.to_vec(),
+            buyer_public_key: tag,
+            result: Ok("harvest-conv-backup-v2:abc".to_string()),
+        });
+
+        let on_screen = state
+            .conversation_backup_on_screen
+            .as_ref()
+            .expect("the backup must reach the screen, or the buyer cannot save it");
+        assert_eq!(on_screen.text(), "harvest-conv-backup-v2:abc");
+        assert_eq!(on_screen.store_contract_id, STORE);
+        assert_eq!(
+            on_screen.buyer_public_key, tag,
+            "a backup shown under the wrong conversation invites the buyer to save it as that \
+             conversation's"
+        );
+    }
+
+    /// **A backup does not print itself.**
+    ///
+    /// It is a portable copy of one conversation. A `Debug` that printed it
+    /// would put that into any console log a user pastes into a bug report.
+    #[test]
+    fn a_backup_on_screen_does_not_print_itself() {
+        let mut state = buyer_state();
+        let tag = recalled(6, false).buyer_public_key;
+        let request_id = asked(&state.conversation_to_export(STORE, &tag));
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationExported {
+            request_id,
+            store_contract_id: STORE.to_vec(),
+            buyer_public_key: tag,
+            result: Ok("harvest-conv-backup-v2:SECRETMATERIAL".to_string()),
+        });
+        let printed = format!("{:?}", state.conversation_backup_on_screen);
+        assert!(
+            !printed.contains("SECRETMATERIAL"),
+            "the backup printed itself: {printed}"
+        );
+    }
+
+    /// A refused export is said out loud rather than leaving a button that
+    /// appears to do nothing.
+    #[test]
+    fn a_refused_export_is_reported() {
+        let mut state = buyer_state();
+        let tag = recalled(7, false).buyer_public_key;
+        let request_id = asked(&state.conversation_to_export(STORE, &tag));
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationExported {
+            request_id,
+            store_contract_id: STORE.to_vec(),
+            buyer_public_key: tag,
+            result: Err("this node does not hold that conversation".to_string()),
+        });
+        assert!(state.conversation_backup_on_screen.is_none());
+        assert!(state
+            .notifications
+            .last()
+            .expect("a refusal must reach the buyer")
+            .contains("does not hold"));
+    }
+
+    /// **Marking names ONE conversation.**
+    ///
+    /// One saved string covers one conversation, so a request that named a
+    /// set would clear the warning on conversations the string does not
+    /// contain -- the granularity form of silencing a warning about a key
+    /// nobody has a backup of.
+    #[test]
+    fn marking_names_only_the_conversation_that_was_saved() {
+        let mut state = buyer_state();
+        let saved = recalled(5, false);
+        let other = recalled(6, false);
+        deliver_recall(&mut state, vec![saved.clone(), other.clone()]);
+
+        match state.conversation_to_mark_backed_up(STORE, &saved.buyer_public_key) {
+            HarvestDelegateRequest::MarkConversationBackedUp {
+                store_contract_id,
+                buyer_public_key,
+                ..
+            } => {
+                assert_eq!(store_contract_id, STORE);
+                assert_eq!(buyer_public_key, saved.buyer_public_key);
+                assert_ne!(buyer_public_key, other.buyer_public_key);
+            }
+            other => panic!("expected MarkConversationBackedUp, got {other:?}"),
+        }
+    }
+
+    /// **A recall refreshes the warning on a conversation this browser
+    /// already holds.**
+    ///
+    /// The delegate is the source of truth for whether a backup exists, and
+    /// marking is confirmed by asking it again rather than by assuming
+    /// locally. A recall that only ADDED conversations would leave the
+    /// warning on screen after the buyer had cleared it.
+    #[test]
+    fn a_recall_refreshes_whether_a_held_conversation_is_backed_up() {
+        let mut state = buyer_state();
+        let conversation = recalled(7, false);
+        deliver_recall(&mut state, vec![conversation.clone()]);
+        assert!(!state.browsing_stores[STORE].conversations[0].backed_up);
+
+        // The whole marking round trip: the buyer says they saved it, the
+        // delegate confirms, and the app asks again rather than assuming.
+        let request_id =
+            asked(&state.conversation_to_mark_backed_up(STORE, &conversation.buyer_public_key));
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationMarkedBackedUp {
+            request_id,
+            store_contract_id: STORE.to_vec(),
+            buyer_public_key: conversation.buyer_public_key,
+            result: Ok(true),
+        });
+        answer_outstanding_recall(
+            &mut state,
+            vec![RecalledConversation {
+                backed_up: true,
+                ..conversation
+            }],
+        );
+
+        assert_eq!(
+            state.browsing_stores[STORE].conversations.len(),
+            1,
+            "a second recall duplicated a conversation"
+        );
+        assert!(
+            state.browsing_stores[STORE].conversations[0].backed_up,
+            "the warning stayed after the buyer said they had saved it"
+        );
+    }
+
+    /// Marking asks the delegate again afterwards, rather than guessing what
+    /// it did.
+    #[test]
+    fn marking_asks_the_delegate_again_rather_than_assuming() {
+        let mut state = buyer_state();
+        let conversation = recalled(8, false);
+        deliver_recall(&mut state, vec![conversation.clone()]);
+        assert!(
+            state.buyer_conversations_recalled.contains(STORE),
+            "precondition: this store has been asked about"
+        );
+
+        let request_id =
+            asked(&state.conversation_to_mark_backed_up(STORE, &conversation.buyer_public_key));
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationMarkedBackedUp {
+            request_id,
+            store_contract_id: STORE.to_vec(),
+            buyer_public_key: conversation.buyer_public_key,
+            result: Ok(true),
+        });
+        assert!(
+            !state.pending_conversation_recalls.is_empty(),
+            "nothing re-asked the delegate, so the screen still shows what it showed before"
+        );
+    }
+
+    /// **A restored conversation is asked for again, so it appears.**
+    ///
+    /// Import writes into the delegate, not into this browser. Without the
+    /// re-ask the buyer pastes a backup, is told it worked, and sees nothing.
+    #[test]
+    fn an_import_asks_for_the_restored_conversation() {
+        let mut state = buyer_state();
+        deliver_recall(&mut state, Vec::new());
+        assert!(
+            state.pending_conversation_recalls.is_empty(),
+            "precondition: nothing is in flight"
+        );
+
+        let tag = recalled(9, true).buyer_public_key;
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationImported {
+            request_id: 1,
+            result: Ok(ImportedConversation::Imported {
+                store_contract_id: STORE.to_vec(),
+                buyer_public_key: tag,
+            }),
+        });
+
+        assert!(
+            !state.pending_conversation_recalls.is_empty(),
+            "a restored conversation was never asked for, so it never appears on screen"
+        );
+        let notice = state
+            .notifications
+            .last()
+            .expect("the buyer must be told what the paste did");
+        assert!(
+            notice.contains(&crate::state::short_conversation_tag(&tag)),
+            "the restored conversation must be named: {notice}"
+        );
+        assert!(
+            notice.contains("whoever gave it to you"),
+            "a restored conversation may be the one the next message continues, and its secret \
+             may not be the buyer's alone: {notice}"
+        );
+    }
+
+    /// **A refused conversation is NAMED with its reason.**
+    ///
+    /// A conversation that did not fit is one the buyer still cannot read,
+    /// and the reason is what tells them what to do about it.
+    #[test]
+    fn a_refused_import_says_which_and_why() {
+        let mut state = buyer_state();
+        let refused = recalled(10, true).buyer_public_key;
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationImported {
+            request_id: 1,
+            result: Ok(ImportedConversation::Refused {
+                store_contract_id: STORE.to_vec(),
+                buyer_public_key: refused,
+                why: "this node is full".to_string(),
+            }),
+        });
+
+        let notice = state
+            .notifications
+            .last()
+            .expect("the buyer must be told")
+            .clone();
+        assert!(
+            notice.contains("this node is full"),
+            "the reason must survive to the buyer: {notice}"
+        );
+        assert!(
+            notice.contains(&crate::state::short_conversation_tag(&refused)),
+            "the refused conversation must be named: {notice}"
+        );
+    }
+
+    /// A backup that is not one is refused with something the buyer can act
+    /// on, rather than silently.
+    #[test]
+    fn a_paste_that_could_not_be_read_is_reported() {
+        let mut state = buyer_state();
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationImported {
+            request_id: 1,
+            result: Err("that does not look like a Harvest conversation backup".to_string()),
+        });
+        assert!(state
+            .notifications
+            .last()
+            .expect("a refusal must reach the buyer")
+            .contains("does not look like"));
+    }
+
+    /// Pasting a backup onto the node that made it must read as success, not
+    /// as a problem.
+    #[test]
+    fn a_backup_pasted_onto_the_node_that_made_it_is_not_an_error() {
+        let mut state = buyer_state();
+        let held = recalled(12, true).buyer_public_key;
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationImported {
+            request_id: 1,
+            result: Ok(ImportedConversation::AlreadyHeld {
+                store_contract_id: STORE.to_vec(),
+                buyer_public_key: held,
+            }),
+        });
+        let notice = state.notifications.last().expect("must say something");
+        assert!(
+            notice.contains("already"),
+            "the buyer must be told nothing was wrong: {notice}"
+        );
+    }
+
+    /// **A backup nothing asked for does not reach the screen.**
+    ///
+    /// Where it belongs is decided by the question this browser asked and not
+    /// by what the answer says about itself.
+    #[test]
+    fn a_backup_nothing_asked_for_does_not_reach_the_screen() {
+        let mut state = buyer_state();
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationExported {
+            request_id: 4321,
+            store_contract_id: STORE.to_vec(),
+            buyer_public_key: [9u8; 32],
+            result: Ok("harvest-conv-backup-v2:abc".to_string()),
+        });
+        assert!(
+            state.conversation_backup_on_screen.is_none(),
+            "a backup nothing asked for was put on screen"
+        );
+    }
+
+    /// And it is filed under the conversation that was asked about, not the
+    /// one the answer names.
+    #[test]
+    fn a_backup_is_filed_under_the_conversation_that_was_asked_about() {
+        const ANOTHER_STORE: &[u8] = &[2u8; 32];
+        let mut state = buyer_state();
+        let asked_about = recalled(13, false).buyer_public_key;
+        let request_id = asked(&state.conversation_to_export(STORE, &asked_about));
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationExported {
+            request_id,
+            store_contract_id: ANOTHER_STORE.to_vec(),
+            buyer_public_key: [0xFF; 32],
+            result: Ok("harvest-conv-backup-v2:abc".to_string()),
+        });
+        let on_screen = state
+            .conversation_backup_on_screen
+            .as_ref()
+            .expect("on screen");
+        assert_eq!(
+            on_screen.store_contract_id, STORE,
+            "a backup was filed under a store this browser never asked about"
+        );
+        assert_eq!(
+            on_screen.buyer_public_key, asked_about,
+            "a backup was filed under a conversation this browser never asked about"
+        );
+    }
+}
+
+/// What a counterparty can do with a nonce, and what the client may claim
+/// afterwards.
+///
+/// The conversation key is symmetric -- the counterparty must hold it to read
+/// replies at all -- so they can always produce anything the buyer could.
+/// Authorship BETWEEN the two parties is therefore not attainable by
+/// cryptography here, and `message_aad` does not help: it binds the nonce to
+/// the ciphertext, and the counterparty can produce a valid binding for
+/// content of their choosing.
+///
+/// What IS available is first-hand knowledge: this client knows the exact
+/// bytes it sent. These tests pin that it uses that knowledge and nothing
+/// weaker.
+#[cfg(test)]
+mod nonce_collision_tests {
+    use super::*;
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes256Gcm, Nonce};
+    use harvest_common::mailbox::{
+        conversation_key_from_dh, entry_digest, message_aad, pad_to_bucket, EncryptedMessage,
+        MailboxStateV1, MessageDirection,
+    };
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    const STORE: &[u8] = &[1u8; 32];
+
+    fn seller_secret() -> StaticSecret {
+        StaticSecret::from([21u8; 32])
+    }
+
+    fn seller_public() -> [u8; 32] {
+        *PublicKey::from(&seller_secret()).as_bytes()
+    }
+
+    fn buyer_state() -> AppState {
+        let mut state = AppState::default();
+        state.browsing_stores.entry(STORE.to_vec()).or_default();
+        state
+    }
+
+    /// The seller's side of one conversation.
+    fn seller_keys(buyer_public_key: &[u8]) -> crate::messaging::ConversationKeys {
+        let peer: [u8; 32] = buyer_public_key.try_into().expect("32-byte tag");
+        let shared = seller_secret()
+            .diffie_hellman(&PublicKey::from(peer))
+            .to_bytes();
+        crate::messaging::ConversationKeys::from_shared_secret(&shared)
+    }
+
+    /// **The attack.** Take a message the buyer sent, put different plaintext
+    /// under the SAME nonce and the same conversation key, and date it one
+    /// second later -- which is what the contract's dedup used to prefer,
+    /// before identity moved to `entry_digest` and the two stopped colliding
+    /// at all.
+    ///
+    /// Built here rather than through `messaging::seal`, which draws a fresh
+    /// nonce -- that is exactly what an attacker declines to do. The attempt
+    /// is still worth driving: it no longer displaces anything, and these
+    /// tests are what say so.
+    fn substitute(original: &EncryptedMessage, text: &str) -> EncryptedMessage {
+        let keys = seller_keys(&original.sender_public_key);
+        let plaintext = crate::messaging::PlaintextMessage {
+            conversation_id: original.conversation_id.clone(),
+            content: crate::messaging::MessageContent::Text(text.to_string()),
+        };
+        let padded = pad_to_bucket(&harvest_common::to_cbor(&plaintext).expect("cbor"));
+        let timestamp = original.timestamp + chrono::Duration::seconds(1);
+        let aad = message_aad(
+            &original.conversation_id,
+            &original.sender_public_key,
+            &timestamp,
+            &original.nonce,
+        );
+        let cipher = Aes256Gcm::new_from_slice(&keys.to_seller).expect("cipher");
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&original.nonce[..12]),
+                Payload {
+                    msg: padded.as_ref(),
+                    aad: &aad,
+                },
+            )
+            .expect("encrypt");
+        EncryptedMessage {
+            conversation_id: original.conversation_id.clone(),
+            sender_public_key: original.sender_public_key.clone(),
+            ciphertext,
+            timestamp,
+            nonce: original.nonce,
+        }
+    }
+
+    /// Put messages through the REAL contract, so what the buyer sees is what
+    /// the mailbox would actually hold -- including the dedup that resolves a
+    /// nonce collision.
+    fn mailbox_after(messages: Vec<EncryptedMessage>) -> Vec<EncryptedMessage> {
+        let mut state = MailboxStateV1::default();
+        state.apply_delta(&Some(messages)).expect("apply");
+        state
+            .verify()
+            .expect("the contract must accept its own result");
+        state.messages
+    }
+
+    fn text(content: &crate::messaging::MessageContent) -> &str {
+        match content {
+            crate::messaging::MessageContent::Text(text) => text,
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// **A substituted message must not be shown as the buyer's own.**
+    ///
+    /// `683feb0` moved attribution off the channel and onto first-hand
+    /// knowledge -- "the one thing a client can know is what it sent itself".
+    /// Recognising that by NONCE puts it straight back onto something the
+    /// counterparty controls: the nonce is public, and the counterparty can
+    /// submit different plaintext under it. Losing a message you sent is bad;
+    /// being shown a stranger's words as your own is worse.
+    #[test]
+    fn a_substituted_message_is_not_shown_as_the_buyers_own() {
+        let mut buyer = buyer_state();
+        let mine = buyer
+            .compose_to_seller(STORE, &seller_public(), "please cancel my order".into())
+            .expect("compose");
+        // As `components::message_view::send` does once the send is
+        // dispatched.
+        buyer.record_sent_message(STORE, "please cancel my order".into(), &mine);
+
+        // Precondition: my own message, in the mailbox, reads as mine.
+        buyer
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("store")
+            .mailbox_messages = mailbox_after(vec![mine.clone()]);
+        let thread = buyer.conversation_thread(STORE);
+        assert_eq!(thread.len(), 1);
+        assert!(
+            buyer.authored_here(STORE, &thread[0].digest),
+            "precondition: a message this tab sent reads as its own"
+        );
+
+        // The seller submits different words under the same nonce.
+        let theirs = substitute(&mine, "actually, never mind, cancel it");
+        let mailbox = mailbox_after(vec![mine.clone(), theirs.clone()]);
+        assert_eq!(
+            mailbox.len(),
+            2,
+            "the substitute displaced the original, so a message can still be retracted"
+        );
+        buyer
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("store")
+            .mailbox_messages = mailbox;
+
+        let thread = buyer.conversation_thread(STORE);
+        assert_eq!(
+            thread.len(),
+            2,
+            "the buyer's own message is missing from their own thread"
+        );
+
+        let mine_shown = thread
+            .iter()
+            .find(|message| text(&message.content) == "please cancel my order")
+            .expect("the buyer's own message must still be readable");
+        assert!(
+            buyer.authored_here(STORE, &mine_shown.digest),
+            "the buyer's own message stopped being recognised as theirs"
+        );
+
+        let theirs_shown = thread
+            .iter()
+            .find(|message| text(&message.content) == "actually, never mind, cancel it")
+            .expect("the substitute is in the mailbox and is shown");
+        assert!(
+            !buyer.authored_here(STORE, &theirs_shown.digest),
+            "the buyer's own UI credited them with words the seller wrote"
+        );
+    }
+
+    /// **A message someone submitted under is not reported as undelivered,
+    /// because it was not displaced.**
+    ///
+    /// There used to be a `replaced_sent` here, reporting a message whose
+    /// nonce was present under different bytes: it had arrived and then been
+    /// displaced by the contract's dedup. That state can no longer arise, so
+    /// it was deleted rather than left rendering a case that cannot happen.
+    ///
+    /// It was not repointed at "an entry shares your nonce" either, and the
+    /// reason is worth keeping: that signal is FORGEABLE. The mailbox is
+    /// open-write and the nonce is public, so any third party can plant an
+    /// unreadable entry under it, and a "somebody tampered with your message"
+    /// notice driven by that would be one an outsider could trigger against a
+    /// seller they have never dealt with.
+    #[test]
+    fn a_message_someone_submitted_under_is_not_reported_as_undelivered() {
+        let mut buyer = buyer_state();
+        let mine = buyer
+            .compose_to_seller(STORE, &seller_public(), "please cancel my order".into())
+            .expect("compose");
+        buyer.record_sent_message(STORE, "please cancel my order".into(), &mine);
+
+        // Before anything lands, it is simply not seen yet.
+        assert_eq!(buyer.unconfirmed_sent(STORE).len(), 1);
+
+        let theirs = substitute(&mine, "actually, never mind, cancel it");
+        buyer
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("store")
+            .mailbox_messages = mailbox_after(vec![mine.clone(), theirs]);
+
+        assert!(
+            buyer.unconfirmed_sent(STORE).is_empty(),
+            "the buyer's message is in the mailbox and was reported as not yet arrived"
+        );
+    }
+
+    /// **A message that is NOT in the mailbox stays unconfirmed, even when
+    /// something else holds its nonce.**
+    ///
+    /// The neighbouring test puts BOTH entries in the mailbox, so the nonce
+    /// rule and the digest rule agree and it cannot see the difference --
+    /// the same fixture shape that let the re-store guard go unpinned. This
+    /// one puts only the substitute there.
+    ///
+    /// The failure it forbids is narrow and composes with the one retraction
+    /// route still open: the buyer's message lands, a funded flood evicts it
+    /// while a same-nonce entry planted earlier survives, and the UI reports
+    /// the message as delivered when it is gone.
+    #[test]
+    fn a_message_absent_from_the_mailbox_is_unconfirmed_even_if_its_nonce_is_there() {
+        let mut buyer = buyer_state();
+        let mine = buyer
+            .compose_to_seller(STORE, &seller_public(), "please cancel my order".into())
+            .expect("compose");
+        buyer.record_sent_message(STORE, "please cancel my order".into(), &mine);
+
+        // Only THEIRS reaches the mailbox: same nonce, different bytes.
+        let theirs = substitute(&mine, "actually, never mind, cancel it");
+        buyer
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("store")
+            .mailbox_messages = mailbox_after(vec![theirs]);
+
+        assert_eq!(
+            buyer.unconfirmed_sent(STORE).len(),
+            1,
+            "a message that is not in the mailbox was reported as delivered, because \
+             something else holds its nonce"
+        );
+    }
+
+    /// The ordinary case still works: a message that landed unaltered is not
+    /// reported as unconfirmed.
+    #[test]
+    fn a_message_that_landed_is_not_reported_as_unconfirmed() {
+        let mut buyer = buyer_state();
+        let mine = buyer
+            .compose_to_seller(STORE, &seller_public(), "hello".into())
+            .expect("compose");
+        buyer.record_sent_message(STORE, "hello".into(), &mine);
+        buyer
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("store")
+            .mailbox_messages = mailbox_after(vec![mine]);
+
+        assert!(buyer.unconfirmed_sent(STORE).is_empty());
+    }
+
+    /// The seller's inbox is the same defect from the other side: their own
+    /// replies are recorded by the same mechanism, so a buyer can substitute
+    /// one and inherit the seller's "you wrote this" label.
+    #[test]
+    fn a_seller_is_not_credited_with_a_substituted_reply() {
+        let mut seller = AppState::default();
+        seller.my_stores.insert(
+            "fp1".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![3u8; 32],
+                mailbox_contract_id: vec![4u8; 32],
+                store_contract_key: None,
+            }],
+        );
+        seller.browsing_stores.entry(STORE.to_vec()).or_default();
+
+        // A buyer's conversation, and the seller's reply into it.
+        let buyer = crate::messaging::BuyerConversation::open(&seller_public()).expect("open");
+        let question = buyer.seal("do you ship?".into()).expect("seal");
+        let keys = seller_keys(&question.sender_public_key);
+        seller
+            .conversation_keys
+            .insert(question.sender_public_key.clone(), keys);
+        let reply = crate::messaging::seal_reply(
+            &keys,
+            &question.sender_public_key,
+            &question.conversation_id,
+            "yes, ten euro".into(),
+        )
+        .expect("seal reply");
+        seller.record_sent_message(STORE, "yes, ten euro".into(), &reply);
+
+        // The buyer substitutes the seller's reply, under the seller's own
+        // nonce, with something the seller never said.
+        let forged = substitute(&reply, "I confess to everything");
+        seller
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("store")
+            .mailbox_messages = mailbox_after(vec![question, reply, forged]);
+
+        let inbox = seller.mailbox_entries(STORE);
+        let substituted = inbox
+            .iter()
+            .find(|entry| match entry {
+                crate::messaging::MailboxEntry::Readable { content, .. } => {
+                    matches!(content, crate::messaging::MessageContent::Text(t) if t == "I confess to everything")
+                }
+                _ => false,
+            })
+            .expect("the substitute is in the mailbox");
+        assert!(
+            !seller.authored_here(STORE, &substituted.digest()),
+            "the seller's own inbox credited them with a confession they did not write"
+        );
+        // And their real reply is still there, which is the half the contract
+        // now guarantees: the buyer could add words, never remove them.
+        assert!(
+            inbox.iter().any(|entry| match entry {
+                crate::messaging::MailboxEntry::Readable { content, .. } => {
+                    matches!(content, crate::messaging::MessageContent::Text(t) if t == "yes, ten euro")
+                }
+                _ => false,
+            }),
+            "the seller's own reply was removed from their own mailbox"
+        );
+        assert!(seller.unconfirmed_sent(STORE).is_empty());
     }
 }

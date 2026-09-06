@@ -31,7 +31,9 @@ pub use bitcoin_delegate::{
     DerivedAddress, PaymentXpubStatus, WatchedPayment,
 };
 pub use delegate::{
-    HarvestDelegateRequest, HarvestDelegateResponse, StoreRegistration, TransactionRecord,
+    ConversationKey, ConversationSecret, EvictedConversation, HarvestDelegateRequest,
+    HarvestDelegateResponse, ImportedConversation, RecalledConversation, StoreRegistration,
+    TransactionRecord,
 };
 pub use feedback::{FeedbackCategory, FeedbackToken, FeedbackTokenMsg};
 pub use listing::{AuthorizedListing, Listing, ListingId, ListingKind, PriceInfo};

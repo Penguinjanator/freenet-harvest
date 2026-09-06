@@ -60,6 +60,10 @@ impl ContractInterface for Contract {
                     let delta: ReputationDelta = new_state
                         .feedback
                         .into_iter()
+                        // nonce-identity-waiver: reputation keys identity on `token.nonce` and has the
+                        // same defect the mailbox re-key fixed -- see
+                        // `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. Parked
+                        // until the reputation contract's own re-key; NOT a site to copy.
                         .filter(|e| !reputation_state.used_nonces.contains(&e.token.nonce))
                         .collect();
                     if !delta.is_empty() {

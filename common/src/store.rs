@@ -79,6 +79,39 @@ pub struct StoreInfoV1 {
     pub description: String,
     /// Payment instructions (freeform, e.g. "BTC: bc1q...").
     pub payment_instructions: String,
+    /// The seller's long-term X25519 public key, so a buyer has something to
+    /// encrypt a message to.
+    ///
+    /// `None` for every store published before this field existed, and for a
+    /// seller whose delegate has not minted one yet. A buyer reading `None`
+    /// cannot message this seller at all, and
+    /// [`crate::mailbox`] has no other route to a conversation key -- the
+    /// mailbox contract is open-write and carries no key exchange of its own.
+    ///
+    /// The private half never leaves the seller's harvest delegate, which
+    /// holds it under `harvest:x25519_sk:{fingerprint}` and answers only the
+    /// derived conversation key.
+    ///
+    /// # `skip_serializing_if` is load-bearing, not a size optimisation
+    ///
+    /// [`AuthorizedStoreInfoV1::verify`] does not compare stored bytes: it
+    /// re-serializes this struct and checks the result against the payload
+    /// inside the signed `ScopedPayload`. A field that serializes when absent
+    /// therefore changes the preimage of every signature taken before it
+    /// existed, and the store contract rejects the seller's own published
+    /// details with "store info signature invalid". Pinned by
+    /// `wire_compat_tests::a_store_info_that_predates_the_encryption_key_re_encodes_unchanged`,
+    /// which was observed red against the naive `#[serde(default)]`-only
+    /// form.
+    ///
+    /// `serde(default)` is belt-and-braces rather than the thing that makes
+    /// old bytes decode: serde's `missing_field` already answers `None` for an
+    /// `Option` field carrying no default attribute, which was checked rather
+    /// than assumed. What the decode test actually catches is a future field
+    /// of a NON-optional type added without a default -- mutated red that way
+    /// on 2026-09-05, `missing field `encryption_public_key``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_public_key: Option<[u8; 32]>,
 }
 
 /// Store info signed by the seller's ghostkey via the ghostkey delegate.
@@ -106,6 +139,7 @@ impl Default for AuthorizedStoreInfoV1 {
                 store_name: String::new(),
                 description: String::new(),
                 payment_instructions: String::new(),
+                encryption_public_key: None,
             },
             scoped_payload: Vec::new(),
             signature: Vec::new(),
@@ -2413,6 +2447,80 @@ mod wire_compat_tests {
     /// `OrdersV1` deriving `Default` is not enough on its own -- serde does
     /// not consult `Default` for a missing field without `#[serde(default)]`,
     /// and `#[composable]` does not add one.
+    /// The `StoreInfoV1` map from inside [`V1_STORE_STATE_CBOR`], on its own.
+    ///
+    /// These are the bytes a ghostkey signature was taken over: the delegate
+    /// signs `to_cbor(&info)`, and `verify_scoped_signature` re-encodes
+    /// `self.info` and compares. So this is not merely an old state's
+    /// encoding -- it is the exact preimage of every store-info signature
+    /// ever produced before the encryption key existed.
+    ///
+    /// Tied to the state literal by
+    /// [`the_store_info_literal_is_the_one_inside_the_state_literal`], so it
+    /// cannot drift into being a plausible fiction of its own.
+    const V1_STORE_INFO_CBOR: &[u8] = &[
+        0xa7, 0x67, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x01, 0x6f, 0x63, 0x65, 0x72, 0x74,
+        0x69, 0x66, 0x69, 0x63, 0x61, 0x74, 0x65, 0x5f, 0x70, 0x65, 0x6d, 0x60, 0x72, 0x73, 0x65,
+        0x6c, 0x6c, 0x65, 0x72, 0x5f, 0x66, 0x69, 0x6e, 0x67, 0x65, 0x72, 0x70, 0x72, 0x69, 0x6e,
+        0x74, 0x60, 0x76, 0x72, 0x65, 0x70, 0x75, 0x74, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x5f, 0x63,
+        0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63, 0x74, 0x5f, 0x69, 0x64, 0x98, 0x20, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6a,
+        0x73, 0x74, 0x6f, 0x72, 0x65, 0x5f, 0x6e, 0x61, 0x6d, 0x65, 0x68, 0x56, 0x31, 0x20, 0x73,
+        0x74, 0x6f, 0x72, 0x65, 0x6b, 0x64, 0x65, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x69, 0x6f,
+        0x6e, 0x60, 0x74, 0x70, 0x61, 0x79, 0x6d, 0x65, 0x6e, 0x74, 0x5f, 0x69, 0x6e, 0x73, 0x74,
+        0x72, 0x75, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x73, 0x60,
+    ];
+
+    /// The two literals above are one literal, sliced.
+    ///
+    /// Without this, [`V1_STORE_INFO_CBOR`] would be a second hand-written
+    /// fixture that could quietly stop describing the same generation as the
+    /// first -- and the signature test below would then be checking a
+    /// round-trip of bytes nobody ever signed.
+    #[test]
+    fn the_store_info_literal_is_the_one_inside_the_state_literal() {
+        assert!(
+            V1_STORE_STATE_CBOR
+                .windows(V1_STORE_INFO_CBOR.len())
+                .any(|window| window == V1_STORE_INFO_CBOR),
+            "the store-info literal is not a slice of the state literal"
+        );
+    }
+
+    /// **A signed record must re-encode to the bytes that were signed.**
+    ///
+    /// `AuthorizedStoreInfoV1::verify` does not compare stored bytes: it
+    /// re-serializes `self.info` and checks the result against the payload
+    /// inside the signed `ScopedPayload` (see
+    /// `crate::listing::verify_scoped_signature`). So any field added to
+    /// `StoreInfoV1` that SERIALIZES when absent changes that preimage, and
+    /// every store info signed before the field existed stops verifying --
+    /// which the store contract reports as "store info signature invalid",
+    /// rejecting the seller's own published details.
+    ///
+    /// `#[serde(default)]` alone does not prevent this. `default` governs
+    /// DEcoding; the serializer still emits the field. Only
+    /// `skip_serializing_if` keeps the old preimage intact, and this test is
+    /// what says so: it fails the moment a new optional field is added
+    /// without one.
+    ///
+    /// Observed red on 2026-09-05 by adding `encryption_public_key` with
+    /// `#[serde(default)]` and no `skip_serializing_if`.
+    #[test]
+    fn a_store_info_that_predates_the_encryption_key_re_encodes_unchanged() {
+        let state: StoreStateV1 =
+            crate::from_cbor(V1_STORE_STATE_CBOR).expect("the V1 state must decode");
+
+        let re_encoded = crate::to_cbor(&state.info.info).expect("re-encode the decoded info");
+
+        assert_eq!(
+            re_encoded, V1_STORE_INFO_CBOR,
+            "a store info decoded from pre-encryption-key bytes re-encoded to \
+             something else, so its ghostkey signature no longer verifies"
+        );
+    }
+
     #[test]
     fn v1_store_state_decodes_without_an_orders_field() {
         let state: StoreStateV1 = crate::from_cbor(V1_STORE_STATE_CBOR)
@@ -2424,6 +2532,35 @@ mod wire_compat_tests {
         assert!(
             state.orders.orders.is_empty(),
             "a state written before orders existed has none"
+        );
+    }
+
+    /// The same requirement for `encryption_public_key`. It is a different
+    /// failure from the one above: a field the decoder cannot supply makes
+    /// the WHOLE state undecodable, so a store published before the key
+    /// existed loses its listings, its orders and its details at once rather
+    /// than merely being keyless.
+    ///
+    /// Removing `#[serde(default)]` alone does NOT turn this red, which was
+    /// checked rather than assumed: serde's `missing_field` answers `None` for
+    /// an `Option` field with no default attribute. What does turn it red is
+    /// the field ceasing to be an `Option` without gaining a default --
+    /// mutated that way on 2026-09-05 and observed failing with
+    /// `missing field `encryption_public_key``. That is the shape a future
+    /// field is most likely to arrive in, which is why the test is worth
+    /// keeping despite `Option` making today's form safe by accident.
+    #[test]
+    fn v1_store_state_decodes_without_an_encryption_key() {
+        let state: StoreStateV1 = crate::from_cbor(V1_STORE_STATE_CBOR)
+            .expect("a V1 store state must still decode into today's StoreStateV1");
+
+        assert_eq!(
+            state.info.info.encryption_public_key, None,
+            "a store published before sellers had an encryption key has none"
+        );
+        assert_eq!(
+            state.info.info.store_name, "V1 store",
+            "the rest of the record must survive alongside the missing field"
         );
     }
 }

@@ -203,42 +203,99 @@ fn certified_key(pem: &str, master: &Option<VerifyingKey>) -> Result<VerifyingKe
 /// Verify a certificate published by, or inside, the store at
 /// `store_contract_id`.
 pub fn verify_store_certificate(pem: &str, store_contract_id: &[u8]) -> CertificateStatus {
-    verify_store_certificate_against(pem, store_contract_id, &None)
+    verify_store_certificate_against(pem, store_contract_id, &None).0
 }
 
+/// The seller's Ed25519 verifying key, but ONLY when the store's certificate
+/// verifies against this store.
+///
+/// # Why this is not a convenience accessor
+///
+/// It is how a buyer finds the seller's mailbox. A mailbox lives at
+/// `BLAKE3(code_hash || cbor(MailboxParameters { owner_verifying_key }))`, and
+/// nothing publishes that address -- the store contract's state does not carry
+/// it. So the address is DERIVED from this key, which means a wrong key sends
+/// the buyer's message into a stranger's mailbox.
+///
+/// "Wrong" here is not hypothetical carelessness. Certificates are public, so
+/// the cheapest attack on this whole module is a scammer publishing a store
+/// carrying somebody else's genuine certificate (see
+/// [`verify_store_certificate`]). Reading the key out of a certificate that
+/// merely *parses* would hand every such buyer's message to whoever the
+/// certificate actually belongs to -- with the buyer's browser reporting a
+/// successful send. Returning `None` unless the certificate is
+/// [`CertificateStatus::Verified`] is what makes the derived address the
+/// address of the store the buyer is looking at.
+///
+/// `None` therefore covers three genuinely different situations -- no
+/// certificate, a certificate that does not hold up, and a store published by
+/// a newer build of Harvest than this one. The caller cannot distinguish
+/// them here and should say the truthful thing that covers all three: this
+/// store cannot be messaged from this build.
+pub fn store_verifying_key(pem: &str, store_contract_id: &[u8]) -> Option<VerifyingKey> {
+    store_verifying_key_against(pem, store_contract_id, &None)
+}
+
+/// [`store_verifying_key`] with the authority named, so the tests can mint a
+/// chain of their own. Not reachable from outside this module, for the same
+/// reason [`certified_key`] is not: which authority a certificate is checked
+/// against is not a caller's decision.
+fn store_verifying_key_against(
+    pem: &str,
+    store_contract_id: &[u8],
+    master: &Option<VerifyingKey>,
+) -> Option<VerifyingKey> {
+    match verify_store_certificate_against(pem, store_contract_id, master) {
+        (CertificateStatus::Verified, key) => key,
+        _ => None,
+    }
+}
+
+/// The verdict, and the key it was reached about.
+///
+/// One function rather than two because the membership check IS the thing
+/// that makes the key trustworthy: a second entry point that re-derived the
+/// key without re-running the check is exactly the shape that ends up
+/// weaker than the first.
 fn verify_store_certificate_against(
     pem: &str,
     store_contract_id: &[u8],
     master: &Option<VerifyingKey>,
-) -> CertificateStatus {
+) -> (CertificateStatus, Option<VerifyingKey>) {
     if pem.trim().is_empty() {
-        return CertificateStatus::Absent;
+        return (CertificateStatus::Absent, None);
     }
 
     let key = match certified_key(pem, master) {
         Ok(key) => key,
-        Err(why) => return CertificateStatus::Invalid(why),
+        Err(why) => return (CertificateStatus::Invalid(why), None),
     };
 
     let Ok(bytes) = <[u8; 32]>::try_from(store_contract_id) else {
-        return CertificateStatus::Invalid(format!(
-            "store contract id is {} bytes, not 32",
-            store_contract_id.len()
-        ));
+        return (
+            CertificateStatus::Invalid(format!(
+                "store contract id is {} bytes, not 32",
+                store_contract_id.len()
+            )),
+            None,
+        );
     };
     let id = ContractInstanceId::new(bytes);
 
     match store_instance_ids(&key) {
-        Ok(ids) if ids.contains(&id) => CertificateStatus::Verified,
+        Ok(ids) if ids.contains(&id) => (CertificateStatus::Verified, Some(key)),
         // The attack this whole module is for: a genuine certificate, issued
         // to somebody else, pasted onto this store. The other explanation is
         // benign and is named too -- see the module docs.
-        Ok(_) => CertificateStatus::Invalid(
-            "genuine, but not this store's identity; or this store was published by a \
-             newer build of Harvest than yours"
-                .to_string(),
+        Ok(_) => (
+            CertificateStatus::Invalid(
+                "genuine, but not this store's identity; or this store was published by a \
+                 newer build of Harvest than yours"
+                    .to_string(),
+            ),
+            None,
         ),
-        Err(e) => CertificateStatus::Invalid(e),
+        Err(e) => (CertificateStatus::Invalid(e), None),
     }
 }
 
@@ -287,6 +344,16 @@ mod tests {
         (cert.verifying_key, pem)
     }
 
+    /// The verdict alone, since most tests here are about the verdict.
+    /// `store_verifying_key`'s own tests use the pair.
+    fn verdict(
+        pem: &str,
+        store_contract_id: &[u8],
+        master: &Option<VerifyingKey>,
+    ) -> CertificateStatus {
+        verify_store_certificate_against(pem, store_contract_id, master).0
+    }
+
     fn test_master() -> Option<VerifyingKey> {
         Some(authority().master.verifying_key())
     }
@@ -302,7 +369,7 @@ mod tests {
     fn a_genuine_certificate_verifies_for_its_own_store() {
         let (key, pem) = issue_ghostkey();
         assert_eq!(
-            verify_store_certificate_against(&pem, &store_id_for(&key), &test_master()),
+            verdict(&pem, &store_id_for(&key), &test_master()),
             CertificateStatus::Verified
         );
     }
@@ -320,11 +387,7 @@ mod tests {
         let (scammer_key, _scammer_pem) = issue_ghostkey();
 
         // The scammer's own store, carrying the victim's real certificate.
-        let status = verify_store_certificate_against(
-            &victim_pem,
-            &store_id_for(&scammer_key),
-            &test_master(),
-        );
+        let status = verdict(&victim_pem, &store_id_for(&scammer_key), &test_master());
 
         assert!(
             matches!(status, CertificateStatus::Invalid(_)),
@@ -333,11 +396,7 @@ mod tests {
         // And the certificate itself is genuine -- the rejection is about
         // identity, not about the chain.
         assert_eq!(
-            verify_store_certificate_against(
-                &victim_pem,
-                &store_id_for(&victim_key),
-                &test_master()
-            ),
+            verdict(&victim_pem, &store_id_for(&victim_key), &test_master()),
             CertificateStatus::Verified,
             "the same certificate must still verify for the store it belongs to"
         );
@@ -356,7 +415,7 @@ mod tests {
         );
         for id in ids.iter().skip(1) {
             assert_eq!(
-                verify_store_certificate_against(&pem, id.as_bytes(), &test_master()),
+                verdict(&pem, id.as_bytes(), &test_master()),
                 CertificateStatus::Verified,
                 "a store at a superseded generation must still verify"
             );
@@ -378,10 +437,62 @@ mod tests {
 
         assert!(
             matches!(
-                verify_store_certificate_against(&pem, future.as_bytes(), &test_master()),
+                verdict(&pem, future.as_bytes(), &test_master()),
                 CertificateStatus::Invalid(_)
             ),
             "a generation this build cannot derive cannot be verified either"
+        );
+    }
+
+    /// A verified store yields the key its mailbox address is derived from.
+    #[test]
+    fn a_verified_store_yields_the_sellers_key() {
+        let (key, pem) = issue_ghostkey();
+        assert_eq!(
+            store_verifying_key_against(&pem, &store_id_for(&key), &test_master()),
+            Some(key),
+            "a verified store must yield the key it is addressed by"
+        );
+    }
+
+    /// **The one that matters.** A scammer's store carrying the victim's
+    /// genuine certificate must yield no key at all.
+    ///
+    /// If it yielded the victim's key, a buyer messaging the scammer's store
+    /// would derive the VICTIM's mailbox address and deposit their message
+    /// there -- reporting a successful send, into a mailbox belonging to
+    /// someone they were never talking to, while the scammer they actually
+    /// contacted receives nothing.
+    ///
+    /// Mutated red by making `store_verifying_key_against` return
+    /// `certified_key(pem, master).ok()`, i.e. trusting a certificate that
+    /// merely parses and chains.
+    #[test]
+    fn a_stolen_certificate_yields_no_key_to_derive_a_mailbox_from() {
+        let (victim_key, victim_pem) = issue_ghostkey();
+        let (scammer_key, _) = issue_ghostkey();
+
+        assert_eq!(
+            store_verifying_key_against(&victim_pem, &store_id_for(&scammer_key), &test_master()),
+            None,
+            "a certificate issued to somebody else must not name this store's mailbox"
+        );
+        // The same certificate on its OWN store still works, so the assertion
+        // above is about identity rather than about a broken fixture.
+        assert_eq!(
+            store_verifying_key_against(&victim_pem, &store_id_for(&victim_key), &test_master()),
+            Some(victim_key)
+        );
+    }
+
+    /// A store with no certificate names no mailbox either. There is no
+    /// weaker fallback: the address has to come from a key, and an
+    /// unverified store supplies none.
+    #[test]
+    fn a_store_without_a_certificate_yields_no_key() {
+        assert_eq!(
+            store_verifying_key_against("", &[7u8; 32], &test_master()),
+            None
         );
     }
 
@@ -390,7 +501,7 @@ mod tests {
         let (key, pem) = issue_ghostkey();
         let stranger = SigningKey::from_bytes(&[0x22; 32]).verifying_key();
 
-        let status = verify_store_certificate_against(&pem, &store_id_for(&key), &Some(stranger));
+        let status = verdict(&pem, &store_id_for(&key), &Some(stranger));
         assert!(
             matches!(status, CertificateStatus::Invalid(_)),
             "a chain to the wrong master key must not verify, got {status:?}"
@@ -406,7 +517,7 @@ mod tests {
         let id = store_id_for(&key);
 
         assert_eq!(
-            verify_store_certificate_against(&pem, &id, &test_master()),
+            verdict(&pem, &id, &test_master()),
             CertificateStatus::Verified,
             "the fixture must be a valid chain under its own authority"
         );
@@ -429,7 +540,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    verify_store_certificate_against(pem, &[7u8; 32], &test_master()),
+                    verdict(pem, &[7u8; 32], &test_master()),
                     CertificateStatus::Invalid(_)
                 ),
                 "{pem:?} is not a certificate and must not verify"
@@ -444,7 +555,7 @@ mod tests {
     fn an_absent_certificate_is_absent_rather_than_invalid() {
         for pem in ["", "   \n "] {
             assert_eq!(
-                verify_store_certificate_against(pem, &[7u8; 32], &test_master()),
+                verdict(pem, &[7u8; 32], &test_master()),
                 CertificateStatus::Absent
             );
         }
@@ -454,7 +565,7 @@ mod tests {
     fn a_contract_id_of_the_wrong_length_does_not_verify() {
         let (_key, pem) = issue_ghostkey();
         assert!(matches!(
-            verify_store_certificate_against(&pem, &[1u8; 31], &test_master()),
+            verdict(&pem, &[1u8; 31], &test_master()),
             CertificateStatus::Invalid(_)
         ));
     }

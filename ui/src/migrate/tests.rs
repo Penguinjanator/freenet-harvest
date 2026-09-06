@@ -236,6 +236,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by the 2026-09-05 correctness review; see the
                 // registry entry for the per-artifact causes.
                 "c1bf133c0029553bee0e092332aac933851e28a1054cce3bf72e42f517bece30",
+                // V8, from `git show 5c33d4f:ui/public/contracts/store_contract.wasm`.
+                // Superseded by the buyer-to-seller messaging work; this
+                // artifact's own change is `StoreInfoV1::encryption_public_key`.
+                "c51cbcf2730b8d8511d48768c435462fa1ae37f0a4b513a96cf1d23d73f78370",
             ],
         ),
         (
@@ -252,6 +256,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by the 2026-09-05 correctness review; see the
                 // registry entry for the per-artifact causes.
                 "7163be62207ae9f77ee2ccb8e0249fe2d824cb52788732eb6fe60cca52b0f801",
+                // V8, from `git show 5c33d4f:ui/public/contracts/\
+                // reputation_contract.wasm`. This artifact took no behavioural
+                // change of its own; `harvest-common` moved underneath it.
+                "c47e6fc580e2ecdbc4f4e4330c926c1e2d3092070519f074366bf09964d0e826",
             ],
         ),
         (
@@ -268,6 +276,11 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by the 2026-09-05 correctness review; see the
                 // registry entry for the per-artifact causes.
                 "2eb1403aa35b94b8c6a0cbf252c7858e07b704740b0b76d4412871a643a78afa",
+                // V8, from `git show 5c33d4f:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by the buyer-to-seller messaging work; for THIS
+                // artifact the cause is its own, and it is a change of
+                // identity -- see the registry entry.
+                "b3bb6b0fd90c0918114e8068de1e1cc9ba6b08aa89fbbf018970ccfb1a6b0f14",
             ],
         ),
     ];
@@ -316,6 +329,11 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // Superseded by the 2026-09-05 correctness review, principally the
             // origin gate on every request.
             "c11c732fce7c00344739cf94ec0934c45fd2fbb152d24fe7de1d353b9ee207a4".to_string(),
+            // V10, from `git show 5c33d4f:ui/public/contracts/harvest_delegate.wasm`.
+            // Superseded by the buyer-to-seller messaging work, which put the
+            // seller's X25519 secret and the buyer's per-conversation store in
+            // this delegate and added `x25519-dalek` as a real dependency.
+            "907c2219b12938d45ce302e82818ca6edad0f6706affafc8da14efe65f0f3ad7".to_string(),
         ],
     );
 }
@@ -654,6 +672,11 @@ const PUBLISHED_UNDER_LEGACY_PARAMS: &[(u32, bool)] = &[
     // like any `common` edit but leaves the encoding at 56 bytes. Current
     // shape, as every generation from V6 on will be unless a FIELD moves.
     (7, false),
+    // V8: the buyer-to-seller messaging work. `StoreInfoV1` gained a field,
+    // which is STATE and not parameters; `StoreParameters` is field-for-field
+    // what it was, verified against V7 rather than assumed, so the encoding is
+    // still 56 bytes and this generation derives under the current one.
+    (8, false),
 ];
 
 /// V1 is derived under TODAY's parameter encoding, not the legacy one.
@@ -1201,6 +1224,18 @@ fn fold_all_preconditions_hold_for_the_store_state() {
 /// That is sound only because the prune is deterministic and re-run on every
 /// merge, so the fold result is pruned again identically. If it were not, the
 /// order-invariance assertion here would fail.
+///
+/// **These three samples are all small in every dimension, and that is a
+/// limitation of this test rather than a property of the merge.** The
+/// mailbox merge NORMALISES -- it prunes to `MAX_MESSAGES`, to
+/// `MAX_MAILBOX_BYTES`, and (since the fold fix) refuses messages over
+/// `MAX_MESSAGE_BYTES` -- so `merge(a, a) == a` is simply false for any `a`
+/// that is not already normalised, and `assert_merge_idempotent` asserts
+/// exactly that strict form. Passing here means "these samples are already
+/// normalised", not "the merge is idempotent".
+///
+/// `fold_all_preconditions_hold_for_a_mailbox_that_needs_normalising` is the
+/// test that faces that, on samples that cross all three bounds.
 #[test]
 fn fold_all_preconditions_hold_for_the_mailbox_state() {
     let ops = MailboxOps {
@@ -1216,6 +1251,312 @@ fn fold_all_preconditions_hold_for_the_mailbox_state() {
     freenet_migrate::driver::policy_check::assert_merge_commutative(&samples, merge);
     freenet_migrate::driver::policy_check::assert_merge_idempotent(&samples, merge);
     freenet_migrate::driver::policy_check::assert_fold_order_invariant(&samples, merge);
+}
+
+/// **The `FoldAllAck` preconditions, on states that actually need
+/// normalising.**
+///
+/// The test above earns the ack token against three samples that are small in
+/// every dimension, so nothing in it exercises a prune or a refusal. That was
+/// found when the size bound made the fold non-commutative and the existing
+/// precondition test stayed green.
+///
+/// **This test then made the same mistake one bound over**, and it is worth
+/// saying so here rather than only in the commit that fixed it. Its samples
+/// crossed `MAX_MESSAGE_BYTES` and `MAX_MESSAGES` and reached 2.86% of
+/// `MAX_MAILBOX_BYTES`; adding a sample that actually filled the byte budget
+/// turned `assert_fold_order_invariant` red, because `enforce_message_cap`'s
+/// prefix walk made the survivors depend on which large message blocked it.
+/// Three fixtures, three times too small, all for the same reason: the sizes
+/// were written as numbers while the bounds were constants. **Every sample
+/// here is now derived from the constant it is tested against** -- see
+/// `sized_message` and `fills_the_byte_budget` -- which is the only version of
+/// this fix that does not need doing again.
+///
+/// # Strict idempotence is the wrong statement here, and always was
+///
+/// `assert_merge_idempotent` asserts `merge(a, a) == a`. A normalising merge
+/// cannot satisfy that for a non-normalised `a`, and the mailbox merge has
+/// normalised since long before the size bound: hand it 517 messages and
+/// `merge(a, a)` returns 512, because `enforce_message_cap` runs on every
+/// `apply_delta`. So this is not a new weakness introduced by the size
+/// refusal -- it is a property the original sample set was too small to
+/// reveal.
+///
+/// What `FoldAll` actually needs, and what is asserted here instead:
+///
+/// * **commutativity**, on raw un-normalised samples -- the property that
+///   broke, and the only one of the three that was ever really at risk;
+/// * **order-invariance** of the fold across those same samples;
+/// * **idempotence on the merge's own output**, which is the honest form: the
+///   fold's result is a fixed point, so re-running the migration or meeting
+///   the same generation twice changes nothing;
+/// * **absorption**, `merge(merge(a, b), b) == merge(a, b)` -- folding a
+///   generation that has already been folded in is a no-op. This is the
+///   property a re-run of the migration actually depends on, and neither the
+///   crate's helpers nor the test above check it.
+#[test]
+fn fold_all_preconditions_hold_for_a_mailbox_that_needs_normalising() {
+    let ops = MailboxOps {
+        params: mailbox_params(&seller_vk()),
+    };
+    let merge = |x: MailboxStateV1, y: MailboxStateV1| ops.merge_generations(x, y);
+    let base = 1_700_000_000;
+
+    // One sample over each bound, all three derived from the constants.
+    let over_cap: Vec<_> = (0..harvest_common::mailbox::MAX_MESSAGES + 5)
+        .map(|i| message((i % 250) as u8, base + 1_000 + i as i64))
+        .collect();
+    let samples = vec![
+        mailbox_with(vec![message(1, base)]),
+        mailbox_with(vec![oversized_message(2, base + 10)]),
+        mailbox_with(vec![message(1, base), oversized_message(3, base + 20)]),
+        mailbox_with(over_cap),
+        // MAX_MAILBOX_BYTES. This one was missing, and it is the bound where
+        // the property actually fails.
+        mailbox_with(fills_the_byte_budget(60, base + 100_000)),
+    ];
+
+    freenet_migrate::driver::policy_check::assert_merge_commutative(&samples, merge);
+    freenet_migrate::driver::policy_check::assert_fold_order_invariant(&samples, merge);
+
+    // Idempotence on the merge's own output. `merge(a, a)` normalises; doing
+    // it again must change nothing.
+    let normalised: Vec<_> = samples
+        .iter()
+        .map(|s| merge(s.clone(), s.clone()))
+        .collect();
+    freenet_migrate::driver::policy_check::assert_merge_idempotent(&normalised, merge);
+
+    // Absorption: re-folding a generation already folded in is a no-op.
+    for (i, a) in samples.iter().enumerate() {
+        for (j, b) in samples.iter().enumerate() {
+            let once = merge(a.clone(), b.clone());
+            let twice = merge(once.clone(), b.clone());
+            assert_eq!(
+                once, twice,
+                "re-folding generation #{j} into the result of folding it with #{i} \
+                 changed the state, so re-running the migration is not safe"
+            );
+        }
+    }
+}
+
+/// A message the successor contract will not accept in a delta: one byte over
+/// `MAX_MESSAGE_BYTES`.
+///
+/// No published generation ever enforced a size limit -- `MAX_MESSAGE_BYTES`
+/// and the UI's send-side refusal both arrive on this branch, after the commit
+/// recording V7 -- so a V1..V7 mailbox may hold one, either from a plaintext
+/// over `LARGEST_BUCKET` (`pad_to_bucket` returned it unpadded rather than
+/// refusing) or from an oversized `sender_public_key`, which was an unbounded
+/// `Vec<u8>` any third party could plant in an open-write mailbox.
+fn oversized_message(nonce: u8, secs: i64) -> EncryptedMessage {
+    sized_message(nonce, secs, harvest_common::mailbox::MAX_MESSAGE_BYTES + 1)
+}
+
+/// A message of exactly `target` encoded bytes.
+///
+/// **Every size in these fixtures is DERIVED from the constant it is tested
+/// against, never written as a number.** Three times now a precondition test
+/// has been too small to observe the property it attests: the samples were
+/// hard-coded, the bounds are constants, and the two drifted. A sample that is
+/// `MAX_MESSAGE_BYTES` because it is written as `MAX_MESSAGE_BYTES` cannot
+/// fall behind a retuned constant.
+fn sized_message(nonce: u8, secs: i64, target: usize) -> EncryptedMessage {
+    let mut message = message(nonce, secs);
+    let headroom = target - harvest_common::mailbox::message_bytes(&message);
+    message.ciphertext = vec![nonce; message.ciphertext.len() + headroom];
+    assert_eq!(
+        harvest_common::mailbox::message_bytes(&message),
+        target,
+        "the fixture must be the size it claims, or it cannot observe anything"
+    );
+    message
+}
+
+/// As few maximum-size messages as it takes to fill `MAX_MAILBOX_BYTES`.
+///
+/// Derived, not counted: the number is whatever the ratio of the two constants
+/// makes it.
+fn fills_the_byte_budget(first_nonce: u8, base: i64) -> Vec<EncryptedMessage> {
+    let mut messages = vec![];
+    let mut total = 0usize;
+    let mut i = 0i64;
+    while total < harvest_common::mailbox::MAX_MAILBOX_BYTES {
+        let m = sized_message(
+            first_nonce.wrapping_add((i % 200) as u8),
+            base + i,
+            harvest_common::mailbox::MAX_MESSAGE_BYTES,
+        );
+        total += harvest_common::mailbox::message_bytes(&m);
+        messages.push(m);
+        i += 1;
+    }
+    messages
+}
+
+/// **The fold is commutative even when a message crosses the size bound.**
+///
+/// This is the `FoldAllAck` precondition, on the sample the existing
+/// precondition test could not contain. `apply_delta` refuses an oversized
+/// message on the INCOMING side only, and `merge_generations(newer, older)`
+/// puts the older generation on that side -- so before the fix,
+/// `merge(big, small)` kept the oversized message and `merge(small, big)`
+/// dropped it, which is a fold whose result depends on which side a message
+/// arrived on rather than on the bytes.
+///
+/// Asserting commutativity rather than the message count is deliberate: the
+/// count is the symptom, and the property the ack token is minted against is
+/// this one.
+///
+/// Strict idempotence is deliberately NOT asserted here -- the merge
+/// normalises, so `merge(a, a) == a` is false for any un-normalised `a`, which
+/// has been true since long before the size bound. See
+/// `fold_all_preconditions_hold_for_a_mailbox_that_needs_normalising`, which
+/// asserts the honest forms.
+#[test]
+fn folding_is_commutative_across_the_message_size_bound() {
+    let ops = MailboxOps {
+        params: mailbox_params(&seller_vk()),
+    };
+    let base = 1_700_000_000;
+    let samples = vec![
+        mailbox_with(vec![message(1, base)]),
+        mailbox_with(vec![oversized_message(2, base + 10)]),
+        mailbox_with(vec![message(1, base), oversized_message(3, base + 20)]),
+    ];
+    let merge = |x: MailboxStateV1, y: MailboxStateV1| ops.merge_generations(x, y);
+    freenet_migrate::driver::policy_check::assert_merge_commutative(&samples, merge);
+    freenet_migrate::driver::policy_check::assert_fold_order_invariant(&samples, merge);
+}
+
+/// **What the fold cannot carry, it drops from BOTH sides.**
+///
+/// The direction matters and is the reason commutativity is restored by
+/// dropping rather than by keeping. `verify` tolerates an over-budget state,
+/// so a folded state carrying an oversized message would be accepted by
+/// `validate_state` and PUT successfully -- and then every peer that merged it
+/// would run `apply_delta` and drop the message, leaving this node holding an
+/// entry no other peer has, permanently. Dropping it here moves the node
+/// toward what the network holds; keeping it would be a silent permanent
+/// divergence dressed up as data preservation.
+#[test]
+fn an_oversized_message_is_dropped_from_whichever_side_it_is_on() {
+    let ops = MailboxOps {
+        params: mailbox_params(&seller_vk()),
+    };
+    let base = 1_700_000_000;
+    let big = oversized_message(9, base + 5);
+    let small = message(1, base);
+
+    let from_older = ops.merge_generations(
+        mailbox_with(vec![small.clone()]),
+        mailbox_with(vec![big.clone()]),
+    );
+    let from_newer = ops.merge_generations(
+        mailbox_with(vec![big.clone()]),
+        mailbox_with(vec![small.clone()]),
+    );
+
+    for (which, folded) in [("older", &from_older), ("newer", &from_newer)] {
+        assert!(
+            !folded.messages.contains(&big),
+            "an oversized message on the {which} side survived the fold; the successor's \
+             own apply_delta would refuse it, so this node would hold an entry no peer has"
+        );
+        assert!(
+            folded.messages.contains(&small),
+            "the honest message was lost too"
+        );
+    }
+}
+
+/// **An unfoldable message is reported, not swallowed.**
+///
+/// The migration exists to preserve messages, so the one thing it must never
+/// do is fail to carry one without saying so. `probe_warn` is the same channel
+/// `decode_probed_state` uses for the neighbouring failure ("this is how a
+/// recoverable generation goes missing silently"), which is the register this
+/// belongs in.
+///
+/// Asserted on the returned report rather than on captured stderr, because a
+/// test that greps a log is a test of the logger.
+#[test]
+fn the_fold_says_what_it_could_not_carry() {
+    let base = 1_700_000_000;
+    let report = merge_mailbox_reporting_drops(
+        mailbox_with(vec![message(1, base), oversized_message(9, base + 5)]),
+        &mailbox_with(vec![oversized_message(8, base + 6)]),
+    );
+    assert_eq!(
+        report.dropped_oversized, 2,
+        "the fold must count what it could not carry, from both sides"
+    );
+    assert_eq!(report.state.messages.len(), 1);
+
+    let warning = report
+        .unfoldable_warning()
+        .expect("a fold that dropped messages must have something to say");
+    assert!(
+        warning.contains("2 message(s)")
+            && warning.contains(&harvest_common::mailbox::MAX_MESSAGE_BYTES.to_string()),
+        "the warning must name how many and against what bound, so an operator can \
+         tell what was lost: {warning}"
+    );
+
+    // And says nothing when there is nothing to say, so the warning is
+    // evidence rather than noise.
+    let clean = merge_mailbox_reporting_drops(
+        mailbox_with(vec![message(1, base)]),
+        &mailbox_with(vec![message(2, base + 1)]),
+    );
+    assert_eq!(clean.dropped_oversized, 0);
+    assert!(clean.unfoldable_warning().is_none());
+}
+
+/// **Absorption for the reputation and store folds, which nothing pinned.**
+///
+/// `fold_all_preconditions_hold_for_a_mailbox_that_needs_normalising` asserts
+/// absorption for the mailbox only. Both of the others hold -- reputation is a
+/// grow-only nonce-keyed union with no cap and a monotone certificate
+/// back-fill; `enforce_order_cap` keeps a strict top-k, so anything it drops
+/// ranks below everything it keeps and re-offering it changes nothing -- but
+/// "holds by argument" and "holds" are the distinction this whole file exists
+/// to keep.
+///
+/// Absorption is the property a RE-RUN of the migration depends on: folding a
+/// generation that has already been folded in must be a no-op, or the state
+/// flaps and each flap is a PUT.
+#[test]
+fn re_folding_a_generation_is_a_no_op_for_reputation_and_store() {
+    let rep_params = reputation_params(vec![1u8; 32], &seller_vk());
+    let rep_ops = ReputationOps {
+        params: rep_params.clone(),
+    };
+    let with_cert = ReputationStateV1 {
+        owner_certificate_pem: "CERT-FROM-OLDER".to_string(),
+        ..Default::default()
+    };
+
+    let once = rep_ops.merge_generations(ReputationStateV1::default(), with_cert.clone());
+    let twice = rep_ops.merge_generations(once.clone(), with_cert);
+    assert_eq!(
+        once, twice,
+        "re-folding a reputation generation changed the state, so a re-run of the \
+         migration is not a fixed point"
+    );
+
+    let store_ops = store_ops();
+    let older = store_with(&[signed_listing(10, "Alpha"), signed_listing(11, "Beta")]);
+    let once =
+        store_ops.merge_generations(store_with(&[signed_listing(12, "Gamma")]), older.clone());
+    let twice = store_ops.merge_generations(once.clone(), older);
+    assert_eq!(
+        once, twice,
+        "re-folding a store generation changed the state, so a re-run of the migration \
+         is not a fixed point"
+    );
 }
 
 /// An empty mailbox or reputation state is a miss.
@@ -1276,6 +1617,156 @@ fn an_unverifiable_merge_keeps_the_primary() {
     assert_eq!(
         merged, primary,
         "an unverifiable delta must leave the primary untouched"
+    );
+}
+
+/// **All three folds report a wholly-discarded predecessor generation.**
+///
+/// The blocking finding of the fold gate: `merge_mailbox` warned, `merge_store`
+/// never had a warning at all, and the reputation fold's report covered token
+/// collisions but not this path -- measured at 0 of 3 predecessor entries
+/// carried, 2 of them verifiable, with nothing said. **And this migration
+/// SEALS**, so a generation dropped quietly on the sealing run is never looked
+/// at again.
+///
+/// Asserted through one shared helper (`fold_or_keep_primary`) rather than
+/// three arms, so there is one place to forget instead of three. The mailbox
+/// arm is unreachable today (`apply_delta` is infallible), which is why this
+/// drives the two that are reachable; the mailbox is covered structurally by
+/// going through the same helper.
+#[test]
+fn a_wholly_discarded_predecessor_generation_is_reported() {
+    // Reputation: one unverifiable entry rejects the whole delta.
+    let rep_params = reputation_params(vec![1u8; 32], &seller_vk());
+    let mut unverifiable = ReputationStateV1::default();
+    unverifiable.feedback.push(dummy_feedback());
+    unverifiable.used_nonces.insert([4u8; 32]);
+
+    let rep = merge_reputation_reporting_exclusions(
+        ReputationStateV1::default(),
+        &unverifiable,
+        &rep_params,
+    );
+    assert!(
+        rep.discarded,
+        "a reputation generation refused in full must be reported, not kept quiet -- \
+         `excluded_variants` is empty on this path, so it was the only signal and it \
+         said nothing"
+    );
+    assert!(
+        rep.state.feedback.is_empty(),
+        "keep-primary is still the behaviour"
+    );
+
+    // And a fold that succeeds does NOT claim a discard, so the flag is
+    // evidence rather than noise.
+    let quiet = merge_reputation_reporting_exclusions(
+        ReputationStateV1::default(),
+        &ReputationStateV1::default(),
+        &rep_params,
+    );
+    assert!(!quiet.discarded);
+
+    // Store: a listing whose signature does not verify against these
+    // parameters.
+    let other_seller = SigningKey::from_bytes(&[77u8; 32]).verifying_key();
+    let store = merge_store_reporting_discard(
+        StoreStateV1::default(),
+        &store_with(&[signed_listing(10, "Alpha")]),
+        &store_params(&other_seller),
+    );
+    assert!(
+        store.discarded,
+        "a store generation refused in full must be reported: it takes every VERIFIED \
+         listing with it, measured at 0 of 2 carried with 1 verifiable"
+    );
+
+    let ok = merge_store_reporting_discard(
+        StoreStateV1::default(),
+        &store_with(&[signed_listing(11, "Beta")]),
+        &store_params(&seller_vk()),
+    );
+    assert!(!ok.discarded, "a successful store fold claims no discard");
+}
+
+/// An oversized message present on BOTH sides is one message that could not be
+/// carried, not two.
+///
+/// A migration report that overstates a loss is as untrustworthy as one that
+/// understates it, and this one is read by a person deciding whether the
+/// migration went well.
+#[test]
+fn an_oversized_message_on_both_sides_is_counted_once() {
+    let base = 1_700_000_000;
+    let shared = oversized_message(9, base + 5);
+    let report = merge_mailbox_reporting_drops(
+        mailbox_with(vec![message(1, base), shared.clone()]),
+        &mailbox_with(vec![shared]),
+    );
+    assert_eq!(
+        report.dropped_oversized, 1,
+        "the same message on both sides was counted twice"
+    );
+}
+
+/// **A fold that excludes a genuine feedback entry says so.**
+///
+/// The second migration-time data-loss path, and the one that matters because
+/// it fires during a migration rather than during an attack somebody has to
+/// mount. The RSA signature covers `entry.token` alone (issue #22), so two
+/// entries can share a token with different words; whichever side the fold
+/// already holds wins, and the other is excluded permanently.
+///
+/// **Nothing here can preserve both.** `ReputationStateV1::verify` requires
+/// `feedback.len() == used_nonces.len()`, so a state carrying two entries
+/// under one token is invalid by construction -- the repair is the reputation
+/// contract's own re-key, which is #22 and not this branch. What the fold CAN
+/// stop doing is losing one in silence, which is the same standard the
+/// oversized-message path is now held to.
+///
+/// Signatures are not the property under test, so the fixture uses unsigned
+/// entries; the report is computed before `apply_delta` is reached.
+#[test]
+fn a_fold_that_excludes_a_feedback_variant_reports_it() {
+    let params = reputation_params(vec![1u8; 32], &seller_vk());
+
+    let genuine = dummy_feedback();
+    let neutered = FeedbackEntry {
+        category: harvest_common::feedback::FeedbackCategory::Other("no complaint".to_string()),
+        comment: "actually it was fine".to_string(),
+        ..genuine.clone()
+    };
+    assert_eq!(
+        genuine.token.nonce, neutered.token.nonce,
+        "precondition: one token, two entries"
+    );
+
+    // The successor holds the neutered variant; the predecessor holds the
+    // genuine entry.
+    let mut successor = ReputationStateV1::default();
+    successor.feedback.push(neutered);
+    successor.used_nonces.insert(genuine.token.nonce);
+    let mut predecessor = ReputationStateV1::default();
+    predecessor.feedback.push(genuine.clone());
+    predecessor.used_nonces.insert(genuine.token.nonce);
+
+    let report = merge_reputation_reporting_exclusions(successor, &predecessor, &params);
+    assert_eq!(
+        report.excluded_variants,
+        vec![genuine.token.nonce],
+        "a genuine entry excluded by a token collision must be named, not dropped in \
+         silence during the one operation that exists to carry data forward"
+    );
+
+    // And says nothing when the two sides agree, so the report is evidence
+    // rather than noise.
+    let mut same = ReputationStateV1::default();
+    same.feedback.push(genuine.clone());
+    same.used_nonces.insert(genuine.token.nonce);
+    let quiet = merge_reputation_reporting_exclusions(same.clone(), &same, &params);
+    assert!(
+        quiet.excluded_variants.is_empty(),
+        "an identical entry on both sides is not an exclusion"
     );
 }
 
@@ -1449,4 +1940,53 @@ fn the_wildcard_outcome_arm_retries() {
          freenet-migrate release would write a permanent marker for a case \
          this code has never seen."
     );
+}
+
+/// **The fold must not drop a message because something in the newer
+/// generation shares its nonce.**
+///
+/// Found by the source scrape added with the contract's identity re-key, not
+/// by review: this was a FOURTH site deciding "already held" by nonce, after
+/// `dedupe_by_nonce`, `summarize` and the contract's state-merge arm. It is
+/// the one with the sharpest consequence, because it runs during a re-key --
+/// the buyer's messages are being carried forward from a superseded
+/// generation, and a message dropped here is dropped at the moment the whole
+/// migration exists to preserve it.
+///
+/// The fix is the same as the contract's: no comparison at all.
+/// `apply_delta` decides, and it decides by `entry_digest`.
+#[test]
+fn folding_keeps_a_message_whose_nonce_the_newer_generation_shares() {
+    let mut confession = message(7, 1_700_000_000);
+    confession.ciphertext = b"I confess".to_vec();
+    let mut retraction = message(7, 1_700_000_001);
+    retraction.ciphertext = b"I said no such thing".to_vec();
+    assert_eq!(
+        confession.nonce, retraction.nonce,
+        "precondition: the two share a nonce"
+    );
+
+    let folded = super::merge_mailbox(
+        mailbox_with(vec![retraction.clone()]),
+        &mailbox_with(vec![confession.clone()]),
+    );
+
+    assert!(
+        folded.messages.contains(&confession),
+        "the fold dropped a message from the older generation because the newer one held \
+         something sharing its nonce"
+    );
+    assert!(folded.messages.contains(&retraction));
+    folded
+        .verify()
+        .expect("the fold must produce a valid state");
+}
+
+/// Folding a generation this one already holds entirely changes nothing.
+#[test]
+fn folding_an_identical_generation_changes_nothing() {
+    let held = mailbox_with(vec![message(1, 1_700_000_000), message(2, 1_700_000_001)]);
+    let folded = super::merge_mailbox(held.clone(), &held);
+    assert_eq!(folded.messages.len(), 2);
+    folded.verify().expect("valid");
 }

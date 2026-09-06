@@ -90,6 +90,10 @@ impl ReputationStateV1 {
                 .map_err(|e| format!("feedback signature invalid: {e}"))?;
 
             // Verify nonce is tracked
+            // nonce-identity-waiver: reputation keys identity on `token.nonce` and has the
+            // same defect the mailbox re-key fixed -- see
+            // `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. Parked
+            // until the reputation contract's own re-key; NOT a site to copy.
             if !self.used_nonces.contains(&entry.token.nonce) {
                 return Err(format!(
                     "feedback entry nonce not in used_nonces set: {:?}",
@@ -116,6 +120,10 @@ impl ReputationStateV1 {
         let new_entries: Vec<_> = self
             .feedback
             .iter()
+            // nonce-identity-waiver: reputation keys identity on `token.nonce` and has the
+            // same defect the mailbox re-key fixed -- see
+            // `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. Parked
+            // until the reputation contract's own re-key; NOT a site to copy.
             .filter(|e| !old_summary.contains(&e.token.nonce))
             .cloned()
             .collect();
@@ -162,6 +170,10 @@ impl ReputationStateV1 {
 
         for entry in entries {
             // Reject duplicate nonces
+            // nonce-identity-waiver: reputation keys identity on `token.nonce` and has the
+            // same defect the mailbox re-key fixed -- see
+            // `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. Parked
+            // until the reputation contract's own re-key; NOT a site to copy.
             if self.used_nonces.contains(&entry.token.nonce) || !seen.insert(entry.token.nonce) {
                 continue;
             }
@@ -335,5 +347,67 @@ mod tests {
             .expect("a repeated valid entry is a duplicate, not an error");
         assert_eq!(state.feedback.len(), 1);
         assert_eq!(state.used_nonces.len(), 1);
+    }
+    /// **KNOWN GAP, found by the 2026-09-05 identity sweep and NOT fixed
+    /// here: two feedback entries sharing a token do not converge.**
+    ///
+    /// The doc on `ReputationStateV1` says feedback is "naturally
+    /// commutative: adding feedback entries in any order produces the same
+    /// final set". It is not, and this is the counterexample.
+    ///
+    /// The RSA signature covers `entry.token` and nothing else, while
+    /// `category`, `comment` and `submitted_at` ride alongside it unsigned.
+    /// Identity is `token.nonce`. So anyone who reads a published entry --
+    /// the contract state is public -- can re-submit the same token and
+    /// signature with different words, and each peer keeps whichever it saw
+    /// FIRST. Two peers that saw the two orders keep different bytes forever.
+    ///
+    /// The consequence is not only convergence: a seller who reads negative
+    /// feedback can push a neutered variant to peers that do not hold the
+    /// original yet, and those peers will refuse the real one when it
+    /// arrives, because its nonce is already used.
+    ///
+    /// This is the same class as the mailbox's nonce identity, which the
+    /// 2026-09-05 change fixed by keying on a digest of the whole entry. It
+    /// is left alone here deliberately: it is a different contract with its
+    /// own re-key, the fix wants its own review, and for feedback the better
+    /// repair is probably to sign the whole entry rather than the token
+    /// alone, so the variant cannot be constructed at all. Recorded in
+    /// `docs/untested-invariants.md`.
+    #[test]
+    fn known_gap_two_feedback_variants_sharing_a_token_do_not_converge() {
+        let (private, params) = key_pair();
+        let genuine = signed_entry(&private, 1);
+        let neutered = FeedbackEntry {
+            category: FeedbackCategory::Other("no complaint".to_string()),
+            comment: "actually it was fine".to_string(),
+            ..genuine.clone()
+        };
+        assert_eq!(
+            genuine.token.nonce, neutered.token.nonce,
+            "precondition: one token, two entries"
+        );
+
+        let mut saw_genuine_first = ReputationStateV1::default();
+        saw_genuine_first
+            .apply_delta(&params, &Some(vec![genuine.clone()]))
+            .expect("apply");
+        saw_genuine_first
+            .apply_delta(&params, &Some(vec![neutered.clone()]))
+            .expect("apply");
+
+        let mut saw_neutered_first = ReputationStateV1::default();
+        saw_neutered_first
+            .apply_delta(&params, &Some(vec![neutered]))
+            .expect("apply");
+        saw_neutered_first
+            .apply_delta(&params, &Some(vec![genuine]))
+            .expect("apply");
+
+        assert_ne!(
+            saw_genuine_first.feedback, saw_neutered_first.feedback,
+            "these two peers converged, so this known gap is CLOSED -- delete this test and \
+             correct the commutativity claim on `ReputationStateV1`"
+        );
     }
 }
