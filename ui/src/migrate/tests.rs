@@ -236,6 +236,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by the 2026-09-05 correctness review; see the
                 // registry entry for the per-artifact causes.
                 "c1bf133c0029553bee0e092332aac933851e28a1054cce3bf72e42f517bece30",
+                // V8, from `git show 5c33d4f:ui/public/contracts/store_contract.wasm`.
+                // Superseded by the buyer-to-seller messaging work; this
+                // artifact's own change is `StoreInfoV1::encryption_public_key`.
+                "c51cbcf2730b8d8511d48768c435462fa1ae37f0a4b513a96cf1d23d73f78370",
             ],
         ),
         (
@@ -252,6 +256,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by the 2026-09-05 correctness review; see the
                 // registry entry for the per-artifact causes.
                 "7163be62207ae9f77ee2ccb8e0249fe2d824cb52788732eb6fe60cca52b0f801",
+                // V8, from `git show 5c33d4f:ui/public/contracts/\
+                // reputation_contract.wasm`. This artifact took no behavioural
+                // change of its own; `harvest-common` moved underneath it.
+                "c47e6fc580e2ecdbc4f4e4330c926c1e2d3092070519f074366bf09964d0e826",
             ],
         ),
         (
@@ -268,6 +276,11 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by the 2026-09-05 correctness review; see the
                 // registry entry for the per-artifact causes.
                 "2eb1403aa35b94b8c6a0cbf252c7858e07b704740b0b76d4412871a643a78afa",
+                // V8, from `git show 5c33d4f:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by the buyer-to-seller messaging work; for THIS
+                // artifact the cause is its own, and it is a change of
+                // identity -- see the registry entry.
+                "b3bb6b0fd90c0918114e8068de1e1cc9ba6b08aa89fbbf018970ccfb1a6b0f14",
             ],
         ),
     ];
@@ -316,6 +329,11 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // Superseded by the 2026-09-05 correctness review, principally the
             // origin gate on every request.
             "c11c732fce7c00344739cf94ec0934c45fd2fbb152d24fe7de1d353b9ee207a4".to_string(),
+            // V10, from `git show 5c33d4f:ui/public/contracts/harvest_delegate.wasm`.
+            // Superseded by the buyer-to-seller messaging work, which put the
+            // seller's X25519 secret and the buyer's per-conversation store in
+            // this delegate and added `x25519-dalek` as a real dependency.
+            "907c2219b12938d45ce302e82818ca6edad0f6706affafc8da14efe65f0f3ad7".to_string(),
         ],
     );
 }
@@ -654,6 +672,11 @@ const PUBLISHED_UNDER_LEGACY_PARAMS: &[(u32, bool)] = &[
     // like any `common` edit but leaves the encoding at 56 bytes. Current
     // shape, as every generation from V6 on will be unless a FIELD moves.
     (7, false),
+    // V8: the buyer-to-seller messaging work. `StoreInfoV1` gained a field,
+    // which is STATE and not parameters; `StoreParameters` is field-for-field
+    // what it was, verified against V7 rather than assumed, so the encoding is
+    // still 56 bytes and this generation derives under the current one.
+    (8, false),
 ];
 
 /// V1 is derived under TODAY's parameter encoding, not the legacy one.
