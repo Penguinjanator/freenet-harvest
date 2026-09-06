@@ -517,30 +517,107 @@ impl ProbeStateOps for ReputationOps {
 /// Mirrors `update_state`'s `UpdateData::State` arm in
 /// `contracts/reputation-contract`, including the certificate back-fill.
 fn merge_reputation(
-    mut base: ReputationStateV1,
+    base: ReputationStateV1,
     other: &ReputationStateV1,
     params: &ReputationParameters,
 ) -> ReputationStateV1 {
-    let snapshot = base.clone();
-    let delta: Vec<_> = other
+    let fold = merge_reputation_reporting_exclusions(base, other, params);
+    if !fold.excluded_variants.is_empty() {
+        probe_warn(&format!(
+            "migration fold: {} feedback entr(y/ies) in the predecessor generation share a \
+             token with a DIFFERENT entry the successor already holds, and were NOT carried \
+             forward. The signature covers the token alone (issue #22), so both are validly \
+             signed and nothing here can tell which is genuine -- and the contract cannot \
+             hold both. This is how a piece of feedback goes missing silently. tokens: {}",
+            fold.excluded_variants.len(),
+            fold.excluded_variants
+                .iter()
+                .map(|n| n.iter().take(4).map(|b| format!("{b:02x}")).collect())
+                .collect::<Vec<String>>()
+                .join(", ")
+        ));
+    }
+    fold.state
+}
+
+/// What a reputation fold carried, and which entries it had to exclude.
+pub(crate) struct ReputationFold {
+    pub(crate) state: ReputationStateV1,
+    /// Tokens whose predecessor entry differs from the one the successor
+    /// already holds. Each is a genuine piece of feedback permanently lost to
+    /// the fold.
+    pub(crate) excluded_variants: Vec<[u8; 32]>,
+}
+
+/// [`merge_reputation`], plus what it could not carry.
+///
+/// # Why this reports rather than repairs
+///
+/// The reputation contract keys identity on `token.nonce` and its RSA
+/// signature covers `entry.token` alone, so a second entry can be published
+/// under a published token carrying different words -- issue #22, demonstrated
+/// by `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. That
+/// is the same defect the mailbox re-key fixed, reached here through the FOLD
+/// rather than through an update, which makes it a migration-time data-loss
+/// path rather than an attack somebody has to mount.
+///
+/// **Nothing at this layer can preserve both entries.**
+/// `ReputationStateV1::verify` requires `feedback.len() == used_nonces.len()`,
+/// so a state holding two entries under one token is invalid by construction,
+/// and both variants are validly signed, so there is no authenticated basis to
+/// prefer either. The repair is the reputation contract's own re-key (#22),
+/// which wants its own change and its own review. What is available here is to
+/// stop losing one in SILENCE -- the same standard `merge_mailbox` is now held
+/// to for an oversized message.
+///
+/// The fold's own `used_nonces` filter is gone. It duplicated
+/// `ReputationStateV1::apply_delta`'s identical skip, so it changed nothing
+/// and made this a second site answering "already held" for itself -- which is
+/// precisely the shape that put a nonce filter in `merge_mailbox` and kept it
+/// there through a whole review round.
+pub(crate) fn merge_reputation_reporting_exclusions(
+    mut base: ReputationStateV1,
+    other: &ReputationStateV1,
+    params: &ReputationParameters,
+) -> ReputationFold {
+    // This is the DETECTOR for the reputation nonce collision, not another
+    // site deciding identity by nonce. It exists to REPORT
+    // `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`
+    // rather than to act on it. Remove it when #22 re-keys the contract.
+    let excluded_variants: Vec<[u8; 32]> = other
         .feedback
         .iter()
-        // nonce-identity-waiver: reputation keys identity on `token.nonce` and has the
-        // same defect the mailbox re-key fixed -- see
-        // `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. Parked
-        // until the reputation contract's own re-key; NOT a site to copy.
-        .filter(|e| !base.used_nonces.contains(&e.token.nonce))
-        .cloned()
+        .filter(|incoming| {
+            base.feedback.iter().any(|held| {
+                // nonce-identity-waiver: see the paragraph above -- reporting a
+                // token collision, not resolving one. The marker is on this
+                // exact line because the scrape waives a line, not a function.
+                held.token.nonce == incoming.token.nonce && held != *incoming
+            })
+        })
+        .map(|incoming| incoming.token.nonce)
         .collect();
-    if !delta.is_empty() && base.apply_delta(params, &Some(delta)).is_err() {
+
+    let snapshot = base.clone();
+    if !other.feedback.is_empty()
+        && base
+            .apply_delta(params, &Some(other.feedback.clone()))
+            .is_err()
+    {
         // One unverifiable entry rejects the whole delta, so keep the primary
         // rather than adopting a partially-applied state.
-        return snapshot;
+        return ReputationFold {
+            state: snapshot,
+            excluded_variants,
+        };
     }
     if base.owner_certificate_pem.is_empty() {
         base.owner_certificate_pem = other.owner_certificate_pem.clone();
     }
-    base
+    ReputationFold {
+        state: base,
+        excluded_variants,
+    }
 }
 
 /// Merge rules for a mailbox's state.
@@ -762,11 +839,18 @@ fn merge_mailbox(base: MailboxStateV1, other: &MailboxStateV1) -> MailboxStateV1
 ///   keeps whichever side already holds that nonce. A genuine entry is then
 ///   permanently EXCLUDED by a fold, which is the same outcome as deletion by
 ///   a different route -- see
-///   `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. The
-///   ack is still earned, because fold-all is no worse here than the
-///   contract's own merge, but a reader weighing it should know the exclusion
-///   exists. The repair is the reputation contract's own re-key, deliberately
-///   not on this branch.
+///   `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. It
+///   differs from the attack in issue #22 in the way that matters to a
+///   migration: #22 needs someone to mount it, whereas the fold fires during
+///   a re-key the owner is running deliberately. Nothing at this layer can
+///   preserve both entries -- `verify` requires
+///   `feedback.len() == used_nonces.len()`, and both variants are validly
+///   signed -- so the fold now REPORTS the exclusion instead of dropping it in
+///   silence (`merge_reputation_reporting_exclusions`), which is the same
+///   standard the mailbox's oversized-message path is held to. The ack is
+///   still earned, because fold-all is no worse here than the contract's own
+///   merge. The repair is the reputation contract's own re-key, #22,
+///   deliberately not on this branch.
 /// * **Mailbox** -- messages are keyed by
 ///   `harvest_common::mailbox::entry_digest` over the whole entry, and
 ///   capacity-pruned by `enforce_message_cap`, re-applied on every
@@ -777,6 +861,18 @@ fn merge_mailbox(base: MailboxStateV1, other: &MailboxStateV1) -> MailboxStateV1
 ///   present" until `ecbec18` deleted that rule. The soundness argument
 ///   survives both, because it never depended on WHICH deterministic
 ///   prune ran, only on there being one.)
+///
+/// **Does the mailbox argument still hold now that identity is the digest?
+/// It holds, and it is STRONGER -- it does not merely transfer.** Fold-all is
+/// unsound where absence encodes a deletion. Under nonce identity, absence had
+/// a second cause: an entry sharing a nonce displaced another, so a message
+/// could be missing from the successor because somebody removed it, and the
+/// fold's own nonce filter then declined to bring it back -- which is exactly
+/// the defect found at `merge_mailbox`. Under digest identity nothing is
+/// removed by collision at all, so absence means only "never held it" or
+/// "capacity-pruned", and the prune is deterministic and re-run on every
+/// merge. The set of things a fold could fail to restore shrinks, and it
+/// shrinks in the direction the ack cares about.
 ///
 /// One property of the mailbox merge that this argument DOES depend on, and
 /// that the obvious precondition test cannot see: the merge **normalises**.

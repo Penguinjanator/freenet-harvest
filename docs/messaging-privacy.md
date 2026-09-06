@@ -152,23 +152,40 @@ Four consequences, all deliberate:
 
   **This is not "a message can never be removed", and the difference matters
   for Phase 2.** A funded flood still evicts it: 512 entries dated later fill
-  the cap and take every honest message with them, measured at about 122 KiB
-  in a single update — see `known_gap_a_funded_flood_still_evicts_every_honest_message`
+  the count cap and take every honest message with them, measured at about
+  122 KiB in a single update -- or, more cheaply, 64 maximum-size entries
+  filling the byte budget, also in a single update — see `known_gap_a_funded_flood_still_evicts_every_honest_message`
   and "The flood, and what bounds it" below. What changed is that retraction
   went from **free, targeted and silent** (one message's worth of bytes, aimed
   at one entry, leaving no trace) to **expensive, indiscriminate and loud** (a
   full cap's worth of bytes, destroying the seller's whole mailbox with it,
   which for a bonded seller is self-incriminating).
 
+  **"Loud" was overstated, and the correction matters for Phase 2.** The count
+  route is about 122 KiB across 512 entries; the BYTE route needs only **64**
+  maximum-size entries, and either way `apply_delta` merges a whole
+  `MailboxDelta` in ONE update, so there is no partially-completed flood for
+  anyone to observe
+  (`known_gap_the_byte_route_evicts_in_one_update_and_costs_fewer_entries`).
+  What is loud is the aftermath -- the seller's own mailbox is destroyed, which
+  for a bonded seller is self-incriminating -- not the act. Nothing is
+  interruptible.
+
   A buyer's recourse must survive a seller willing to spend that, so the
   confession needs a home outside the mailbox. **That is now settled** (Ian,
-  2026-09-05): in Phase 2 the buyer persists the confession itself in their
-  own delegate store on receipt, not merely the conversation keys, so the
-  mailbox becomes the channel that delivered it rather than custody of it.
-  Written up in `docs/buyer-conversation-persistence.md`, "Phase 2 stores the
-  confession here, not just the keys" — including why storing-on-receipt is
-  sufficient against the flood when it was rightly rejected against
-  substitution. Not built.
+  2026-09-05): in Phase 2 the buyer persists the confession itself in their own
+  delegate store on receipt, not merely the conversation keys, so the mailbox
+  becomes the channel that delivered it rather than custody of it. **And the
+  buy flow is ordered so the remaining race cannot matter: persist the
+  confession, confirm the write, and only then pay.** An eviction after that
+  point achieves nothing, because the buyer already holds the capability in a
+  store the seller cannot reach. Written up in
+  `docs/buyer-conversation-persistence.md`, "Phase 2 stores the confession
+  here, not just the keys", including the correction above -- an earlier
+  version of that section argued storing-on-receipt was sufficient *because*
+  the flood was slow and visible, which the measurement above refutes. Not
+  built.
+
 * **`MailboxSummary` became `MailboxSummaryV2`** and carries 32-byte digests
   instead of 24-byte nonces. A change of payload is a change of name.
 

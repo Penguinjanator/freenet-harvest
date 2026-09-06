@@ -92,6 +92,64 @@ thing in its old role?"** Grep for the symbol before promoting it, not after.
 
 ---
 
+## Attribution: the same error, got right and got wrong in one commit
+
+The convergence comments in `common/src/mailbox.rs` are careful about
+attribution -- they name both mechanisms, say that either alone suffices, and
+say what fails when both go. In the same commit, the register row for the
+AES-GCM nonce limitation credited the invariant to a test whose body referenced
+no Harvest symbol at all, while the three tests that actually pin nonce
+freshness went uncredited. One commit, the correct form in one place and the
+error in the other.
+
+**The difference was not care, it was the forcing function.** The convergence
+claim came out of a mutation matrix: deleting each mechanism in turn produced
+a table, and a table with two rows reading "passes" makes it impossible to
+write "this one carries it" without noticing you cannot support that. The
+register row had no such table. It was written from the belief that a test with
+a matching name must be pinning the thing the row describes -- and the name
+matched because the row and the test were written in the same sitting, for each
+other.
+
+**So the practice worth generalising is not "attribute carefully".** It is:
+*run the mutation before writing the attribution, and let the result name the
+mechanism.* Where that is too expensive, write the weaker claim the evidence
+supports. Both rows now name the mutation that produced them.
+
+---
+
+## Three doc comments have attached to the wrong item, all by a missing blank line
+
+`decode_probed_state`, `enforce_message_cap`, and
+`known_limit_the_counterparty_can_write_in_either_direction`. In each case a
+new doc block was inserted directly above an existing one with no blank line
+between them; Rust merges consecutive `///` lines into a single doc comment, so
+the compiler is content, `rustfmt` is content, and the combined block silently
+documents whichever item comes last. The item that lost its documentation is
+left bare.
+
+Three instances on one branch is a mechanism, not bad luck, and the last one
+cost the most: it stripped the doc from a test whose entire value is telling a
+future reader that a red result means **inverting the assertion, not repairing
+the code**. A bare `known_limit_*` test is one somebody fixes.
+
+**Is there a cheap check? Yes, for the consequence rather than the cause.** The
+cause is undetectable: a merged doc block is syntactically identical to a long
+one, and no lint can know where you meant the boundary. `clippy` catches only
+the neighbouring shape -- `empty_line_after_doc_comment`, which is what caught
+the `enforce_message_cap` instance -- and that fires on a blank line where
+there should be none, the opposite defect.
+
+The consequence is detectable and is the same in all three cases: **an item
+silently loses its documentation.** A source scrape asserting that every
+`#[test] fn` (and every `pub fn`) is immediately preceded by a `///` line, or
+by attributes that are themselves preceded by one, catches every instance of
+this class, because the absorbed doc always leaves its owner bare. It is the
+same shape as `no_production_code_compares_message_nonces_for_identity` and
+would reuse its file walker. Filed, not built.
+
+---
+
 ## A citation is a claim, and this file makes hundreds of them
 
 Four rows in the tables below cited tests by names that did not exist:
@@ -292,8 +350,9 @@ is the only way this file stays a record rather than an archaeology exercise.
 | `contracts/mailbox-contract::summarize_state` | The summary reports what the state holds. | **Yes, since 2026-09-05** -- `a_summary_of_what_a_peer_holds_asks_only_for_what_it_lacks`, found by mutation while re-checking the tests added the same day: stubbing `summarize_state` to answer a non-empty state with an empty summary failed nothing, because the two empty-summary tests drive `get_state_delta` and take the summary as given. The producer/consumer split again -- the consumer was covered and the producer was not. |
 | `common/src/reputation.rs::ReputationStateV1` | "Feedback is naturally commutative: adding entries in any order produces the same final set." | **NO -- and the claim is FALSE, which this row previously recorded only as untested.** The RSA signature covers `entry.token` alone while `category`, `comment` and `submitted_at` ride alongside it unsigned, and identity is `token.nonce`. So a published entry can be re-submitted with different words under the same token, and each peer keeps whichever it saw first. Demonstrated by execution in `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. Beyond convergence: a seller who reads negative feedback can push a neutered variant to peers that do not hold the original, and those peers then refuse the real one because its nonce is used. Same class as the mailbox's nonce identity; **deliberately not fixed on this branch** -- different contract, its own re-key, and for feedback the better repair is probably to sign the whole entry so the variant cannot exist at all. |
 | `harvest_common::mailbox` convergence for a same-nonce pair | Which mechanism carries it. | **The JOINT property IS pinned; no SINGLE mutation observes it.** Both halves matter and the first is the one that gets lost: three tests fail when both mechanisms are removed, so the suite does defend convergence -- what it cannot do is tell you which mechanism to keep. Corrected after review, because the first version of this row stated a measurement that does not reproduce. The matrix: an order-dependent dedup alone passes (the final `(nonce, entry_digest)` sort re-normalises); removing the final sort's tiebreak alone passes (dedup already ordered them); doing BOTH fails three tests. `enforce_message_cap`'s digest tiebreak is a third mechanism and is redundant to both. The earlier inference -- "the tiebreaks survive their own mutation, so the property lives in the dedup sort" -- was invalid, since the dedup sort survives its own mutation too. Each comment now says it is one of two and that removing both is what breaks; two comments each truthfully saying "no test fails without me" would together authorise deleting both, which is the only real exposure here. |
-| `harvest_common::mailbox` identity | The counterparty can delete a message you sent. | **FIXED on 2026-09-05, not a limitation any more.** Identity is `entry_digest` over the whole entry, computed by the contract, so there is no collision to resolve. Pinned by `a_message_cannot_be_retracted_by_submitting_another_under_its_nonce` and four neighbours, plus the contract's own `a_state_merge_keeps_a_message_whose_nonce_something_else_shares`. **What remains is narrower and is still a live gap:** a funded flood evicts it under the cap (`known_gap_a_funded_flood_still_evicts_every_honest_message`), so retraction is expensive, indiscriminate and loud rather than impossible. This row previously told a reader that deletion was an accepted live limitation of the shipped contract, which was true when written and false by the end of the same day. |
-| `ui/src/messaging.rs` (AES-GCM) | A deliberate nonce collision reuses the keystream. | **Pinned as a LIMITATION, since 2026-09-05** -- `known_limit_a_nonce_collision_reuses_the_keystream` asserts `C1 xor C2 == P1 xor P2`, so if the property is ever closed the test fails and the documentation must be updated rather than the assertion; confirmed red under a mutation that makes the two nonces differ. This row asserted the pin for a day before the test existed, and was cited in the nonce-reuse analysis that led to the entry-digest change -- an argument resting in part on a test nobody had written. |
+| `harvest_common::mailbox` identity | The counterparty can delete a message you sent. | **FIXED on 2026-09-05, not a limitation any more.** Identity is `entry_digest` over the whole entry, computed by the contract, so there is no collision to resolve. Pinned by `a_message_cannot_be_retracted_by_submitting_another_under_its_nonce` and four neighbours, plus the contract's own `a_state_merge_keeps_a_message_whose_nonce_something_else_shares`. **What remains is narrower and is still a live gap:** a funded flood evicts it under the cap (`known_gap_a_funded_flood_still_evicts_every_honest_message`, and more cheaply `known_gap_the_byte_route_evicts_in_one_update_and_costs_fewer_entries` -- 64 entries via the byte budget rather than 512 via the count cap), so retraction is expensive and indiscriminate rather than impossible. It is NOT interruptible: `apply_delta` merges a whole delta, so either route is one update. This row previously told a reader that deletion was an accepted live limitation of the shipped contract, which was true when written and false by the end of the same day. |
+| `ui/src/messaging.rs::encrypt_message` | The mailbox nonce is FRESH per message, so an honest client never collides. | **Yes** -- and credited here only after review pointed out this file named the wrong test. Three tests die when `encrypt_message` derives the nonce deterministically instead of drawing it from `getrandom`: `each_conversation_carries_a_fresh_tag`, `a_mailbox_is_read_with_the_keys_on_hand_and_says_so_when_it_cannot_be`, and `state::conversation_tests::a_second_message_continues_the_same_conversation`. Verified by that mutation. This is the invariant that makes the row below a limitation rather than a defect. |
+| `ui/src/messaging.rs` (AES-GCM) | A deliberate nonce collision reuses the keystream, and Harvest's AAD does not prevent it. | **Pinned as a LIMITATION, since 2026-09-05** -- `known_limit_a_nonce_collision_reuses_the_keystream` asserts `C1 xor C2 == P1 xor P2`, red under a mutation that separates the two nonces. **What it establishes, precisely:** the xor assertion is a property of AES-GCM and holds for any key, so it is not evidence about Harvest's crypto specifically; the first version of this test used a bare key and bare `aes_gcm` call and would have passed with all of Harvest's construction deleted. It now derives the key with `conversation_key_from_dh`, pads with `pad_to_bucket` and binds `message_aad` exactly as `encrypt_message` does, so a change to any of those reaches the test -- and it makes the non-obvious Harvest claim explicit: the mailbox nonce IS bound into the AAD, and that authenticates without randomising, so it does nothing about keystream reuse. This row asserted the pin for a day before the test existed, and was cited in the nonce-reuse analysis that led to the entry-digest change -- an argument resting in part on a test nobody had written. |
 | `delegates/.../messaging.rs::make_room` | A conversation that exists only on this node is the last thing evicted. | **Yes** -- `a_conversation_that_exists_only_here_outlives_an_imported_one`, red when the ranking ignores `backed_up`. The reproduction is the reviewer's: a pasted backup fills the store, and the next conversation the buyer opens destroys one of their own. |
 | same | An eviction is reported. | **Yes** -- `an_eviction_is_reported` and `storing_without_evicting_reports_no_eviction` (so the report is evidence rather than noise), plus `a_conversation_discarded_to_make_room_is_reported` and `discarding_a_backed_up_conversation_says_it_can_be_restored` on the consumer side, all red under mutation. |
 | same, `decode_backup` | An oversized paste is refused before it is decoded. | **Yes** -- `a_backup_string_longer_than_the_cap_is_refused_without_decoding_it`, which also asserts the refusal is fast. Found by measurement, not by reading: base58 is quadratic, and a 253-conversation round trip took 72 seconds in a debug build with nothing bounding the length. |

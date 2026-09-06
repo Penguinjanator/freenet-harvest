@@ -548,10 +548,12 @@ pub fn entry_digest(message: &EncryptedMessage) -> [u8; 32] {
 /// here and it was too strong. Together with [`entry_digest`] it closes
 /// retraction BY SUBSTITUTION. A funded flood still evicts a message under the
 /// cap (`known_gap_a_funded_flood_still_evicts_every_honest_message`), so
-/// retraction is expensive, indiscriminate and loud rather than impossible.
-/// For Phase 2 that residual is settled by the buyer persisting the confession
-/// in their own delegate store on receipt, which is recorded in
-/// `docs/buyer-conversation-persistence.md` and not built here.
+/// retraction is expensive and indiscriminate rather than impossible -- though
+/// not interruptible: either flood route is a single update. For Phase 2 that
+/// residual is settled by the buyer persisting the confession in their own
+/// delegate store on receipt AND paying only after the write is confirmed,
+/// which is recorded in `docs/buyer-conversation-persistence.md` and not built
+/// here.
 pub type MailboxSummaryV2 = HashSet<[u8; 32]>;
 
 /// Delta: new messages to add. Unchanged in shape -- it always carried whole
@@ -1222,6 +1224,62 @@ mod retention_security_tests {
     /// silently rots if the cap is retuned: one message short of the cap
     /// evicts nothing. That is the whole difference from the timestamp defect
     /// this replaced, where the price was one message.
+    /// **The byte budget is the CHEAPER flood route, and it is also one
+    /// update.**
+    ///
+    /// Written because a Phase 2 argument was built on the opposite premise:
+    /// that a flood "needs 512 entries and is visible before it completes",
+    /// so a buyer persisting a confession on receipt would win the race. Both
+    /// halves were wrong. `MAX_MAILBOX_BYTES` binds before `MAX_MESSAGES` for
+    /// large entries, so the cheaper route is **64** entries rather than 512 --
+    /// and a `MailboxDelta` is a bare `Vec` that `apply_delta` merges whole,
+    /// so either route is a SINGLE update with no partial state in between.
+    /// There is no window to be quick in.
+    ///
+    /// The Phase 2 answer is therefore not "persist fast enough" but an
+    /// ordering: persist the confession, confirm the write, and only then pay.
+    /// See `docs/buyer-conversation-persistence.md`.
+    #[test]
+    fn known_gap_the_byte_route_evicts_in_one_update_and_costs_fewer_entries() {
+        let base = 1_700_000_000;
+        let honest = msg(9u8, base);
+
+        // As few maximum-size entries as fill the byte budget.
+        let mut flood = vec![];
+        let mut total = 0usize;
+        let mut i = 0i64;
+        while total < MAX_MAILBOX_BYTES {
+            let mut big = msg((i % 250) as u8, base + 20_000 + i);
+            big.ciphertext =
+                vec![7u8; MAX_MESSAGE_BYTES - message_bytes(&big) + big.ciphertext.len()];
+            total += message_bytes(&big);
+            flood.push(big);
+            i += 1;
+        }
+
+        assert!(
+            flood.len() * 4 < MAX_MESSAGES,
+            "the byte route took {} entries against a count cap of {MAX_MESSAGES}; if it is \
+             no longer much cheaper in entries, the flood analysis in \
+             docs/buyer-conversation-persistence.md needs redoing",
+            flood.len()
+        );
+
+        let mut state = MailboxStateV1::default();
+        state
+            .apply_delta(&Some(vec![honest.clone()]))
+            .expect("apply");
+        // ONE update. Not a sequence a watcher could interrupt.
+        state.apply_delta(&Some(flood)).expect("apply");
+
+        assert!(
+            !state.messages.contains(&honest),
+            "the honest message survived a full byte-budget flood, so this known gap is \
+             CLOSED -- delete this test and correct the Phase 2 argument, which currently \
+             assumes it is open"
+        );
+    }
+
     #[test]
     fn known_gap_a_funded_flood_still_evicts_every_honest_message() {
         let base = 1_700_000_000;
@@ -1931,10 +1989,14 @@ mod entry_identity_tests {
     /// Note the qualification, which is load-bearing for Phase 2: this closes
     /// the free, targeted, silent route. It does NOT make a message
     /// permanently un-removable -- a funded flood still evicts it, at about
-    /// 122 KiB and taking the whole mailbox with it
-    /// (`known_gap_a_funded_flood_still_evicts_every_honest_message`). If the
-    /// buyer's recourse must survive a seller willing to spend that, the
-    /// confession needs a home outside the mailbox.
+    /// 122 KiB across 512 entries
+    /// (`known_gap_a_funded_flood_still_evicts_every_honest_message`) or, more
+    /// cheaply, 64 maximum-size entries filling the byte budget
+    /// (`known_gap_the_byte_route_evicts_in_one_update_and_costs_fewer_entries`),
+    /// taking the whole mailbox with it either way. **Both are ONE update**, so
+    /// there is no window to be quick in -- which is why Phase 2's answer is an
+    /// ordering (persist, confirm, then pay) rather than persisting fast
+    /// enough. See `docs/buyer-conversation-persistence.md`.
     ///
     /// This is the reason the contract computes identity for itself. In Phase
     /// 2 the seller's reply carries a pre-signed confession, and that

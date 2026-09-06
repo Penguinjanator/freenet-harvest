@@ -505,22 +505,16 @@ On the UI side:
 below is built.**
 
 The mailbox re-key on 2026-09-05 made a message unretractable *by
-substitution*: identity is `entry_digest` over the whole entry, so a seller
-can no longer submit a different message under a sent message's nonce and
-displace it. It did **not** make a message permanently un-removable. A funded
-flood still evicts one -- 512 later-dated entries fill the cap, at about
-122 KiB in a single update, and take the seller's whole mailbox with them
-(`known_gap_a_funded_flood_still_evicts_every_honest_message`). Retraction
-went from free, targeted and silent to expensive, indiscriminate and loud. It
-did not go away.
+substitution*: identity is `entry_digest` over the whole entry, so a seller can
+no longer submit a different message under a sent message's nonce and displace
+it. It did **not** make a message permanently un-removable. A funded flood
+still evicts one, and the cost is lower than it first appears -- see below.
 
 That distinction is only academic until Phase 2. There the seller's reply
 carries a **pre-signed confession**, which is the buyer's SOLE capability to
 file against the seller's bond. It travels as an ordinary message in the
 seller's own mailbox. A bonded seller facing a claim has a direct, priced
-incentive to spend a cap's worth of bytes to destroy it, and the loudness that
-bounds the attack for an ordinary conversation is worth little when the
-alternative is losing the bond.
+incentive to spend a cap's worth of bytes to destroy it.
 
 **The resolution: the buyer persists the confession itself, in this delegate
 store, on receipt.** Not merely the conversation keys, which is what a
@@ -531,37 +525,92 @@ channel that delivered it, and mailbox eviction stops mattering to the claim.
 Two things make this the right home rather than a workaround:
 
 * The delegate store is **private and durable, and outside the seller's
-  reach**. It is the buyer's own secret store; nothing the seller can submit
-  to a public contract touches it. That is the property the mailbox cannot
-  offer for an open-write contract with a cap.
+  reach**. It is the buyer's own secret store; nothing the seller can submit to
+  a public contract touches it. That is the property the mailbox cannot offer
+  for an open-write contract with a cap.
 * The buyer already carries it across machines. Per-conversation export
   (`harvest-conv-backup-v2:`) is the mechanism, so a confession the buyer
-  backed up survives a lost laptop the same way the conversation keys do --
-  and the backed-up marker already tells them whether it has.
+  backed up survives a lost laptop the same way the conversation keys do.
 
-**The objection this answers, and why storing-on-receipt is now sufficient
-when it was not before.** "Tell the buyer to store it on receipt" was
-rejected on 2026-09-05 as a fix for the *substitution* route, and correctly:
-against substitution it made the guarantee a race between the buyer's client
-persisting and the seller submitting a colliding entry, and a race is not a
-foundation for "the buyer has recourse". That objection does not carry over.
-The re-key closed the substitution route outright, so what remains is the
-flood -- which needs 512 entries and is visible before it completes, not a
-single well-timed write. Persistence-on-receipt loses to a race and wins
-against a flood, so it became sufficient exactly when the other route closed.
-The order matters: it would have been the wrong answer yesterday.
+### The race, and why the ORDERING closes it rather than the speed
 
-What Phase 2 still has to decide, and this note does not:
+**An earlier version of this section argued that storing-on-receipt is
+sufficient because a flood "needs 512 entries, not a single well-timed write".
+That was wrong on both halves, and it is worth keeping the correction because
+the right answer is better than the wrong one.**
+
+Measured, in `known_gap_the_byte_route_evicts_in_one_update_and_costs_fewer_entries`:
+
+* `MAX_MAILBOX_BYTES` binds before `MAX_MESSAGES` for large entries, so the
+  cheaper route is **64** maximum-size entries, not 512;
+* a `MailboxDelta` is a bare `Vec` and `apply_delta` merges the whole of it, so
+  **either route is a SINGLE update**. There is no partially-completed flood
+  for anyone to notice, and nothing to be quick enough for.
+
+So storing-on-receipt narrows the window -- from unbounded and at the seller's
+convenience down to whatever a local delegate write takes -- but it does not
+eliminate it. A narrower race is still a race, and "the buyer has recourse" is
+not a claim that should rest on one.
+
+**What eliminates it is the order of the buy flow, not the speed of the
+write.** In the incentive design the confession arrives with the invoice at
+step 4, and the buyer pays at step 5. So:
+
+> **The buyer persists the confession, confirms the persistence, and only then
+> pays.**
+
+An eviction after that point achieves nothing: the buyer already holds their
+capability, in a store the seller cannot reach, and the seller has no way to
+take it back. The race stops mattering because nothing of value happens after
+it. It is not "store it fast enough" -- it is **do not part with money until
+you hold the thing that protects you**.
+
+Two consequences that are constraints on other work, not observations:
+
+* **The client MUST confirm the delegate write before treating the reply as
+  usable.** This was left open as a question of preference; it is not one. A
+  silently-refused write leaves the buyer paying for a confession they do not
+  have, which is the exact loss the whole design is avoiding. The delegate can
+  already report a refused write rather than counting it as "not stored"
+  (`marking_reports_a_failure_when_the_node_refuses_the_write` is the same
+  shape on the marking path).
+* **Persisting the confession is a precondition of payment.** That is a
+  constraint on the Buy button, which is not built yet, and it needs to be true
+  when it is. A Buy flow that pays first and stores after satisfies every test
+  in this repository and defeats the entire argument above.
+
+### Receiving a confession must CLEAR the backed-up flag
+
+`make_room` prefers to evict conversations marked `backed_up`, on the sound
+reasoning that the buyer can get those back. Once a record can hold a
+confession, that preference **inverts into a hazard**: a record marked
+backed-up becomes the *preferred* eviction victim, while the backup string that
+justified the mark may predate the confession entirely. The flag says
+"recoverable", the string does not contain it, and the record is first out.
+
+**So receiving a confession must clear `backed_up` on that record.** The
+connection worth recording is that this is exactly Ian's own argument for
+per-conversation export, one level down. He moved export from per-store to
+per-conversation because **a per-store backup goes stale the moment a new
+conversation starts**. The same staleness applies within a conversation: **a
+per-conversation backup goes stale the moment new content arrives in that
+conversation**. The mark describes a string, and the string describes a moment.
+
+This is easy to miss precisely because the eviction preference is correct in
+isolation. Someone re-deriving it will check that shedding recoverable records
+before unrecoverable ones is right, find that it is, and not notice that it
+depends on the record's contents not changing after the mark. Today they do not
+change; in Phase 2 they will.
+
+### What Phase 2 still has to decide, and this note does not
 
 * **What is persisted.** The confession bytes as received, or a
   verified-and-normalised form. Storing what arrived is the safer default,
   since a normaliser is a second place the claim can be broken.
-* **When.** On receipt is the obvious answer; whether the buyer's client must
-  confirm the delegate write before it treats the reply as usable is a real
-  question, because a silently-refused write reproduces the loss.
-* **Size.** `MAX_BACKUP_STRING_BYTES` bounds the backup string, and a record
-  carrying a confession is larger than one carrying keys. The cap and the
-  eviction ranking in `make_room` both assume today's record size.
+* **Size.** `MAX_BACKUP_STRING_BYTES` bounds the backup string at 4 KiB against
+  an honest backup of just under 400 characters, and a record carrying a
+  confession is larger than one carrying keys. Both that cap and the eviction
+  ranking in `make_room` assume today's record size.
 
 ## What this does not do
 

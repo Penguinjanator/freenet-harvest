@@ -1506,6 +1506,67 @@ fn an_unverifiable_merge_keeps_the_primary() {
     );
 }
 
+/// **A fold that excludes a genuine feedback entry says so.**
+///
+/// The second migration-time data-loss path, and the one that matters because
+/// it fires during a migration rather than during an attack somebody has to
+/// mount. The RSA signature covers `entry.token` alone (issue #22), so two
+/// entries can share a token with different words; whichever side the fold
+/// already holds wins, and the other is excluded permanently.
+///
+/// **Nothing here can preserve both.** `ReputationStateV1::verify` requires
+/// `feedback.len() == used_nonces.len()`, so a state carrying two entries
+/// under one token is invalid by construction -- the repair is the reputation
+/// contract's own re-key, which is #22 and not this branch. What the fold CAN
+/// stop doing is losing one in silence, which is the same standard the
+/// oversized-message path is now held to.
+///
+/// Signatures are not the property under test, so the fixture uses unsigned
+/// entries; the report is computed before `apply_delta` is reached.
+#[test]
+fn a_fold_that_excludes_a_feedback_variant_reports_it() {
+    let params = reputation_params(vec![1u8; 32], &seller_vk());
+
+    let genuine = dummy_feedback();
+    let neutered = FeedbackEntry {
+        category: harvest_common::feedback::FeedbackCategory::Other("no complaint".to_string()),
+        comment: "actually it was fine".to_string(),
+        ..genuine.clone()
+    };
+    assert_eq!(
+        genuine.token.nonce, neutered.token.nonce,
+        "precondition: one token, two entries"
+    );
+
+    // The successor holds the neutered variant; the predecessor holds the
+    // genuine entry.
+    let mut successor = ReputationStateV1::default();
+    successor.feedback.push(neutered);
+    successor.used_nonces.insert(genuine.token.nonce);
+    let mut predecessor = ReputationStateV1::default();
+    predecessor.feedback.push(genuine.clone());
+    predecessor.used_nonces.insert(genuine.token.nonce);
+
+    let report = merge_reputation_reporting_exclusions(successor, &predecessor, &params);
+    assert_eq!(
+        report.excluded_variants,
+        vec![genuine.token.nonce],
+        "a genuine entry excluded by a token collision must be named, not dropped in \
+         silence during the one operation that exists to carry data forward"
+    );
+
+    // And says nothing when the two sides agree, so the report is evidence
+    // rather than noise.
+    let mut same = ReputationStateV1::default();
+    same.feedback.push(genuine.clone());
+    same.used_nonces.insert(genuine.token.nonce);
+    let quiet = merge_reputation_reporting_exclusions(same.clone(), &same, &params);
+    assert!(
+        quiet.excluded_variants.is_empty(),
+        "an identical entry on both sides is not an exclusion"
+    );
+}
+
 // --- markers ------------------------------------------------------------
 
 /// Marker keys are hex, and two distinct instances never share one.

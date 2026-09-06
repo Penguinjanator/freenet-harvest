@@ -1396,67 +1396,6 @@ mod tests {
     /// **If this test ever goes red, do not make it pass.** It would mean
     /// something now distinguishes the two holders, which is a real
     /// improvement -- invert the assertion and delete this comment.
-    /// **A deliberate nonce collision reuses the keystream.**
-    ///
-    /// `docs/untested-invariants.md` claimed this was pinned by a test of
-    /// this name for a day before the test existed. It is written now rather
-    /// than the row downgraded, because the claim is worth pinning and the
-    /// pin is four lines.
-    ///
-    /// AES-GCM is a stream cipher under the hood: with one key and one
-    /// 12-byte nonce, two messages share a keystream, so `C1 xor C2` is
-    /// `P1 xor P2` and an observer who guesses one plaintext reads the other.
-    /// (GHASH's authentication subkey is also recoverable, which is the
-    /// sharper half of the classic result and not asserted here.)
-    ///
-    /// **Why it is a documented limit and not a bug.** `encrypt_message`
-    /// draws all 24 nonce bytes from `getrandom` per message, so an honest
-    /// client never collides -- this test has to reach past it to the cipher
-    /// to construct one at all. Creating the collision requires the
-    /// conversation KEY, so the only party who can do it is a party who can
-    /// already read both messages. It buys an attacker nothing they did not
-    /// have; what it rules out is a future change that derives the nonce
-    /// from anything less than fresh randomness.
-    ///
-    /// **If this test ever goes red, do not make it pass.** Red means the
-    /// construction changed -- a nonce misuse-resistant mode, say. That is an
-    /// improvement: invert the assertion and update the row in
-    /// `docs/untested-invariants.md`.
-    #[test]
-    fn known_limit_a_nonce_collision_reuses_the_keystream() {
-        use aes_gcm::aead::Aead;
-
-        let key = [9u8; 32];
-        let nonce = [3u8; 12];
-        // Equal length, so the relation covers the whole body.
-        let first = b"pay to bc1qhonest0000000000000";
-        let second = b"pay to bc1qattacker00000000000";
-
-        let cipher = Aes256Gcm::new_from_slice(&key).expect("key");
-        let c1 = cipher
-            .encrypt(Nonce::from_slice(&nonce), first.as_ref())
-            .expect("encrypt");
-        let c2 = cipher
-            .encrypt(Nonce::from_slice(&nonce), second.as_ref())
-            .expect("encrypt");
-
-        // Strip the 16-byte tag; the rest is plaintext xor keystream.
-        let body = first.len();
-        let ciphertext_xor: Vec<u8> = c1[..body]
-            .iter()
-            .zip(&c2[..body])
-            .map(|(a, b)| a ^ b)
-            .collect();
-        let plaintext_xor: Vec<u8> = first.iter().zip(second).map(|(a, b)| a ^ b).collect();
-
-        assert_eq!(
-            ciphertext_xor, plaintext_xor,
-            "a nonce collision no longer reveals the xor of the two plaintexts -- if the \
-             construction has been strengthened, invert this assertion and update \
-             docs/untested-invariants.md"
-        );
-    }
-
     #[test]
     fn known_limit_the_counterparty_can_write_in_either_direction() {
         let seller = Seller::new(73);
@@ -1492,6 +1431,126 @@ mod tests {
             }
             other => panic!("expected a readable entry: {other:?}"),
         }
+    }
+
+    /// **THIS TEST PINS A LIMITATION, NOT A DEFENCE: a deliberate nonce
+    /// collision reuses the keystream, and Harvest's AAD does not help.**
+    ///
+    /// AES-GCM is a stream cipher underneath, so one key plus one 12-byte
+    /// nonce means two messages share a keystream: `C1 xor C2 == P1 xor P2`,
+    /// and anyone who guesses one plaintext reads the other. (GHASH's
+    /// authentication subkey is also recoverable, the sharper half of the
+    /// classic result, not asserted here.)
+    ///
+    /// # Why this goes through Harvest's own construction
+    ///
+    /// An earlier version of this test used a bare key, a bare nonce and a
+    /// bare `aes_gcm` call, and review was right that it pinned the crate
+    /// rather than anything of ours -- it would have passed unchanged if
+    /// Harvest's key derivation, padding and associated data had all been
+    /// deleted. It now derives the key with
+    /// [`conversation_key_from_dh`], pads with
+    /// [`harvest_common::mailbox::pad_to_bucket`], and binds
+    /// [`harvest_common::mailbox::message_aad`] exactly as
+    /// [`encrypt_message`] does.
+    ///
+    /// That turns it into a claim about Harvest specifically, and one worth
+    /// making, because the obvious reading of `message_aad` is wrong: the
+    /// mailbox nonce IS bound into the associated data, which stops an
+    /// envelope field being altered -- and does **nothing** about keystream
+    /// reuse, because AAD authenticates and does not randomise. Two messages
+    /// with the same nonce have the same AAD contribution and the same
+    /// keystream.
+    ///
+    /// # Why it is a documented limit and not a bug
+    ///
+    /// [`encrypt_message`] draws all 24 nonce bytes from `getrandom` per
+    /// message, so an honest client never collides -- this test has to reach
+    /// past it to the cipher to construct one at all, and that freshness is
+    /// pinned separately (making the nonce deterministic kills three tests).
+    /// Creating the collision needs the conversation key, so the only party
+    /// who can is one who can already read both messages. It buys an attacker
+    /// nothing they did not have. What it rules out is a future change that
+    /// derives the nonce from anything less than fresh randomness.
+    ///
+    /// # What routing it through Harvest does and does not buy
+    ///
+    /// Said plainly, because the obvious reading is too generous. The xor
+    /// assertion holds for ANY key and ANY associated data -- substituting a
+    /// zero key leaves it green -- so using our key derivation does not make
+    /// that assertion Harvest-specific, and it cannot: the property is the
+    /// cipher's. What the Harvest symbols buy is that the test tracks OUR
+    /// construction rather than a textbook one, so a change to the key
+    /// derivation, the padding or the AAD shape reaches this test instead of
+    /// sailing past it. The one assertion here that is genuinely ours is the
+    /// equal-length check on `pad_to_bucket`, which fails if the bucketing
+    /// stops padding to a common size.
+    ///
+    /// **If this test ever goes red, do not make it pass.** Red means the
+    /// construction changed -- a nonce misuse-resistant mode, say. That is an
+    /// improvement: invert the assertion and update the row in
+    /// `docs/untested-invariants.md`.
+    #[test]
+    fn known_limit_a_nonce_collision_reuses_the_keystream() {
+        use aes_gcm::aead::Aead;
+
+        // Harvest's own key, for a real conversation.
+        let seller = Seller::new(41);
+        let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+        let keys = seller.keys_for(&buyer.buyer_public_key);
+        let aes_key = keys.to_seller;
+
+        // Harvest's own padding, so both plaintexts are the length the wire
+        // would carry rather than a length chosen to make the xor line up.
+        let first = harvest_common::mailbox::pad_to_bucket(b"pay to bc1qhonest");
+        let second = harvest_common::mailbox::pad_to_bucket(b"pay to bc1qattacker");
+        assert_eq!(
+            first.len(),
+            second.len(),
+            "the bucketing is what makes these comparable; if it stopped padding to a \
+             common size the size-privacy claim would be the bigger news"
+        );
+
+        // Harvest's own associated data, over one mailbox nonce used twice.
+        let mailbox_nonce = [3u8; 24];
+        let timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let aad = harvest_common::mailbox::message_aad(
+            &buyer.conversation_id,
+            &buyer.buyer_public_key,
+            &timestamp,
+            &mailbox_nonce,
+        );
+
+        let cipher = Aes256Gcm::new_from_slice(&aes_key).expect("key");
+        let seal = |plaintext: &[u8]| {
+            cipher
+                .encrypt(
+                    Nonce::from_slice(&mailbox_nonce[..12]),
+                    Payload {
+                        msg: plaintext,
+                        aad: &aad,
+                    },
+                )
+                .expect("encrypt")
+        };
+        let c1 = seal(&first);
+        let c2 = seal(&second);
+
+        // Strip the 16-byte tag; the rest is plaintext xor keystream.
+        let body = first.len();
+        let ciphertext_xor: Vec<u8> = c1[..body]
+            .iter()
+            .zip(&c2[..body])
+            .map(|(a, b)| a ^ b)
+            .collect();
+        let plaintext_xor: Vec<u8> = first.iter().zip(&second).map(|(a, b)| a ^ b).collect();
+
+        assert_eq!(
+            ciphertext_xor, plaintext_xor,
+            "a nonce collision no longer reveals the xor of the two plaintexts -- if the \
+             construction has been strengthened, invert this assertion and update \
+             docs/untested-invariants.md"
+        );
     }
 
     /// A low-order "public key" is refused rather than encrypted to under a

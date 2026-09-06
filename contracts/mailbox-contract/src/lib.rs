@@ -51,6 +51,14 @@ impl ContractInterface for Contract {
         for update in data {
             match update {
                 UpdateData::State(new_state) => {
+                    // Zero bytes means "there is no state here", the same
+                    // convention `validate_state`, `summarize_state` and
+                    // `get_state_delta` all use, and the same one the `Delta`
+                    // arm below already applied. This arm was the odd one out
+                    // and answered an empty state with `Deser(UnexpectedEof)`.
+                    if new_state.as_ref().is_empty() {
+                        continue;
+                    }
                     let new_state = from_reader::<MailboxStateV1, &[u8]>(new_state.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     // Everything, and `apply_delta` decides what is already
@@ -419,6 +427,29 @@ mod tests {
         assert!(delta.as_ref().is_empty());
     }
 
+    /// **An empty state in an update is "nothing", not a malformed encoding.**
+    ///
+    /// The `Delta` arm guarded this and the `State` arm did not, so the same
+    /// zero bytes were "nothing to merge" through one and
+    /// `Deser(UnexpectedEof)` through the other. A small asymmetry, but it is
+    /// the same convention `validate_state`, `summarize_state` and
+    /// `get_state_delta` follow, and the one inconsistent arm is where the
+    /// next reader forms the wrong idea of what zero bytes mean here.
+    #[test]
+    fn an_empty_state_in_an_update_merges_nothing_rather_than_erroring() {
+        let held = MailboxStateV1 {
+            messages: vec![message([7u8; 24], b"one", 1_700_000_000)],
+        };
+        let merged = update(
+            &held,
+            vec![UpdateData::State(State::from(Vec::<u8>::new()))],
+        );
+        assert_eq!(
+            merged.messages, held.messages,
+            "an empty state must leave the mailbox exactly as it was"
+        );
+    }
+
     /// **The summary reports what the state actually holds.**
     ///
     /// Found by mutation while re-checking the six tests added with this
@@ -532,11 +563,17 @@ mod tests {
     /// # Waivers
     ///
     /// The reputation contract decides identity by `token.nonce` and has the
-    /// same defect (`known_gap_two_feedback_variants_sharing_a_token_do_not_converge`).
-    /// Its re-key is deliberately not on this branch, so those sites carry an
-    /// explicit `nonce-identity-waiver:` marker naming the gap. The count is
-    /// asserted, so a SIXTH site cannot join them quietly -- which is the
-    /// whole difference between a documented gap and a spreading one.
+    /// same defect (`known_gap_two_feedback_variants_sharing_a_token_do_not_converge`,
+    /// issue #22). Its re-key is deliberately not on this branch, so those
+    /// sites carry an explicit `nonce-identity-waiver:` marker naming the gap,
+    /// as does the one line in `merge_reputation_reporting_exclusions` that
+    /// DETECTS such a collision in order to report it. The count is asserted,
+    /// so another site cannot join them quietly -- which is the whole
+    /// difference between a documented gap and a spreading one.
+    ///
+    /// A waiver marks a LINE, not a function: it applies to the next line that
+    /// is not blank or a comment. That is deliberate, so a waiver written for
+    /// one comparison cannot silently cover a second one added below it.
     #[test]
     fn no_production_code_compares_message_nonces_for_identity() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
