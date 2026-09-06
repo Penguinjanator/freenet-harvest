@@ -796,6 +796,11 @@ mod listing_identity_tests {
     /// published data and not a refactor. Updating the constant is the last
     /// step, not the first.
     ///
+    /// **`docs/design/migratability.md` is the requirement and the procedure.**
+    /// It carries the argument in full, including the re-issue path that would
+    /// let a change like this keep the data, and why accepting the old format
+    /// in `verify` is not the answer.
+    ///
     /// The expected value comes from this crate's own derivation rather than
     /// an outside tool, which is weaker than the `b3sum` known answers in
     /// `mailbox`: what it pins is CHANGE, not correctness.

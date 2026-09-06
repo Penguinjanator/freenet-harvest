@@ -554,6 +554,13 @@ Three things make it worse than the loss:
 * every other test in this repository builds its fixtures with the NEW
   derivation, so not one of them could see it. It passed all four gates.
 
+**The requirement this produced lives in
+[`docs/design/migratability.md`](design/migratability.md).** A new contract
+version must be migratable from every version that has ever held user data;
+that document carries the argument, the unbuilt re-issue path, and why
+accepting the old format in `verify` is wrong. What follows is what this
+branch actually did.
+
 **RESOLVED 2026-09-06, by decision rather than by repair.** Ian's answer: no
 published store holds data worth preserving, sellers republish. So the loss
 stands, and what changed is that it is now a decision the affected person is

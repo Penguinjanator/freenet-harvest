@@ -1976,6 +1976,11 @@ mod order_identity_tests {
     /// generation is one nobody could pay. It is still the same class of
     /// change, and it still takes the store's listings with it, because the
     /// fold refuses the generation rather than the record.
+    ///
+    /// **`docs/design/migratability.md` is the requirement and the procedure.**
+    /// It carries the argument in full, including the re-issue path that would
+    /// let a change like this keep the data, and why accepting the old format
+    /// in `verify` is not the answer.
     #[test]
     fn the_order_id_derivation_is_pinned() {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
