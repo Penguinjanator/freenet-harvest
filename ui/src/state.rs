@@ -927,14 +927,6 @@ pub struct BrowsingStore {
 pub struct SentMessage {
     pub text: String,
     pub sent_at: chrono::DateTime<chrono::Utc>,
-    /// The mailbox nonce this message was sealed under.
-    ///
-    /// Not an identity: the nonce is public and anyone may submit different
-    /// content under it. It is kept because the mailbox entry carries it and
-    /// dropping it from the local record would lose the ability to relate
-    /// this to a specific entry at all. Recognition is by
-    /// [`Self::digest`].
-    pub nonce: [u8; 24],
     /// [`harvest_common::mailbox::entry_digest`] of the exact entry that was
     /// sealed and dispatched.
     ///
@@ -2363,7 +2355,7 @@ impl AppState {
         crate::messaging::seal_reply(keys, conversation_tag, &conversation_id, text)
     }
 
-    /// Whether THIS browser wrote the message with this nonce.
+    /// Whether THIS browser wrote the message with this digest.
     ///
     /// # Why authorship is answered from local records and not from the
     /// message
@@ -2438,7 +2430,6 @@ impl AppState {
             .push(SentMessage {
                 text,
                 sent_at: chrono::Utc::now(),
-                nonce: sealed.nonce,
                 digest: harvest_common::mailbox::entry_digest(sealed),
             });
     }

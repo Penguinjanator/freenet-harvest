@@ -648,9 +648,13 @@ pub(crate) const BUYER_CONVERSATION_BACKUP_PREFIX: &str = "harvest-conv-backup-v
 /// someone else hands them is equally paste-able. The origin gate stops
 /// another web app calling this; it does not stop a string.
 ///
-/// 4 KiB is far above an honest backup, which carries ONE conversation and
-/// comes to about 210 characters. Pinned by
-/// `a_backup_string_longer_than_the_cap_is_refused_without_decoding_it`.
+/// 4 KiB is about ten times an honest backup, which carries ONE conversation
+/// and comes to just under 400 characters -- measured, after an earlier
+/// version of this comment guessed 210 and was caught by review. Both the cap
+/// and that figure are pinned:
+/// `a_backup_string_longer_than_the_cap_is_refused_without_decoding_it` and
+/// `an_honest_backup_is_far_inside_the_length_cap`, which asserts the real
+/// size falls in a band so the number here cannot drift again.
 pub(crate) const MAX_BACKUP_STRING_BYTES: usize = 4 * 1024;
 
 /// One conversation, as it travels between two nodes.
@@ -2213,6 +2217,16 @@ mod buyer_conversation_backup_tests {
             backup.len() * 4 < MAX_BACKUP_STRING_BYTES,
             "an honest backup is {} bytes against a cap of {MAX_BACKUP_STRING_BYTES}, which \
              leaves too little room to be sure the cap never refuses a real one",
+            backup.len()
+        );
+        // The band pins the FIGURE, not just the margin. `MAX_BACKUP_STRING_BYTES`
+        // documents a size, and an undocumented drift in the format would
+        // silently make that sentence wrong -- which is how it came to say
+        // 210 when the real number was nearly twice that.
+        assert!(
+            (300..500).contains(&backup.len()),
+            "an honest backup is now {} characters; the size documented on \
+             `MAX_BACKUP_STRING_BYTES` says just under 400, so update one or the other",
             backup.len()
         );
     }

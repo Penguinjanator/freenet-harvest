@@ -488,6 +488,12 @@ pub struct MailboxStateV1 {
 ///
 /// Domain-separated, so a digest of a message can never coincide with a
 /// digest of anything else this codebase hashes.
+///
+/// This comment described the OPPOSITE of the above for the length of one
+/// commit -- it still said identity was the nonce -- because the digest was
+/// promoted from a client-side aid to the contract's identity without its own
+/// body changing, so nothing in the diff invited anyone to read it. See "A doc
+/// comment outlives the design it described" in `docs/untested-invariants.md`.
 pub fn entry_digest(message: &EncryptedMessage) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key("harvest mailbox entry digest v1");
     hasher.update(&message.nonce);
@@ -527,11 +533,20 @@ pub fn entry_digest(message: &EncryptedMessage) -> [u8; 32] {
 /// so it would answer "I hold these" for digests it has never seen. The
 /// re-key is what makes that unreachable, not the encoding.
 ///
-/// The change is what makes a message unretractable. While the summary was a
-/// set of nonces, a peer that held ONE of two entries sharing a nonce
-/// answered "I have that one" for the other and never received it -- so the
-/// message could be intact in the contract and absent from that peer, which
-/// from the buyer's side is the same loss. See [`entry_digest`].
+/// The change is the half of the fix that lives in synchronisation. While the
+/// summary was a set of nonces, a peer that held ONE of two entries sharing a
+/// nonce answered "I have that one" for the other and never received it -- so
+/// the message could be intact in the contract and absent from that peer,
+/// which from the buyer's side is the same loss.
+///
+/// Note what that does and does not buy, because "unretractable" was the word
+/// here and it was too strong. Together with [`entry_digest`] it closes
+/// retraction BY SUBSTITUTION. A funded flood still evicts a message under the
+/// cap (`known_gap_a_funded_flood_still_evicts_every_honest_message`), so
+/// retraction is expensive, indiscriminate and loud rather than impossible.
+/// For Phase 2 that residual is settled by the buyer persisting the confession
+/// in their own delegate store on receipt, which is recorded in
+/// `docs/buyer-conversation-persistence.md` and not built here.
 pub type MailboxSummaryV2 = HashSet<[u8; 32]>;
 
 /// Delta: new messages to add. Unchanged in shape -- it always carried whole
@@ -583,18 +598,26 @@ pub type MailboxDelta = Vec<EncryptedMessage>;
 ///   whatever order this leaves behind;
 /// * removing that final tiebreak alone: **everything still passes**, because
 ///   this sort already ordered them;
-/// * doing BOTH: **three tests fail**, including
-///   `two_different_messages_sharing_a_nonce_converge_and_both_survive`.
+/// * doing BOTH: **three tests fail** --
+///   `two_different_messages_sharing_a_nonce_converge_and_both_survive`,
+///   `a_nonce_collision_inside_one_delta_converges_and_keeps_both`, and
+///   `a_retraction_that_arrives_first_does_not_keep_the_original_out`.
 ///
-/// So the two are mutually redundant and neither is individually observable.
-/// The earlier inference -- "the tiebreaks survive their own mutation, so the
-/// property lives here" -- was invalid, because THIS survives its own
-/// mutation too; single-mutation survival is symmetric and cannot attribute
-/// anything.
+/// **So the property itself IS pinned; what is not pinned is which mechanism
+/// provides it.** That distinction is the whole content of this comment. The
+/// suite fails the moment convergence for a same-nonce pair actually breaks,
+/// which is the guarantee that matters; it just cannot tell you, from any
+/// single mutation, which of the two to keep -- because the two are mutually
+/// redundant and each survives its own deletion. The earlier inference --
+/// "the tiebreaks survive their own mutation, so the property lives here" --
+/// was invalid for exactly that reason: single-mutation survival is symmetric
+/// and attributes nothing.
 ///
-/// **Do not delete both.** Each of the two comments is individually true and
-/// together they would authorise exactly that, which is a silent permanent
-/// divergence with a green suite.
+/// **The one real exposure is deleting both.** No test objects to either
+/// deletion on its own, so two changes months apart, each individually
+/// justified by a green suite, end in a silent permanent divergence. This
+/// comment and its twin in `apply_delta` are the only thing standing between
+/// those two changes.
 ///
 /// (`enforce_message_cap`'s digest tiebreak is a third and is redundant to
 /// both: removing the two above kills the suite whether or not it is
@@ -838,23 +861,25 @@ impl MailboxStateV1 {
         enforce_message_cap(&mut self.messages);
 
         // Normalisation, and ONE OF TWO mechanisms that make a same-nonce
-        // pair converge -- see `dedupe_identical_entries` for the other and
-        // for the mutation matrix. Deleting this alone passes the whole
-        // workspace; deleting both fails three tests.
+        // pair converge; `dedupe_identical_entries` is the other, and carries
+        // the full mutation matrix. The digest tiebreak is what makes this a
+        // total order.
+        //
+        // Convergence itself IS pinned: delete both mechanisms and three
+        // tests fail (`two_different_messages_sharing_a_nonce_converge_and_\
+        // both_survive`, `a_nonce_collision_inside_one_delta_converges_and_\
+        // keeps_both`, `a_retraction_that_arrives_first_does_not_keep_the_\
+        // original_out`). What is NOT pinned is this mechanism's own
+        // necessity: either alone suffices, so deleting this one on its own
+        // leaves the workspace green. Do not read that as evidence it is
+        // dead code -- read the twin comment first.
         //
         // This comment has been wrong twice, in opposite directions, which is
         // why it is careful now. It first said "sort deterministically by
         // nonce for CRDT convergence" (it was not the only such mechanism),
-        // then said it carried nothing at all (it is one of the two that
-        // do). A comment attributing a property to the wrong
-        // mechanism is how the next person deletes the mechanism that
-        // actually provides it.
-        //
-        // The digest tiebreak makes this a total order, and it is one of the
-        // TWO mechanisms that carry convergence for a same-nonce pair -- see
-        // `dedupe_identical_entries`, which is the other. Either alone is
-        // sufficient, so removing this one alone passes; removing both fails
-        // three tests. Do not delete both.
+        // then said it carried nothing at all (it is one of the two that do).
+        // A comment attributing a property to the wrong mechanism is how the
+        // next person deletes the mechanism that actually provides it.
         self.messages.sort_by(|a, b| {
             a.nonce
                 .cmp(&b.nonce)

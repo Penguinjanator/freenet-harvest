@@ -132,10 +132,24 @@ impl ContractInterface for Contract {
     ) -> Result<StateDelta<'static>, ContractError> {
         let _parameters = from_reader::<MailboxParameters, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
+        // Both empties are the SAME convention `summarize_state` above uses
+        // and `validate_state` uses: zero bytes means "there is no state
+        // here yet", not a malformed encoding. Decoding either as CBOR gives
+        // `UnexpectedEof`, so before this the very first exchange a new
+        // subscriber makes -- it summarizes its absent state, which is zero
+        // bytes, and asks a holder for the difference -- was answered with a
+        // decode error rather than the mailbox.
+        if state.as_ref().is_empty() {
+            return Ok(StateDelta::from(vec![]));
+        }
         let mailbox_state = from_reader::<MailboxStateV1, &[u8]>(state.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
-        let old_summary = from_reader::<MailboxSummaryV2, &[u8]>(summary.as_ref())
-            .map_err(|e| ContractError::Deser(e.to_string()))?;
+        let old_summary = if summary.as_ref().is_empty() {
+            MailboxSummaryV2::default()
+        } else {
+            from_reader::<MailboxSummaryV2, &[u8]>(summary.as_ref())
+                .map_err(|e| ContractError::Deser(e.to_string()))?
+        };
 
         match mailbox_state.delta(&old_summary) {
             Some(delta) => {
@@ -319,6 +333,56 @@ mod tests {
         )
         .expect("validate");
         assert!(matches!(verdict, ValidateResult::Valid));
+    }
+
+    /// **A peer that holds nothing yet can still be sent everything.**
+    ///
+    /// `summarize_state` answers a zero-byte state with a zero-byte summary
+    /// -- that is the "I have nothing" summary, and it is the FIRST thing a
+    /// new subscriber sends. If the holder cannot decode it, the new
+    /// subscriber is answered with an error instead of the mailbox, and it
+    /// never bootstraps at all.
+    #[test]
+    fn a_holder_answers_the_empty_summary_with_everything_it_has() {
+        let held = MailboxStateV1 {
+            messages: vec![
+                message([7u8; 24], b"one", 1_700_000_000),
+                message([8u8; 24], b"two", 1_700_000_001),
+            ],
+        };
+        let empty_summary = <Contract as ContractInterface>::summarize_state(
+            parameters(),
+            State::from(Vec::<u8>::new()),
+        )
+        .expect("summarizing an absent state must succeed");
+
+        let delta = <Contract as ContractInterface>::get_state_delta(
+            parameters(),
+            State::from(encoded(&held)),
+            empty_summary,
+        )
+        .expect("a holder must answer the empty summary rather than erroring");
+
+        let carried = from_reader::<MailboxDelta, &[u8]>(delta.as_ref())
+            .expect("the delta must be a decodable message list");
+        assert_eq!(
+            carried.len(),
+            2,
+            "the empty summary means 'I have nothing', so the answer is everything"
+        );
+    }
+
+    /// The mirror: a peer that holds nothing has nothing to send, which is an
+    /// empty delta and not an error.
+    #[test]
+    fn a_holder_of_nothing_answers_with_an_empty_delta() {
+        let delta = <Contract as ContractInterface>::get_state_delta(
+            parameters(),
+            State::from(Vec::<u8>::new()),
+            StateSummary::from(Vec::<u8>::new()),
+        )
+        .expect("a peer holding no state must answer, not error");
+        assert!(delta.as_ref().is_empty());
     }
 
     /// **No production code decides "the same message" by comparing nonces.**

@@ -60,6 +60,68 @@ thread the buyer is writing into, which is the newest.
 
 ---
 
+## A doc comment outlives the design it described
+
+`entry_digest`'s doc comment said, in the same commit that made the digest the
+contract's identity, that identity is the writer's NONCE and that a colliding
+substitute displaces the original -- the exact inverse of the security
+property the commit established. Nothing was wrong when it was written. The
+digest existed first as a client-side convenience for recognising your own
+messages, and that paragraph described the world it lived in truthfully. When
+the digest was PROMOTED to the contract's definition of identity, the code
+moved and the comment did not, because the promotion touched `verify`,
+`summarize`, `delta` and the dedup -- and not the function whose meaning had
+changed underneath them all.
+
+**The general shape: a symbol whose ROLE changes without its BODY changing is
+the one whose documentation goes stale silently.** A rename or a signature
+change drags the comment into the diff and a reviewer reads it. A promotion
+does not: `entry_digest`'s body is byte-for-byte what it was, so the diff
+offered nothing to read. Every reviewer looked at the call sites, which is
+where the change was.
+
+It is also the worst possible direction of staleness. A comment that merely
+lags is a nuisance; this one asserted the *negation* of a property the code
+now guarantees, in the doc comment of the function that guarantees it, which
+is the first thing anyone touching identity would read. A later change could
+have been justified by it in good faith.
+
+The check that would have caught it costs one question, asked at the moment a
+helper is promoted rather than at review: **"which comments described this
+thing in its old role?"** Grep for the symbol before promoting it, not after.
+
+---
+
+## A citation is a claim, and this file makes hundreds of them
+
+Four rows in the tables below cited tests by names that did not exist:
+`a_backup_is_filed_under_the_store_that_was_asked_about` (renamed when export
+became per-conversation), `an_import_asks_for_the_restored_conversations`
+(plural, the test is singular), `known_limit_a_nonce_collision_reuses_the_\
+keystream` (asserted as a pin for a day before anyone wrote it), and the
+handler `on_conversations_exported` (also singular). All four are fixed above;
+the keystream one was fixed by writing the test, because the claim was worth
+pinning and the pin was short.
+
+The third is the one to learn from. That row was read as evidence in the
+nonce-reuse analysis that led to the entry-digest change -- an argument
+resting, in part, on a test nobody had written. **A "Yes -- `test_name`" in
+this file is a load-bearing claim, and an unresolvable name is a claim that
+was never checked.**
+
+**A cheap way to make a dead citation fail the build, not yet built.** A
+single `#[test]` in `harvest-common` that reads this file, extracts every
+snake_case identifier appearing in a "Yes"/"Pinned" cell, greps the workspace
+`.rs` sources for `fn <name>`, and asserts every one resolves. It is the same
+shape as `no_production_code_compares_message_nonces_for_identity`, which
+already reads sources from `CARGO_MANIFEST_DIR`, so the machinery exists. Two
+details decide whether it is worth having: it must skip cells marked **No** or
+**Partly** (which legitimately name things that do not exist), and it must
+tolerate non-test identifiers like `skip_serializing_if` and `conversation_id`
+-- most cheaply by requiring an explicit opt-out marker rather than by
+guessing. Filed here rather than built, because the decision to spend a test
+on documentation-integrity is the lead's.
+
 ## `common/src/store.rs`
 
 | Line | Claim | Caught? |
@@ -217,7 +279,7 @@ is the only way this file stays a record rather than an archaeology exercise.
 | same, `mark_conversations_backed_up` | The backup marker is deleted with the conversation it describes. | **Yes** -- `forgetting_a_conversation_leaves_no_backup_marker_behind`, observed red against the ghostkey vault's own shape (a marker key of its own), which left `harvest:conv_backedup:...` behind naming the store. This is why the marker is a field of the record here and not a separate secret. |
 | `delegates/.../handlers.rs` | A foreign web app can neither export a buyer's secrets NOR silence the warning that they exist in one place only. | **Yes** -- `another_web_app_cannot_export_or_silence_a_buyers_backup_warning`, red with the `authorize` call removed. The marker half is the one worth the test: it writes no secret and answers none, so it reads as harmless, and what it does is stop a warning about a conversation nobody has a copy of. |
 | `harvest_common::ImportedConversations` / `ui/src/state.rs::on_conversations_imported` | A conversation that could not be restored is NAMED with its reason, not folded into a count. | **Yes** -- `a_refused_import_says_which_and_why`, which asserts both the reason and the shortened tag survive into what the buyer is told. |
-| `ui/src/state.rs::on_conversations_marked_backed_up` / `on_conversations_imported` | The screen is refreshed by re-asking the delegate, not by assuming what it did. | **Yes** -- `marking_asks_the_delegate_again_rather_than_assuming`, `an_import_asks_for_the_restored_conversations`, and `a_recall_refreshes_whether_a_held_conversation_is_backed_up`, which drives the whole marking round trip and would fail if a recall only ADDED conversations instead of refreshing held ones. |
+| `ui/src/state.rs::on_conversations_marked_backed_up` / `on_conversations_imported` | The screen is refreshed by re-asking the delegate, not by assuming what it did. | **Yes** -- `marking_asks_the_delegate_again_rather_than_assuming`, `an_import_asks_for_the_restored_conversation`, and `a_recall_refreshes_whether_a_held_conversation_is_backed_up`, which drives the whole marking round trip and would fail if a recall only ADDED conversations instead of refreshing held ones. |
 | `ui/src/state.rs::on_buyer_conversations` | An answer is filed under the store this browser ASKED about, and one nothing asked for is ignored. | **Yes, since the backup work** -- `conversations_are_filed_under_the_store_that_was_asked_about` and `a_recall_answer_nothing_asked_for_is_ignored`, both red against the obvious implementations (file by the echoed id; act on any answer). The recall carried no request id until this change, so neither guard could exist; the defect it would have caused is a buyer reading, and composing into, a thread against the wrong seller's mailbox. |
 | `ui/src/state.rs::ConversationBackup` | A backup does not print itself. | **Yes** -- `a_backup_on_screen_does_not_print_itself`, red against a derived `Debug`. More at stake than the single secret it shares this guard's reasoning with: this one is a complete portable copy of every conversation with a store. |
 | `ui/src/state.rs::authored_here` | "What this tab sent" is recognised by something the counterparty cannot reproduce. | **Yes, since the review** -- `a_substituted_message_is_not_shown_as_the_buyers_own` and `a_seller_is_not_credited_with_a_substituted_reply`, both red against the shipped nonce-matching. It was NOT true before: the nonce is public, the counterparty holds the key, and `dedupe_by_nonce` keeps whichever entry ranks highest under attacker-chosen fields -- so their words appeared under "You, from this tab" in both directions. The tests drive the REAL `MailboxStateV1::apply_delta`, so the displacement is the contract's own, not a fixture's. |
@@ -225,16 +287,16 @@ is the only way this file stays a record rather than an archaeology exercise.
 | `harvest_common::mailbox::entry_digest` | Every field is covered, and a substitute sharing a nonce differs. | **Yes** -- four tests, two of them red under mutation (dropping the ciphertext; dropping the length prefixes). |
 | `contracts/mailbox-contract` `UpdateData::State` arm, `ui/src/migrate.rs::merge_mailbox` | "Already held" is decided by the same identity `verify` enforces. | **Yes, since the final review** -- neither site decides it any more: both hand everything to `apply_delta`, which dedups by `entry_digest`. Pinned behaviourally by `a_state_merge_keeps_a_message_whose_nonce_something_else_shares` and `folding_keeps_a_message_whose_nonce_the_newer_generation_shares` (both red first), and structurally by `no_production_code_compares_message_nonces_for_identity`, a source scrape that fails when a site starts answering the question for itself. The scrape found the migration fold, which review had not. |
 | `common/src/reputation.rs::ReputationStateV1` | "Feedback is naturally commutative: adding entries in any order produces the same final set." | **NO -- and the claim is FALSE, which this row previously recorded only as untested.** The RSA signature covers `entry.token` alone while `category`, `comment` and `submitted_at` ride alongside it unsigned, and identity is `token.nonce`. So a published entry can be re-submitted with different words under the same token, and each peer keeps whichever it saw first. Demonstrated by execution in `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. Beyond convergence: a seller who reads negative feedback can push a neutered variant to peers that do not hold the original, and those peers then refuse the real one because its nonce is used. Same class as the mailbox's nonce identity; **deliberately not fixed on this branch** -- different contract, its own re-key, and for feedback the better repair is probably to sign the whole entry so the variant cannot exist at all. |
-| `harvest_common::mailbox` convergence for a same-nonce pair | Which mechanism carries it. | **Redundantly carried, and no single mutation observes it.** Corrected after review, because the first version of this row stated a measurement that does not reproduce. The matrix: an order-dependent dedup alone passes (the final `(nonce, entry_digest)` sort re-normalises); removing the final sort's tiebreak alone passes (dedup already ordered them); doing BOTH fails three tests. `enforce_message_cap`'s digest tiebreak is a third mechanism and is redundant to both. The earlier inference -- "the tiebreaks survive their own mutation, so the property lives in the dedup sort" -- was invalid, since the dedup sort survives its own mutation too. Each comment now says it is one of two and that removing both is what breaks; two comments each truthfully saying "no test fails without me" would together authorise deleting both. |
+| `harvest_common::mailbox` convergence for a same-nonce pair | Which mechanism carries it. | **The JOINT property IS pinned; no SINGLE mutation observes it.** Both halves matter and the first is the one that gets lost: three tests fail when both mechanisms are removed, so the suite does defend convergence -- what it cannot do is tell you which mechanism to keep. Corrected after review, because the first version of this row stated a measurement that does not reproduce. The matrix: an order-dependent dedup alone passes (the final `(nonce, entry_digest)` sort re-normalises); removing the final sort's tiebreak alone passes (dedup already ordered them); doing BOTH fails three tests. `enforce_message_cap`'s digest tiebreak is a third mechanism and is redundant to both. The earlier inference -- "the tiebreaks survive their own mutation, so the property lives in the dedup sort" -- was invalid, since the dedup sort survives its own mutation too. Each comment now says it is one of two and that removing both is what breaks; two comments each truthfully saying "no test fails without me" would together authorise deleting both, which is the only real exposure here. |
 | `harvest_common::mailbox` identity | The counterparty can delete a message you sent. | **FIXED on 2026-09-05, not a limitation any more.** Identity is `entry_digest` over the whole entry, computed by the contract, so there is no collision to resolve. Pinned by `a_message_cannot_be_retracted_by_submitting_another_under_its_nonce` and four neighbours, plus the contract's own `a_state_merge_keeps_a_message_whose_nonce_something_else_shares`. **What remains is narrower and is still a live gap:** a funded flood evicts it under the cap (`known_gap_a_funded_flood_still_evicts_every_honest_message`), so retraction is expensive, indiscriminate and loud rather than impossible. This row previously told a reader that deletion was an accepted live limitation of the shipped contract, which was true when written and false by the end of the same day. |
-| `harvest_common::mailbox` (AES-GCM) | A deliberate nonce collision reuses the keystream. | **Pinned as a LIMITATION** -- `known_limit_a_nonce_collision_reuses_the_keystream` asserts `C1 xor C2 == P1 xor P2`, so if the property is ever closed the test fails and the documentation must be updated rather than the assertion. |
+| `ui/src/messaging.rs` (AES-GCM) | A deliberate nonce collision reuses the keystream. | **Pinned as a LIMITATION, since 2026-09-05** -- `known_limit_a_nonce_collision_reuses_the_keystream` asserts `C1 xor C2 == P1 xor P2`, so if the property is ever closed the test fails and the documentation must be updated rather than the assertion; confirmed red under a mutation that makes the two nonces differ. This row asserted the pin for a day before the test existed, and was cited in the nonce-reuse analysis that led to the entry-digest change -- an argument resting in part on a test nobody had written. |
 | `delegates/.../messaging.rs::make_room` | A conversation that exists only on this node is the last thing evicted. | **Yes** -- `a_conversation_that_exists_only_here_outlives_an_imported_one`, red when the ranking ignores `backed_up`. The reproduction is the reviewer's: a pasted backup fills the store, and the next conversation the buyer opens destroys one of their own. |
 | same | An eviction is reported. | **Yes** -- `an_eviction_is_reported` and `storing_without_evicting_reports_no_eviction` (so the report is evidence rather than noise), plus `a_conversation_discarded_to_make_room_is_reported` and `discarding_a_backed_up_conversation_says_it_can_be_restored` on the consumer side, all red under mutation. |
 | same, `decode_backup` | An oversized paste is refused before it is decoded. | **Yes** -- `a_backup_string_longer_than_the_cap_is_refused_without_decoding_it`, which also asserts the refusal is fast. Found by measurement, not by reading: base58 is quadratic, and a 253-conversation round trip took 72 seconds in a debug build with nothing bounding the length. |
 | same, `import_buyer_conversations` | A record whose keys cannot be derived is refused rather than silently occupying a slot. | **Yes, since the review** -- `a_record_whose_keys_cannot_be_derived_is_refused_and_stores_nothing`. It was one of the two guards the sweep section did not cover. |
 | same, `store_buyer_conversation` | Re-storing a held conversation evicts nothing. | **Yes, since the review.** The test existed and could not observe its own claim: it re-stored the OLDEST held conversation, which is also the eviction victim, so with the guard deleted the eviction cancelled itself out and the suite stayed green. It now re-stores the NEWEST -- the thread the buyer is actually writing into, which is what the UI re-sends -- and is red under that mutation. |
 | same, `mark_conversations_backed_up` | A refused write is reported rather than counted as "not marked". | **Yes, since the review** -- `marking_reports_a_failure_when_the_node_refuses_the_write`. The response could not express a failure before, which made the UI's error path dead code. |
-| `ui/src/state.rs::on_conversations_exported` | A backup is filed under the store that was ASKED about, and one nothing asked for is ignored. | **Yes, since the review** -- `a_backup_is_filed_under_the_store_that_was_asked_about` and `a_backup_nothing_asked_for_does_not_reach_the_screen`. This file states the principle for `BuyerConversationList` and did not follow it here; a backup on screen under the wrong heading invites the buyer to save it as that store's. |
+| `ui/src/state.rs::on_conversation_exported` | A backup is filed under the CONVERSATION that was ASKED about, and one nothing asked for is ignored. | **Yes, since the review** -- `a_backup_is_filed_under_the_conversation_that_was_asked_about` and `a_backup_nothing_asked_for_does_not_reach_the_screen`. Both the handler and the test were named for the STORE until export became per-conversation; this row kept the old names for a day, which is the citation drift the note at the end of this file is about. This file states the principle for `BuyerConversationList` and did not follow it here; a backup on screen under the wrong heading invites the buyer to save it as that store's. |
 | `ui/src/state.rs::on_buyer_conversations` (sort) | The NEWEST recalled conversation is the one a new message continues. | **Yes, since the review** -- `a_new_message_continues_the_newest_of_several_recalled_conversations`, red with the sort deleted. The two existing tests could not see it: one had a single recalled conversation, the other had two but only asserted both were readable. |
 | `ui/src/state.rs::on_conversations_imported` | An imported conversation may become the active thread, and its secret may be known to whoever supplied the string. | **No, and it is a residual rather than a claim.** The notification says so; nothing tests the wording, and nothing prevents it -- a backup the buyer was handed is indistinguishable from one they made. Recorded here rather than left in the commit message. |
 | `delegates/.../messaging.rs` (backup format) | One backup string covers ONE conversation. | **Yes** -- `a_backup_carries_one_conversation`, which holds two conversations with one store and a third with another, and asserts the restore brings back exactly the one that was asked for. The granularity is the whole point of the change: a store-wide string is silently incomplete the moment the next conversation is opened. |

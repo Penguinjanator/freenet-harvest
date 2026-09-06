@@ -398,9 +398,13 @@ pub struct ConversationMessage {
     /// [`Addressing`].
     pub addressing: Addressing,
     pub timestamp: chrono::DateTime<chrono::Utc>,
-    /// The mailbox nonce: the message's identity TO THE CONTRACT, and the
-    /// thing a substitute deliberately shares. Not an identity a client may
-    /// use to recognise its own writing -- see [`Self::digest`].
+    /// The mailbox nonce, which identifies nothing.
+    ///
+    /// It was the contract's identity for a message until 2026-09-05, and is
+    /// now just a field the writer fills in -- the contract keys on
+    /// [`harvest_common::mailbox::entry_digest`], and so does every client.
+    /// Kept because it is part of the entry and the AEAD binds it; used to
+    /// recognise nothing. See [`Self::digest`].
     pub nonce: [u8; 24],
     /// [`harvest_common::mailbox::entry_digest`] of the entry this came from:
     /// what a client compares against to know whether this is a message it
@@ -502,9 +506,9 @@ pub enum MailboxEntry {
         /// (`a_reply_naming_another_conversation_is_not_shown`), so the only
         /// place a seller can learn the right one is a message they decrypted.
         conversation_id: ConversationId,
-        /// The mailbox nonce: the message's identity to the CONTRACT. It is
-        /// public and a substitute deliberately shares it, so it is not how
-        /// a client recognises its own writing -- see `digest`.
+        /// The mailbox nonce, which identifies nothing: public, chosen by
+        /// the writer, and no longer the contract's identity for a message
+        /// either. Recognition is by `digest`.
         nonce: [u8; 24],
         /// [`harvest_common::mailbox::entry_digest`]: the identity a client
         /// compares against to know whether it sent this itself.
@@ -541,16 +545,6 @@ impl MailboxEntry {
         match self {
             MailboxEntry::Readable { conversation, .. }
             | MailboxEntry::Unreadable { conversation, .. } => conversation,
-        }
-    }
-
-    /// The message's identity in the mailbox, TO THE CONTRACT.
-    ///
-    /// Public, and shared deliberately by a substitute. Use
-    /// [`Self::digest`] to recognise a message this client sent.
-    pub fn nonce(&self) -> [u8; 24] {
-        match self {
-            MailboxEntry::Readable { nonce, .. } | MailboxEntry::Unreadable { nonce, .. } => *nonce,
         }
     }
 
@@ -1402,6 +1396,67 @@ mod tests {
     /// **If this test ever goes red, do not make it pass.** It would mean
     /// something now distinguishes the two holders, which is a real
     /// improvement -- invert the assertion and delete this comment.
+    /// **A deliberate nonce collision reuses the keystream.**
+    ///
+    /// `docs/untested-invariants.md` claimed this was pinned by a test of
+    /// this name for a day before the test existed. It is written now rather
+    /// than the row downgraded, because the claim is worth pinning and the
+    /// pin is four lines.
+    ///
+    /// AES-GCM is a stream cipher under the hood: with one key and one
+    /// 12-byte nonce, two messages share a keystream, so `C1 xor C2` is
+    /// `P1 xor P2` and an observer who guesses one plaintext reads the other.
+    /// (GHASH's authentication subkey is also recoverable, which is the
+    /// sharper half of the classic result and not asserted here.)
+    ///
+    /// **Why it is a documented limit and not a bug.** `encrypt_message`
+    /// draws all 24 nonce bytes from `getrandom` per message, so an honest
+    /// client never collides -- this test has to reach past it to the cipher
+    /// to construct one at all. Creating the collision requires the
+    /// conversation KEY, so the only party who can do it is a party who can
+    /// already read both messages. It buys an attacker nothing they did not
+    /// have; what it rules out is a future change that derives the nonce
+    /// from anything less than fresh randomness.
+    ///
+    /// **If this test ever goes red, do not make it pass.** Red means the
+    /// construction changed -- a nonce misuse-resistant mode, say. That is an
+    /// improvement: invert the assertion and update the row in
+    /// `docs/untested-invariants.md`.
+    #[test]
+    fn known_limit_a_nonce_collision_reuses_the_keystream() {
+        use aes_gcm::aead::Aead;
+
+        let key = [9u8; 32];
+        let nonce = [3u8; 12];
+        // Equal length, so the relation covers the whole body.
+        let first = b"pay to bc1qhonest0000000000000";
+        let second = b"pay to bc1qattacker00000000000";
+
+        let cipher = Aes256Gcm::new_from_slice(&key).expect("key");
+        let c1 = cipher
+            .encrypt(Nonce::from_slice(&nonce), first.as_ref())
+            .expect("encrypt");
+        let c2 = cipher
+            .encrypt(Nonce::from_slice(&nonce), second.as_ref())
+            .expect("encrypt");
+
+        // Strip the 16-byte tag; the rest is plaintext xor keystream.
+        let body = first.len();
+        let ciphertext_xor: Vec<u8> = c1[..body]
+            .iter()
+            .zip(&c2[..body])
+            .map(|(a, b)| a ^ b)
+            .collect();
+        let plaintext_xor: Vec<u8> = first.iter().zip(second).map(|(a, b)| a ^ b).collect();
+
+        assert_eq!(
+            ciphertext_xor, plaintext_xor,
+            "a nonce collision no longer reveals the xor of the two plaintexts -- if the \
+             construction has been strengthened, invert this assertion and update \
+             docs/untested-invariants.md"
+        );
+    }
+
     #[test]
     fn known_limit_the_counterparty_can_write_in_either_direction() {
         let seller = Seller::new(73);

@@ -158,15 +158,34 @@ Four consequences, all deliberate:
   went from **free, targeted and silent** (one message's worth of bytes, aimed
   at one entry, leaving no trace) to **expensive, indiscriminate and loud** (a
   full cap's worth of bytes, destroying the seller's whole mailbox with it,
-  which for a bonded seller is self-incriminating). If a buyer's recourse must
-  survive a seller willing to spend that, the confession needs a home outside
-  the mailbox — a Phase 2 design decision this change does not settle.
+  which for a bonded seller is self-incriminating).
+
+  A buyer's recourse must survive a seller willing to spend that, so the
+  confession needs a home outside the mailbox. **That is now settled** (Ian,
+  2026-09-05): in Phase 2 the buyer persists the confession itself in their
+  own delegate store on receipt, not merely the conversation keys, so the
+  mailbox becomes the channel that delivered it rather than custody of it.
+  Written up in `docs/buyer-conversation-persistence.md`, "Phase 2 stores the
+  confession here, not just the keys" — including why storing-on-receipt is
+  sufficient against the flood when it was rightly rejected against
+  substitution. Not built.
 * **`MailboxSummary` became `MailboxSummaryV2`** and carries 32-byte digests
-  instead of 24-byte nonces. A change of payload is a change of name. The two
-  cannot be confused on the wire — a 24-element array does not deserialize as
-  a 32-element one, so an old summary meeting new code is a decode error, not
-  a misparse — and nothing needs to read the old shape, because no mailbox
-  contract carrying it was ever published.
+  instead of 24-byte nonces. A change of payload is a change of name.
+
+  **Two claims first made here were false, and are corrected rather than
+  deleted, because a later decision is exactly the kind of thing that gets
+  built on a premise like this.** It said no mailbox contract carrying the old
+  shape had ever been published; `legacy/mailbox_contract.toml` records seven
+  published generations, and every one shipped the 24-byte summary. It said
+  the two shapes "cannot be confused on the wire"; measured through this
+  crate's own `to_cbor`/`from_cbor`, that holds in one direction only — a
+  non-empty 24-byte summary read as 32-byte fails with "invalid length 24", an
+  EMPTY one decodes cleanly as an empty set, and a 32-byte summary read by old
+  code is silently TRUNCATED to 24-byte prefixes, so it would answer "I hold
+  these" for digests it has never seen. What actually makes the old shape
+  unreachable is neither of those: the contract is **content-addressed**, so
+  this change re-keys it, and a V7 peer and a V8 summary are never talking
+  about the same contract.
 * **`verify` rejects a repeated ENTRY, not a repeated nonce.** The old check
   made a legal pair permanently invalid, and that is what turned a collision
   into a way of destroying a message.

@@ -499,11 +499,75 @@ On the UI side:
   place, which is the safe direction and exactly what a local guess gets
   wrong.
 
+## Phase 2 stores the confession here, not just the keys
+
+**Settled by Ian on 2026-09-05; recorded so Phase 2 starts from it. Nothing
+below is built.**
+
+The mailbox re-key on 2026-09-05 made a message unretractable *by
+substitution*: identity is `entry_digest` over the whole entry, so a seller
+can no longer submit a different message under a sent message's nonce and
+displace it. It did **not** make a message permanently un-removable. A funded
+flood still evicts one -- 512 later-dated entries fill the cap, at about
+122 KiB in a single update, and take the seller's whole mailbox with them
+(`known_gap_a_funded_flood_still_evicts_every_honest_message`). Retraction
+went from free, targeted and silent to expensive, indiscriminate and loud. It
+did not go away.
+
+That distinction is only academic until Phase 2. There the seller's reply
+carries a **pre-signed confession**, which is the buyer's SOLE capability to
+file against the seller's bond. It travels as an ordinary message in the
+seller's own mailbox. A bonded seller facing a claim has a direct, priced
+incentive to spend a cap's worth of bytes to destroy it, and the loudness that
+bounds the attack for an ordinary conversation is worth little when the
+alternative is losing the bond.
+
+**The resolution: the buyer persists the confession itself, in this delegate
+store, on receipt.** Not merely the conversation keys, which is what a
+`BuyerConversationRecord` holds today. Once the confession is in the delegate,
+the mailbox stops being custody of the buyer's recourse and becomes only the
+channel that delivered it, and mailbox eviction stops mattering to the claim.
+
+Two things make this the right home rather than a workaround:
+
+* The delegate store is **private and durable, and outside the seller's
+  reach**. It is the buyer's own secret store; nothing the seller can submit
+  to a public contract touches it. That is the property the mailbox cannot
+  offer for an open-write contract with a cap.
+* The buyer already carries it across machines. Per-conversation export
+  (`harvest-conv-backup-v2:`) is the mechanism, so a confession the buyer
+  backed up survives a lost laptop the same way the conversation keys do --
+  and the backed-up marker already tells them whether it has.
+
+**The objection this answers, and why storing-on-receipt is now sufficient
+when it was not before.** "Tell the buyer to store it on receipt" was
+rejected on 2026-09-05 as a fix for the *substitution* route, and correctly:
+against substitution it made the guarantee a race between the buyer's client
+persisting and the seller submitting a colliding entry, and a race is not a
+foundation for "the buyer has recourse". That objection does not carry over.
+The re-key closed the substitution route outright, so what remains is the
+flood -- which needs 512 entries and is visible before it completes, not a
+single well-timed write. Persistence-on-receipt loses to a race and wins
+against a flood, so it became sufficient exactly when the other route closed.
+The order matters: it would have been the wrong answer yesterday.
+
+What Phase 2 still has to decide, and this note does not:
+
+* **What is persisted.** The confession bytes as received, or a
+  verified-and-normalised form. Storing what arrived is the safer default,
+  since a normaliser is a second place the claim can be broken.
+* **When.** On receipt is the obvious answer; whether the buyer's client must
+  confirm the delegate write before it treats the reply as usable is a real
+  question, because a silently-refused write reproduces the loss.
+* **Size.** `MAX_BACKUP_STRING_BYTES` bounds the backup string, and a record
+  carrying a confession is larger than one carrying keys. The cap and the
+  eviction ranking in `make_room` both assume today's record size.
+
 ## What this does not do
 
-* **It does not persist `authored_here`.** The nonces of messages this tab
-  sent are the only authorship this browser can establish, and they are not
-  kept. After a reload the buyer's own messages are described by direction
+* **It does not persist `authored_here`.** The entry digests of messages this
+  tab sent are the only authorship this browser can establish, and they are
+  not kept. After a reload the buyer's own messages are described by direction
   ("Addressed to the seller") rather than as "You, from this tab". Both are
   truthful; the second is less specific. What is at stake in this change is the
   ability to READ the thread, which is unaffected.
