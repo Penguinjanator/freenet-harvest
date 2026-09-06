@@ -259,6 +259,14 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by the buyer-to-seller messaging work; this
                 // artifact's own change is `StoreInfoV1::encryption_public_key`.
                 "c51cbcf2730b8d8511d48768c435462fa1ae37f0a4b513a96cf1d23d73f78370",
+                // V9, from `git show baaff9d:ui/public/contracts/store_contract.wasm`.
+                // Superseded by the buy flow. This artifact's own change is
+                // that it now REJECTS a record whose id is not the one its
+                // terms give, which is what makes the content-derived
+                // `OrderId`/`ListingId` binding on the network rather than on
+                // the issuer -- and it calls the shared address derivation
+                // instead of holding a second copy of it.
+                "8884c7258f9547743367a1b440f3803b216c09903148407c7f6f5a2af84ae785",
             ],
         ),
         (
@@ -279,6 +287,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // reputation_contract.wasm`. This artifact took no behavioural
                 // change of its own; `harvest-common` moved underneath it.
                 "c47e6fc580e2ecdbc4f4e4330c926c1e2d3092070519f074366bf09964d0e826",
+                // V9, from `git show baaff9d:ui/public/contracts/reputation_contract.wasm`.
+                // Superseded by the buy flow; this artifact moves only
+                // because `harvest-common` is compiled into it.
+                "152a12dcf119e72d9b4a909033dcc367b0c9e57a1395c7fa02f5463131499dae",
             ],
         ),
         (
@@ -300,6 +312,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // artifact the cause is its own, and it is a change of
                 // identity -- see the registry entry.
                 "b3bb6b0fd90c0918114e8068de1e1cc9ba6b08aa89fbbf018970ccfb1a6b0f14",
+                // V9, from `git show baaff9d:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by the buy flow; for THIS artifact the cause
+                // is `harvest-common` gaining `order_binding_from_secret`.
+                "08d0e54aceaa2a5a40226f371d3d1fd9dfd85cbd3694a7afdddb40ad89becd8f",
             ],
         ),
     ];
@@ -353,6 +369,13 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // seller's X25519 secret and the buyer's per-conversation store in
             // this delegate and added `x25519-dalek` as a real dependency.
             "907c2219b12938d45ce302e82818ca6edad0f6706affafc8da14efe65f0f3ad7".to_string(),
+            // V11, from `git show baaff9d:ui/public/contracts/harvest_delegate.wasm`.
+            // Superseded by the buy flow. This delegate's own change is one
+            // field on an answer it already sent: `RecalledConversation`
+            // gained `order_binding`, derived in `recall()` from the STORED
+            // conversation secret and deliberately not from the
+            // Diffie-Hellman shared secret, which the seller also holds.
+            "73f5761fc6dfa2602d3b683473209a44b1f649d507c3187a05e7dcef02e051e8".to_string(),
         ],
     );
 }
@@ -696,6 +719,11 @@ const PUBLISHED_UNDER_LEGACY_PARAMS: &[(u32, bool)] = &[
     // what it was, verified against V7 rather than assumed, so the encoding is
     // still 56 bytes and this generation derives under the current one.
     (8, false),
+    // V9: the buy flow. `OrderId` and `ListingId` became content-derived and
+    // 32 bytes, and `Order` gained two fields -- all STATE, none of it
+    // parameters. `StoreParameters` is field-for-field what it was, diffed
+    // against V8 rather than assumed, so the encoding is still 56 bytes.
+    (9, false),
 ];
 
 /// V1 is derived under TODAY's parameter encoding, not the legacy one.
