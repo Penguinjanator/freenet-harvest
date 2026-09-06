@@ -554,7 +554,41 @@ Three things make it worse than the loss:
 * every other test in this repository builds its fixtures with the NEW
   derivation, so not one of them could see it. It passed all four gates.
 
-**There is no clean repair, which is why it is recorded rather than fixed.**
+**RESOLVED 2026-09-06, by decision rather than by repair.** Ian's answer: no
+published store holds data worth preserving, sellers republish. So the loss
+stands, and what changed is that it is now a decision the affected person is
+TOLD about:
+
+* `migrate::describe_lost_store` names the store, its details, and how many
+  listings and orders went with it, and says to publish them again --
+  "migration incomplete" is not something a seller can act on.
+* It reaches `AppState::notifications` rather than a console line, drained in
+  `migrate_ops::finish` **before** the nothing-was-recovered early return.
+  That ordering is the whole of it: draining after that return would mean the
+  one message that matters is the one never sent.
+* Pinned by `migrate::uncarried_tests`, including that a fold which carries
+  everything reports nothing -- a notification on every successful migration
+  is one a seller learns to dismiss, which costs exactly the case it exists
+  for.
+
+**And the structural half, which is worth more than the rest.** The reason
+neither the author nor the review saw this is that **every fixture in this
+repository builds its records with the CURRENT derivation**, so none of them
+could hold what a predecessor generation produced. The fix is a known-answer
+test on each derivation --
+`listing::listing_identity_tests::the_listing_id_derivation_is_pinned` and its
+order counterpart -- whose doc comments carry the consequence and say to read
+the migration tests before changing the constant.
+
+A first attempt at this pin did not work and the failure is worth recording:
+it built a record with a hard-coded foreign id, which is refused whatever the
+derivation is, so simulating a future derivation change (`v2` to `v3`) failed
+**zero** tests. What fires is a fixture that depends on the derivation's
+actual output. Verified by making that change and watching the KAT go red,
+and again by adding a field to the order id's preimage.
+
+**The original difficulty, for a reader who reaches this by a different
+route:**
 The id is inside what the seller signed, so the fold cannot re-stamp a record
 without invalidating its signature. Accepting the old form in `verify` works
 mechanically -- the seller's fingerprint is derivable from the verifying key

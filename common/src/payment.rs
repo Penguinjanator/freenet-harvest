@@ -1963,6 +1963,45 @@ mod order_identity_tests {
         assert_eq!(OrderId::from_terms(&order), first);
     }
 
+    /// **The order id derivation is pinned.**
+    ///
+    /// Same instrument and same reason as
+    /// `listing::listing_identity_tests::the_listing_id_derivation_is_pinned`,
+    /// which carries the full argument: a change here makes every order a
+    /// previous generation published fail `verify`, and the migration's fold
+    /// discards that generation whole rather than the offending record.
+    ///
+    /// Milder for orders than for listings, because an order expires after
+    /// [`MAX_ANCHOR_AGE_BLOCKS`] and one old enough to be in a predecessor
+    /// generation is one nobody could pay. It is still the same class of
+    /// change, and it still takes the store's listings with it, because the
+    /// fold refuses the generation rather than the record.
+    #[test]
+    fn the_order_id_derivation_is_pinned() {
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let order = Order {
+            id: OrderId([0u8; 32]),
+            listing_id: ListingId([1u8; 32]),
+            buyer_fingerprint: String::new(),
+            seller_fingerprint: "seller-fp".to_string(),
+            amount_sats: 50_000,
+            network: BitcoinNetwork::Signet,
+            payment_script_pubkey: vec![0x00, 0x14, 0xaa],
+            payment_address: "tb1qexample".to_string(),
+            required_confirmations: 1,
+            payment_hash: None,
+            trusted_bridges: Vec::new(),
+            bitcoin_address_code_hash: None,
+            anchor: None,
+            order_binding: None,
+            created_at,
+        };
+        assert_eq!(
+            hex::encode(OrderId::from_terms(&order).0),
+            "a9fca6b22ee60ee36880d5b1ae447b0ab13a9d5a4b5d5f11e62a0987e334f1c8",
+        );
+    }
+
     /// **The id is the WHOLE digest, not a prefix of one.**
     ///
     /// The width is the point of the change that widened it: at 16 bytes a

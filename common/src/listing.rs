@@ -768,6 +768,57 @@ mod listing_identity_tests {
         );
     }
 
+    /// **The listing id derivation is pinned, and changing it costs a
+    /// seller their shop.**
+    ///
+    /// # Read this before changing the derivation
+    ///
+    /// This test exists to FAIL when somebody changes how a `ListingId` is
+    /// derived, because the consequence is not local to this function and is
+    /// not visible from it.
+    ///
+    /// Every listing published by a previous generation carries an id derived
+    /// the old way. `AuthorizedListing::verify` refuses any listing whose id
+    /// is not the one its terms give, and `ListingsV1::apply_delta` returns
+    /// on the first refusal -- so the migration's fold discards the ENTIRE
+    /// predecessor generation: the listings, the orders, and the store's own
+    /// name, description and certificate with them. The migration then
+    /// SEALS, so there is no second attempt.
+    ///
+    /// That happened on this branch. It passed every gate and survived a
+    /// review round, because every other fixture in this repository builds
+    /// its records with the CURRENT derivation and so none of them could see
+    /// it. See `harvest_ui::migrate::uncarried_tests` for what the fold does
+    /// and what the seller is told.
+    ///
+    /// So: if you are here because this test went red, the change may still
+    /// be right -- it was, on that branch -- but it is a decision about
+    /// published data and not a refactor. Updating the constant is the last
+    /// step, not the first.
+    ///
+    /// The expected value comes from this crate's own derivation rather than
+    /// an outside tool, which is weaker than the `b3sum` known answers in
+    /// `mailbox`: what it pins is CHANGE, not correctness.
+    #[test]
+    fn the_listing_id_derivation_is_pinned() {
+        let created_at = DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let listing = Listing {
+            id: ListingId([0u8; 32]),
+            title: "Ghost Pepper".into(),
+            description: "Hot".into(),
+            kind: ListingKind::Sale,
+            price: Some(PriceInfo {
+                amount: "0.001".into(),
+                currency: "BTC".into(),
+            }),
+            created_at,
+        };
+        assert_eq!(
+            hex::encode(ListingId::from_terms(&listing).0),
+            "abf0ddc0555aaabae4edfbc9d60ab5e7c33bf7966a9022a44efa018be2e9d5c5",
+        );
+    }
+
     /// **The id is the WHOLE digest, not a prefix of one.**
     ///
     /// Same reasoning as `payment::order_identity_tests::the_id_is_the_whole_digest`:

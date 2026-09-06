@@ -743,6 +743,15 @@ fn finish(mut probe: Probe) {
         probe.fingerprint
     );
 
+    // Tell the seller what the migration could not carry, BEFORE the early
+    // return below. That return is the nothing-was-recovered path, which is
+    // precisely the case this reports -- draining after it would mean the one
+    // message that matters is the one never sent.
+    //
+    // The migration seals after this, so there is no second attempt and no
+    // later screen where it turns up again. See `migrate::take_uncarried`.
+    report_uncarried();
+
     let Some(forward) = forward else {
         // Nothing to carry forward, so there is nothing that could have
         // reached the successor and condition 1 cannot hold. `Seal` without a
@@ -935,6 +944,24 @@ fn settle_forward(successor: ContractInstanceId, how: Confirmation) {
                 ),
             }
         }
+    }
+}
+
+/// Push everything the migration could not carry into the notifications the
+/// seller actually sees.
+///
+/// A `probe_warn` is a browser console line. The loss is permanent -- the
+/// migration seals -- and a decision the person affected is not told about is
+/// indistinguishable from a bug, so this is the half that reaches them.
+fn report_uncarried() {
+    let lost = crate::migrate::take_uncarried();
+    if lost.is_empty() {
+        return;
+    }
+    let mut state = super::APP_STATE.write();
+    for what in lost {
+        warn!("migration: {what}");
+        state.notifications.push(what);
     }
 }
 
