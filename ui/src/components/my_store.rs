@@ -405,7 +405,6 @@ fn IdentityCard(
 
         if show_listing_form() {
             ListingForm {
-                seller_fingerprint: fp.clone(),
                 on_submit: move |listing: Listing| {
                     show_listing_form.set(false);
                     sign_and_submit_listing(fp.clone(), listing);

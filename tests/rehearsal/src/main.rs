@@ -170,7 +170,7 @@ fn scoped_sign<T: serde::Serialize>(sk: &SigningKey, data: &T) -> (Vec<u8>, Vec<
 fn make_listing(sk: &SigningKey, fingerprint: &str, title: &str, at: i64) -> AuthorizedListing {
     let created_at = ts(at);
     let listing = Listing {
-        id: ListingId::new(fingerprint, &created_at, title),
+        id: ListingId::from_label(title),
         title: title.to_string(),
         description: format!("{title} -- written by the rehearsal harness"),
         kind: ListingKind::Sale,

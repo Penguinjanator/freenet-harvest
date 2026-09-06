@@ -353,7 +353,7 @@ mod tests {
 
     fn make_order(script: &[u8], code_hash: Option<[u8; 32]>) -> Order {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let listing_id = ListingId::new("seller-fp", &ts, "Widget");
+        let listing_id = ListingId::from_label("Widget");
         Order {
             id: OrderId([0u8; 16]),
             listing_id,

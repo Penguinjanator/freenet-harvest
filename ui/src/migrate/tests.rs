@@ -42,15 +42,21 @@ fn store_bytes(state: &StoreStateV1) -> Vec<u8> {
 /// A listing signed the way the ghostkey delegate signs one, so
 /// `AuthorizedListing::verify` -- which the store contract's `apply_delta`
 /// runs on every merged listing -- accepts it.
-fn signed_listing(id: u8, title: &str) -> AuthorizedListing {
+fn signed_listing(title: &str) -> AuthorizedListing {
+    // The id is derived from the terms rather than passed in: a listing
+    // carrying anything else is refused by `AuthorizedListing::verify`, which
+    // the store contract runs on every merged listing -- so a hand-chosen id
+    // would make every fixture here unmergeable. Distinct titles still give
+    // distinct listings, which is all these tests identify them by.
     let listing = Listing {
-        id: ListingId([id; 16]),
+        id: ListingId([0u8; 16]),
         title: title.to_string(),
         description: String::new(),
         kind: ListingKind::Sale,
         price: None,
         created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
-    };
+    }
+    .with_derived_id();
     let payload = harvest_common::to_cbor(&listing).expect("serialize listing");
     let scoped = ghostkey_common::ScopedPayload {
         requestor: ghostkey_common::SignatureRequestor::WebApp(
@@ -73,6 +79,19 @@ fn signed_listing(id: u8, title: &str) -> AuthorizedListing {
 fn store_with(listings: &[AuthorizedListing]) -> StoreStateV1 {
     let mut state = StoreStateV1::default();
     state.listings.listings = listings.to_vec();
+    // Sorted by id, which is the order `ListingsV1::apply_delta` leaves
+    // behind and therefore the only order a state reached through a merge is
+    // ever in. Assigning an arbitrary vec here builds a state no peer could
+    // hold, and the commutativity check then fails against a difference this
+    // fixture invented rather than one the merge caused.
+    //
+    // It went unnoticed while ids were hand-chosen bytes that happened to
+    // ascend with the fixture's own argument order; deriving ids from the
+    // terms reordered them and made the assumption visible.
+    state
+        .listings
+        .listings
+        .sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
     state
 }
 
@@ -941,7 +960,7 @@ fn a_populated_predecessor_is_recovered_and_seals() {
     let params = store_params_encoded();
     let ids = predecessor_ids(&params, store_lineage());
     let newest = *ids.last().expect("a lineage with rows");
-    let populated = store_with(&[signed_listing(1, "Coffee")]);
+    let populated = store_with(&[signed_listing("Coffee")]);
     let bytes = store_bytes(&populated);
 
     let (outcome, seal) = run(store_session(StoreStateV1::default()), |id| {
@@ -981,8 +1000,8 @@ fn fold_all_recovers_listings_spread_across_generations() {
     let newest = ids[ids.len() - 1];
     let older = ids[0];
 
-    let from_newest = store_bytes(&store_with(&[signed_listing(2, "Beans")]));
-    let from_older = store_bytes(&store_with(&[signed_listing(1, "Coffee")]));
+    let from_newest = store_bytes(&store_with(&[signed_listing("Beans")]));
+    let from_older = store_bytes(&store_with(&[signed_listing("Coffee")]));
 
     let (outcome, _) = run(store_session(StoreStateV1::default()), |id| {
         if id == newest {
@@ -1021,8 +1040,8 @@ fn a_recovery_never_drops_the_local_snapshot() {
     let params = store_params_encoded();
     let ids = predecessor_ids(&params, store_lineage());
     let newest = *ids.last().expect("rows");
-    let recovered = store_bytes(&store_with(&[signed_listing(1, "Coffee")]));
-    let local = store_with(&[signed_listing(9, "Local only")]);
+    let recovered = store_bytes(&store_with(&[signed_listing("Coffee")]));
+    let local = store_with(&[signed_listing("Local only")]);
 
     let (outcome, _) = run(store_session(local), |id| {
         if id == newest {
@@ -1090,7 +1109,7 @@ fn silence_anywhere_keeps_the_migration_open() {
     let ids = predecessor_ids(&params, store_lineage());
     let newest = *ids.last().expect("rows");
     let silent = ids[0];
-    let bytes = store_bytes(&store_with(&[signed_listing(1, "Coffee")]));
+    let bytes = store_bytes(&store_with(&[signed_listing("Coffee")]));
 
     let (outcome, seal) = run(store_session(StoreStateV1::default()), |id| {
         if id == newest {
@@ -1147,7 +1166,7 @@ fn an_empty_predecessor_is_a_miss() {
     let ids = predecessor_ids(&params, store_lineage());
     let newest = *ids.last().expect("rows");
     let empty = store_bytes(&StoreStateV1::default());
-    let populated = store_bytes(&store_with(&[signed_listing(1, "Coffee")]));
+    let populated = store_bytes(&store_with(&[signed_listing("Coffee")]));
 
     let (outcome, _) = run(store_session(StoreStateV1::default()), |id| {
         if id == newest {
@@ -1186,7 +1205,7 @@ fn undecodable_state_is_a_miss_not_a_crash() {
     let params = store_params_encoded();
     let ids = predecessor_ids(&params, store_lineage());
     let newest = *ids.last().expect("rows");
-    let populated = store_bytes(&store_with(&[signed_listing(1, "Coffee")]));
+    let populated = store_bytes(&store_with(&[signed_listing("Coffee")]));
     let (outcome, _) = run(store_session(StoreStateV1::default()), |id| {
         if id == newest {
             Answer::State(b"garbage".to_vec())
@@ -1208,9 +1227,9 @@ fn undecodable_state_is_a_miss_not_a_crash() {
 fn fold_all_preconditions_hold_for_the_store_state() {
     let ops = store_ops();
     let samples = vec![
-        store_with(&[signed_listing(10, "Alpha")]),
-        store_with(&[signed_listing(11, "Beta")]),
-        store_with(&[signed_listing(10, "Alpha"), signed_listing(12, "Gamma")]),
+        store_with(&[signed_listing("Alpha")]),
+        store_with(&[signed_listing("Beta")]),
+        store_with(&[signed_listing("Alpha"), signed_listing("Gamma")]),
     ];
     let merge = |x: StoreStateV1, y: StoreStateV1| ops.merge_generations(x, y);
     freenet_migrate::driver::policy_check::assert_merge_commutative(&samples, merge);
@@ -1548,9 +1567,8 @@ fn re_folding_a_generation_is_a_no_op_for_reputation_and_store() {
     );
 
     let store_ops = store_ops();
-    let older = store_with(&[signed_listing(10, "Alpha"), signed_listing(11, "Beta")]);
-    let once =
-        store_ops.merge_generations(store_with(&[signed_listing(12, "Gamma")]), older.clone());
+    let older = store_with(&[signed_listing("Alpha"), signed_listing("Beta")]);
+    let once = store_ops.merge_generations(store_with(&[signed_listing("Gamma")]), older.clone());
     let twice = store_ops.merge_generations(once.clone(), older);
     assert_eq!(
         once, twice,
@@ -1672,7 +1690,7 @@ fn a_wholly_discarded_predecessor_generation_is_reported() {
     let other_seller = SigningKey::from_bytes(&[77u8; 32]).verifying_key();
     let store = merge_store_reporting_discard(
         StoreStateV1::default(),
-        &store_with(&[signed_listing(10, "Alpha")]),
+        &store_with(&[signed_listing("Alpha")]),
         &store_params(&other_seller),
     );
     assert!(
@@ -1683,7 +1701,7 @@ fn a_wholly_discarded_predecessor_generation_is_reported() {
 
     let ok = merge_store_reporting_discard(
         StoreStateV1::default(),
-        &store_with(&[signed_listing(11, "Beta")]),
+        &store_with(&[signed_listing("Beta")]),
         &store_params(&seller_vk()),
     );
     assert!(!ok.discarded, "a successful store fold claims no discard");

@@ -1437,7 +1437,7 @@ mod lightning_tests {
 
     fn lightning_order(payment_hash: Option<[u8; 32]>) -> Order {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let listing_id = ListingId::new("seller", &ts, "Widget");
+        let listing_id = ListingId::from_label("Widget");
         Order {
             id: OrderId([0u8; 16]),
             listing_id,
@@ -1546,7 +1546,7 @@ mod lightning_tests {
             created_at: chrono::DateTime<chrono::Utc>,
         }
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let listing_id = ListingId::new("seller", &ts, "Widget");
+        let listing_id = ListingId::from_label("Widget");
         let old = OldOrder {
             id: OrderId([3u8; 16]),
             listing_id,

@@ -463,6 +463,35 @@ a sentence this document used to carry.
 | `ui/src/components/buy_view.rs::remedy` | Every blocker is classified as wait, ask-the-seller, or walk-away. | **Yes, structurally** -- wildcard-free match, so a new blocker does not compile until classified. The specific case review found is pinned by `an_expired_order_sends_the_buyer_back_to_the_seller`, which asserts both the classification and that the sentence no longer accuses the seller of backdating. |
 | `ui/src/state.rs::payment_blocker_wording_tests::every_blocker` | Every variant has a sentence. | **Yes, since the review round.** It was NOT before, and the way it failed is worth keeping: the test held a hand-written `vec!` with an exhaustive `match` NEXT TO it, and its own comment claimed that made a missing variant a compile error. The match forced only itself; a variant could be added to it and omitted from the list, and the test would silently stop covering it. It now matches over each element of the list, so the list is the only way to reach the match, plus a count assertion. Verified by removing one variant from the list. |
 
+**And one the sweep for the same shape found elsewhere.**
+
+The review asked whether any other id in this flow had the order id's shape.
+One did. `ListingId` hashed `(seller_fingerprint, created_at_ms, title)` --
+not the price, the description or the kind -- so a seller could sign two
+listings with one id at different prices.
+
+The symptom is different and arguably worse than the order case.
+`ListingsV1::apply_delta` is first-writer-wins: a listing whose id is already
+held is SKIPPED. So nothing is displaced; instead a peer that saw the cheap
+copy first keeps it and thereafter excludes that id from every delta it sends
+and every delta it asks for, a peer that saw the dear copy keeps that, and
+**neither can ever tell the other**, because each one's summary already names
+the id. Two readers see two prices for one listing, permanently. Fixed the
+same way and pinned by `listing::listing_identity_tests`, including a merge in
+both orders through the real `apply_delta`.
+
+Fixing it exposed a second thing, in a test rather than in the code:
+`migrate::tests::store_with` assigned an arbitrary `Vec` to
+`ListingsV1::listings`, building a state no peer could hold, since the only
+order a merged state is ever in is sorted by id. It passed while the fixture's
+hand-chosen ids happened to ascend with its own argument order, and the
+commutativity check went red the moment derived ids reordered them. The
+fixture now sorts. **The underlying gap is still open**: `ListingsV1::verify`
+does not require sortedness, so a peer that deserialized an unsorted state
+from the network would merge to different bytes than one that reached the same
+set through deltas. Pre-existing, not touched by this branch, recorded here
+because this is where it was found.
+
 **Two things the round did not close.**
 
 **`OrderId` is 16 bytes, so swapping terms costs a collision rather than
