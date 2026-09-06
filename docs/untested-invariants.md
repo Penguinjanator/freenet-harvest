@@ -434,7 +434,7 @@ covering more than they do.
 
 | Where | Claim | Caught? |
 |---|---|---|
-| `ui/src/state.rs::AppState::payment_blockers` | A buyer will not pay a commitment that is unpublished, not the seller's, for a listing they never asked about, not awaiting payment, unanchored, off-chain, or stale. | **Yes** -- `buy_flow_tests`, one test per blocker, each mutated red by deleting the guard it names. The mutations were run and the failures recorded: dropping the kept-conversation check, the staleness check, the canonicality check, the direction filter, the signature check and the listing check each turned exactly the intended test red. |
+| `ui/src/state.rs::AppState::payment_blockers` | A buyer will not pay a commitment that is unpublished, not the seller's, not theirs, for a listing they never asked about, not awaiting payment, unanchored, off-chain, stale, unbridgeable, or paying an address that is not its own script. | **Yes** -- `buy_flow_tests`, one test per blocker, each mutated red by deleting the guard it names. **This list was shorter, and the missing entries were the two HIGH findings below plus the bridge and destination checks that were card footnotes rather than blockers.** The mutations were run and the failures recorded: dropping the kept-conversation check, the staleness check, the canonicality check, the direction filter, the signature check and the listing check each turned exactly the intended test red. |
 | same, `ConversationNotKept` | The buyer does not part with money before their node has confirmed it is keeping the key that reads the conversation. | **Yes** -- `a_buyer_does_not_pay_before_the_node_confirms_it_kept_the_conversation`, and the other half, `only_the_delegates_answer_marks_a_conversation_kept`, which drives a refusal and then a success through `on_delegate_response`. This is the Phase 2 ordering constraint from `buyer-conversation-persistence.md` applied to the thing that exists today; the confession does not exist, so nothing here holds a confession. |
 | `ui/src/state.rs::PaymentBlocker` | Adding the Phase 2 blocker is one variant and one check, and no screen can quietly ignore it. | **Yes, structurally.** `components::buy_view::is_temporary` matches the enum without a wildcard, so a new variant does not compile until somebody has said whether it means "wait" or "walk away" -- which is the sentence the buyer is shown. This fired for real while the change was being written: adding `CommitmentNotRequested` failed the build until that question was answered. |
 | `harvest_common::payment::Order::anchor` | `skip_serializing_if` keeps every pre-existing order signature verifying. | **Yes** -- `order_wire_compat_tests::an_order_that_predates_the_anchor_re_encodes_unchanged`, observed red against the naive `#[serde(default)]`-only form: `0xae` map(14) with `"anchor": null` against the `0xad` map(13) the signature was taken over. Same trap, and the same fix, as `StoreInfoV1::encryption_public_key`. |
@@ -444,6 +444,45 @@ covering more than they do.
 | same | The commitment is published before the buyer is told about it. | **No, and deliberately not attempted.** The two are independent fire-and-forget dispatches and may land in either order. The buy flow does not depend on the order: a buyer holding an acceptance for a commitment that has not arrived reads `CommitmentNotPublished` and does not pay, which is the same answer a seller who never published would produce. |
 | `ui/src/state.rs::PaymentBlocker::CommitmentNotRequested` | The commitment is for something this conversation asked about. | **Yes for the case it closes** -- `a_commitment_for_a_listing_never_requested_is_refused` and its converse. **The claim is narrower than it looks**, and the doc comment says so rather than overstating it: the request it compares against sits in the buyer's own thread, and direction is not authorship (`messaging::Addressing`), so a seller can insert a request the buyer never sent. What the check closes is the seller answering a cheap listing's request with a commitment against an expensive one; what it does not close is a forged request, which shows up instead as a line in the buyer's own thread they do not recognise. |
 | `ui/src/components/buy_view.rs` | Everything the buy form, the purchases panel and the accept control say on screen. | **No.** There are no component tests in this repository at all -- the same row as `message_view` above, and worth repeating here because this is the screen that tells a buyer an order is safe to pay. The *decisions* behind the words are all in `AppState` and tested; the words are not. |
+
+#### What the review round changed, and what it left open
+
+Two HIGH findings, both single-seller attacks reachable through the ordinary
+UI, both defeating properties this section previously claimed. They are
+recorded here rather than only in the commit log because the first one falsifies
+a sentence this document used to carry.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `harvest_common::mailbox::order_binding_from_secret` | Two buyers never share a binding, and the seller cannot compute one. | **Yes** -- a known-answer test against `b3sum --derive-key`, plus `two_conversations_do_not_share_a_binding` and the delegate's `recall_answers_the_binding_the_shared_derivation_gives`, which also asserts the binding is NOT the one the shared secret would give. That second assertion is the load-bearing one: deriving from the DH shared secret would look identical and would hand the seller the ability to compute any buyer's binding. |
+| `ui/src/state.rs::AppState::payment_blockers` (`CommitmentNotForThisBuyer`) | One published commitment is payable by exactly one buyer. | **Yes** -- `one_commitment_is_payable_by_exactly_one_buyer` drives two independent `AppState`s with separate ephemeral secrets at one commitment. Mutation-verified twice: deleting the check, and -- the one that matters -- changing it to compare against the binding in the mailbox request instead of the locally-derived one, which is the wrong version a reasonable person would write. |
+| same | The binding this browser computes is the same value the delegate answers on recall. | **Yes, in two halves, and it cannot be one test.** They are different crates on different machines, so each side is pinned to the shared derivation (`the_browsers_binding_is_the_shared_derivation` in the UI, `recall_answers_the_binding_the_shared_derivation_gives` in the delegate) and the derivation itself has the known-answer test. A drift on either side turns one of the three red. The failure it prevents is silent: a returning buyer would simply find their own commitment unrecognisable and could never pay it. |
+| `harvest_common::payment::OrderId::from_terms` | Two differently-termed orders cannot share an id, so a seller cannot swap the payment address under one after the buyer has seen it. | **Yes** -- `two_differently_termed_orders_cannot_share_an_id` and `an_id_determines_the_terms_it_was_derived_from`, both mutated red by restoring the old four-field preimage. `a_record_whose_id_is_not_its_terms_is_rejected` covers the enforcement half and is mutated red by dropping the check from `verify_terms`. |
+| `harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS` | The freshness tolerance fits inside the tip contract's retained window. | **Yes, as a BUILD failure** -- a `const _: () = assert!(...)` against `freenet_bitcoin_common::TIP_RETAIN`, verified by raising the constant to 96 and watching the build fail. A test would have been the wrong instrument: the two constants live in different crates and the failure is silent, since an anchor inside the tolerance but outside the retained window reads as unverifiable and refuses payment for a reason nobody can act on. |
+| `ui/src/state.rs::AppState::needs_reissue` | A seller learns when one of their own orders has aged out. | **Yes** -- `a_seller_is_told_which_of_their_orders_need_reissuing` covers fresh, expired, never-anchored and settled, and `a_seller_with_no_chain_view_is_told_to_reissue_nothing` covers the no-clock case. The screen that renders it is not tested; see the component row above. |
+| `ui/src/components/buy_view.rs::remedy` | Every blocker is classified as wait, ask-the-seller, or walk-away. | **Yes, structurally** -- wildcard-free match, so a new blocker does not compile until classified. The specific case review found is pinned by `an_expired_order_sends_the_buyer_back_to_the_seller`, which asserts both the classification and that the sentence no longer accuses the seller of backdating. |
+| `ui/src/state.rs::payment_blocker_wording_tests::every_blocker` | Every variant has a sentence. | **Yes, since the review round.** It was NOT before, and the way it failed is worth keeping: the test held a hand-written `vec!` with an exhaustive `match` NEXT TO it, and its own comment claimed that made a missing variant a compile error. The match forced only itself; a variant could be added to it and omitted from the list, and the test would silently stop covering it. It now matches over each element of the list, so the list is the only way to reach the match, plus a count assertion. Verified by removing one variant from the list. |
+
+**Two things the round did not close.**
+
+**`OrderId` is 16 bytes, so swapping terms costs a collision rather than
+nothing.** Deriving the id from the terms means an attacker needs two orders
+that hash to one id. Second-preimage against an id a buyer already holds is
+2^128 and out of reach. But the attack only needs a COLLISION between two
+orders the seller chooses, which is ~2^64 -- expensive, no longer free, and not
+zero. Widening `OrderId` to 32 bytes closes it and is a wire change touching
+every order ever published. The buyer-side binding does not help, since the
+seller can put the buyer's binding on both halves of a collision.
+
+**One binding per conversation, not per order.** Two orders a buyer places in
+one thread carry the same binding, so the binding does not distinguish them
+from each other -- their distinct ids and the buyer's own request list do. It
+distinguishes BUYERS, which is the hole. A consequence on the seller's side:
+`unanswered_requests` treats a request as answered when a published commitment
+carries its binding AND its listing, so a buyer who asks twice for the same
+listing in one conversation sees the second ask read as already answered. Per
+order it would need a durable per-order counter in the delegate, which Phase 2
+can add if filing turns out to need it.
 
 #### Two design gaps this change does NOT close
 
@@ -460,8 +499,18 @@ bought is public, and the address links the order to a chain transaction.
 
 Who bought is not published -- `buyer_fingerprint` is empty for every order
 the buy flow produces, and the buyer has no identity to name -- and the
-shipping address never leaves the AEAD. But the design's claim is stronger
-than the code, and the difference is real.
+shipping address never leaves the AEAD. The commitment now also carries
+`order_binding`, and that one genuinely reveals nothing: it is a hash of a
+value only the buyer holds (see
+`harvest_common::mailbox::order_binding_from_secret`), so it identifies the
+buyer to the buyer and to nobody else. But the design's claim about the whole
+commitment is stronger than the code, and the difference is real.
+
+Two further seller-chosen fields are published per order and are not on the
+design's list either: `required_confirmations` and `trusted_bridges`. They
+make the bridge set a per-order fingerprint of the seller's configuration.
+Minor, but the accept panel's enumeration is written to be exact and this is
+the honest full list.
 
 It is not fixable here: the payment address must be public, because a stranger
 being able to verify the payment is the entire point of the on-chain rail.
@@ -479,11 +528,25 @@ against yet, which is why this is Phase 2 rather than a defect.
 
 #### And one thing the buy flow does not do at all
 
-**It does not send money.** Step 5 of the design is a person opening a wallet.
-Harvest shows the address and the amount once the checks pass, and the
-existing on-chain verification path takes over from there. Nothing in this
-repository moves coin, and the "Pay" surface is a payment address rather than
-a button that pays.
+**It does not send money, and nothing takes over once it is sent.** Step 5 of
+the design is a person opening a wallet. Harvest shows the address and the
+amount once the checks pass, and stops.
+
+An earlier version of this paragraph said "the existing on-chain verification
+path takes over from there", which review showed was false in both halves, in
+a document whose whole purpose is not claiming more than the code does:
+
+* **No watch is registered.** `live_address_for_order` resolves through
+  `bitcoin.watches`, and the only thing that creates one is the manual "Watch
+  address" form. So `live` is `None` for every purchase and the card reads
+  "Awaiting payment" however much has arrived.
+* **Nothing constructs an `OrderPaymentProof`.** Every `payment_proof` site in
+  `ui/` is `None`, so a published order never advances to `Paid` and
+  `NotAwaitingPayment` never fires for a real settlement.
+
+The verification machinery exists and is tested (`verify_payment_proof`, the
+bridge claims, the fold); what does not exist is anything in the buy flow that
+drives it. That is the honest boundary of this change.
 
 ## The four that matter
 

@@ -52,9 +52,21 @@ fn offered_networks() -> &'static [BitcoinNetwork] {
 pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> Element {
     let mut show_form = use_signal(|| false);
 
-    let (xpub, xpub_loaded, store_loaded, listings, orders, live) = {
+    let (xpub, xpub_loaded, store_loaded, listings, orders, live, needs_reissue) = {
         let state = APP_STATE.read();
         let store = state.browsing_stores.get(&store_contract_id);
+        let mine = invoices_issued_by(
+            store.map(|s| s.orders.as_slice()).unwrap_or_default(),
+            &seller_fingerprint,
+        );
+        // Decided once, here, against this node's own view of the chain --
+        // the same read `payment_blockers` makes on the buyer's side, so the
+        // two cannot disagree about whether an order has aged out.
+        let needs_reissue: std::collections::HashSet<harvest_common::payment::OrderId> = mine
+            .iter()
+            .filter(|order| state.needs_reissue(order))
+            .map(|order| order.order.id.clone())
+            .collect();
         (
             state.bitcoin.payment_xpub.clone(),
             state.bitcoin.payment_xpub_loaded,
@@ -65,13 +77,11 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
             // documents at length for the store's version number.
             state.store_details_are_resolved(&store_contract_id),
             store.map(|s| s.listings.clone()).unwrap_or_default(),
-            invoices_issued_by(
-                store.map(|s| s.orders.as_slice()).unwrap_or_default(),
-                &seller_fingerprint,
-            ),
+            mine,
             // Cloned once outside the render loop below; taking a fresh read
             // guard per order would be a borrow per row for no gain.
             state.bitcoin.clone(),
+            needs_reissue,
         )
     };
 
@@ -112,10 +122,28 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                 p { class: "section-count", "{orders.len()} invoice(s) issued" }
                 PaymentWatchNote {}
                 for order in orders.iter() {
-                    super::bitcoin_view::OrderCard {
-                        key: "{order.order.id}",
-                        order: order.clone(),
-                        live: super::bitcoin_view::live_address_for_order(&live, &order.order),
+                    // One keyed node per invoice, wrapping both, because a
+                    // `key` is only honoured on the first node of a block.
+                    div { key: "{order.order.id}",
+                        // Said above the card rather than inside it, because
+                        // it is about what the SELLER should do and
+                        // `OrderCard` is shared with the buyer's view. An
+                        // order's anchor is fixed at signing, so an unpaid
+                        // one eventually stops being payable -- and without
+                        // this the only party who can fix that never learns
+                        // of it.
+                        if needs_reissue.contains(&order.order.id) {
+                            p { class: "text-warning",
+                                "Invoice {order.order.id.short()} has expired: it is anchored "
+                                "to a Bitcoin block too old for a buyer's software to accept, "
+                                "so nobody can pay it now. Issue it again if the buyer still "
+                                "wants it."
+                            }
+                        }
+                        super::bitcoin_view::OrderCard {
+                            order: order.clone(),
+                            live: super::bitcoin_view::live_address_for_order(&live, &order.order),
+                        }
                     }
                 }
             }

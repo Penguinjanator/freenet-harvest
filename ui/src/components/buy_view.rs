@@ -237,11 +237,18 @@ fn PurchaseCard(purchase: BuyerPurchase, bitcoin: crate::state::BitcoinState) ->
                         p { class: "text-warning", "{blocker.describe()}" }
                     }
                     p { class: "text-muted", style: "font-size: 0.85rem;",
-                        if purchase.blockers.iter().all(is_temporary) {
-                            "No payment details are shown while that is true. Look again in a moment."
-                        } else {
-                            "No payment details are shown while that is true, and this is not "
-                            "something waiting will fix."
+                        // The worst remedy among the blockers, because the
+                        // buyer has to do the hardest of them: one thing that
+                        // waiting will not fix means waiting is not the
+                        // answer.
+                        match purchase.blockers.iter().map(remedy).max_by_key(|r| match r {
+                            Remedy::Wait => 0,
+                            Remedy::AskTheSeller => 1,
+                            Remedy::WalkAway => 2,
+                        }) {
+                            Some(Remedy::WalkAway) => "No payment details are shown while that is true, and this is not something either of you can put right.",
+                            Some(Remedy::AskTheSeller) => "No payment details are shown while that is true. The seller can fix it by issuing the order again.",
+                            _ => "No payment details are shown while that is true. Look again in a moment.",
                         }
                     }
                 },
@@ -310,9 +317,9 @@ pub fn AcceptRequest(
             h5 { style: "margin-bottom: 0.25rem;", "{quantity} x {listing_title}" }
             p { class: "text-muted", style: "font-size: 0.85rem;",
                 "Accepting publishes this order on your store, where anyone can see it. It "
-                "carries the amount, the listing, the payment address and a recent block. It "
-                "does NOT carry who asked or where they want it sent -- those stay in this "
-                "conversation."
+                "carries the amount, the listing, the payment address, a recent block, the "
+                "confirmations you require and the bridges you trust. It does NOT carry who "
+                "asked or where they want it sent -- those stay in this conversation."
             }
             div { class: "form-group",
                 label { class: "form-label",
@@ -410,25 +417,59 @@ fn accept(
     })
 }
 
-/// The blockers that mean "wait" rather than "walk away".
+/// What a buyer can actually DO about one blocker.
 ///
-/// The distinction is what a buyer needs and the one a single "cannot pay"
-/// would destroy: a node that has not caught up is a reason to look again in
-/// a minute, and an order signed by somebody else is a reason to stop.
-pub fn is_temporary(blocker: &PaymentBlocker) -> bool {
+/// # Why three and not a bool
+///
+/// It was a bool -- wait, or walk away -- and review found the case that
+/// breaks it: an order whose anchor has aged out is neither. Waiting does not
+/// fix it, and there is nothing wrong with the seller; the remedy is to ask
+/// for the order again. Told to walk away, a buyer abandons a purchase that
+/// one message would have rescued, and does it while being told the seller
+/// backdated something.
+///
+/// Several other blockers were being classified as walk-away for the same
+/// wrong reason -- an unbridgeable invoice, an address that disagrees with
+/// its script, a missing anchor -- all of which are a seller's mistake that a
+/// seller can undo.
+///
+/// The match is exhaustive, with no wildcard, and that is the Phase 2 seam:
+/// adding a blocker does not compile until somebody has said which of these
+/// three a buyer should be told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Remedy {
+    /// Nothing is wrong; this node is not ready yet. Look again shortly.
+    Wait,
+    /// The seller can put this right by issuing the order again.
+    AskTheSeller,
+    /// Nothing either party can do makes this order safe to pay.
+    WalkAway,
+}
+
+/// What can be done about one blocker.
+pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
     match blocker {
+        // Not ready yet, on this side of the wire.
         PaymentBlocker::CommitmentNotPublished
         | PaymentBlocker::ChainUnknown
         | PaymentBlocker::AnchorUnverifiable
         | PaymentBlocker::AnchorAheadOfTip { .. }
-        | PaymentBlocker::ConversationNotKept => true,
+        | PaymentBlocker::ConversationNotKept => Remedy::Wait,
+        // The seller issued something that cannot be acted on, and issuing it
+        // again fixes every one of these.
+        PaymentBlocker::NoTrustedBridge
+        | PaymentBlocker::BridgeNotRecognised(_)
+        | PaymentBlocker::DestinationDisagrees
+        | PaymentBlocker::DestinationUnreadable
+        | PaymentBlocker::AnchorMissing
+        | PaymentBlocker::AnchorStale { .. } => Remedy::AskTheSeller,
+        // The order is not this buyer's, not this seller's, or not payable at
+        // all. None of these is a mistake anybody can undo.
         PaymentBlocker::SellerIdentityUnknown
         | PaymentBlocker::CommitmentNotTheSellers(_)
         | PaymentBlocker::CommitmentNotForThisBuyer
         | PaymentBlocker::CommitmentNotRequested
         | PaymentBlocker::NotAwaitingPayment(_)
-        | PaymentBlocker::AnchorMissing
-        | PaymentBlocker::AnchorOffChain
-        | PaymentBlocker::AnchorStale { .. } => false,
+        | PaymentBlocker::AnchorOffChain => Remedy::WalkAway,
     }
 }

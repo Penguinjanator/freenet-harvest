@@ -372,7 +372,7 @@ pub(crate) fn live_address_for_order(
 ///
 /// `bitcoin_config::TRUSTED_BRIDGE_ID_BS58` is the compiled-in trust policy:
 /// whose signature on a Bitcoin fact this build believes.
-fn unrecognised_bridges(order: &harvest_common::payment::Order) -> Vec<String> {
+pub(crate) fn unrecognised_bridges(order: &harvest_common::payment::Order) -> Vec<String> {
     order
         .trusted_bridges
         .iter()
@@ -382,7 +382,7 @@ fn unrecognised_bridges(order: &harvest_common::payment::Order) -> Vec<String> {
 }
 
 /// Short, quotable form of a bridge id, for a line that has to fit on a card.
-fn short_bridge(id: &str) -> String {
+pub(crate) fn short_bridge(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
@@ -446,7 +446,7 @@ pub(super) mod __address_check_test_support {
 
 /// What an invoice's card has to say about its own payment destination.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum DestinationNote {
+pub(crate) enum DestinationNote {
     /// The address denotes exactly the script that settles this order.
     Agrees,
     /// The address is well-formed and denotes a DIFFERENT script.
@@ -457,7 +457,7 @@ enum DestinationNote {
 }
 
 impl DestinationNote {
-    fn of(order: &harvest_common::payment::Order) -> Self {
+    pub(crate) fn of(order: &harvest_common::payment::Order) -> Self {
         match address_matches_script(order) {
             Some(true) => DestinationNote::Agrees,
             Some(false) => DestinationNote::Contradicts,

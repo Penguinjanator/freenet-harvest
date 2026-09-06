@@ -877,14 +877,21 @@ fn attribution(
 ///
 /// # Why direction is not checked here, and where it IS
 ///
-/// This is the seller's side, and it deliberately mirrors the buyer's rule
-/// (`state::AppState::buyer_purchases`, which ignores an acceptance not
-/// addressed to the buyer) only in spirit. A request the SELLER composed
-/// would be one they wrote to themselves, which costs them their own money
-/// and nobody else's -- so the asymmetry is real rather than an oversight,
-/// and `MailboxEntry` does not carry direction anyway. What protects the
-/// buyer is that accepting publishes a commitment the buyer then has to
-/// recognise as answering their own request.
+/// This is the seller's side, and it deliberately does NOT mirror the buyer's
+/// rule (`state::AppState::buyer_purchases`, which ignores an acceptance not
+/// addressed to the buyer). `MailboxEntry::Readable` does carry
+/// `addressing`, so the check is available -- an earlier version of this
+/// comment said it was not, which was simply false and is corrected here
+/// rather than quietly dropped, because a reader auditing why the two sides
+/// differ was being given one true reason and one invented one.
+///
+/// The true reason stands on its own: a request the SELLER composed is one
+/// they wrote to themselves, and acting on it costs them their own
+/// derivation index and publishes a commitment nobody will pay. There is
+/// nothing for a third party to gain, because there is no third party -- only
+/// the two holders of the conversation key can produce a readable entry at
+/// all. What protects the BUYER is not this filter but the binding: accepting
+/// publishes a commitment carrying a value only the real buyer can match.
 fn unanswered_requests(
     entries: &[MailboxEntry],
     listings: &[harvest_common::listing::AuthorizedListing],

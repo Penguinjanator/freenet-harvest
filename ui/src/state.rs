@@ -965,6 +965,32 @@ pub enum PaymentBlocker {
     /// delegate that predates the field) bound to all-zeros. All three mean
     /// the same thing to the buyer, and none is safe.
     CommitmentNotForThisBuyer,
+    /// The commitment names no Bitcoin bridge, so no payment to it could ever
+    /// be proven.
+    ///
+    /// `verify_payment_proof` answers `NoTrustedBridges` for such an order
+    /// permanently, and `trusted_bridges` is per-order and seller-chosen. It
+    /// was a footnote on the card, in smaller text UNDER the sentence saying
+    /// the order checked out and under the payment address; a condition that
+    /// decides whether money can ever be recovered belongs in the same list
+    /// as everything else that decides whether to pay.
+    NoTrustedBridge,
+    /// The commitment names a bridge this build does not know, so its "Paid"
+    /// verdict would rest on a stranger's signature.
+    ///
+    /// Carries the ids, because "check with the seller about bridge 7Kf2..."
+    /// is actionable and "an unknown bridge" is not.
+    BridgeNotRecognised(String),
+    /// The address the commitment DISPLAYS is not the script that would
+    /// settle it.
+    ///
+    /// The seller's signature covers both forms, so it proves the seller
+    /// wrote them, not that they agree. Verification uses the script; the
+    /// human pays the address.
+    DestinationDisagrees,
+    /// The address cannot be read for this network at all, so nothing can be
+    /// said about it -- which is itself a reason not to pay it.
+    DestinationUnreadable,
     /// The commitment names a listing this conversation never asked about.
     ///
     /// "Confirm your own order is present" is not satisfied by an order being
@@ -1001,9 +1027,26 @@ pub enum PaymentBlocker {
     /// The anchor is further behind the tip than
     /// [`harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS`].
     ///
-    /// A backdated commitment reads to everyone as one that is already
-    /// closed, so a seller carrying it is showing no exposure while taking
-    /// money.
+    /// # This is expiry, and the wording must not say otherwise
+    ///
+    /// Two different things land here and the code cannot tell them apart: a
+    /// commitment BACKDATED at signing, which is the attack the rule exists
+    /// for, and one that simply AGED since it was signed, which is what
+    /// happens to every honest order nobody paid in time. The anchor is
+    /// stamped when the seller signs and is immutable under their signature,
+    /// so the second is by far the common case.
+    ///
+    /// An earlier version of the sentence shown for this said "an order
+    /// backdated like this reads to everyone else as already finished, so do
+    /// not pay it" -- an accusation, delivered to a buyer whose seller had
+    /// done nothing wrong, with `is_temporary` classifying it as walk-away
+    /// and no way for either side to recover. Both are fixed: the sentence
+    /// says the order expired and to ask for another, and the remedy is
+    /// [`Remedy::AskTheSeller`].
+    ///
+    /// Refusing is still right in both cases. An expired order is one readers
+    /// are about to stop counting as open exposure, so paying it buys the
+    /// buyer a declaration that is going quiet either way.
     AnchorStale { anchor_height: u32, tip_height: u32 },
     /// This node has not confirmed it is keeping the key that reads this
     /// conversation.
@@ -1033,6 +1076,23 @@ impl PaymentBlocker {
                  to you. Anyone can read it, but paying it would be paying somebody else's \
                  bill -- and the seller would still owe only the one order they published. \
                  Do not pay it."
+                .to_string(),
+            PaymentBlocker::NoTrustedBridge => "The published order names no Bitcoin bridge, \
+                 so no payment to it could ever be proven -- not by you, not by anyone. Ask \
+                 the seller to reissue it."
+                .to_string(),
+            PaymentBlocker::BridgeNotRecognised(ids) => format!(
+                "The published order would be settled by a bridge this app does not recognise \
+                 ({ids}). Whether it counts as paid would rest on a signature you have no \
+                 reason to trust. Check with the seller before paying."
+            ),
+            PaymentBlocker::DestinationDisagrees => "The address shown on the published order \
+                 is not the destination that would settle it. Do not pay it -- ask the seller \
+                 to reissue it."
+                .to_string(),
+            PaymentBlocker::DestinationUnreadable => "The published order's payment address \
+                 cannot be read for its network, so nothing can be checked about it. Ask the \
+                 seller to reissue it."
                 .to_string(),
             PaymentBlocker::CommitmentNotRequested => "The published order is for a different \
                  listing than the one you asked about. Do not pay it -- ask the seller what it \
@@ -1067,9 +1127,10 @@ impl PaymentBlocker {
                 anchor_height,
                 tip_height,
             } => format!(
-                "The published order is anchored to block {anchor_height}, {} blocks behind \
-                 the {tip_height} your node sees. An order backdated like this reads to \
-                 everyone else as already finished, so do not pay it.",
+                "This order has expired. It was declared against Bitcoin block \
+                 {anchor_height}, which is {} blocks behind the {tip_height} your node sees, \
+                 and an order that old stops counting as something the seller openly owes. \
+                 Ask the seller to issue it again.",
                 tip_height.saturating_sub(*anchor_height)
             ),
             PaymentBlocker::ConversationNotKept => "Your node has not confirmed it is keeping \
@@ -2640,6 +2701,49 @@ impl AppState {
             .collect()
     }
 
+    /// Whether one of the SELLER's own orders has stopped being payable and
+    /// should be issued again.
+    ///
+    /// The other side of `PaymentBlocker::AnchorStale`. An order's anchor is
+    /// stamped when the seller signs and cannot be changed afterwards, so
+    /// every honest order eventually ages past
+    /// [`harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS`] and stops being one
+    /// any buyer will pay. Without this the expiry is invisible on the only
+    /// side that can fix it: the buyer is sent back to a seller who has no
+    /// idea anything happened.
+    ///
+    /// Answers `false` when this node cannot see the chain. The judgement
+    /// needs the reader's own clock, and answering `true` without one would
+    /// have a seller reissuing every order every time their node was slow --
+    /// the unknown-treated-as-a-verdict mistake, in the direction that
+    /// creates work rather than the one that loses money.
+    ///
+    /// Deliberately NOT the whole of `payment_blockers`: most of those are
+    /// about a particular buyer, and a seller looking at their own invoice
+    /// list has no buyer in hand.
+    pub fn needs_reissue(&self, order: &harvest_common::payment::AuthorizedOrder) -> bool {
+        use harvest_common::payment::{OrderStatus, MAX_ANCHOR_AGE_BLOCKS};
+
+        if order.status != OrderStatus::AwaitingPayment {
+            return false;
+        }
+        let Some(tip_height) = self
+            .bitcoin
+            .tips
+            .get(&order.order.network)
+            .and_then(|tip| tip.tip_height)
+        else {
+            return false;
+        };
+        match order.order.anchor {
+            // Nothing to date it by, so no buyer will pay it -- the same
+            // verdict `order_for_invoice` refuses to create today, reached
+            // here for orders issued before it did.
+            None => true,
+            Some(anchor) => tip_height.saturating_sub(anchor.height) > MAX_ANCHOR_AGE_BLOCKS,
+        }
+    }
+
     /// What stands between this buyer and paying one commitment.
     ///
     /// Ordered so the first blocker is the one worth showing first: what is
@@ -2719,6 +2823,37 @@ impl AppState {
                     },
                 },
             },
+        }
+
+        // Whether a payment to this order could ever be PROVEN, and whether
+        // the address the buyer would type is the destination that settles
+        // it. Both are decided by fields the seller chose and the seller
+        // signed, and both were card footnotes until review pointed out that
+        // a condition deciding whether money is recoverable belongs with
+        // everything else that decides whether to pay.
+        if commitment.order.trusted_bridges.is_empty() {
+            blockers.push(PaymentBlocker::NoTrustedBridge);
+        } else {
+            let strangers =
+                crate::components::bitcoin_view::unrecognised_bridges(&commitment.order);
+            if !strangers.is_empty() {
+                blockers.push(PaymentBlocker::BridgeNotRecognised(
+                    strangers
+                        .iter()
+                        .map(|id| crate::components::bitcoin_view::short_bridge(id))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ));
+            }
+        }
+        match crate::components::bitcoin_view::DestinationNote::of(&commitment.order) {
+            crate::components::bitcoin_view::DestinationNote::Agrees => {}
+            crate::components::bitcoin_view::DestinationNote::Contradicts => {
+                blockers.push(PaymentBlocker::DestinationDisagrees)
+            }
+            crate::components::bitcoin_view::DestinationNote::Unreadable => {
+                blockers.push(PaymentBlocker::DestinationUnreadable)
+            }
         }
 
         // Last, and separate from everything above: the others are about the
@@ -9392,6 +9527,48 @@ mod buy_flow_tests {
 
     const STORE: &[u8] = &[7u8; 32];
 
+    /// A real signet address, the BIP-173 test vector this repository already
+    /// uses in `components::bitcoin_view`.
+    ///
+    /// The fixture's `payment_script_pubkey` is DERIVED from it rather than
+    /// written out, so the two cannot drift into the disagreement that
+    /// `PaymentBlocker::DestinationDisagrees` exists to refuse -- which would
+    /// otherwise make every fixture here unpayable for a reason unrelated to
+    /// what the test is about.
+    const PAYMENT_ADDRESS: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+
+    /// A different, equally valid signet address (the BIP-173 P2WSH vector),
+    /// for the case where the two disagree.
+    const ANOTHER_ADDRESS: &str = "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7";
+
+    fn script_of(address: &str) -> Vec<u8> {
+        crate::gateway::bitcoin_address::address_to_script_pubkey(address, BitcoinNetwork::Signet)
+            .expect("a known-good signet address")
+    }
+
+    /// Re-stamp and re-sign a commitment whose terms a test has edited.
+    ///
+    /// Both halves are needed and forgetting either is a test that passes for
+    /// the wrong reason: the id is derived from the terms, and the signature
+    /// is over them.
+    fn resigned(mut order: AuthorizedOrder, signing_key: &SigningKey) -> AuthorizedOrder {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        order.order = order.order.with_derived_id();
+        let message = harvest_common::to_cbor(&order.order).expect("serialize order");
+        let scoped = ghostkey_common::ScopedPayload {
+            requestor: ghostkey_common::SignatureRequestor::WebApp(
+                harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                    .parse::<ContractInstanceId>()
+                    .expect("canonical webapp id"),
+            ),
+            payload: message,
+        };
+        order.scoped_payload = harvest_common::to_cbor(&scoped).expect("serialize scoped");
+        order.signature = signing_key.sign(&order.scoped_payload).to_bytes().to_vec();
+        order
+    }
+
     fn seller_signing_key() -> SigningKey {
         SigningKey::from_bytes(&[21u8; 32])
     }
@@ -9437,11 +9614,18 @@ mod buy_flow_tests {
             seller_fingerprint: "seller-fp".to_string(),
             amount_sats: 50_000,
             network: BitcoinNetwork::Signet,
-            payment_script_pubkey: vec![0x00, 0x14, 0xaa, 0xbb],
-            payment_address: "tb1qexample".to_string(),
+            payment_script_pubkey: script_of(PAYMENT_ADDRESS),
+            payment_address: PAYMENT_ADDRESS.to_string(),
             required_confirmations: 1,
             payment_hash: None,
-            trusted_bridges: vec![freenet_bitcoin_common::BridgeId([3u8; 32])],
+            // The bridge this build actually trusts, derived rather than
+            // invented: an invoice naming any other is refused
+            // (`PaymentBlocker::BridgeNotRecognised`), so a made-up id here
+            // would make every fixture unpayable.
+            trusted_bridges: crate::gateway::bitcoin_config::default_trusted_bridges(
+                BitcoinNetwork::Signet,
+            )
+            .expect("the build's own bridge constant must parse"),
             bitcoin_address_code_hash: Some([4u8; 32]),
             anchor: anchor_at,
             order_binding,
@@ -10115,6 +10299,199 @@ mod buy_flow_tests {
         assert_eq!(recalled.order_binding(), [9u8; 32]);
     }
 
+    /// **An invoice naming no Bitcoin bridge is refused, not footnoted.**
+    ///
+    /// Found in review. `verify_payment_proof` returns `NoTrustedBridges` for
+    /// such an order permanently, so no payment to it can EVER be proven --
+    /// and `trusted_bridges` is per-order and seller-chosen, so a malicious
+    /// seller picks it. The card said so in smaller text underneath the
+    /// sentence saying the order checked out, with the payment address shown
+    /// above it. A condition that decides whether money can ever be recovered
+    /// belongs in the same list as everything else that decides whether to
+    /// pay.
+    #[test]
+    fn an_invoice_naming_no_bridge_is_refused() {
+        let mut order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        order.order.trusted_bridges = Vec::new();
+        let order = resigned(order, &seller_signing_key());
+        let (state, _) = buyer_after_acceptance(&order);
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::NoTrustedBridge]
+        );
+    }
+
+    /// **An invoice settled by a bridge this build does not know is refused.**
+    ///
+    /// Its "Paid" verdict would rest on a signature the buyer has no reason
+    /// to trust, and the seller chose it.
+    #[test]
+    fn an_invoice_naming_an_unknown_bridge_is_refused() {
+        let mut order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        order.order.trusted_bridges = vec![freenet_bitcoin_common::BridgeId([0x77; 32])];
+        let order = resigned(order, &seller_signing_key());
+        let (state, _) = buyer_after_acceptance(&order);
+
+        assert!(
+            matches!(
+                purchases(&state)[0].blockers.as_slice(),
+                [PaymentBlocker::BridgeNotRecognised(_)]
+            ),
+            "got {:?}",
+            purchases(&state)[0].blockers
+        );
+    }
+
+    /// **An invoice whose displayed address is not the script that settles it
+    /// is refused.**
+    ///
+    /// An `Order` carries both forms and the seller's signature covers both,
+    /// so a signature proves the seller wrote them, not that they agree.
+    /// Every verification path uses the script; the human pays the address.
+    ///
+    /// `OrderCard` already withheld the address for this, which is why it is
+    /// the one case review found handled correctly -- but as a card-level
+    /// special case rather than a blocker, so the top-line sentence still
+    /// said the order checked out. Moving it here makes the pattern one
+    /// pattern.
+    #[test]
+    fn an_invoice_whose_address_is_not_its_script_is_refused() {
+        let mut order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        // A well-formed signet address that is not the order's script.
+        order.order.payment_address = ANOTHER_ADDRESS.to_string();
+        let order = resigned(order, &seller_signing_key());
+        let (state, _) = buyer_after_acceptance(&order);
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::DestinationDisagrees]
+        );
+    }
+
+    /// **An address that cannot be read at all is refused too.**
+    ///
+    /// Nothing can be said about it, which is itself a reason not to pay it.
+    #[test]
+    fn an_invoice_with_an_unreadable_address_is_refused() {
+        let mut order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        order.order.payment_address = "not an address".to_string();
+        let order = resigned(order, &seller_signing_key());
+        let (state, _) = buyer_after_acceptance(&order);
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::DestinationUnreadable]
+        );
+    }
+
+    /// **An expired order is not the seller's fault, and is not the end of
+    /// the purchase.**
+    ///
+    /// The anchor is stamped when the seller signs and cannot be changed
+    /// afterwards, so every honest order eventually ages past the tolerance.
+    /// The buyer's screen used to accuse the seller of backdating and
+    /// classify it as walk-away, which abandons a purchase one message would
+    /// have rescued.
+    #[test]
+    fn an_expired_order_sends_the_buyer_back_to_the_seller() {
+        use crate::components::buy_view::{remedy, Remedy};
+
+        let expired = PaymentBlocker::AnchorStale {
+            anchor_height: TIP_HEIGHT - MAX_ANCHOR_AGE_BLOCKS - 1,
+            tip_height: TIP_HEIGHT,
+        };
+        assert_eq!(remedy(&expired), Remedy::AskTheSeller);
+
+        let said = expired.describe();
+        assert!(
+            said.contains("expired"),
+            "the buyer should be told what happened: {said}"
+        );
+        assert!(
+            !said.contains("backdated"),
+            "and not told the seller did something: {said}"
+        );
+    }
+
+    /// **A seller is told when one of their own orders has aged out.**
+    ///
+    /// Without this the expiry is invisible on the side that can fix it: the
+    /// buyer is asked to go back to a seller who has no idea anything
+    /// happened, and nothing anywhere says the order stopped being payable.
+    #[test]
+    fn a_seller_is_told_which_of_their_orders_need_reissuing() {
+        let fresh = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let expired = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - MAX_ANCHOR_AGE_BLOCKS - 1)),
+            OrderStatus::AwaitingPayment,
+        );
+        let unanchored = commitment(&seller_signing_key(), None, OrderStatus::AwaitingPayment);
+        let mut settled = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - MAX_ANCHOR_AGE_BLOCKS - 1)),
+            OrderStatus::AwaitingPayment,
+        );
+        cancel(&mut settled, &seller_signing_key());
+
+        let mut state = AppState::default();
+        state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
+
+        assert!(!state.needs_reissue(&fresh), "a fresh order is fine");
+        assert!(state.needs_reissue(&expired), "an aged-out order is not");
+        assert!(
+            state.needs_reissue(&unanchored),
+            "and neither is one that never had an anchor"
+        );
+        assert!(
+            !state.needs_reissue(&settled),
+            "an order nobody is waiting to pay needs nothing"
+        );
+    }
+
+    /// **A seller who cannot see the chain is not told to reissue
+    /// everything.**
+    ///
+    /// The judgement needs the reader's own clock. Without a tip there is no
+    /// clock, and answering "yes" would have every seller reissuing every
+    /// order every time their node was slow to load -- the same
+    /// unknown-read-as-a-verdict mistake the buyer's side refuses to make in
+    /// the other direction.
+    #[test]
+    fn a_seller_with_no_chain_view_is_told_to_reissue_nothing() {
+        let expired = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - MAX_ANCHOR_AGE_BLOCKS - 1)),
+            OrderStatus::AwaitingPayment,
+        );
+        let state = AppState::default();
+        assert!(!state.needs_reissue(&expired));
+    }
+
     /// **A commitment for something this conversation never asked about is
     /// refused.**
     ///
@@ -10634,36 +11011,31 @@ mod payment_blocker_wording_tests {
     use super::*;
     use harvest_common::payment::OrderStatus;
 
-    /// Every variant, listed by hand so that adding one without a sentence is
-    /// a compile error rather than a silent gap.
+    /// Every variant, once each.
     ///
-    /// The `match` is what does that work: a wildcard here would let a new
-    /// blocker reach a buyer as an empty line on the screen that tells them
-    /// whether to pay.
+    /// # Why the match is over the LIST rather than beside it
+    ///
+    /// The first version of this built a `vec!` and put an exhaustive `match`
+    /// next to it, and its comment claimed that made a missing variant a
+    /// compile error. It did not: the match forced itself to be updated and
+    /// the list was independent, so a variant could be added to one and left
+    /// out of the other and this test would silently stop covering it. Review
+    /// found it.
+    ///
+    /// Matching on each element of the list is what actually ties them: a new
+    /// variant does not compile until it is in the match, and the only way to
+    /// reach the match is to be in the list. The `seen` count then fails if
+    /// the list holds fewer distinct variants than the match has arms.
     fn every_blocker() -> Vec<PaymentBlocker> {
-        let sample = PaymentBlocker::CommitmentNotPublished;
-        // Exhaustive over the enum, and the value is discarded -- this exists
-        // only to fail the build when a variant is added.
-        match sample {
-            PaymentBlocker::CommitmentNotPublished
-            | PaymentBlocker::SellerIdentityUnknown
-            | PaymentBlocker::CommitmentNotTheSellers(_)
-            | PaymentBlocker::CommitmentNotForThisBuyer
-            | PaymentBlocker::CommitmentNotRequested
-            | PaymentBlocker::NotAwaitingPayment(_)
-            | PaymentBlocker::AnchorMissing
-            | PaymentBlocker::ChainUnknown
-            | PaymentBlocker::AnchorOffChain
-            | PaymentBlocker::AnchorUnverifiable
-            | PaymentBlocker::AnchorAheadOfTip { .. }
-            | PaymentBlocker::AnchorStale { .. }
-            | PaymentBlocker::ConversationNotKept => {}
-        }
-        vec![
+        let all = vec![
             PaymentBlocker::CommitmentNotPublished,
             PaymentBlocker::SellerIdentityUnknown,
             PaymentBlocker::CommitmentNotTheSellers("the signature is not theirs".to_string()),
             PaymentBlocker::CommitmentNotForThisBuyer,
+            PaymentBlocker::NoTrustedBridge,
+            PaymentBlocker::BridgeNotRecognised("7Kf2abcd".to_string()),
+            PaymentBlocker::DestinationDisagrees,
+            PaymentBlocker::DestinationUnreadable,
             PaymentBlocker::CommitmentNotRequested,
             PaymentBlocker::NotAwaitingPayment(OrderStatus::Cancelled),
             PaymentBlocker::AnchorMissing,
@@ -10679,8 +11051,50 @@ mod payment_blocker_wording_tests {
                 tip_height: 800_000,
             },
             PaymentBlocker::ConversationNotKept,
-        ]
+        ];
+
+        // Exhaustive and wildcard-free, over the list itself. Each arm is
+        // reached exactly once by a well-formed list; `discriminant` counts
+        // distinct variants rather than entries, so duplicating one to pad
+        // the list does not hide an omission.
+        let mut seen = std::collections::HashSet::new();
+        for blocker in &all {
+            match blocker {
+                PaymentBlocker::CommitmentNotPublished
+                | PaymentBlocker::SellerIdentityUnknown
+                | PaymentBlocker::CommitmentNotTheSellers(_)
+                | PaymentBlocker::CommitmentNotForThisBuyer
+                | PaymentBlocker::NoTrustedBridge
+                | PaymentBlocker::BridgeNotRecognised(_)
+                | PaymentBlocker::DestinationDisagrees
+                | PaymentBlocker::DestinationUnreadable
+                | PaymentBlocker::CommitmentNotRequested
+                | PaymentBlocker::NotAwaitingPayment(_)
+                | PaymentBlocker::AnchorMissing
+                | PaymentBlocker::ChainUnknown
+                | PaymentBlocker::AnchorOffChain
+                | PaymentBlocker::AnchorUnverifiable
+                | PaymentBlocker::AnchorAheadOfTip { .. }
+                | PaymentBlocker::AnchorStale { .. }
+                | PaymentBlocker::ConversationNotKept => {}
+            }
+            seen.insert(std::mem::discriminant(blocker));
+        }
+        assert_eq!(
+            seen.len(),
+            EVERY_BLOCKER,
+            "the list must hold every variant exactly once; add the new one here as well as \
+             to the match"
+        );
+        all
     }
+
+    /// How many variants `PaymentBlocker` has.
+    ///
+    /// The one number a future edit has to change by hand, and the assertion
+    /// above is what makes forgetting it fail rather than silently narrow the
+    /// coverage.
+    const EVERY_BLOCKER: usize = 17;
 
     /// **Every blocker says something, and says it as prose.**
     ///

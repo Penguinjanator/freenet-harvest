@@ -238,15 +238,49 @@ impl OrderStatus {
 /// replicas would diverge. The network stores the anchor; the reader forms
 /// the verdict.
 ///
-/// # Why 6
+/// # It is also the order's LIFETIME, which is what sets the number
 ///
-/// It is the same order of magnitude as Bitcoin's customary confirmation
-/// depth: about an hour, which is long enough that an honest seller
-/// accepting an order and a buyer reading it back a few minutes later always
-/// agree, and short enough that a backdated anchor is useless. Nothing here
-/// depends on the exact number, and anything that reads it derives from it
-/// rather than repeating it -- see `harvest_ui::state::RECENT_BLOCKS_KEPT`.
-pub const MAX_ANCHOR_AGE_BLOCKS: u32 = 6;
+/// This was 6, by analogy with Bitcoin's customary confirmation depth. Review
+/// pointed out that the analogy is the wrong one, because the anchor is
+/// stamped when the seller signs and is immutable under their signature -- so
+/// the rule is not only a backdating guard, it is how long an accepted order
+/// stays payable. At 6 blocks an honest buyer who came back after lunch found
+/// their order refused, with no way for either party to see why and no way to
+/// reissue.
+///
+/// So the number is set by the SHORTER of two requirements:
+///
+/// * **Long enough to buy something.** A person is offered a Bitcoin address
+///   and has to reach a wallet. An hour is not that; a working day is.
+/// * **Short enough that backdating buys nothing.** A seller who anchors an
+///   old block gets readers to stop counting the order that much earlier.
+///   What that is measured against is the complaint window, which Phase 2
+///   sets and which is certainly days rather than hours -- so a few hours of
+///   slack is noise, while an hour of buyer patience is not.
+///
+/// 48 blocks is about eight hours and satisfies both. Nothing here depends on
+/// the exact number, and everything that reads it derives from it rather than
+/// repeating it -- see `harvest_ui::state::RECENT_BLOCKS_KEPT`.
+///
+/// **It cannot exceed the tip contract's retention.** A reader checks the
+/// anchor is on their chain by looking the height up in the block summaries
+/// the tip contract keeps, and that is `TIP_RETAIN` deep. A tolerance wider
+/// than the retention would accept anchors nobody can check, which is the
+/// unverified-reads-as-verified direction. Held by the assertion below rather
+/// than by this paragraph.
+pub const MAX_ANCHOR_AGE_BLOCKS: u32 = 48;
+
+/// A fresh anchor must be one a reader can still check against their own
+/// chain.
+///
+/// A build failure rather than a test, because the two constants live in
+/// different crates and the failure it prevents is silent: an anchor inside
+/// the tolerance but outside the retained window reads as unverifiable, which
+/// refuses payment for a reason no user or seller could act on.
+const _: () = assert!(
+    (MAX_ANCHOR_AGE_BLOCKS as usize) < freenet_bitcoin_common::TIP_RETAIN,
+    "the freshness tolerance must fit inside the tip contract's retained window"
+);
 
 /// The immutable terms of an order, as agreed and published by the seller.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]

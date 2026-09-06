@@ -142,7 +142,13 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                         // because there is no key to encrypt an address to
                         // and no identity to hold to the order. See
                         // `BuyControl`.
-                        buyable: buyable(&store, &contract_id, owned),
+                        // `None` for a listing whose OWN certificate did
+                        // not verify, as well as for a store that cannot be
+                        // bought from at all. The store-level check cannot
+                        // see this: `buyable` is computed once per store,
+                        // and a mismatched listing is a per-listing fact.
+                        buyable: buyable(&store, &contract_id, owned)
+                            .filter(|_| !store.unverified_listings.contains(&listing.listing.id)),
                     }
                 }
             }
@@ -240,6 +246,13 @@ pub struct Buyable {
 /// encryption key has nothing to seal a shipping address to, and one whose
 /// certificate does not verify has no identity whose signature on a
 /// commitment would mean anything.
+///
+/// **Per-store only.** A listing whose OWN certificate does not verify is a
+/// per-listing fact this cannot see, and the caller filters on it -- review
+/// found the Buy control being offered on exactly those listings while the
+/// module comment read as though signature failure disabled buying. The
+/// consequence was contained (a commitment for a listing id the seller never
+/// signed) but the screen was claiming something it did not do.
 fn buyable(
     store: &crate::state::BrowsingStore,
     contract_id: &[u8],
@@ -480,6 +493,57 @@ mod buy_control_tests {
         assert!(
             buyable(&store, STORE, false).is_some(),
             "and the same store IS buyable when it is somebody else's"
+        );
+    }
+}
+
+#[cfg(test)]
+mod listing_buy_gate_tests {
+    use super::*;
+    use harvest_common::listing::ListingId;
+
+    const STORE: &[u8] = &[4u8; 32];
+
+    /// **A listing whose own certificate did not verify cannot be bought.**
+    ///
+    /// The store may check out perfectly while one listing on it does not --
+    /// that is exactly what `unverified_listings` records, and the card
+    /// already warns about it. Offering Buy underneath that warning invites a
+    /// purchase of something this seller never signed for.
+    ///
+    /// Written against the expression the component actually renders, since
+    /// the store-level `buyable` cannot see a per-listing fact and a test of
+    /// `buyable` alone would pass while the screen was wrong.
+    #[test]
+    fn a_listing_whose_certificate_did_not_verify_is_not_buyable() {
+        let good = ListingId([1u8; 16]);
+        let bad = ListingId([2u8; 16]);
+        let mut store = crate::state::BrowsingStore {
+            info: Some(harvest_common::store::StoreInfoV1 {
+                version: 1,
+                certificate_pem: String::new(),
+                seller_fingerprint: "seller-fp".to_string(),
+                reputation_contract_id: [0u8; 32],
+                store_name: "Hot sauce".to_string(),
+                description: String::new(),
+                payment_instructions: String::new(),
+                encryption_public_key: Some([1u8; 32]),
+            }),
+            seller_verifying_key: Some([2u8; 32]),
+            ..Default::default()
+        };
+        store.unverified_listings.insert(bad.clone());
+
+        let for_listing = |id: &ListingId| {
+            buyable(&store, STORE, false).filter(|_| !store.unverified_listings.contains(id))
+        };
+        assert!(
+            for_listing(&good).is_some(),
+            "a listing that verifies is buyable"
+        );
+        assert!(
+            for_listing(&bad).is_none(),
+            "and one whose certificate is not this seller's is not"
         );
     }
 }
