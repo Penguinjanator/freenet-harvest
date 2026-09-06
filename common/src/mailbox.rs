@@ -478,10 +478,27 @@ pub fn entry_digest(message: &EncryptedMessage) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// Summary for delta computation: set of known message nonces.
-pub type MailboxSummary = HashSet<[u8; 24]>;
+/// Summary for delta computation: the set of entry digests this peer holds.
+///
+/// # This was a set of NONCES, and the name changed with the payload
+///
+/// `MailboxSummary` carried `[u8; 24]` nonces until 2026-09-05. The rename is
+/// deliberate: a change of payload is a change of name, and the two shapes
+/// must never be confused for one another. They cannot be, in practice --
+/// a 24-element array does not deserialize as a 32-element one, so an old
+/// summary meeting new code is a decode error rather than a misparse. Nothing
+/// needs to read the old shape: this branch is unmerged and no mailbox
+/// contract carrying it has ever been published.
+///
+/// The change is what makes a message unretractable. While the summary was a
+/// set of nonces, a peer that held ONE of two entries sharing a nonce
+/// answered "I have that one" for the other and never received it -- so the
+/// message could be intact in the contract and absent from that peer, which
+/// from the buyer's side is the same loss. See [`entry_digest`].
+pub type MailboxSummaryV2 = HashSet<[u8; 32]>;
 
-/// Delta: new messages to add.
+/// Delta: new messages to add. Unchanged in shape -- it always carried whole
+/// messages, and only what counts as "already held" moved.
 pub type MailboxDelta = Vec<EncryptedMessage>;
 
 /// Drop the lowest-ranked messages until `messages` satisfies BOTH
@@ -516,46 +533,55 @@ pub type MailboxDelta = Vec<EncryptedMessage>;
 /// -- an attacker can put their message at the top of this ranking for free,
 /// so "one message empties the mailbox" would have been cheaper and more
 /// total than the unbounded growth the budget exists to stop.
-/// Keep one message per nonce, chosen by CONTENT rather than by arrival.
+/// Keep one copy of each distinct message.
 ///
 /// # Why this exists at all
 ///
-/// [`MailboxStateV1::verify`] rejects a state holding a duplicate nonce, so a
-/// state carrying one is permanently invalid: it cannot be updated, cannot
-/// converge, and pruning never removes it, because pruning truncates a sorted
-/// prefix and both copies sit in it together. Producing such a state has to
-/// be impossible here, and it was not: the dedup set used to be snapshotted
-/// from `self.messages` before the loop and never updated inside it, so a
-/// delta naming one message twice stored both. One contract update, no key,
-/// no relationship with either party.
+/// [`MailboxStateV1::verify`] rejects a state holding the same entry twice,
+/// so a state carrying one is permanently invalid: it cannot be updated,
+/// cannot converge, and pruning never removes it, because pruning truncates a
+/// sorted prefix and both copies sit in it together. Producing such a state
+/// has to be impossible here, and it was not: the dedup set used to be
+/// snapshotted from `self.messages` before the loop and never updated inside
+/// it, so a delta naming one message twice stored both. One contract update,
+/// no key, no relationship with either party.
 ///
-/// # Why the winner is decided by content
+/// # There is no longer a winner to choose
 ///
-/// Two DIFFERENT messages may share a nonce -- an attacker submits both, in
-/// different orders, to different peers. First-arrival-wins makes the two
-/// peers keep different bytes forever, which for a contract is as bad as
-/// invalidity and much harder to notice. So the survivor is the one that
-/// ranks highest under a total order over the fields, and both peers reach it
-/// from the same set regardless of the order they saw it in.
+/// This deduplicated by NONCE until 2026-09-05, which meant two DIFFERENT
+/// messages sharing one had to be resolved -- and the ~30 lines of reasoning
+/// that used to live here explained how the survivor was picked by a total
+/// order over the fields, since first-arrival-wins would leave two peers
+/// holding different bytes forever.
 ///
-/// The order is `(timestamp, ciphertext, sender_public_key, conversation_id)`,
-/// which is total because it ends in fields that together cannot tie without
-/// the messages being equal. Like every other ranking here it is made of
-/// attacker-chosen values and is not offered as a defence -- it is offered as
-/// a function of the SET, which is what convergence needs.
-fn dedupe_by_nonce(messages: &mut Vec<EncryptedMessage>) {
-    messages.sort_by(|a, b| {
-        a.nonce.cmp(&b.nonce).then_with(|| {
-            b.timestamp
-                .cmp(&a.timestamp)
-                .then_with(|| b.ciphertext.cmp(&a.ciphertext))
-                .then_with(|| b.sender_public_key.cmp(&a.sender_public_key))
-                .then_with(|| b.conversation_id.0.cmp(&a.conversation_id.0))
-        })
-    });
-    // Duplicates are now adjacent with the winner first, so this keeps the
-    // winner and drops the rest.
-    messages.dedup_by(|later, kept| later.nonce == kept.nonce);
+/// All of that is gone, and its absence is the point. Every field in that
+/// order was chosen by whoever wrote the message, so the resolution was
+/// always the writer's to steer: submit a second message under someone's
+/// nonce and the contract itself deleted theirs. Identity is now
+/// [`entry_digest`] over the whole entry, so two entries that differ in any
+/// byte are two entries and there is nothing to resolve. Only genuinely
+/// identical copies collapse, and for those any survivor is the same bytes.
+///
+/// What that costs: a substitute now sits BESIDE the original rather than
+/// replacing it. The mailbox is open-write, so an attacker could always add
+/// an entry; what they can no longer do is remove one. See
+/// `docs/messaging-privacy.md`.
+/// # This sort is where convergence comes from
+///
+/// Not the cap's ranking, and not the normalisation at the end of
+/// `apply_delta`. Sorting by digest imposes a TOTAL order on the whole
+/// collection -- two entries that tie on it are the same entry -- and every
+/// later sort is stable, so ties keep this order. Two peers given the same
+/// set in different orders therefore hold the same bytes.
+///
+/// Measured, not assumed: with this line replaced by an order-dependent
+/// dedup, `two_different_messages_sharing_a_nonce_converge_and_both_survive`
+/// and two neighbours fail. With the digest tiebreaks removed from either of
+/// the later sorts, nothing fails -- which is the evidence that the property
+/// lives here and not there.
+fn dedupe_identical_entries(messages: &mut Vec<EncryptedMessage>) {
+    messages.sort_by_key(entry_digest);
+    messages.dedup_by_key(|message| entry_digest(message));
 }
 
 fn enforce_message_cap(messages: &mut Vec<EncryptedMessage>) {
@@ -565,10 +591,21 @@ fn enforce_message_cap(messages: &mut Vec<EncryptedMessage>) {
         return;
     }
 
+    // Descending. `(timestamp, nonce)` stopped being a total order the moment
+    // two entries could share both, so the digest is appended to close it.
+    //
+    // **This tiebreak is NOT what makes pruning converge, and no test fails
+    // without it**, because `dedupe_identical_entries` has already sorted the
+    // whole collection by digest and this sort is stable. It is here so that
+    // the ranking is self-sufficient rather than resting on an invisible
+    // precondition about what ran before it -- verified by removing it and
+    // seeing the suite stay green, which is why this says so instead of
+    // claiming the property.
     messages.sort_by(|a, b| {
         b.timestamp
             .cmp(&a.timestamp)
             .then_with(|| b.nonce.cmp(&a.nonce))
+            .then_with(|| entry_digest(b).cmp(&entry_digest(a)))
     });
 
     let mut bytes = 0usize;
@@ -607,24 +644,29 @@ impl MailboxStateV1 {
                 self.messages.len()
             ));
         }
-        let mut seen_nonces = HashSet::new();
+        // Duplicate ENTRIES, not duplicate nonces. The nonce is chosen by
+        // whoever wrote the message, so rejecting on it made a legal pair --
+        // two different messages that happen to share one -- permanently
+        // invalid, and that is what turned a nonce collision into a way of
+        // destroying somebody else's message. See [`entry_digest`].
+        let mut seen = HashSet::new();
         for msg in &self.messages {
-            if !seen_nonces.insert(msg.nonce) {
-                return Err("duplicate message nonce".into());
+            if !seen.insert(entry_digest(msg)) {
+                return Err("duplicate message".into());
             }
         }
         Ok(())
     }
 
-    pub fn summarize(&self) -> MailboxSummary {
-        self.messages.iter().map(|m| m.nonce).collect()
+    pub fn summarize(&self) -> MailboxSummaryV2 {
+        self.messages.iter().map(entry_digest).collect()
     }
 
-    pub fn delta(&self, old_summary: &MailboxSummary) -> Option<MailboxDelta> {
+    pub fn delta(&self, old_summary: &MailboxSummaryV2) -> Option<MailboxDelta> {
         let new_messages: Vec<_> = self
             .messages
             .iter()
-            .filter(|m| !old_summary.contains(&m.nonce))
+            .filter(|m| !old_summary.contains(&entry_digest(m)))
             .cloned()
             .collect();
         if new_messages.is_empty() {
@@ -740,7 +782,7 @@ impl MailboxStateV1 {
         //
         // It runs before the cap, not after, so a duplicate cannot occupy two
         // of the slots the cap is about to hand out.
-        dedupe_by_nonce(&mut self.messages);
+        dedupe_identical_entries(&mut self.messages);
         enforce_message_cap(&mut self.messages);
 
         // Normalisation, NOT the thing that makes the state converge. This
@@ -751,12 +793,21 @@ impl MailboxStateV1 {
         // own deterministic one, so both peers agree on the byte order
         // without this. Deleting it passes the whole workspace.
         //
-        // It stays because it normalises the over-cap case back to
-        // nonce-ascending, which keeps ONE stored order rather than two. What
-        // it must not do is carry the claim, because a comment attributing a
-        // property to the wrong mechanism is how the next person deletes the
-        // mechanism that actually provides it.
-        self.messages.sort_by(|a, b| a.nonce.cmp(&b.nonce));
+        // It stays because it normalises the over-cap case back to one
+        // stored order rather than two. What it must not do is carry the
+        // claim, because a comment attributing a property to the wrong
+        // mechanism is how the next person deletes the mechanism that
+        // actually provides it.
+        //
+        // The digest tiebreak is here for the same reason it is in the cap's
+        // ranking, and with the same caveat: nonce alone no longer
+        // distinguishes two entries, and no test fails without this, because
+        // dedup already ordered them. Self-sufficiency, not the mechanism.
+        self.messages.sort_by(|a, b| {
+            a.nonce
+                .cmp(&b.nonce)
+                .then_with(|| entry_digest(a).cmp(&entry_digest(b)))
+        });
 
         Ok(())
     }
@@ -1600,7 +1651,8 @@ mod dedup_tests {
         m.verify().expect("a merge must heal a state it can heal");
     }
 
-    /// **Two DIFFERENT messages sharing a nonce must converge.**
+    /// **Two DIFFERENT messages sharing a nonce must converge -- and both
+    /// must survive.**
     ///
     /// A separate defect from the one above and reachable the same way: an
     /// attacker submits both, in different orders, to different peers. If the
@@ -1610,8 +1662,15 @@ mod dedup_tests {
     ///
     /// Observed red on 2026-09-05 against first-arrival-wins, which is what
     /// the snapshot form did across batches.
+    ///
+    /// **The second assertion was added when identity moved to
+    /// [`entry_digest`].** Convergence alone stopped being the whole claim:
+    /// two peers agreeing to discard the same message converges perfectly and
+    /// is exactly the retraction this contract must not allow. A test whose
+    /// name outlives the rule it was written for is how the next reader
+    /// concludes the old rule still holds.
     #[test]
-    fn two_different_messages_sharing_a_nonce_converge() {
+    fn two_different_messages_sharing_a_nonce_converge_and_both_survive() {
         let one = message([2u8; 24], 1_700_000_000, 0x11);
         let other = message([2u8; 24], 1_700_000_000, 0x22);
 
@@ -1628,12 +1687,18 @@ mod dedup_tests {
             crate::to_cbor(&b).unwrap(),
             "two peers given the same pair in different orders kept different bytes"
         );
+        assert_eq!(
+            a.messages.len(),
+            2,
+            "one message displaced the other, so a message can be retracted by submitting \
+             another under its nonce"
+        );
         a.verify().expect("valid");
     }
 
     /// And within a single delta, for the same reason.
     #[test]
-    fn a_nonce_collision_inside_one_delta_converges() {
+    fn a_nonce_collision_inside_one_delta_converges_and_keeps_both() {
         let one = message([4u8; 24], 1_700_000_000, 0x33);
         let other = message([4u8; 24], 1_700_000_000, 0x44);
 
@@ -1644,6 +1709,11 @@ mod dedup_tests {
         b.apply_delta(&Some(vec![other, one])).unwrap();
 
         assert_eq!(crate::to_cbor(&a).unwrap(), crate::to_cbor(&b).unwrap());
+        assert_eq!(
+            a.messages.len(),
+            2,
+            "a collision inside one delta lost a message"
+        );
     }
 
     /// Deduplication must not swallow distinct messages -- the guard above is
@@ -1745,5 +1815,195 @@ mod entry_digest_tests {
         b.sender_public_key = b"abc".to_vec();
         b.ciphertext = b"def".to_vec();
         assert_ne!(entry_digest(&a), entry_digest(&b));
+    }
+}
+
+/// What the CONTRACT treats as one message, and why it is not the nonce.
+#[cfg(test)]
+mod entry_identity_tests {
+    use super::*;
+
+    fn message(nonce: [u8; 24], ciphertext: &[u8], seconds: i64) -> EncryptedMessage {
+        EncryptedMessage {
+            conversation_id: ConversationId([1u8; 32]),
+            sender_public_key: vec![2u8; 32],
+            ciphertext: ciphertext.to_vec(),
+            timestamp: chrono::DateTime::from_timestamp(seconds, 0).expect("timestamp"),
+            nonce,
+        }
+    }
+
+    fn mailbox(messages: Vec<EncryptedMessage>) -> MailboxStateV1 {
+        let mut state = MailboxStateV1::default();
+        state.apply_delta(&Some(messages)).expect("apply");
+        state
+            .verify()
+            .expect("the contract must accept its own result");
+        state
+    }
+
+    /// **The message a bond rests on cannot be retracted by the party who
+    /// sent it.**
+    ///
+    /// This is the reason the contract computes identity for itself. In Phase
+    /// 2 the seller's reply carries a pre-signed confession, and that
+    /// confession is the buyer's SOLE capability to file against the seller's
+    /// bond. It travels as an ordinary message in the seller's own mailbox,
+    /// so the seller knows its nonce.
+    ///
+    /// While identity was the writer's nonce, the seller could send the
+    /// confession, wait for payment, and then submit a different message
+    /// under the same nonce: the dedup resolved the collision in favour of
+    /// whichever ranked higher on fields the seller chooses, and the
+    /// confession was gone from a public contract. The buyer would watch
+    /// their recourse arrive and then vanish, at a moment of the seller's
+    /// choosing.
+    ///
+    /// Storing it on receipt does not fix that -- it makes the guarantee a
+    /// race between the buyer's client persisting and the seller
+    /// substituting, and a race is not a foundation for "the buyer has
+    /// recourse".
+    #[test]
+    fn a_message_cannot_be_retracted_by_submitting_another_under_its_nonce() {
+        let confession = message([7u8; 24], b"I confess", 1_700_000_000);
+        // Same nonce, later timestamp: what the old ranking preferred.
+        let retraction = message([7u8; 24], b"I said no such thing", 1_700_000_001);
+
+        let state = mailbox(vec![confession.clone(), retraction.clone()]);
+
+        assert_eq!(
+            state.messages.len(),
+            2,
+            "one message displaced the other, so the confession can be retracted"
+        );
+        assert!(
+            state.messages.contains(&confession),
+            "the message the bond rests on is gone from the mailbox"
+        );
+        assert!(state.messages.contains(&retraction));
+    }
+
+    /// Order does not matter: the retraction arriving first must not keep the
+    /// confession out either.
+    #[test]
+    fn a_retraction_that_arrives_first_does_not_keep_the_original_out() {
+        let confession = message([7u8; 24], b"I confess", 1_700_000_000);
+        let retraction = message([7u8; 24], b"I said no such thing", 1_700_000_001);
+
+        let forwards = mailbox(vec![confession.clone(), retraction.clone()]);
+        let backwards = mailbox(vec![retraction, confession.clone()]);
+
+        assert!(backwards.messages.contains(&confession));
+        assert_eq!(
+            forwards.messages, backwards.messages,
+            "two peers that saw the same messages in different orders hold different bytes"
+        );
+    }
+
+    /// **A true duplicate is still one message.**
+    ///
+    /// Deduplication has not been given up, only re-keyed: the same message
+    /// twice is the same message, and a re-send must not occupy two of the
+    /// cap's slots.
+    #[test]
+    fn the_same_message_twice_is_still_one_message() {
+        let once = message([9u8; 24], b"hello", 1_700_000_000);
+        let state = mailbox(vec![once.clone(), once.clone(), once]);
+        assert_eq!(state.messages.len(), 1);
+    }
+
+    /// `verify` rejects a state carrying the same ENTRY twice, and accepts
+    /// two different entries that happen to share a nonce.
+    ///
+    /// The check has not merely moved: it changed meaning. Rejecting on the
+    /// nonce made a legitimate pair permanently invalid, which is what turned
+    /// a nonce collision into a way of destroying a message.
+    #[test]
+    fn verify_rejects_a_repeated_entry_and_accepts_a_shared_nonce() {
+        let one = message([7u8; 24], b"first", 1_700_000_000);
+        let other = message([7u8; 24], b"second", 1_700_000_000);
+
+        let shared_nonce = MailboxStateV1 {
+            messages: vec![one.clone(), other],
+        };
+        shared_nonce
+            .verify()
+            .expect("two different messages sharing a nonce is a legal state");
+
+        let repeated = MailboxStateV1 {
+            messages: vec![one.clone(), one],
+        };
+        repeated
+            .verify()
+            .expect_err("the same entry twice must be rejected");
+    }
+
+    /// **A summary names entries, so a peer holding one of a same-nonce pair
+    /// is still sent the other.**
+    ///
+    /// This is the half that would silently undo the rest. While a summary
+    /// was a set of nonces, a peer that held the retraction would answer "I
+    /// have that one" for the confession and never receive it -- the message
+    /// would be intact in the contract and absent from that peer, which from
+    /// the buyer's side is the same loss.
+    #[test]
+    fn a_peer_holding_one_of_a_shared_nonce_pair_is_sent_the_other() {
+        let confession = message([7u8; 24], b"I confess", 1_700_000_000);
+        let retraction = message([7u8; 24], b"I said no such thing", 1_700_000_001);
+
+        let complete = mailbox(vec![confession.clone(), retraction.clone()]);
+        let partial = mailbox(vec![retraction]);
+
+        let delta = complete
+            .delta(&partial.summarize())
+            .expect("the peer is missing a message");
+        assert!(
+            delta.contains(&confession),
+            "a peer holding one message of a shared nonce was told it had both"
+        );
+    }
+
+    /// Nothing is sent to a peer that already holds everything.
+    #[test]
+    fn a_peer_holding_everything_is_sent_nothing() {
+        let state = mailbox(vec![
+            message([7u8; 24], b"one", 1_700_000_000),
+            message([8u8; 24], b"two", 1_700_000_001),
+        ]);
+        assert!(state.delta(&state.summarize()).is_none());
+    }
+
+    /// **An over-cap set of entries sharing a nonce AND a timestamp still
+    /// converges.**
+    ///
+    /// `apply_delta` end to end, not the cap's ranking in isolation: the
+    /// ranking's own digest tiebreak is unobservable, because
+    /// `dedupe_identical_entries` sorts by digest first and every later sort
+    /// is stable. What this pins is that SOME step imposes a total order on a
+    /// set where neither the nonce nor the timestamp distinguishes anything
+    /// -- which is the shape a nonce collision creates, and which
+    /// `(timestamp, nonce)` alone could not have handled.
+    #[test]
+    fn pruning_is_total_when_two_entries_share_a_nonce_and_a_timestamp() {
+        let mut messages = Vec::new();
+        for i in 0..(MAX_MESSAGES + 4) {
+            // Deliberately colliding: one nonce and one timestamp across every
+            // message, so only the ciphertext distinguishes them.
+            messages.push(message(
+                [3u8; 24],
+                format!("message {i}").as_bytes(),
+                1_700_000_000,
+            ));
+        }
+        let mut reversed = messages.clone();
+        reversed.reverse();
+
+        let one = mailbox(messages);
+        let other = mailbox(reversed);
+        assert_eq!(
+            one.messages, other.messages,
+            "two peers pruned the same set to different bytes"
+        );
+        assert_eq!(one.messages.len(), MAX_MESSAGES);
     }
 }

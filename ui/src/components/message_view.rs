@@ -78,14 +78,12 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
             .map(|entry| entry.digest())
             .filter(|digest| app_state.authored_here(&store_contract_id, digest))
             .collect();
-        let replaced = app_state.replaced_sent(&store_contract_id);
         drop(app_state);
         return rsx! {
             Inbox {
                 store_contract_id: store_contract_id.clone(),
                 entries: entries,
                 authored: authored,
-                replaced: replaced,
             }
         };
     }
@@ -98,7 +96,6 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
     let seller_identity = store.and_then(|s| s.seller_verifying_key);
     let thread = app_state.conversation_thread(&store_contract_id);
     let unconfirmed = app_state.unconfirmed_sent(&store_contract_id);
-    let replaced = app_state.replaced_sent(&store_contract_id);
     // What this node is keeping, which is what the buyer can ask it to
     // forget. Empty until the delegate answers, and empty for a store this
     // node has never written to.
@@ -165,11 +162,10 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
                 },
             }
 
-            if !thread.is_empty() || !unconfirmed.is_empty() || !replaced.is_empty() {
+            if !thread.is_empty() || !unconfirmed.is_empty() {
                 Thread {
                     thread: thread,
                     unconfirmed: unconfirmed,
-                    replaced: replaced,
                     authored_here: authored_here,
                 }
             }
@@ -419,9 +415,6 @@ fn Restore() -> Element {
 fn Thread(
     thread: Vec<crate::messaging::ConversationMessage>,
     unconfirmed: Vec<crate::state::SentMessage>,
-    /// Messages this browser sent whose place in the mailbox is now occupied
-    /// by something else. See `state::AppState::replaced_sent`.
-    replaced: Vec<crate::state::SentMessage>,
     /// Entry digests this browser wrote. The ONLY authorship anything here
     /// can establish -- see `state::AppState::authored_here`. Digests rather
     /// than nonces because a nonce is public and a substitute shares it.
@@ -461,28 +454,6 @@ fn Thread(
                                 "Sender's timestamp: {when}"
                             }
                         }
-                    }
-                }
-            }
-
-            // Sent, arrived, and then displaced by something else under the
-            // same nonce. Shown as its own thing rather than folded into
-            // "not seen yet", because it will not arrive: what is in the
-            // mailbox now is somebody else's message in its place. See
-            // `state::AppState::replaced_sent`.
-            for message in replaced.iter() {
-                div { class: "card",
-                    style: "margin-top: 0.5rem;",
-                    p { class: "text-warning", style: "font-size: 0.8rem;",
-                        "You — replaced"
-                    }
-                    p { style: "white-space: pre-wrap;", "{message.text}" }
-                    p { class: "text-warning",
-                        style: "font-size: 0.8rem;",
-                        "This message reached the mailbox and a DIFFERENT message now stands "
-                        "in its place. Only someone holding this conversation's key can do "
-                        "that, which here means the other party. Anything shown above under "
-                        "its place was not written by you."
                     }
                 }
             }
@@ -661,12 +632,8 @@ fn Inbox(
     store_contract_id: Vec<u8>,
     entries: Vec<MailboxEntry>,
     authored: Vec<[u8; 32]>,
-    /// Replies this browser sent that something else now stands in the place
-    /// of. The buyer holds the same conversation key, so this is available to
-    /// them exactly as it is to the seller.
-    replaced: Vec<crate::state::SentMessage>,
 ) -> Element {
-    if entries.is_empty() && replaced.is_empty() {
+    if entries.is_empty() {
         return rsx! {
             div { class: "card",
                 h3 { "Messages" }
@@ -700,17 +667,6 @@ fn Inbox(
             h3 { "Messages" }
             p { class: "section-count",
                 "{entries.len()} message(s) in {conversations.len()} conversation(s)"
-            }
-            for message in replaced.iter() {
-                div { class: "card", style: "margin-top: 0.5rem;",
-                    p { class: "text-warning", style: "font-size: 0.8rem;", "Your reply — replaced" }
-                    p { style: "white-space: pre-wrap;", "{message.text}" }
-                    p { class: "text-warning", style: "font-size: 0.8rem;",
-                        "This reply reached the mailbox and a DIFFERENT message now stands in "
-                        "its place. Only someone holding that conversation's key can do that, "
-                        "which here means the buyer you were replying to."
-                    }
-                }
             }
             if unreadable > 0 {
                 p { class: "text-muted",

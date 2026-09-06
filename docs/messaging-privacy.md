@@ -77,11 +77,25 @@ entry, not by its nonce. The distinction is the subject of the next section
 and it is not a detail: the nonce is public and the counterparty can put their
 own words under it.
 
-## The counterparty can DELETE a message you sent, and take its place
+## The counterparty could DELETE a message you sent — FIXED
 
-Found by review on 2026-09-05, demonstrated by execution, and **not fixed** —
-what changed is that the client no longer mistakes the result for your own
-words, and says out loud that it happened.
+Found by review on 2026-09-05, demonstrated by execution, and closed the same
+day by moving what the contract treats as identity. The account below is kept
+because the reasoning that led there is worth more than the conclusion, and
+because the fix is only obvious once the failed attempt is visible.
+
+**Why it was worth fixing rather than documenting.** The residual was first
+described as "the counterparty can grief a conversation they are already
+inside". That is wrong, and Phase 2 is where it shows: the seller's reply
+carries a pre-signed confession which is the buyer's SOLE capability to file
+against the seller's bond, it travels as an ordinary message in the seller's
+own mailbox, and the seller knows its nonce. So the bonded seller could send
+the confession, wait for payment, and then retract it at a moment of their
+choosing. That is not griefing a conversation; it is the bonded party being
+able to withdraw the instrument the bond rests on. Telling the buyer to store
+it on receipt does not help -- it makes the guarantee a race between the
+buyer's client persisting and the seller substituting, and a race is not a
+foundation for "the buyer has recourse".
 
 The mailbox keeps **one entry per nonce**: `MailboxStateV1::verify` rejects a
 state holding a duplicate, and a summary is a set of nonces. The nonce is
@@ -91,23 +105,28 @@ plaintext under the same key with the **same nonce**, date it one second
 later, and submit it. `dedupe_by_nonce` keeps one of the two by a total order
 over content, and every field in that order is theirs to choose.
 
-Three things happen at once: your message is gone from a public contract, the
-substitute reads as a normal message of the conversation, and — until this was
-fixed — your own screen labelled it as something you wrote, because
-`authored_here` matched on the nonce.
+Three things happened at once: your message was gone from a public contract,
+the substitute read as a normal message of the conversation, and your own
+screen labelled it as something you wrote, because `authored_here` matched on
+the nonce.
 
-**Why no tiebreak fixes it.** The dedup rule must be a pure function of the
-SET of messages, or two peers that saw them in different orders keep different
-bytes forever. A function of the set has no notion of which arrived first, so
-it cannot protect the incumbent. Ranking by content instead of timestamp only
-changes the attacker's cost from "add one second" to "try a few ciphertexts
-until one sorts first" — they choose the whole plaintext, so they win about
-half of any comparison on the first attempt.
+**Why no tiebreak fixed it, which is what pointed at the real answer.** The
+dedup rule must be a pure function of the SET of messages, or two peers that
+saw them in different orders keep different bytes forever. A function of the
+set has no notion of which arrived first, so it cannot protect the incumbent.
+Ranking by content instead of timestamp only changed the attacker's cost from
+"add one second" to "try a few ciphertexts until one sorts first" — they
+choose the whole plaintext, so they win about half of any comparison on the
+first attempt.
 
-**What would actually close it.** The first answer written here was wrong and
-is corrected rather than deleted, because the mistake is instructive: it said
-to derive the nonce deterministically from the message (an SIV-style
-construction), so that two different plaintexts could not share a nonce.
+The conclusion to draw from that is not "pick a better tiebreak". It is that
+**there should be no collision to resolve**, which is what the fix does.
+
+**What closed it, and the wrong answer that came first.** The first answer
+written here was wrong and is kept rather than deleted, because the mistake is
+instructive: it said to derive the nonce deterministically from the message
+(an SIV-style construction), so that two different plaintexts could not share
+a nonce.
 
 **That does not work, because nothing can enforce it.** The nonce is a field
 the writer fills in, and the reader takes it from the entry
@@ -117,13 +136,34 @@ because the displacement already happened at the contract. An attacker who
 holds the conversation key simply does not follow the derivation rule. A rule
 only honest clients obey is not a defence against a dishonest one.
 
-What WOULD close it is making the identity **the contract itself computes**:
-key the summary, the delta, the duplicate check and the dedup on a hash of the
-whole entry rather than on the writer's nonce. Two entries that differ in any
-byte are then two entries; there is no collision to resolve, so there is
-nothing to displace. It needs no key, so the contract can enforce it. It costs
-a wire-format change to the summary and delta shape, and it is not attempted
-here.
+What closed it is making the identity **the contract itself computes**: the
+summary, the delta, the duplicate check and the dedup are all keyed on
+[`entry_digest`] over the whole entry rather than on the writer's nonce. Two
+entries that differ in any byte are two entries; there is no collision to
+resolve, so there is nothing to displace. It needs no key, so the contract
+enforces it — which is exactly what the derivation rule could not do.
+
+Four consequences, all deliberate:
+
+* **A substitute now sits BESIDE the original.** The mailbox is open-write, so
+  an attacker could always ADD an entry; what they can no longer do is remove
+  one. The buyer sees both, their own marked as theirs and the other
+  unattributed.
+* **`MailboxSummary` became `MailboxSummaryV2`** and carries 32-byte digests
+  instead of 24-byte nonces. A change of payload is a change of name. The two
+  cannot be confused on the wire — a 24-element array does not deserialize as
+  a 32-element one, so an old summary meeting new code is a decode error, not
+  a misparse — and nothing needs to read the old shape, because no mailbox
+  contract carrying it was ever published.
+* **`verify` rejects a repeated ENTRY, not a repeated nonce.** The old check
+  made a legal pair permanently invalid, and that is what turned a collision
+  into a way of destroying a message.
+* **The client's "your message was replaced" report was DELETED**, not
+  repointed. The state it described can no longer arise, and the nearest
+  surviving signal — "an entry shares your message's nonce" — is forgeable by
+  any third party, since the mailbox is open-write and the nonce is public. A
+  tampering notice an outsider can trigger against a seller they have never
+  dealt with is worse than none.
 
 **What was done instead**, at the client, where first-hand knowledge lives:
 
@@ -183,6 +223,14 @@ bytes; it does nothing about a key holder who chooses to collide, for the same
 reason it does nothing about displacement. Nothing short of removing the
 counterparty's key removes this, and the counterparty must hold the key to
 read replies at all.
+
+**The content-identity fix above does not close this either, and does not
+claim to.** It stops a collision destroying a message; it cannot stop one
+being created, because creating one needs only a key the counterparty must
+have. The two entries now coexist, which is if anything a slightly better
+position for an observer — both ciphertexts are durably in the mailbox rather
+than one displacing the other. That changes nothing about the analysis above:
+the party who can create the collision could publish the plaintext instead.
 
 ## NOT visible
 

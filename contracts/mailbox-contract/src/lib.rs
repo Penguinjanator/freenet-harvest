@@ -3,7 +3,7 @@
 use ciborium::{de::from_reader, ser::into_writer};
 use freenet_stdlib::prelude::*;
 
-use harvest_common::mailbox::{MailboxDelta, MailboxParameters, MailboxStateV1, MailboxSummary};
+use harvest_common::mailbox::{MailboxDelta, MailboxParameters, MailboxStateV1, MailboxSummaryV2};
 
 #[allow(dead_code)]
 struct Contract;
@@ -125,7 +125,7 @@ impl ContractInterface for Contract {
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         let mailbox_state = from_reader::<MailboxStateV1, &[u8]>(state.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
-        let old_summary = from_reader::<MailboxSummary, &[u8]>(summary.as_ref())
+        let old_summary = from_reader::<MailboxSummaryV2, &[u8]>(summary.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
         match mailbox_state.delta(&old_summary) {

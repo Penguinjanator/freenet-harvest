@@ -907,9 +907,7 @@ pub struct BrowsingStore {
     ///
     /// This is the AUTHORSHIP record, not the message record: what this tab
     /// wrote is the only authorship anything here can establish (see
-    /// [`AppState::authored_here`]), and it is also what lets this browser
-    /// notice one of its messages being displaced (see
-    /// [`AppState::replaced_sent`]). It lives for the life of the tab and no
+    /// [`AppState::authored_here`]). It lives for the life of the tab and no
     /// longer, and it is deliberately not persisted alongside the
     /// conversation secret -- it is not part of what a buyer loses by closing
     /// a tab, since the messages themselves come back out of the mailbox
@@ -930,11 +928,11 @@ pub struct SentMessage {
     pub sent_at: chrono::DateTime<chrono::Utc>,
     /// The mailbox nonce this message was sealed under.
     ///
-    /// Kept to recognise a SUBSTITUTION, not to recognise the message: the
-    /// nonce is public and the counterparty can submit different content
-    /// under it. An entry sharing this nonce with a different
-    /// [`Self::digest`] is somebody else's message in the place of this one
-    /// -- see [`AppState::replaced_sent`].
+    /// Not an identity: the nonce is public and anyone may submit different
+    /// content under it. It is kept because the mailbox entry carries it and
+    /// dropping it from the local record would lose the ability to relate
+    /// this to a specific entry at all. Recognition is by
+    /// [`Self::digest`].
     pub nonce: [u8; 24],
     /// [`harvest_common::mailbox::entry_digest`] of the exact entry that was
     /// sealed and dispatched.
@@ -2287,25 +2285,30 @@ impl AppState {
         let Some(store) = self.browsing_stores.get(store_contract_id) else {
             return Vec::new();
         };
-        // Landed means THIS message is there, not that its nonce is. A nonce
-        // match with different bytes is a substitution, which
-        // [`Self::replaced_sent`] reports instead -- reporting it here would
-        // tell the buyer their message might still arrive, when what actually
-        // happened is that it arrived and was displaced.
+        // Landed means THIS message is there, not that its nonce is: an entry
+        // with the same nonce and different bytes is somebody else's message,
+        // and since 2026-09-05 it sits beside this one rather than in place
+        // of it -- the contract keys identity on `entry_digest`.
+        //
+        // There used to be a second category, `replaced_sent`, for a message
+        // whose nonce was present under different bytes: it had arrived and
+        // then been displaced by the contract's dedup. That state can no
+        // longer arise, so it was deleted rather than left rendering a case
+        // that cannot happen. It was not repointed at "an entry shares your
+        // nonce" either, because that signal is FORGEABLE: the mailbox is
+        // open-write and the nonce is public, so any third party can plant an
+        // unreadable entry under it, and a "somebody tampered with your
+        // message" notice driven by that would be one an outsider could
+        // trigger against a seller they have never dealt with.
         let landed: std::collections::HashSet<[u8; 32]> = store
             .mailbox_messages
             .iter()
             .map(harvest_common::mailbox::entry_digest)
             .collect();
-        let displaced: std::collections::HashSet<[u8; 24]> = store
-            .mailbox_messages
-            .iter()
-            .map(|message| message.nonce)
-            .collect();
         store
             .sent_messages
             .iter()
-            .filter(|sent| !landed.contains(&sent.digest) && !displaced.contains(&sent.nonce))
+            .filter(|sent| !landed.contains(&sent.digest))
             .cloned()
             .collect()
     }
@@ -2392,11 +2395,13 @@ impl AppState {
     /// `a_substituted_message_is_not_shown_as_the_buyers_own` and
     /// `a_seller_is_not_credited_with_a_substituted_reply`.
     ///
-    /// **This does not stop the substitution**, and nothing at this layer
-    /// could: the conversation key is symmetric, so the counterparty can
-    /// always produce anything this client could. See
-    /// [`Self::replaced_sent`], which is the other half -- saying so out loud
-    /// -- and `docs/messaging-privacy.md` for the displacement itself.
+    /// **This does not stop the counterparty writing**, and nothing at this
+    /// layer could: the conversation key is symmetric, so they can always
+    /// produce anything this client could. What it stops is their words being
+    /// labelled as the buyer's. They can no longer DELETE a message either,
+    /// but that is the contract's doing rather than this one's -- identity is
+    /// `entry_digest`, so a substitute sits beside the original. See
+    /// `docs/messaging-privacy.md`.
     ///
     /// It is per-tab, like everything else about a conversation: a reload
     /// loses it, and messages this browser really did send then read as
@@ -2410,47 +2415,6 @@ impl AppState {
                     .iter()
                     .any(|sent| &sent.digest == digest)
             })
-    }
-
-    /// Messages this browser sent whose place in the mailbox something else
-    /// now occupies.
-    ///
-    /// # Why this exists, and why it is not "not delivered yet"
-    ///
-    /// The mailbox holds one entry per nonce, and the nonce is public. The
-    /// counterparty holds the conversation key, so they can seal DIFFERENT
-    /// content under a nonce this client used and let the contract's
-    /// tiebreak keep theirs. The buyer's message is then gone from an
-    /// open-write public contract, and something they did not write stands
-    /// where it was.
-    ///
-    /// Nothing here prevents that -- see `docs/messaging-privacy.md`. What
-    /// this does is refuse to be silent about it. The two situations are
-    /// different things to tell someone:
-    ///
-    /// * [`Self::unconfirmed_sent`] -- nothing with this identity has
-    ///   appeared. It may still arrive.
-    /// * this -- something with this NONCE is in the mailbox and it is not
-    ///   what was sent. It will not arrive; it has been displaced.
-    ///
-    /// A nonce is 24 random bytes, so an accidental collision is not a
-    /// practical possibility: an entry sharing a nonce and differing in its
-    /// digest was deliberate, by someone holding this conversation's key.
-    pub fn replaced_sent(&self, store_contract_id: &[u8]) -> Vec<SentMessage> {
-        let Some(store) = self.browsing_stores.get(store_contract_id) else {
-            return Vec::new();
-        };
-        store
-            .sent_messages
-            .iter()
-            .filter(|sent| {
-                store.mailbox_messages.iter().any(|message| {
-                    message.nonce == sent.nonce
-                        && harvest_common::mailbox::entry_digest(message) != sent.digest
-                })
-            })
-            .cloned()
-            .collect()
     }
 
     /// Record a message this browser sent, so the buyer can see what they
@@ -8413,18 +8377,13 @@ mod nonce_collision_tests {
             "precondition: a message this tab sent reads as its own"
         );
 
-        // The seller substitutes different words under the same nonce.
+        // The seller submits different words under the same nonce.
         let theirs = substitute(&mine, "actually, never mind, cancel it");
         let mailbox = mailbox_after(vec![mine.clone(), theirs.clone()]);
         assert_eq!(
             mailbox.len(),
-            1,
-            "the contract keeps one message per nonce, which is what makes this a substitution"
-        );
-        assert_eq!(
-            entry_digest(&mailbox[0]),
-            entry_digest(&theirs),
-            "precondition: the substitute is what survived"
+            2,
+            "the substitute displaced the original, so a message can still be retracted"
         );
         buyer
             .browsing_stores
@@ -8433,23 +8392,47 @@ mod nonce_collision_tests {
             .mailbox_messages = mailbox;
 
         let thread = buyer.conversation_thread(STORE);
-        assert_eq!(thread.len(), 1);
-        assert_eq!(text(&thread[0].content), "actually, never mind, cancel it");
+        assert_eq!(
+            thread.len(),
+            2,
+            "the buyer's own message is missing from their own thread"
+        );
+
+        let mine_shown = thread
+            .iter()
+            .find(|message| text(&message.content) == "please cancel my order")
+            .expect("the buyer's own message must still be readable");
         assert!(
-            !buyer.authored_here(STORE, &thread[0].digest),
+            buyer.authored_here(STORE, &mine_shown.digest),
+            "the buyer's own message stopped being recognised as theirs"
+        );
+
+        let theirs_shown = thread
+            .iter()
+            .find(|message| text(&message.content) == "actually, never mind, cancel it")
+            .expect("the substitute is in the mailbox and is shown");
+        assert!(
+            !buyer.authored_here(STORE, &theirs_shown.digest),
             "the buyer's own UI credited them with words the seller wrote"
         );
     }
 
-    /// **A message that was replaced is visible AS replaced.**
+    /// **A message someone submitted under is not reported as undelivered,
+    /// because it was not displaced.**
     ///
-    /// The client knows what it sent. If that entry is no longer in the
-    /// mailbox, saying so is the honest thing -- silence would leave the
-    /// buyer believing the substitute is the whole story, and "not delivered
-    /// yet" would be a different and wrong claim about a message that was
-    /// delivered and then displaced.
+    /// There used to be a `replaced_sent` here, reporting a message whose
+    /// nonce was present under different bytes: it had arrived and then been
+    /// displaced by the contract's dedup. That state can no longer arise, so
+    /// it was deleted rather than left rendering a case that cannot happen.
+    ///
+    /// It was not repointed at "an entry shares your nonce" either, and the
+    /// reason is worth keeping: that signal is FORGEABLE. The mailbox is
+    /// open-write and the nonce is public, so any third party can plant an
+    /// unreadable entry under it, and a "somebody tampered with your message"
+    /// notice driven by that would be one an outsider could trigger against a
+    /// seller they have never dealt with.
     #[test]
-    fn a_replaced_message_is_reported_as_replaced_and_not_as_undelivered() {
+    fn a_message_someone_submitted_under_is_not_reported_as_undelivered() {
         let mut buyer = buyer_state();
         let mine = buyer
             .compose_to_seller(STORE, &seller_public(), "please cancel my order".into())
@@ -8458,7 +8441,6 @@ mod nonce_collision_tests {
 
         // Before anything lands, it is simply not seen yet.
         assert_eq!(buyer.unconfirmed_sent(STORE).len(), 1);
-        assert!(buyer.replaced_sent(STORE).is_empty());
 
         let theirs = substitute(&mine, "actually, never mind, cancel it");
         buyer
@@ -8467,95 +8449,16 @@ mod nonce_collision_tests {
             .expect("store")
             .mailbox_messages = mailbox_after(vec![mine.clone(), theirs]);
 
-        let replaced = buyer.replaced_sent(STORE);
-        assert_eq!(
-            replaced.len(),
-            1,
-            "a message that was displaced in the mailbox was not reported"
-        );
-        assert_eq!(replaced[0].text, "please cancel my order");
         assert!(
             buyer.unconfirmed_sent(STORE).is_empty(),
-            "a replaced message must not also be reported as merely not-yet-seen: it arrived, \
-             and was then displaced, which is a different thing to tell someone"
+            "the buyer's message is in the mailbox and was reported as not yet arrived"
         );
     }
 
-    /// **KNOWN LIMITATION, pinned: a deliberate nonce collision is AES-GCM
-    /// nonce reuse, and the keystream repeats.**
-    ///
-    /// Recorded as an executable fact rather than a paragraph, because it is
-    /// a cryptographic property and not a UX one, and because the honest
-    /// account of what it costs depends on it being true.
-    ///
-    /// Two different plaintexts encrypted under one key and one nonce give
-    /// `C1 xor C2 == P1 xor P2`. **Who this exposes what to:**
-    ///
-    /// * **Not the counterparty.** They hold the conversation key, so they
-    ///   could already read and write everything in it. The reuse gives them
-    ///   nothing they did not have -- which is why this is not a way IN.
-    /// * **A third party watching the mailbox** sees both entries (the
-    ///   original is public until the substitute displaces it) and learns
-    ///   `P1 xor P2` **without any key**. The substitute's plaintext is
-    ///   chosen by the attacker, so anyone who knows or guesses it recovers
-    ///   the buyer's original message. `pad_to_bucket` puts both in the same
-    ///   size bucket, so the xor typically covers the whole message.
-    /// * **A third party who obtains one of the two plaintexts** recovers the
-    ///   keystream for that nonce, and the repeated-nonce pair also permits
-    ///   GHASH-subkey recovery -- so they can then forge further entries
-    ///   under that nonce without holding the key. What they cannot do is
-    ///   decrypt anything under a different nonce.
-    ///
-    /// **How much it matters, and why a deterministic nonce is NOT the fix.**
-    /// A key holder can already decrypt this conversation and publish the
-    /// plaintext, so the xor leak gives them a more deniable route to a
-    /// disclosure they could make anyway; the one additional capability is
-    /// narrow (handing a third party forgery without handing over reading).
-    /// And deriving the nonce from the message would not close it: the nonce
-    /// is a field the WRITER fills in and the reader takes as given, so an
-    /// attacker simply does not follow the rule. A rule only honest clients
-    /// obey is not a defence against a dishonest one. See
-    /// `docs/messaging-privacy.md`, where the earlier, overstated version of
-    /// this is corrected rather than deleted.
+    /// The ordinary case still works: a message that landed unaltered is not
+    /// reported as unconfirmed.
     #[test]
-    fn known_limit_a_nonce_collision_reuses_the_keystream() {
-        let mut buyer = buyer_state();
-        let mine = buyer
-            .compose_to_seller(STORE, &seller_public(), "please cancel my order".into())
-            .expect("compose");
-        let theirs = substitute(&mine, "actually, never mind, cancel it");
-        assert_eq!(mine.nonce, theirs.nonce, "precondition: one nonce");
-
-        // What each ciphertext encrypts: the padded CBOR of the plaintext.
-        let padded = |text: &str| {
-            pad_to_bucket(
-                &harvest_common::to_cbor(&crate::messaging::PlaintextMessage {
-                    conversation_id: mine.conversation_id.clone(),
-                    content: crate::messaging::MessageContent::Text(text.to_string()),
-                })
-                .expect("cbor"),
-            )
-        };
-        let p1 = padded("please cancel my order");
-        let p2 = padded("actually, never mind, cancel it");
-        assert_eq!(p1.len(), p2.len(), "precondition: one size bucket");
-
-        // GCM appends a 16-byte tag; the rest is keystream xor plaintext.
-        let c1 = &mine.ciphertext[..p1.len()];
-        let c2 = &theirs.ciphertext[..p2.len()];
-        let ciphertext_xor: Vec<u8> = c1.iter().zip(c2).map(|(a, b)| a ^ b).collect();
-        let plaintext_xor: Vec<u8> = p1.iter().zip(&p2).map(|(a, b)| a ^ b).collect();
-        assert_eq!(
-            ciphertext_xor, plaintext_xor,
-            "if this ever stops holding, the keystream is no longer being reused and this \
-             limitation has been closed -- update the documentation rather than the assertion"
-        );
-    }
-
-    /// The ordinary case still works: a message that landed unaltered is
-    /// neither unconfirmed nor replaced.
-    #[test]
-    fn a_message_that_landed_is_neither_unconfirmed_nor_replaced() {
+    fn a_message_that_landed_is_not_reported_as_unconfirmed() {
         let mut buyer = buyer_state();
         let mine = buyer
             .compose_to_seller(STORE, &seller_public(), "hello".into())
@@ -8568,7 +8471,6 @@ mod nonce_collision_tests {
             .mailbox_messages = mailbox_after(vec![mine]);
 
         assert!(buyer.unconfirmed_sent(STORE).is_empty());
-        assert!(buyer.replaced_sent(STORE).is_empty());
     }
 
     /// The seller's inbox is the same defect from the other side: their own
@@ -8627,10 +8529,17 @@ mod nonce_collision_tests {
             !seller.authored_here(STORE, &substituted.digest()),
             "the seller's own inbox credited them with a confession they did not write"
         );
-        assert_eq!(
-            seller.replaced_sent(STORE).len(),
-            1,
-            "the seller was not told their reply had been displaced"
+        // And their real reply is still there, which is the half the contract
+        // now guarantees: the buyer could add words, never remove them.
+        assert!(
+            inbox.iter().any(|entry| match entry {
+                crate::messaging::MailboxEntry::Readable { content, .. } => {
+                    matches!(content, crate::messaging::MessageContent::Text(t) if t == "yes, ten euro")
+                }
+                _ => false,
+            }),
+            "the seller's own reply was removed from their own mailbox"
         );
+        assert!(seller.unconfirmed_sent(STORE).is_empty());
     }
 }
