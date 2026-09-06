@@ -79,8 +79,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::listing::ListingId;
 
-/// Unique order identifier: the first 16 bytes of a hash of the order's own
-/// TERMS.
+/// Unique order identifier: a hash of the order's own TERMS.
 ///
 /// # Why the identity is the content
 ///
@@ -116,6 +115,17 @@ use crate::listing::ListingId;
 /// field beside -- which is exactly how the old preimage came to omit the
 /// amount and the address. A field added to [`Order`] tomorrow is inside the
 /// preimage without anybody remembering to put it there.
+///
+/// **With one exception, which is the way to break this.** `#[serde(skip)]`
+/// omits a field from `to_cbor` entirely, so it would be outside both this
+/// preimage AND the signature comparison in
+/// [`AuthorizedOrder::verify_terms`] -- a field free to vary under a fixed id
+/// and a valid signature, which is the swap attack again. `serde(default)`
+/// and `skip_serializing_if` are both fine: they still encode when set, so
+/// they are inside the digest. Do not put `#[serde(skip)]` on a field of
+/// [`Order`]. The compiler will not stop you; the guard one level up
+/// (`verify_unused_fields_absent`, which destructures without `..`) covers
+/// `AuthorizedOrder` and not this struct.
 ///
 /// # Why 32 bytes and not 16
 ///

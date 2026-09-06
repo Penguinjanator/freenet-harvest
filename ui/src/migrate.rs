@@ -494,11 +494,11 @@ impl ProbeStateOps for StoreOps {
     }
 
     fn merge_with_local(&self, recovered: Self::State, local: &Self::State) -> Self::State {
-        merge_store(recovered, local, &self.params)
+        merge_store(recovered, local, &self.params, DiscardedSide::LocalSnapshot)
     }
 
     fn merge_generations(&self, newer: Self::State, older: Self::State) -> Self::State {
-        merge_store(newer, &older, &self.params)
+        merge_store(newer, &older, &self.params, DiscardedSide::Predecessor)
     }
 }
 
@@ -564,8 +564,38 @@ pub(crate) struct FoldOutcome<S> {
     pub(crate) discarded: bool,
 }
 
-fn merge_store(base: StoreStateV1, other: &StoreStateV1, params: &StoreParameters) -> StoreStateV1 {
-    merge_store_reporting_discard(base, other, params).state
+/// Which side of a fold `other` is, so a discard is described truthfully.
+///
+/// # Why the message cannot be unconditional
+///
+/// `merge_store_reporting_discard` has two callers and `other` means a
+/// different thing in each: for `merge_generations` it is the PREDECESSOR,
+/// which is what the upgrade wording is written for; for `merge_with_local`
+/// it is this node's own CURRENT-generation snapshot.
+///
+/// Telling a seller that the store already at the new address "was not
+/// carried over when Harvest upgraded" and that they should republish it
+/// would be false, and would send them re-publishing data that is fine.
+/// Reachability is low -- a local snapshot's listings are current-derivation
+/// by construction, so the merge should not refuse them -- but this message
+/// is seen once and then the data is gone, which is the standard that forbids
+/// relying on "should not".
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum DiscardedSide {
+    /// An older generation, refused while being carried forward.
+    Predecessor,
+    /// This node's own snapshot of the current generation, refused while
+    /// being merged with what was recovered.
+    LocalSnapshot,
+}
+
+fn merge_store(
+    base: StoreStateV1,
+    other: &StoreStateV1,
+    params: &StoreParameters,
+    side: DiscardedSide,
+) -> StoreStateV1 {
+    merge_store_reporting_discard(base, other, params, side).state
 }
 
 /// [`merge_store`], saying whether it discarded the predecessor wholesale.
@@ -578,17 +608,18 @@ pub(crate) fn merge_store_reporting_discard(
     base: StoreStateV1,
     other: &StoreStateV1,
     params: &StoreParameters,
+    side: DiscardedSide,
 ) -> FoldOutcome<StoreStateV1> {
     use freenet_scaffold::ComposableState;
     let snapshot = base.clone();
     let outcome = fold_or_keep_primary("store", base, |base| base.merge(&snapshot, params, other));
     if outcome.discarded {
         // Named specifically, and here rather than in `fold_or_keep_primary`,
-        // because this is the only place that still holds the predecessor and
-        // can say WHAT was in it. "Migration incomplete" is not something a
+        // because this is the only place that still holds the refused side
+        // and can say WHAT was in it. "Migration incomplete" is not something a
         // seller can act on; "your store's name and two listings were not
         // carried, republish them" is.
-        record_uncarried(describe_lost_store(other));
+        record_uncarried(describe_lost_store(other, side));
     }
     outcome
 }
@@ -613,7 +644,7 @@ pub(crate) fn merge_store_reporting_discard(
 /// made" and "a thing that happened to you" is carried entirely by this
 /// sentence, so it is asserted rather than left to whoever edits the copy
 /// next.
-fn describe_lost_store(lost: &StoreStateV1) -> String {
+fn describe_lost_store(lost: &StoreStateV1, side: DiscardedSide) -> String {
     let name = lost.info.info.store_name.trim();
     let which = if name.is_empty() {
         "One of your stores".to_string()
@@ -623,21 +654,39 @@ fn describe_lost_store(lost: &StoreStateV1) -> String {
     let listings = lost.listings.listings.len();
     let orders = lost.orders.orders.len();
 
-    let mut said = format!(
-        "{which} was not carried over when Harvest upgraded. This is expected -- an upgrade \
-         moves your store to a new address and this one could not be brought across -- but it \
-         does mean the following is gone: its name, description and seller certificate"
-    );
+    let mut said = match side {
+        DiscardedSide::Predecessor => format!(
+            "{which} was not carried over when Harvest upgraded. This is expected -- an \
+             upgrade moves your store to a new address and this one could not be brought \
+             across -- but it does mean the following is gone: its name, description and \
+             seller certificate"
+        ),
+        // Deliberately different: this store is at the new address and is not
+        // going anywhere. What failed is the merge, not the store, so
+        // "republish it" would send the seller re-publishing data that is
+        // fine.
+        DiscardedSide::LocalSnapshot => format!(
+            "{which} could not be merged with what was recovered from an earlier version of \
+             Harvest. Your store here is intact; what could not be brought in alongside it \
+             is: its name, description and seller certificate"
+        ),
+    };
     if listings > 0 {
         said.push_str(&format!(", {listings} listing(s)"));
     }
     if orders > 0 {
         said.push_str(&format!(", {orders} order(s)"));
     }
-    said.push_str(
-        ". Nothing was recovered and it will not be retried. Publish your store details and \
-         listings again to carry on selling.",
-    );
+    said.push_str(match side {
+        DiscardedSide::Predecessor => {
+            ". Nothing was recovered and it will not be retried. Publish your store details \
+             and listings again to carry on selling."
+        }
+        DiscardedSide::LocalSnapshot => {
+            ". Nothing from the earlier version was recovered and it will not be retried. \
+             Your current store is unaffected."
+        }
+    });
     said
 }
 
@@ -1536,6 +1585,7 @@ mod predecessor_generation_tests {
             StoreStateV1::default(),
             &predecessor,
             &StoreParameters::new(key.verifying_key()),
+            DiscardedSide::Predecessor,
         );
 
         assert!(
@@ -1582,6 +1632,7 @@ mod predecessor_generation_tests {
             StoreStateV1::default(),
             &predecessor,
             &StoreParameters::new(key.verifying_key()),
+            DiscardedSide::Predecessor,
         );
 
         assert!(!outcome.discarded);
@@ -1696,8 +1747,12 @@ mod uncarried_tests {
 
         for (what, predecessor) in cases {
             take_uncarried();
-            let outcome =
-                merge_store_reporting_discard(StoreStateV1::default(), &predecessor, &params);
+            let outcome = merge_store_reporting_discard(
+                StoreStateV1::default(),
+                &predecessor,
+                &params,
+                DiscardedSide::Predecessor,
+            );
 
             assert!(
                 outcome.discarded,
@@ -1790,6 +1845,7 @@ mod uncarried_tests {
             StoreStateV1::default(),
             &predecessor,
             &StoreParameters::new(key.verifying_key()),
+            DiscardedSide::Predecessor,
         );
         assert!(outcome.discarded, "the premise");
 
@@ -1812,6 +1868,53 @@ mod uncarried_tests {
             said.to_lowercase().contains("expected"),
             "and that this was a consequence of the upgrade rather than a fault -- without \
              it the seller goes looking for a bug instead of republishing: {said}"
+        );
+    }
+
+    /// **A refused LOCAL snapshot is not described as an upgrade loss.**
+    ///
+    /// Found in review. `merge_store_reporting_discard` has two callers and
+    /// `other` means a different thing in each: the predecessor for
+    /// `merge_generations`, and this node's own current-generation snapshot
+    /// for `merge_with_local`. The message was unconditional, so on the
+    /// second path a seller would be told the store already at the new
+    /// address "was not carried over when Harvest upgraded" and that they
+    /// should republish it -- false, and it would send them re-publishing
+    /// data that is fine.
+    ///
+    /// Low reachability: a local snapshot's listings are current-derivation
+    /// by construction. That is not a reason to leave it, because this
+    /// message is seen once and then the data is gone.
+    #[test]
+    fn a_refused_local_snapshot_is_described_as_a_failed_merge() {
+        take_uncarried();
+        let key = SigningKey::from_bytes(&[52u8; 32]);
+        let mut local = StoreStateV1::default();
+        local.info.info.store_name = "Alice's Hot Sauce".to_string();
+        local.info.info.version = 1;
+        local.listings.listings = vec![listing_with_a_foreign_id(&key, "Ghost Pepper")];
+
+        let outcome = merge_store_reporting_discard(
+            StoreStateV1::default(),
+            &local,
+            &StoreParameters::new(key.verifying_key()),
+            DiscardedSide::LocalSnapshot,
+        );
+        assert!(outcome.discarded, "the premise");
+
+        let said = take_uncarried().pop().expect("the seller is told");
+        assert!(
+            said.contains("Alice's Hot Sauce"),
+            "it still names the store: {said}"
+        );
+        assert!(
+            !said.contains("was not carried over when Harvest upgraded"),
+            "but not as an upgrade loss -- this store is at the new address: {said}"
+        );
+        assert!(said.contains("intact"), "and it says so: {said}");
+        assert!(
+            !said.to_lowercase().contains("publish your store details"),
+            "and does not send the seller re-publishing data that is fine: {said}"
         );
     }
 
@@ -1857,6 +1960,7 @@ mod uncarried_tests {
             StoreStateV1::default(),
             &predecessor,
             &StoreParameters::new(key.verifying_key()),
+            DiscardedSide::Predecessor,
         );
 
         assert!(!outcome.discarded);

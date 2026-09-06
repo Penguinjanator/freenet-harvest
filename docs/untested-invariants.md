@@ -607,16 +607,20 @@ decisions about whether any published store holds listings worth preserving.
 The asymmetry worth carrying into that decision: an ORDER expiring is fine,
 because orders expire anyway. A LISTING is a seller's shop and does not.
 
-**Two things the round did not close.**
+**One thing the round did not close, and one it did.**
 
-**`OrderId` is 16 bytes, so swapping terms costs a collision rather than
-nothing.** Deriving the id from the terms means an attacker needs two orders
-that hash to one id. Second-preimage against an id a buyer already holds is
-2^128 and out of reach. But the attack only needs a COLLISION between two
-orders the seller chooses, which is ~2^64 -- expensive, no longer free, and not
-zero. Widening `OrderId` to 32 bytes closes it and is a wire change touching
-every order ever published. The buyer-side binding does not help, since the
-seller can put the buyer's binding on both halves of a collision.
+**`OrderId` was 16 bytes, and that is CLOSED.** It is recorded here because
+this section is where a reader looks for open gaps and this one was left
+listed as open after it had been fixed -- which costs the same as overstating
+a gap, since a reader cannot tell which sentence is current.
+
+Deriving the id from the terms means an attacker needs two orders that hash to
+one id. Second-preimage against an id a buyer already holds is 2^128 and out
+of reach, but the swap attack needs only a COLLISION between two orders the
+SELLER chooses, which at 16 bytes was ~2^64. Both ids are now 32 bytes, so it
+is 2^128 either way. See "The id widening, and what it costs at the migration
+boundary" above, and `docs/design/migratability.md` for what the widening cost
+at the re-key.
 
 **One binding per conversation, not per order.** Two orders a buyer places in
 one thread carry the same binding, so the binding does not distinguish them

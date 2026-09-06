@@ -19,7 +19,8 @@ pub struct PriceInfo {
     pub currency: String,
 }
 
-/// Unique listing identifier: first 16 bytes of BLAKE3(fingerprint || timestamp_ms || title).
+/// Unique listing identifier: a hash of the listing's own TERMS.
+///
 /// # Why 32 bytes, and why the reasoning is NOT the order's
 ///
 /// Widened alongside [`crate::payment::OrderId`] while the wire was open, but
@@ -71,7 +72,14 @@ impl ListingId {
     /// a field beside, which is exactly how this preimage came to omit the
     /// price.
     ///
-    /// The same 16-byte birthday residual applies; see that function.
+    /// The same `#[serde(skip)]` exception applies and is the way to break
+    /// it -- a skipped field is outside both this preimage and the signature
+    /// comparison in [`AuthorizedListing::verify`]. See that function's
+    /// counterpart on `OrderId` for the full statement.
+    ///
+    /// Derived the same way and at the same width as
+    /// [`crate::payment::OrderId::from_terms`], which carries the argument
+    /// for both.
     pub fn from_terms(listing: &Listing) -> Self {
         let mut probe = listing.clone();
         probe.id = Self([0u8; 32]);

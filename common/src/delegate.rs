@@ -535,9 +535,14 @@ pub struct RecalledConversation {
     /// filing will need it.
     ///
     /// `serde(default)` so a delegate answer produced before this field
-    /// existed decodes; it comes back as all-zeros, which no honest
-    /// commitment carries, so the buyer's check fails closed rather than
-    /// matching everything.
+    /// existed decodes; it comes back as all-zeros. That is **not** a
+    /// binding, and the reader must not compare it: a seller chooses the
+    /// value they sign, so signing all-zeros would match every conversation
+    /// in that state. The consumer treats it as absent -- see
+    /// `harvest_ui::messaging::BuyerConversation::usable_order_binding` --
+    /// rather than as a value that happens not to collide. An earlier version
+    /// of this comment claimed the opposite, reasoning about an honest
+    /// commitment in a check that exists for a dishonest one.
     #[serde(default)]
     pub order_binding: [u8; 32],
     /// When the buyer opened it, in unix seconds, as they reported it.

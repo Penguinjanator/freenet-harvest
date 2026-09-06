@@ -366,8 +366,9 @@ impl BuyerConversation {
             // The delegate derived this from the secret it kept, which this
             // browser no longer holds -- so it is carried rather than
             // recomputed. A record written before the field existed answers
-            // all-zeros, which no honest commitment carries, so the buyer's
-            // check fails closed.
+            // all-zeros; that is NOT treated as a binding, because a seller
+            // is free to sign all-zeros and would then match every
+            // conversation in that state. See `usable_order_binding`.
             order_binding: recalled.order_binding,
         }
     }
@@ -388,6 +389,32 @@ impl BuyerConversation {
         self.secret
             .expect("a conversation opened in this tab holds its secret")
             .0
+    }
+
+    /// The binding to compare a commitment against, or `None` when this
+    /// conversation has none that identifies anybody.
+    ///
+    /// # All-zeros is not a binding, and treating it as one failed OPEN
+    ///
+    /// [`harvest_common::RecalledConversation::order_binding`] carries
+    /// `#[serde(default)]`, so a delegate answer produced before the field
+    /// existed decodes to all-zeros and arrives here verbatim. The other side
+    /// of the comparison is a field the SELLER chooses and signs -- so a
+    /// seller who signs all-zeros matched every conversation in that state at
+    /// once, which is the one-commitment-many-buyers hole reopened for a
+    /// population.
+    ///
+    /// Three comments in this repository asserted that could not happen, all
+    /// of them reasoning about an *honest* commitment. The threat model is a
+    /// malicious seller, who carries whatever value they like.
+    ///
+    /// So the absence is made explicit at the type rather than left as a
+    /// sentinel value for a caller to remember: a conversation with no usable
+    /// binding cannot match anything, and
+    /// `state::AppState::payment_blockers` refuses rather than comparing.
+    /// Pinned by `a_conversation_with_no_usable_binding_cannot_pay`.
+    pub fn usable_order_binding(&self) -> Option<[u8; 32]> {
+        (self.order_binding != [0u8; 32]).then_some(self.order_binding)
     }
 
     /// Whether this node's delegate has said it is keeping this conversation.

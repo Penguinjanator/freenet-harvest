@@ -970,10 +970,15 @@ pub enum PaymentBlocker {
     /// once. Pinned by
     /// `a_forged_request_cannot_supply_the_binding_the_check_uses`.
     ///
-    /// Covers three cases with one sentence, deliberately: bound to somebody
-    /// else, bound to nothing at all, and (for a conversation recalled from a
-    /// delegate that predates the field) bound to all-zeros. All three mean
-    /// the same thing to the buyer, and none is safe.
+    /// Covers four cases with one sentence, deliberately: bound to somebody
+    /// else, bound to nothing at all, bound to all-zeros, and -- the one a
+    /// review found missing -- this CONVERSATION having no usable binding,
+    /// which a delegate answer predating the field produces. That last case
+    /// used to pass the check, because the seller chooses the value they sign
+    /// and could simply sign all-zeros back. See
+    /// `crate::messaging::BuyerConversation::usable_order_binding`.
+    ///
+    /// All four mean the same thing to the buyer, and none is safe.
     CommitmentNotForThisBuyer,
     /// The commitment names no Bitcoin bridge, so no payment to it could ever
     /// be proven.
@@ -3051,7 +3056,16 @@ impl AppState {
         // business, whatever its listing or anchor says. Compared against
         // what this node derives, never against a value carried in a message
         // -- see `PaymentBlocker::CommitmentNotForThisBuyer`.
-        if commitment.order.order_binding != Some(conversation.order_binding()) {
+        // `usable_order_binding` rather than the raw value: an all-zeros
+        // binding identifies nobody, and comparing it would let a seller who
+        // signs all-zeros match every conversation in that state. A missing
+        // input must not read as a satisfied check -- see
+        // `no_missing_input_reads_as_approval`, which enumerates every other
+        // input to this function against the same question.
+        let Some(expected) = conversation.usable_order_binding() else {
+            return vec![PaymentBlocker::CommitmentNotForThisBuyer];
+        };
+        if commitment.order.order_binding != Some(expected) {
             return vec![PaymentBlocker::CommitmentNotForThisBuyer];
         }
         // What this conversation actually asked about. Empty for a
@@ -11209,6 +11223,204 @@ mod buy_flow_tests {
             state.publish_settled_orders(STORE).is_empty(),
             "a second notification must not send a second update"
         );
+    }
+
+    /// **A conversation with no usable binding cannot pay anything.**
+    ///
+    /// Found in review. `RecalledConversation::order_binding` carries
+    /// `#[serde(default)]` so a delegate answer produced before the field
+    /// existed still decodes -- and it decodes to all-zeros, which
+    /// `BuyerConversation::recalled` carried through verbatim. The commitment
+    /// side of the comparison is a field the SELLER chooses and signs, so a
+    /// seller signing `Some([0u8; 32])` matched every buyer in that state at
+    /// once: H1 again, narrowed to a population rather than closed.
+    ///
+    /// Three comments asserted this could not happen, all reasoning about an
+    /// *honest* commitment. The threat model here is a malicious seller, who
+    /// is free to carry whatever value they like.
+    ///
+    /// Unreachable in a shipped build today -- the delegate WASM is
+    /// `include_bytes!`d into the UI, so a new UI cannot reach an old
+    /// delegate. That is the weakest kind of safe, and it is exactly why this
+    /// is worth closing rather than deleting: the `serde(default)` exists FOR
+    /// the skew case and got the skew case wrong.
+    #[test]
+    fn a_conversation_with_no_usable_binding_cannot_pay() {
+        let (state, live) = buyer_conversation();
+        let tag = live.buyer_public_key;
+        let keys = seller_keys_for(&tag);
+        // Exactly what `RecalledConversation` decodes to from a delegate
+        // built before `order_binding` existed.
+        let legacy =
+            crate::messaging::BuyerConversation::recalled(&harvest_common::RecalledConversation {
+                buyer_public_key: tag,
+                conversation_id: live.conversation_id.0,
+                buyer_to_seller: keys.to_seller,
+                seller_to_buyer: keys.from_seller,
+                order_binding: [0u8; 32],
+                created_at: 0,
+                imported: false,
+                backed_up: false,
+            });
+        assert_eq!(legacy.order_binding(), [0u8; 32], "the premise");
+
+        // The seller signs the matching value, which they are free to do.
+        let published = commitment_bound_to(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+            Some([0u8; 32]),
+        );
+        let state = buyer_holding(state, legacy, &published);
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::CommitmentNotForThisBuyer],
+            "a binding that identifies nobody must not identify everybody"
+        );
+    }
+
+    /// **Every input `payment_blockers` reads either yields a verdict or a
+    /// blocker -- absence never reads as approval.**
+    ///
+    /// The generalisable half of the finding above. That function's entire
+    /// contract is "empty means safe to pay", so a missing input that reads
+    /// as a satisfied check is the one defect shape it cannot tolerate. The
+    /// review found one; this enumerates the rest so the next one is a
+    /// failing test rather than another review round.
+    ///
+    /// Each case removes exactly one input from an otherwise payable
+    /// purchase and asserts SOME blocker comes back. It deliberately does not
+    /// assert WHICH -- the individual blockers have their own tests, and
+    /// pinning the identity here would make this test fail for reasons that
+    /// are not the property it is about.
+    ///
+    /// The one deliberate exception is documented rather than tested as a
+    /// blocker: an empty `requested_listings` does NOT block, because a
+    /// conversation that never used the buy form is a real case (a seller
+    /// invoicing against a plain question). It is safe only because the
+    /// binding check above it already requires the seller to hold a value
+    /// they can only have learned from a request -- so "no request" and "a
+    /// matching binding" cannot both be true. If the binding check is ever
+    /// weakened, that exception stops being safe.
+    #[test]
+    fn no_missing_input_reads_as_approval() {
+        let order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+
+        // The baseline: everything present, nothing standing in the way.
+        let (state, _) = buyer_after_acceptance(&order);
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            Vec::new(),
+            "the baseline must be payable, or the cases below prove nothing"
+        );
+
+        /// One input, and how to take it away.
+        type MissingInput = (&'static str, Box<dyn Fn(&mut AppState)>);
+
+        // Each case names an input and takes it away.
+        let cases: Vec<MissingInput> = vec![
+            (
+                "the published commitment",
+                Box::new(|s: &mut AppState| {
+                    s.browsing_stores
+                        .get_mut(STORE)
+                        .expect("store")
+                        .orders
+                        .clear();
+                }),
+            ),
+            (
+                "the store's identity key",
+                Box::new(|s: &mut AppState| {
+                    s.browsing_stores
+                        .get_mut(STORE)
+                        .expect("store")
+                        .seller_verifying_key = None;
+                }),
+            ),
+            (
+                "this node's view of the chain",
+                Box::new(|s: &mut AppState| s.bitcoin.tips.clear()),
+            ),
+            (
+                "the tip's height",
+                Box::new(|s: &mut AppState| {
+                    for tip in s.bitcoin.tips.values_mut() {
+                        tip.tip_height = None;
+                    }
+                }),
+            ),
+            (
+                "the blocks the anchor is checked against",
+                Box::new(|s: &mut AppState| {
+                    for tip in s.bitcoin.tips.values_mut() {
+                        tip.recent_blocks.clear();
+                    }
+                }),
+            ),
+        ];
+
+        // Safe means EITHER a blocker or no purchase shown at all -- a buyer
+        // shown nothing is a buyer shown no payment address, which is the
+        // property. Asserting a blocker specifically would fail for the cases
+        // where the purchase becomes unreadable, which are safe by a
+        // different route.
+        let refuses = |state: &AppState| {
+            let found = purchases(state);
+            found.is_empty() || found.iter().all(|p| !p.blockers.is_empty())
+        };
+
+        for (what, remove) in cases {
+            let (mut state, _) = buyer_after_acceptance(&order);
+            remove(&mut state);
+            assert!(
+                refuses(&state),
+                "without {what}, the buyer is told it is safe to pay"
+            );
+        }
+
+        // The delegate's confirmation that it is keeping the conversation.
+        // Built through the fixture rather than by swapping the conversation
+        // out, because a fresh one carries a fresh `conversation_id` and the
+        // acceptance then cannot be read at all -- safe, but for the wrong
+        // reason, which would make this case prove nothing.
+        let (not_kept, _) = buyer_after_acceptance_with(&order, false);
+        assert!(
+            refuses(&not_kept),
+            "without the delegate's confirmation, the buyer is told it is safe to pay"
+        );
+
+        // The commitment's own optional fields, taken away one at a time.
+        // These need re-signing, so they do not fit the closure shape above.
+        for (what, mutate) in [
+            (
+                "the block anchor",
+                Box::new(|o: &mut AuthorizedOrder| o.order.anchor = None)
+                    as Box<dyn Fn(&mut AuthorizedOrder)>,
+            ),
+            (
+                "the buyer binding",
+                Box::new(|o: &mut AuthorizedOrder| o.order.order_binding = None),
+            ),
+            (
+                "the trusted bridges",
+                Box::new(|o: &mut AuthorizedOrder| o.order.trusted_bridges.clear()),
+            ),
+        ] {
+            let mut stripped = order.clone();
+            mutate(&mut stripped);
+            let stripped = resigned(stripped, &seller_signing_key());
+            let (state, _) = buyer_after_acceptance(&stripped);
+            assert!(
+                refuses(&state),
+                "without {what}, the buyer is told it is safe to pay"
+            );
+        }
     }
 
     /// **A commitment for something this conversation never asked about is

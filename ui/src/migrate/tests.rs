@@ -1692,6 +1692,7 @@ fn a_wholly_discarded_predecessor_generation_is_reported() {
         StoreStateV1::default(),
         &store_with(&[signed_listing("Alpha")]),
         &store_params(&other_seller),
+        DiscardedSide::Predecessor,
     );
     assert!(
         store.discarded,
@@ -1703,6 +1704,7 @@ fn a_wholly_discarded_predecessor_generation_is_reported() {
         StoreStateV1::default(),
         &store_with(&[signed_listing("Beta")]),
         &store_params(&seller_vk()),
+        DiscardedSide::Predecessor,
     );
     assert!(!ok.discarded, "a successful store fold claims no discard");
 }
