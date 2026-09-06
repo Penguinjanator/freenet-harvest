@@ -28,12 +28,18 @@ These are about the code rather than the mechanism.
 
 - **[migratability.md](migratability.md)** — **a requirement**: a new contract
   version must be migratable from every version that has ever held user data.
-  Read it before changing how any record's identity is derived. It records
-  what such a change cost on `feat/buy-flow` (a seller's entire shop, to a
-  console line, on a migration that then sealed), the re-issue path that would
-  have prevented it and which nobody has built, and why the obvious first idea
-  — accepting the old format in `verify` — is wrong for two independent
-  reasons.
+  Read it before changing how any record's identity is derived, or any
+  parameter struct or state shape.
+
+  The property it protects is that *any UI can migrate a contract*, because
+  new versions accept old state and migration is therefore pure data transfer
+  — so a seller who never opens Harvest again is still carried forward by
+  whoever does. A derivation change breaks that by construction, and the
+  owner-assisted re-issue fallback buys the data back at the price of that
+  property. The document's real argument is the third option: once an app has
+  users, "new accepts old" stops being a preference and becomes a constraint
+  on which bugs are fixable at all. It records what one such change cost here
+  — a seller's entire shop, to a console line, on a migration that sealed.
 - **[migrate-ops-testability.md](migrate-ops-testability.md)** — why nothing
   automated executes `ui/src/gateway/migrate_ops.rs`, what that has cost in
   found-by-hand defects, and a staged plan to fix it. Deferred deliberately,

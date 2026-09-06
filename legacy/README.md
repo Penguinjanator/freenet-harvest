@@ -51,10 +51,11 @@ the split in `ui/src/migrate.rs` is still yours to write.
   also alters how a record's identity or signature preimage is derived, the
   predecessor's records stop verifying and the fold discards that generation
   **in full** -- listings, orders and the store's own details together -- on a
-  migration that then seals. See
-  [`docs/design/migratability.md`](../docs/design/migratability.md) for the
-  requirement, what it cost once, and the re-issue path that would have
-  prevented it.
+  migration that then seals -- and it spends the property that **any UI can
+  migrate a contract**, which holds only while new versions accept old state.
+  See [`docs/design/migratability.md`](../docs/design/migratability.md) for the
+  requirement, what one such change cost, and why the owner-assisted re-issue
+  fallback is an escape hatch rather than the answer.
 * **Verify a hash rather than copying it.** Every hash below was produced by
   hashing the committed artifact out of git history:
   `git show <commit>:ui/public/contracts/<artifact>.wasm | b3sum --no-names`.

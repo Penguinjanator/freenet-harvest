@@ -797,9 +797,12 @@ mod listing_identity_tests {
     /// step, not the first.
     ///
     /// **`docs/design/migratability.md` is the requirement and the procedure.**
-    /// It carries the argument in full, including the re-issue path that would
-    /// let a change like this keep the data, and why accepting the old format
-    /// in `verify` is not the answer.
+    /// The first question it asks is whether the new version can accept old
+    /// state after all, because that is the only option costing nobody
+    /// anything -- and it is what keeps ANY UI able to migrate a contract.
+    /// Owner-assisted re-issue buys the data back and spends that property.
+    /// Accepting the old format in `verify` is not available; the document
+    /// says why, twice over.
     ///
     /// The expected value comes from this crate's own derivation rather than
     /// an outside tool, which is weaker than the `b3sum` known answers in

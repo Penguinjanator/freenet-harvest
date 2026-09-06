@@ -1978,9 +1978,12 @@ mod order_identity_tests {
     /// fold refuses the generation rather than the record.
     ///
     /// **`docs/design/migratability.md` is the requirement and the procedure.**
-    /// It carries the argument in full, including the re-issue path that would
-    /// let a change like this keep the data, and why accepting the old format
-    /// in `verify` is not the answer.
+    /// The first question it asks is whether the new version can accept old
+    /// state after all, because that is the only option costing nobody
+    /// anything -- and it is what keeps ANY UI able to migrate a contract.
+    /// Owner-assisted re-issue buys the data back and spends that property.
+    /// Accepting the old format in `verify` is not available; the document
+    /// says why, twice over.
     #[test]
     fn the_order_id_derivation_is_pinned() {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
