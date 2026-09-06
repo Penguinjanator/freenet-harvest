@@ -200,6 +200,12 @@ pub struct AppState {
     /// delegate never stored.
     pub pending_conversation_persists: std::collections::BTreeMap<u64, (Vec<u8>, [u8; 32])>,
 
+    /// Orders this tab has already published a `Paid` transition for.
+    ///
+    /// In-flight only. See [`AppState::publish_settled_orders`] for why it is
+    /// deliberately not durable.
+    pub settlements_submitted: HashSet<harvest_common::payment::OrderId>,
+
     /// `ForgetBuyerConversation` requests in flight, as request id -> the
     /// store and routing tag asked about.
     ///
@@ -1683,6 +1689,16 @@ impl AppState {
             ) {
                 Ok(addr_state) => {
                     self.apply_address_state(contract_id, network, &addr_state);
+                    // A payment confirming is exactly the moment an order
+                    // becomes provable, and this is the only notification
+                    // that says so -- the store's own state does not change
+                    // when coins arrive. Every store, because the claims that
+                    // just landed do not say which order they settle.
+                    for store_contract_id in
+                        self.browsing_stores.keys().cloned().collect::<Vec<_>>()
+                    {
+                        self.publish_settled_orders(&store_contract_id);
+                    }
                     return;
                 }
                 Err(e) => warn!(
@@ -1780,6 +1796,12 @@ impl AppState {
                     // to see whether the address they are about to pay has
                     // already been paid. Idempotent per tab.
                     self.watch_purchase_addresses(&contract_id);
+
+                    // And publish any order whose payment this node can now
+                    // prove. Here as well as on the address path below,
+                    // because the two arrive independently: the claims may be
+                    // in hand before the order is, or the other way round.
+                    self.publish_settled_orders(&contract_id);
                     return;
                 }
             };
@@ -2712,6 +2734,142 @@ impl AppState {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Every order at this store that this node can now prove was paid, as
+    /// the `Paid` record it would publish.
+    ///
+    /// # Why anything has to do this
+    ///
+    /// `verify_payment_proof`, the bridge-signed claims and the address
+    /// subscription all existed and nothing CONSTRUCTED the proof they
+    /// verify, so an order stayed `AwaitingPayment` however much had been
+    /// paid. That is not only a wrong line on a screen: the published record
+    /// is what every later mechanism reads, and Phase 2's reversal argument
+    /// is arithmetic over an order's status.
+    ///
+    /// # Why the buyer, and why anyone may
+    ///
+    /// `Paid` is authorized by EVIDENCE, not by a signature over the status
+    /// (see `AuthorizedOrder::verify`), so any reader holding the claims can
+    /// publish the transition -- there is nothing here only the seller could
+    /// sign. The buyer is simply the party who cares soonest, and the same
+    /// call serves a seller looking at their own invoices.
+    ///
+    /// # What it will not publish
+    ///
+    /// An order whose status has already moved, and an order whose evidence
+    /// does not carry the transition. The second is the one that matters:
+    /// `assemble_on_chain_proof` verifies before it returns, so a record this
+    /// produces is one the network accepts. Publishing `Paid` on evidence
+    /// that fails verification is a state every peer refuses, and on the
+    /// buyer's screen that looks like the payment never registering.
+    ///
+    /// Returns the records rather than dispatching them, so what would be
+    /// published is decidable without a browser.
+    pub fn settled_orders(
+        &self,
+        store_contract_id: &[u8],
+    ) -> Vec<harvest_common::payment::AuthorizedOrder> {
+        use harvest_common::payment::{assemble_on_chain_proof, OrderStatus};
+
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return Vec::new();
+        };
+        // Not scoped to orders this node is party to, and it does not need to
+        // be: `Paid` is evidence-backed, so publishing a stranger's settled
+        // order would be correct if it happened. It cannot, because
+        // `bitcoin.addresses` only ever holds the addresses
+        // `address_contracts_to_watch` subscribed to, which ARE this node's
+        // own. The scoping is the subscription's, and saying so here is
+        // cheaper than a second copy of the rule that could disagree with it.
+        let mut settled = Vec::new();
+        for order in &store.orders {
+            if order.status != OrderStatus::AwaitingPayment {
+                continue;
+            }
+            let Some(view) = order
+                .order
+                .bitcoin_address_instance_id()
+                .and_then(|id| self.bitcoin.addresses.get(id.as_slice()))
+            else {
+                continue;
+            };
+            let Some(tip) = self
+                .bitcoin
+                .tips
+                .get(&order.order.network)
+                .and_then(|tip| tip.signed_tip.as_ref())
+            else {
+                continue;
+            };
+            // Declines for every ordinary reason -- nothing seen yet, not
+            // deep enough, short of the amount -- which is the common case
+            // and not worth a line anywhere.
+            let Ok(proof) = assemble_on_chain_proof(&order.order, &view.claims, tip) else {
+                continue;
+            };
+            let mut paid = order.clone();
+            paid.status = OrderStatus::Paid;
+            paid.payment_proof = Some(proof);
+            settled.push(paid);
+        }
+        settled
+    }
+
+    /// [`Self::settled_orders`], published.
+    ///
+    /// Each order once per tab. Between dispatching the update and the
+    /// store's state coming back with it applied, every further notification
+    /// would otherwise re-derive the same settlement and send it again -- one
+    /// update per notification per paid order.
+    ///
+    /// The guard is in-flight only and deliberately not durable: after a
+    /// reload the order is either `Paid` in the state that arrives, in which
+    /// case `settled_orders` skips it, or it is not, in which case the
+    /// earlier update did not land and re-sending is exactly right.
+    ///
+    /// Returns what it actually dispatched. Not decoration: the dispatch is
+    /// wasm-gated, so without this a test of the guard can only look at the
+    /// in-flight SET -- and a set is idempotent, so it holds one entry
+    /// whether the guard skipped the second send or not. That test passed
+    /// under a mutation that deleted the guard, which is the
+    /// reports-success-while-measuring-nothing shape this repository is
+    /// built around avoiding.
+    pub fn publish_settled_orders(
+        &mut self,
+        store_contract_id: &[u8],
+    ) -> Vec<harvest_common::payment::AuthorizedOrder> {
+        let mut published = Vec::new();
+        for settled in self.settled_orders(store_contract_id) {
+            if !self.settlements_submitted.insert(settled.order.id.clone()) {
+                continue;
+            }
+            published.push(settled.clone());
+            info!(
+                "Publishing the settled order {} -- the payment verifies",
+                settled.order.id.short()
+            );
+            #[cfg(target_arch = "wasm32")]
+            {
+                let store_id = store_contract_id.to_vec();
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(e) =
+                        crate::gateway::store_ops::submit_order_by_id(&store_id, settled).await
+                    {
+                        dioxus::logger::tracing::error!("Failed to publish a settled order: {e}");
+                        crate::gateway::APP_STATE
+                            .write()
+                            .notifications
+                            .push(format!(
+                                "Your payment was seen on chain, but the order could not be \
+                             updated to say so: {e}"
+                            ));
+                    }
+                });
+            }
+        }
+        published
     }
 
     /// The Bitcoin address contracts this node should be watching for one
@@ -4513,10 +4671,16 @@ impl AppState {
         let view = self.bitcoin.tips.entry(network).or_insert_with(|| TipView {
             network,
             tip_height: None,
+            signed_tip: None,
             last_block_time: None,
             recent_blocks: Vec::new(),
         });
         view.tip_height = state.tip_height();
+        // The signed original, kept alongside the projection: a payment proof
+        // carries one and `tip_height` cannot stand in for it.
+        view.signed_tip = state
+            .tip_height()
+            .and_then(|height| state.blocks.blocks.get(&height).cloned());
         view.last_block_time = last_block_time;
         view.recent_blocks = recent
             .into_iter()
@@ -4609,12 +4773,26 @@ impl AppState {
             .entry(contract_id)
             .or_insert_with(|| AddressView {
                 network,
+                claims: Vec::new(),
                 scanned_to: None,
                 confirmed_sats: 0,
                 pending_sats: 0,
                 txs: Vec::new(),
             });
         view.network = network;
+        // The signed claims themselves, capped at what a proof may carry.
+        // `scanned` watermarks come first: a `ScannedTo` is what lets a
+        // confirmation attest any depth at all, so dropping those to keep
+        // payment claims would leave a proof that cannot reach the order's
+        // `required_confirmations`.
+        view.claims = state
+            .claims
+            .scanned
+            .values()
+            .chain(state.claims.claims.values())
+            .take(harvest_common::payment::MAX_PROOF_CLAIMS)
+            .cloned()
+            .collect();
         view.scanned_to = state.scanned_to();
         view.confirmed_sats = confirmed_sats;
         view.pending_sats = pending_sats;
@@ -4706,6 +4884,7 @@ impl AppState {
         self.bitcoin.tips.entry(network).or_insert_with(|| TipView {
             network,
             tip_height: None,
+            signed_tip: None,
             last_block_time: None,
             recent_blocks: Vec::new(),
         });
@@ -4885,6 +5064,12 @@ impl BitcoinState {
 pub struct TipView {
     pub network: BitcoinNetwork,
     pub tip_height: Option<u32>,
+    /// The tip entry as the bridge signed it.
+    ///
+    /// A payment proof carries one, and it is what the verifier measures
+    /// confirmation depth against. The projected `tip_height` beside it is
+    /// for display and cannot be put in a proof.
+    pub signed_tip: Option<freenet_bitcoin_common::SignedTipEntry>,
     /// Header timestamp (Bitcoin's clock) of the most recent block. Display
     /// only -- e.g. "X minutes ago" computed against the browser's own
     /// clock, never trusted as authoritative.
@@ -4968,6 +5153,20 @@ impl TipView {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AddressView {
     pub network: BitcoinNetwork,
+    /// The bridge-signed claims themselves, not just the balances folded out
+    /// of them.
+    ///
+    /// The projection below is what a screen renders; a payment PROOF needs
+    /// the signed originals, and until this field existed nothing in the app
+    /// held them -- so `verify_payment_proof` and the whole bridge-claim
+    /// machinery had nothing to verify, and an order stayed `AwaitingPayment`
+    /// however much had been paid.
+    ///
+    /// Bounded by [`harvest_common::payment::MAX_PROOF_CLAIMS`], because that
+    /// is the most a proof may carry: keeping more would be keeping what
+    /// cannot be used. An address that exceeds it is left un-provable rather
+    /// than curated, which `assemble_on_chain_proof` reports.
+    pub claims: Vec<freenet_bitcoin_common::SignedClaim>,
     /// The highest height any trusted bridge has scanned this script to.
     /// `None` means "not synchronized yet", distinct from "no activity".
     pub scanned_to: Option<u32>,
@@ -6583,6 +6782,7 @@ mod invoice_tests {
         TipView {
             network: BitcoinNetwork::Signet,
             tip_height: Some(height),
+            signed_tip: None,
             last_block_time: None,
             recent_blocks: (0..RECENT_BLOCKS_KEPT as u32)
                 .map(|back| {
@@ -10705,6 +10905,310 @@ mod buy_flow_tests {
         let (state, _) = buyer_after_acceptance(&published);
 
         assert!(state.address_contracts_to_watch(STORE).is_empty());
+    }
+
+    /// The bridge these settlement fixtures sign with.
+    ///
+    /// The order has to NAME it, because `verify_on_chain_proof` refuses a
+    /// claim from a bridge the order does not trust -- so `a_paid_order`
+    /// re-signs the commitment with this bridge in `trusted_bridges` rather
+    /// than the build's own constant, whose private key nobody here has.
+    fn settling_bridge() -> SigningKey {
+        SigningKey::from_bytes(&[61u8; 32])
+    }
+
+    /// An order naming [`settling_bridge`], the claims that settle it, and a
+    /// tip deep enough for its `required_confirmations`.
+    fn a_paid_order() -> (
+        AuthorizedOrder,
+        Vec<freenet_bitcoin_common::SignedClaim>,
+        freenet_bitcoin_common::SignedTipEntry,
+    ) {
+        use freenet_bitcoin_common::spv::testing::payment_proof;
+        use freenet_bitcoin_common::{
+            BlockHash, ClaimBody, SignedClaim, SignedTipEntry, TipEntryBody,
+        };
+
+        let mut order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        order.order.trusted_bridges = vec![freenet_bitcoin_common::BridgeId(
+            settling_bridge().verifying_key().to_bytes(),
+        )];
+        let order = resigned(order, &seller_signing_key());
+
+        let confirmed_at = TIP_HEIGHT - 1;
+        let (spv, txid, block_hash) = payment_proof(
+            &order.order.payment_script_pubkey,
+            order.order.amount_sats,
+            1,
+            [7u8; 32],
+        );
+        let claim = SignedClaim::sign(
+            &settling_bridge(),
+            &ClaimBody {
+                script_id: order.order.bitcoin_params().script_id(),
+                network: order.order.network,
+                // The bridge has scanned as far as the tip, which is what
+                // lets the confirmation attest any depth at all -- see
+                // `payment::proof_assembly_tests::confirmation`.
+                as_of: freenet_bitcoin_common::BlockAnchor {
+                    height: TIP_HEIGHT,
+                    hash: BlockHash([5u8; 32]),
+                },
+                claim: freenet_bitcoin_common::Claim::ConfirmedOutput {
+                    outpoint: freenet_bitcoin_common::OutPoint { txid, vout: 0 },
+                    value_sats: order.order.amount_sats,
+                    anchor: freenet_bitcoin_common::BlockAnchor {
+                        height: confirmed_at,
+                        hash: block_hash,
+                    },
+                    spv,
+                },
+            },
+        )
+        .expect("sign the claim");
+
+        let tip = SignedTipEntry::sign(
+            &settling_bridge(),
+            &TipEntryBody {
+                network: order.order.network,
+                anchor: anchor(TIP_HEIGHT),
+                prev_hash: BlockHash([8u8; 32]),
+                block_time: 1_700_000_000,
+                tx_count: 1,
+                median_time: 1_700_000_000,
+            },
+        )
+        .expect("sign the tip");
+
+        (order, vec![claim], tip)
+    }
+
+    /// The same claim shape as [`a_paid_order`], one satoshi short.
+    ///
+    /// A genuine, verifying, bridge-signed claim about this order's own
+    /// script -- so it reaches the assembler's verify rather than being
+    /// filtered out before it.
+    fn an_underpayment(order: &AuthorizedOrder) -> Vec<freenet_bitcoin_common::SignedClaim> {
+        use freenet_bitcoin_common::spv::testing::payment_proof;
+        use freenet_bitcoin_common::{BlockHash, ClaimBody, SignedClaim};
+
+        let short = order.order.amount_sats - 1;
+        let (spv, txid, block_hash) =
+            payment_proof(&order.order.payment_script_pubkey, short, 1, [7u8; 32]);
+        vec![SignedClaim::sign(
+            &settling_bridge(),
+            &ClaimBody {
+                script_id: order.order.bitcoin_params().script_id(),
+                network: order.order.network,
+                as_of: freenet_bitcoin_common::BlockAnchor {
+                    height: TIP_HEIGHT,
+                    hash: BlockHash([5u8; 32]),
+                },
+                claim: freenet_bitcoin_common::Claim::ConfirmedOutput {
+                    outpoint: freenet_bitcoin_common::OutPoint { txid, vout: 0 },
+                    value_sats: short,
+                    anchor: freenet_bitcoin_common::BlockAnchor {
+                        height: TIP_HEIGHT - 1,
+                        hash: block_hash,
+                    },
+                    spv,
+                },
+            },
+        )
+        .expect("sign")]
+    }
+
+    /// Put the chain material where a subscription would have put it.
+    fn give_the_node_the_chain(
+        state: &mut AppState,
+        order: &AuthorizedOrder,
+        claims: Vec<freenet_bitcoin_common::SignedClaim>,
+        tip: freenet_bitcoin_common::SignedTipEntry,
+    ) {
+        let mut view = tip_at(TIP_HEIGHT);
+        view.signed_tip = Some(tip);
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, view);
+        state.bitcoin.addresses.insert(
+            order
+                .order
+                .bitcoin_address_instance_id()
+                .expect("the fixture names a build")
+                .to_vec(),
+            AddressView {
+                network: BitcoinNetwork::Signet,
+                claims,
+                scanned_to: Some(TIP_HEIGHT),
+                confirmed_sats: order.order.amount_sats,
+                pending_sats: 0,
+                txs: Vec::new(),
+            },
+        );
+    }
+
+    /// **A buyer whose payment has confirmed publishes the settled order.**
+    ///
+    /// The gap this closes: `verify_payment_proof`, the bridge claims and the
+    /// address subscription all existed, and nothing constructed the proof --
+    /// so an order sat `AwaitingPayment` forever however much had been paid,
+    /// and the public record permanently misstated what happened. Every later
+    /// mechanism reads that record; Phase 2's reversal argument is arithmetic
+    /// over it.
+    #[test]
+    fn a_confirmed_payment_produces_a_paid_order_to_publish() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+
+        let settled = state
+            .settled_orders(STORE)
+            .pop()
+            .expect("a confirmed payment settles the order");
+
+        assert_eq!(settled.order.id, order.order.id);
+        assert_eq!(settled.status, OrderStatus::Paid);
+        assert!(settled.payment_proof.is_some());
+        // And it is a record the network will actually accept.
+        settled
+            .verify(&seller_signing_key().verifying_key())
+            .expect("a settled order must verify as Paid");
+    }
+
+    /// **An order whose payment has not confirmed is not settled.**
+    ///
+    /// Two cases, and the second is the one that would otherwise go
+    /// untested here. Nothing seen at all takes the assembler's early
+    /// refusal; a claim that exists but does not carry the transition takes
+    /// the verify. An earlier version of this test covered only the first,
+    /// so deleting the assembler's `verify_payment_proof` call left it green
+    /// -- the guard is pinned in
+    /// `harvest_common::payment::proof_assembly_tests`, and this is the same
+    /// question asked through the state that actually publishes.
+    ///
+    /// Publishing `Paid` on evidence that does not carry it is a state every
+    /// peer refuses, which on the buyer's screen looks like the payment
+    /// never registering.
+    #[test]
+    fn an_unpaid_order_is_not_settled() {
+        let (order, claims, tip) = a_paid_order();
+
+        // Nothing seen at all.
+        let (mut nothing_seen, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut nothing_seen, &order, Vec::new(), tip.clone());
+        assert!(nothing_seen.settled_orders(STORE).is_empty());
+
+        // Seen, and short of the amount: the claims verify, and what they
+        // attest is not this order being paid.
+        let underpaid = an_underpayment(&order);
+        assert_eq!(claims.len(), underpaid.len(), "the same shape of evidence");
+        let (mut short, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut short, &order, underpaid, tip);
+        assert!(
+            short.settled_orders(STORE).is_empty(),
+            "an underpayment is not a payment"
+        );
+    }
+
+    /// **An order already past `AwaitingPayment` is not settled again.**
+    ///
+    /// Status is a monotonic maximum under merge, so re-publishing is inert
+    /// rather than harmful -- but it is an update per state arrival for an
+    /// order that has already moved, which is exactly the churn the
+    /// subscription path exists to avoid.
+    #[test]
+    fn an_order_that_has_already_moved_is_not_settled_again() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+
+        // Publish the settled form back into the store's state, as the
+        // network would once the update lands.
+        let settled = state.settled_orders(STORE).pop().expect("settles once");
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .orders = vec![settled];
+
+        assert!(
+            state.settled_orders(STORE).is_empty(),
+            "an order that is already Paid has nothing left to settle"
+        );
+    }
+
+    /// **Settling an order does not stop the node keeping the conversation.**
+    ///
+    /// The ordering constraint from `docs/buyer-conversation-persistence.md`,
+    /// checked at the moment it would be easiest to break: "paid" is exactly
+    /// when a buyer's software might conclude the transaction is over and the
+    /// conversation record no longer matters. In Phase 2 the confession lives
+    /// in that record and has to be persisted BEFORE payment, so treating
+    /// payment as a reason to stop caring about it inverts the whole
+    /// argument.
+    #[test]
+    fn settling_leaves_the_conversation_record_alone() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, tag) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+
+        let settled = state.settled_orders(STORE).pop().expect("settles");
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .orders = vec![settled];
+
+        let store = &state.browsing_stores[STORE];
+        assert_eq!(
+            store.conversations.len(),
+            1,
+            "the conversation is still kept after payment"
+        );
+        assert_eq!(store.conversations[0].buyer_public_key, tag);
+        assert!(
+            store.conversations[0].is_kept(),
+            "and the node has not forgotten it is keeping it"
+        );
+        // The purchase is still shown, now as one there is nothing to pay.
+        assert_eq!(
+            state.buyer_purchases(STORE)[0].blockers,
+            vec![PaymentBlocker::NotAwaitingPayment(OrderStatus::Paid)]
+        );
+    }
+
+    /// **A settlement is published once, not once per notification.**
+    ///
+    /// Between dispatching the update and the store's state coming back with
+    /// it applied, `settled_orders` keeps answering the same order -- the
+    /// state it reads has not changed yet. Without the guard that is one
+    /// update per notification per paid order, against a contract, forever.
+    #[test]
+    fn a_settlement_is_published_once_per_tab() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+
+        assert_eq!(
+            state.settled_orders(STORE).len(),
+            1,
+            "the order is settleable"
+        );
+        assert_eq!(
+            state.publish_settled_orders(STORE).len(),
+            1,
+            "and was published once"
+        );
+
+        // The store's state has not come back yet, so it is still settleable
+        // -- and must not be published again.
+        assert_eq!(state.settled_orders(STORE).len(), 1);
+        assert!(
+            state.publish_settled_orders(STORE).is_empty(),
+            "a second notification must not send a second update"
+        );
     }
 
     /// **A commitment for something this conversation never asked about is

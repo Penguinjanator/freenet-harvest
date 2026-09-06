@@ -784,6 +784,84 @@ impl std::fmt::Display for ProofError {
 /// of its arguments: no clock, no network, no ambient state. Everything it
 /// needs is either in the order or in the proof — including which bridges to
 /// believe, which the seller fixed when they signed the order.
+/// Build the on-chain proof that settles `order`, out of the claims a node
+/// holds for its payment address and the chain tip it can see.
+///
+/// # Why this exists at all
+///
+/// The verifier, the bridge-signed claims and the fold were all here; nothing
+/// CONSTRUCTED the thing they verify. So an order stayed `AwaitingPayment`
+/// forever however much had been paid, and the public record permanently
+/// misstated what happened -- which matters beyond the buyer's screen,
+/// because every later mechanism reads that record and Phase 2's whole
+/// argument is arithmetic over an order's status.
+///
+/// # It verifies before it returns, and that is the contract
+///
+/// An order published as `Paid` carrying a proof that does not verify is a
+/// state every peer refuses. On the buyer's screen that looks like the
+/// payment simply not registering, with nothing anywhere saying why. So this
+/// returns the verifier's own complaint instead, and a caller that gets `Ok`
+/// has something the network will accept.
+///
+/// # What it selects, and what it refuses
+///
+/// Claims about THIS order's script, and no others: a foreign claim makes
+/// `verify_on_chain_proof` refuse the whole proof, so including one would
+/// turn a provable payment into an unprovable one.
+///
+/// Beyond [`MAX_PROOF_CLAIMS`] it refuses rather than truncating. Dropping
+/// the excess would be curating which of a bridge's claims the network sees
+/// -- the omission [`OnChainPaymentProof`] documents as undetectable
+/// downstream -- and doing it on the buyer's behalf, in the buyer's favour.
+/// Refusing says so.
+///
+/// # What it does NOT establish
+///
+/// That the claims it was handed are the complete history. They are whatever
+/// the node's subscription to the address contract has delivered, and a
+/// retraction that has not arrived is invisible here exactly as it is to the
+/// verifier. See [`OnChainPaymentProof`]'s doc comment; this function inherits
+/// that gap whole and does not widen it.
+pub fn assemble_on_chain_proof(
+    order: &Order,
+    claims: &[SignedClaim],
+    tip: &SignedTipEntry,
+) -> Result<OrderPaymentProof, String> {
+    let expected_script = order.bitcoin_params().script_id();
+    // Filtered on the SIGNED body rather than on anything a caller says about
+    // the claim, so a claim that does not verify is dropped here rather than
+    // poisoning the proof.
+    let addr_params = order.bitcoin_params();
+    let mine: Vec<SignedClaim> = claims
+        .iter()
+        .filter(|claim| {
+            claim
+                .verify(&addr_params)
+                .is_ok_and(|body| body.script_id == expected_script)
+        })
+        .cloned()
+        .collect();
+
+    if mine.is_empty() {
+        return Err(
+            "no bridge has published anything about this order's payment address yet".to_string(),
+        );
+    }
+    let distinct = distinct_claims(&mine).len();
+    if distinct > MAX_PROOF_CLAIMS {
+        return Err(format!(
+            "this address has {distinct} distinct claims and a payment proof may carry \
+             {MAX_PROOF_CLAIMS}; a proof cannot be assembled without leaving some out, which \
+             would be choosing what the network gets to see"
+        ));
+    }
+
+    let proof = OrderPaymentProof::on_chain(mine, tip.clone());
+    verify_payment_proof(order, &proof).map_err(|e| e.to_string())?;
+    Ok(proof)
+}
+
 pub fn verify_payment_proof(order: &Order, proof: &OrderPaymentProof) -> Result<u64, ProofError> {
     match proof {
         OrderPaymentProof::OnChain(p) => verify_on_chain_proof(order, p),
@@ -2042,6 +2120,217 @@ mod address_instance_tests {
         assert_eq!(
             order.bitcoin_address_instance_id(),
             Some(*hasher.finalize().as_bytes())
+        );
+    }
+}
+
+#[cfg(test)]
+mod proof_assembly_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use freenet_bitcoin_common::spv::testing::payment_proof;
+    use freenet_bitcoin_common::{BlockHash, ClaimBody, SignedTipEntry, TipEntryBody};
+
+    fn bridge() -> SigningKey {
+        SigningKey::from_bytes(&[61u8; 32])
+    }
+
+    fn order_for(amount_sats: u64, required_confirmations: u32) -> Order {
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        Order {
+            id: OrderId([0u8; 32]),
+            listing_id: ListingId([1u8; 32]),
+            buyer_fingerprint: String::new(),
+            seller_fingerprint: "seller-fp".to_string(),
+            amount_sats,
+            network: BitcoinNetwork::Signet,
+            payment_script_pubkey: vec![0x00, 0x14, 0xaa, 0xbb],
+            payment_address: "tb1qexample".to_string(),
+            required_confirmations,
+            payment_hash: None,
+            trusted_bridges: vec![BridgeId(bridge().verifying_key().to_bytes())],
+            bitcoin_address_code_hash: Some([4u8; 32]),
+            anchor: None,
+            order_binding: None,
+            created_at,
+        }
+        .with_derived_id()
+    }
+
+    /// One bridge-signed confirmation of `value_sats` to this order's script,
+    /// included at `confirmed_at` and attested by a bridge that has scanned
+    /// as far as `scanned_to`.
+    ///
+    /// # The two heights are not the same thing, and it took a red test to
+    /// see it
+    ///
+    /// The depth a claim attests is capped by the BRIDGE's own watermark
+    /// (`as_of`), not by the chain tip: a bridge that has only scanned to the
+    /// block a payment landed in is attesting one confirmation, however high
+    /// the tip has since climbed. That is deliberate upstream -- otherwise a
+    /// submitter could pair a pre-reorg confirmation with a fresh tip and
+    /// claim any depth they liked.
+    ///
+    /// A fixture that moved only the tip therefore reported "1 confirmation"
+    /// forever, which is what the first version of the depth test did.
+    fn confirmation(
+        order: &Order,
+        value_sats: u64,
+        confirmed_at: u32,
+        scanned_to: u32,
+    ) -> SignedClaim {
+        let (spv, txid, block_hash) =
+            payment_proof(&order.payment_script_pubkey, value_sats, 1, [7u8; 32]);
+        SignedClaim::sign(
+            &bridge(),
+            &ClaimBody {
+                script_id: order.bitcoin_params().script_id(),
+                network: order.network,
+                as_of: BlockAnchor {
+                    height: scanned_to,
+                    hash: BlockHash([5u8; 32]),
+                },
+                claim: Claim::ConfirmedOutput {
+                    outpoint: freenet_bitcoin_common::OutPoint { txid, vout: 0 },
+                    value_sats,
+                    anchor: BlockAnchor {
+                        height: confirmed_at,
+                        hash: block_hash,
+                    },
+                    spv,
+                },
+            },
+        )
+        .expect("sign")
+    }
+
+    fn tip_at(order: &Order, height: u32) -> SignedTipEntry {
+        SignedTipEntry::sign(
+            &bridge(),
+            &TipEntryBody {
+                network: order.network,
+                anchor: BlockAnchor {
+                    height,
+                    hash: BlockHash([9u8; 32]),
+                },
+                prev_hash: BlockHash([8u8; 32]),
+                block_time: 1_700_000_000,
+                tx_count: 1,
+                median_time: 1_700_000_000,
+            },
+        )
+        .expect("sign")
+    }
+
+    /// **A confirmed payment assembles into a proof that verifies.**
+    ///
+    /// The whole point: `verify_payment_proof` and the bridge claims existed
+    /// already, and nothing constructed the thing they verify -- so a
+    /// published order sat `AwaitingPayment` forever however much had been
+    /// paid, and the public record permanently misstated what happened.
+    #[test]
+    fn a_confirmed_payment_assembles_into_a_proof_that_verifies() {
+        let order = order_for(50_000, 1);
+        let claims = vec![confirmation(&order, 50_000, 100, 100)];
+
+        let proof = assemble_on_chain_proof(&order, &claims, &tip_at(&order, 100))
+            .expect("a confirmed payment of the full amount must assemble");
+
+        assert_eq!(
+            verify_payment_proof(&order, &proof).expect("and must verify"),
+            50_000
+        );
+    }
+
+    /// **The assembler verifies before it returns, so a caller cannot publish
+    /// a proof that will be refused.**
+    ///
+    /// Asserted through the cases a caller would otherwise have to know to
+    /// check for itself. Each is the assembler declining rather than handing
+    /// back something the contract rejects -- an order published as `Paid`
+    /// with a proof that does not verify is a state every peer refuses, which
+    /// on the buyer's screen looks like the payment simply not registering.
+    #[test]
+    fn the_assembler_declines_what_would_not_verify() {
+        let order = order_for(50_000, 6);
+
+        // Nothing seen at all.
+        assert!(assemble_on_chain_proof(&order, &[], &tip_at(&order, 100)).is_err());
+
+        // Seen, but the bridge has not scanned deep enough to attest the six
+        // confirmations this order asks for.
+        let shallow = vec![confirmation(&order, 50_000, 100, 102)];
+        assert!(
+            assemble_on_chain_proof(&order, &shallow, &tip_at(&order, 102)).is_err(),
+            "three confirmations is not the six this order asks for"
+        );
+        // The same payment, once the bridge has scanned on.
+        let deep = vec![confirmation(&order, 50_000, 100, 105)];
+        assert!(assemble_on_chain_proof(&order, &deep, &tip_at(&order, 105)).is_ok());
+
+        // Deep enough, but short of the amount.
+        let short = vec![confirmation(&order, 49_999, 100, 105)];
+        assert!(
+            assemble_on_chain_proof(&order, &short, &tip_at(&order, 105)).is_err(),
+            "an underpayment is not a payment"
+        );
+    }
+
+    /// **A claim about somebody else's address is not carried into the
+    /// proof.**
+    ///
+    /// The claims a node holds come from whatever address contracts it has
+    /// subscribed to, and there is no reason a caller cannot hand over the
+    /// wrong set. `verify_on_chain_proof` refuses a foreign claim outright --
+    /// so including one would turn a perfectly provable payment into an
+    /// unprovable one, which is the failure a buyer could not diagnose.
+    #[test]
+    fn a_claim_about_another_address_is_left_out() {
+        let order = order_for(50_000, 1);
+        let mut elsewhere = order_for(50_000, 1);
+        elsewhere.payment_script_pubkey = vec![0x00, 0x14, 0xcc, 0xdd];
+        let elsewhere = elsewhere.with_derived_id();
+
+        let claims = vec![
+            confirmation(&elsewhere, 50_000, 100, 100),
+            confirmation(&order, 50_000, 100, 100),
+        ];
+
+        let proof = assemble_on_chain_proof(&order, &claims, &tip_at(&order, 100))
+            .expect("the order's own claim is enough");
+        match &proof {
+            OrderPaymentProof::OnChain(on_chain) => assert_eq!(
+                on_chain.claims.len(),
+                1,
+                "only the claim about this order's script belongs in its proof"
+            ),
+            other => panic!("expected an on-chain proof, got {other:?}"),
+        }
+    }
+
+    /// **More claims than a proof may carry is refused, not truncated.**
+    ///
+    /// [`MAX_PROOF_CLAIMS`] is what the verifier will accept. Silently
+    /// dropping the excess would be choosing which of a bridge's claims the
+    /// network gets to see -- the curation the `OnChainPaymentProof` doc
+    /// comment says nothing downstream can detect -- and choosing it on a
+    /// buyer's behalf, in their own favour. Refusing says so instead.
+    ///
+    /// The fixture is sized from the constant, so raising the cap moves the
+    /// test with it.
+    #[test]
+    fn more_claims_than_a_proof_may_carry_is_refused() {
+        let order = order_for(50_000, 1);
+        let claims: Vec<SignedClaim> = (0..=MAX_PROOF_CLAIMS)
+            .map(|i| confirmation(&order, 50_000 + i as u64, 100, 100))
+            .collect();
+        assert!(claims.len() > MAX_PROOF_CLAIMS);
+
+        let refused = assemble_on_chain_proof(&order, &claims, &tip_at(&order, 100))
+            .expect_err("more claims than the verifier accepts must be refused");
+        assert!(
+            refused.contains("claims"),
+            "the refusal should name what is wrong: {refused}"
         );
     }
 }

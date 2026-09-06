@@ -629,25 +629,75 @@ that the buyer's OWN commitment is published, which is the half that forces
 the seller to publish at all, and stops there. There is no bond to count
 against yet, which is why this is Phase 2 rather than a defect.
 
+#### The payment proof: what now takes over after payment, and what still does not
+
+The gap this document recorded twice -- "nothing takes over after payment" --
+is closed for the transition itself. `harvest_common::payment::
+assemble_on_chain_proof` builds the proof out of the claims a node holds and
+the tip it can see, and `AppState::settled_orders` publishes the `Paid`
+record.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `assemble_on_chain_proof` | A confirmed payment assembles into a proof the verifier accepts. | **Yes** -- `proof_assembly_tests`, built on GENUINE bridge-signed claims and SPV proofs (`freenet_bitcoin_common::spv::testing`, added to `harvest-ui`'s dev-dependencies for the same reason `harvest-common` takes it). Not stubs: the thing being tested is whether real evidence verifies. |
+| same | It verifies before returning, so a caller cannot publish a proof the network refuses. | **Yes** -- `the_assembler_declines_what_would_not_verify`, mutated red by deleting the `verify_payment_proof` call. Also caught on the state side by `an_unpaid_order_is_not_settled`, but only after that test was fixed: see below. |
+| same | A claim about another address is left out, and more claims than a proof may carry is refused rather than truncated. | **Yes** -- two tests. The refusal matters more than it looks: silently dropping the excess would be curating which of a bridge's claims the network sees, which `OnChainPaymentProof` documents as undetectable downstream, and doing it in the buyer's favour. |
+| `AppState::settled_orders` | An order already past `AwaitingPayment` is not settled again. | **Yes** -- mutated red by deleting the status guard. |
+| `AppState::publish_settled_orders` | A settlement is dispatched once per tab, not once per notification. | **Yes, after a correction.** See below. |
+| same, dispatch | The update reaches the contract. | **No.** Wasm-gated `spawn_local`, like every send here. What is tested is which records it would publish. |
+| the ordering constraint from `buyer-conversation-persistence.md` | Settling does not stop the node keeping the conversation. | **Yes** -- `settling_leaves_the_conversation_record_alone`, which checks the conversation is still held and still marked kept after the order goes `Paid`. Payment is exactly the moment a buyer's software might conclude the transaction is over; in Phase 2 the confession lives in that record and must be persisted BEFORE payment, so treating payment as a reason to stop caring about it inverts the argument. |
+
+**Two of these tests initially reported success while measuring nothing, and
+both were found by mutation rather than by reading.** Recorded because the
+second is the exact shape this document exists for.
+
+* `an_unpaid_order_is_not_settled` passed a claim set that was EMPTY, so it
+  took the assembler's early "nothing seen" refusal and never reached the
+  verify. Deleting `verify_payment_proof` from the assembler left it green. It
+  now also drives a genuine, verifying, correctly-scripted claim that is one
+  satoshi short -- evidence that exists and does not carry the transition.
+* `a_settlement_is_published_once_per_tab` asserted on the length of the
+  in-flight `settlements_submitted` SET. A set insert is idempotent, so the
+  length was one whether the guard skipped the second send or not; deleting
+  the guard left it green. `publish_settled_orders` now returns what it
+  actually dispatched, and the test counts that. **The dispatch being
+  wasm-gated is what made the wrong thing the only observable thing** -- which
+  is the general trap, not a detail of this test.
+
+**What still does not happen.** Nothing constructs a `PaymentReversed`
+transition, so a reorg that undoes a settled payment leaves the order reading
+`Paid`. The evidence rule for it is stricter than for `Paid` -- a reversal has
+to show confirmations that were themselves retracted -- and the claims to do
+it arrive by the same subscription, so the shape is available; it is simply
+not built. `Paid` is the transition the buy flow needs and the one that was
+missing.
+
 #### And one thing the buy flow does not do at all
 
-**It does not send money, and nothing takes over once it is sent.** Step 5 of
-the design is a person opening a wallet. Harvest shows the address and the
-amount once the checks pass, and stops.
+**It does not send money.** Step 5 of the design is a person opening a wallet.
+Harvest shows the address and the amount once the checks pass, watches the
+address, and publishes the settled order once the payment verifies -- but the
+paying itself is a person and a wallet, and nothing here moves coin.
+
+An earlier version of this paragraph said "nothing takes over once it is
+sent", which was true when written and is no longer. What was missing then,
+and is recorded above now:
 
 An earlier version of this paragraph said "the existing on-chain verification
 path takes over from there", which review showed was false in both halves, in
 a document whose whole purpose is not claiming more than the code does:
 
-* **No watch is registered.** `live_address_for_order` resolved only through
+* **No watch is registered.** *(Closed.)* `live_address_for_order` resolved only through
   `bitcoin.watches`, and the only thing that creates one is the manual "Watch
   address" form. So `live` was `None` for every purchase and the card read
   "Awaiting payment" however much had arrived. **Closed** -- the lookup now
   derives the address contract from the order's own signed terms and the buy
   flow subscribes to it; see the round-2 section above.
-* **Nothing constructs an `OrderPaymentProof`.** Every `payment_proof` site in
-  `ui/` is `None`, so a published order never advances to `Paid` and
-  `NotAwaitingPayment` never fires for a real settlement.
+* **Nothing constructs an `OrderPaymentProof`.** *(Closed.)* Every
+  `payment_proof` site in `ui/` was `None`, so a published order never
+  advanced to `Paid` and `NotAwaitingPayment` never fired for a real
+  settlement. `assemble_on_chain_proof` and `settled_orders` are what changed
+  it; `PaymentReversed` is still unbuilt.
 
 The verification machinery exists and is tested (`verify_payment_proof`, the
 bridge claims, the fold); what does not exist is anything in the buy flow that

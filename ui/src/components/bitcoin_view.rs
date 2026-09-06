@@ -1048,6 +1048,7 @@ mod live_address_tests {
     fn a_view(confirmed_sats: u64) -> AddressView {
         AddressView {
             network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+            claims: Vec::new(),
             scanned_to: Some(800_000),
             confirmed_sats,
             pending_sats: 0,
