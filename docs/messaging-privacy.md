@@ -153,23 +153,29 @@ Four consequences, all deliberate:
   **This is not "a message can never be removed", and the difference matters
   for Phase 2.** A funded flood still evicts it: 512 entries dated later fill
   the count cap and take every honest message with them, measured at about
-  122 KiB in a single update -- or, more cheaply, 64 maximum-size entries
-  filling the byte budget, also in a single update — see `known_gap_a_funded_flood_still_evicts_every_honest_message`
+  122 KiB in a single update — see `known_gap_a_funded_flood_still_evicts_every_honest_message`
   and "The flood, and what bounds it" below. What changed is that retraction
   went from **free, targeted and silent** (one message's worth of bytes, aimed
   at one entry, leaving no trace) to **expensive, indiscriminate and loud** (a
   full cap's worth of bytes, destroying the seller's whole mailbox with it,
   which for a bonded seller is self-incriminating).
 
-  **"Loud" was overstated, and the correction matters for Phase 2.** The count
-  route is about 122 KiB across 512 entries; the BYTE route needs only **64**
-  maximum-size entries, and either way `apply_delta` merges a whole
-  `MailboxDelta` in ONE update, so there is no partially-completed flood for
-  anyone to observe
-  (`known_gap_the_byte_route_evicts_in_one_update_and_costs_fewer_entries`).
-  What is loud is the aftermath -- the seller's own mailbox is destroyed, which
-  for a bonded seller is self-incriminating -- not the act. Nothing is
-  interruptible.
+  **"Loud" was overstated, and the correction matters for Phase 2.**
+  `apply_delta` merges a whole `MailboxDelta`, so the flood is ONE update and
+  there is no partially-completed state for anyone to observe. What is loud is
+  the aftermath -- the seller's own mailbox is destroyed, which for a bonded
+  seller is self-incriminating -- not the act. Nothing is interruptible, so
+  there is no window a quick client could win.
+
+  A second correction, in the other direction: the byte-budget route was
+  briefly measured as a cheaper way to the same result (64 maximum-size entries
+  rather than 512 small ones). It is not one any more. `enforce_message_cap`
+  now SKIPS a message that will not fit instead of stopping at it -- changed
+  for an unrelated reason, to restore the migration fold's order-invariance --
+  and a small honest message consequently survives in the gap a flood of
+  maximum-size entries leaves
+  (`the_byte_route_no_longer_evicts_a_small_honest_message`). The count route
+  still works and is cheaper anyway, so the flood is narrowed, not closed.
 
   A buyer's recourse must survive a seller willing to spend that, so the
   confession needs a home outside the mailbox. **That is now settled** (Ian,

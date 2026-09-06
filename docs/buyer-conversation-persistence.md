@@ -536,21 +536,28 @@ Two things make this the right home rather than a workaround:
 
 **An earlier version of this section argued that storing-on-receipt is
 sufficient because a flood "needs 512 entries, not a single well-timed write".
-That was wrong on both halves, and it is worth keeping the correction because
-the right answer is better than the wrong one.**
-
-Measured, in `known_gap_the_byte_route_evicts_in_one_update_and_costs_fewer_entries`:
-
-* `MAX_MAILBOX_BYTES` binds before `MAX_MESSAGES` for large entries, so the
-  cheaper route is **64** maximum-size entries, not 512;
-* a `MailboxDelta` is a bare `Vec` and `apply_delta` merges the whole of it, so
-  **either route is a SINGLE update**. There is no partially-completed flood
-  for anyone to notice, and nothing to be quick enough for.
+The second half was wrong, and it was the load-bearing half.** A `MailboxDelta`
+is a bare `Vec` and `apply_delta` merges the whole of it, so **a flood is a
+SINGLE update** (`known_gap_a_funded_flood_still_evicts_every_honest_message`).
+There is no partially-completed flood for anyone to notice and nothing to be
+quick enough for, so an argument resting on the buyer winning a race was
+resting on a race that does not exist in the shape it assumed.
 
 So storing-on-receipt narrows the window -- from unbounded and at the seller's
 convenience down to whatever a local delegate write takes -- but it does not
 eliminate it. A narrower race is still a race, and "the buyer has recourse" is
 not a claim that should rest on one.
+
+*A footnote, because it changed twice in one day and someone will otherwise
+re-derive it:* the byte-budget route was briefly measured as a cheaper path,
+64 maximum-size entries rather than 512 small ones. It is not one any more.
+`enforce_message_cap` now skips a message that will not fit rather than
+stopping at it -- changed to restore the migration fold's order-invariance, not
+for this -- and a small honest message therefore survives in the gap a
+maximum-size flood leaves (`the_byte_route_no_longer_evicts_a_small_honest_message`).
+The count route still works, is cheaper anyway at about 122 KiB, and is still
+one update. **None of that changes the argument below**, which depends only on
+the flood being one update, and would hold even if every route were closed.
 
 **What eliminates it is the order of the buy flow, not the speed of the
 write.** In the incentive design the confession arrives with the invoice at

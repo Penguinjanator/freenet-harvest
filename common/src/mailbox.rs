@@ -648,25 +648,49 @@ fn dedupe_identical_entries(messages: &mut Vec<EncryptedMessage>) {
 /// mailbox carrying only honest traffic behaving as a recency window, which is
 /// what the age-based rule it replaces was for.
 ///
-/// # Why both caps are one pass, and why the kept set is a PREFIX
+/// # Why both caps are one pass, and why the walk SKIPS rather than stopping
 ///
-/// The kept set is the longest prefix of that ranking which satisfies both
-/// budgets: the walk stops at the first message that does not fit rather than
-/// skipping it and trying smaller ones behind it. Packing greedily would keep
-/// more bytes, and it would also mean a lower-ranked message could survive
-/// while a higher-ranked one was dropped -- a rule that is still
-/// deterministic, but whose convergence argument is a bin-packing walk rather
-/// than "both peers keep the same prefix of the same total order". The
-/// simpler argument is worth more here than the extra bytes, because
-/// divergence in this function is silent and permanent.
+/// The walk takes messages in rank order and skips any that will not fit,
+/// continuing to the next. **This was a prefix walk -- stopping at the first
+/// message that did not fit -- until 2026-09-05, and the prefix rule was
+/// wrong.** The argument for it was that "both peers keep the same prefix of
+/// the same total order" is a simpler convergence story than a greedy pack,
+/// and that the simpler story is worth more than the extra bytes because
+/// divergence here is silent and permanent.
 ///
-/// A prefix rule has one failure mode, and it is closed elsewhere rather than
-/// here: if the FIRST message did not fit, nothing would be kept at all. That
-/// is why [`MAX_MESSAGE_BYTES`] is far below [`MAX_MAILBOX_BYTES`] and why
-/// [`MailboxStateV1::apply_delta`] refuses an oversized message on the way in
-/// -- an attacker can put their message at the top of this ranking for free,
-/// so "one message empties the mailbox" would have been cheaper and more
-/// total than the unbounded growth the budget exists to stop.
+/// The simplicity was real; the conclusion did not follow. Both rules are pure
+/// functions of the SET, so both converge between two peers holding the same
+/// messages -- that was never the difference. What the prefix rule broke is
+/// **fold ORDER-invariance**, which is one of the properties
+/// `FoldAllAck` is minted against, and which `ui/src/migrate.rs`'s
+/// `fold_all_policy` asserts through freenet-migrate's own
+/// `assert_fold_order_invariant`. Under a prefix walk, which messages survive
+/// depends on *which large message happened to be present to block the walk*,
+/// and that is a property of the fold order rather than of the byte set:
+/// remove the blocker and a smaller message behind it now fits. Absorption
+/// failed the same way, so re-running the migration was not a fixed point and
+/// the state could flap between two sizes, each flap a PUT.
+///
+/// Skipping restores both, and it is the same one pass: `retain` in rank
+/// order, keeping what fits. Two consequences worth stating rather than
+/// discovering:
+///
+/// * **A lower-ranked message can now survive while a higher-ranked one is
+///   dropped.** That is the thing the prefix rule was protecting, and it turns
+///   out to be a benefit: an honest small message now survives a flood of
+///   maximum-size entries that would previously have blocked the walk and
+///   taken it. The byte-budget flood route is materially weaker for it -- see
+///   `the_byte_route_no_longer_evicts_a_small_honest_message`.
+/// * **The count route is unaffected**, so flooding is not defeated, only made
+///   to go the cheaper way it already went
+///   (`known_gap_a_funded_flood_still_evicts_every_honest_message`).
+///
+/// The prefix rule's one failure mode is now gone as well: it could keep
+/// NOTHING if the first message did not fit. [`MAX_MESSAGE_BYTES`] is still far
+/// below [`MAX_MAILBOX_BYTES`] and [`MailboxStateV1::apply_delta`] still
+/// refuses an oversized message on the way in, because a single entry must
+/// still be bounded -- but neither is now load-bearing against "one message
+/// empties the mailbox", because a skipping walk cannot do that.
 fn enforce_message_cap(messages: &mut Vec<EncryptedMessage>) {
     let over_count = messages.len() > MAX_MESSAGES;
     let over_bytes = messages.iter().map(message_bytes).sum::<usize>() > MAX_MAILBOX_BYTES;
@@ -692,18 +716,22 @@ fn enforce_message_cap(messages: &mut Vec<EncryptedMessage>) {
 
     let mut bytes = 0usize;
     let mut kept = 0usize;
-    for message in messages.iter() {
+    messages.retain(|message| {
         if kept == MAX_MESSAGES {
-            break;
+            return false;
         }
         let with_this = bytes + message_bytes(message);
         if with_this > MAX_MAILBOX_BYTES {
-            break;
+            // Skip, do not stop. Stopping made the surviving set depend on
+            // which large message happened to block the walk, which is a
+            // property of the fold order rather than of the byte set, and it
+            // broke `FoldAllAck`'s order-invariance and absorption.
+            return false;
         }
         bytes = with_this;
         kept += 1;
-    }
-    messages.truncate(kept);
+        true
+    });
 }
 
 impl MailboxStateV1 {
@@ -1224,23 +1252,30 @@ mod retention_security_tests {
     /// silently rots if the cap is retuned: one message short of the cap
     /// evicts nothing. That is the whole difference from the timestamp defect
     /// this replaced, where the price was one message.
-    /// **The byte budget is the CHEAPER flood route, and it is also one
-    /// update.**
+    /// **The byte route no longer evicts a small honest message -- and the
+    /// count route still does.**
     ///
-    /// Written because a Phase 2 argument was built on the opposite premise:
-    /// that a flood "needs 512 entries and is visible before it completes",
-    /// so a buyer persisting a confession on receipt would win the race. Both
-    /// halves were wrong. `MAX_MAILBOX_BYTES` binds before `MAX_MESSAGES` for
-    /// large entries, so the cheaper route is **64** entries rather than 512 --
-    /// and a `MailboxDelta` is a bare `Vec` that `apply_delta` merges whole,
-    /// so either route is a SINGLE update with no partial state in between.
-    /// There is no window to be quick in.
+    /// This test was added on 2026-09-05 asserting the opposite, and the
+    /// assertion is inverted here rather than the test deleted, exactly as its
+    /// own failure message instructed. What changed is
+    /// [`enforce_message_cap`]: it skips a message that will not fit instead of
+    /// stopping at it, so a small honest message now survives in the gap that
+    /// a flood of maximum-size entries leaves at the end of the budget. That
+    /// change was made for `FoldAllAck`'s order-invariance, and this is a
+    /// second, unlooked-for benefit of it.
     ///
-    /// The Phase 2 answer is therefore not "persist fast enough" but an
-    /// ordering: persist the confession, confirm the write, and only then pay.
-    /// See `docs/buyer-conversation-persistence.md`.
+    /// **The flood is NOT defeated**, and nothing here should be read as
+    /// saying so. The count route still evicts everything
+    /// (`known_gap_a_funded_flood_still_evicts_every_honest_message`), it is
+    /// cheaper anyway at about 122 KiB against roughly 4 MiB, and it is still a
+    /// single update. What is gone is the claim that the byte budget offered a
+    /// *cheaper in entries* route to the same result.
+    ///
+    /// The Phase 2 argument in `docs/buyer-conversation-persistence.md` does
+    /// not depend on which route works: it depends on the flood being one
+    /// update with no window to be quick in, which the count route still is.
     #[test]
-    fn known_gap_the_byte_route_evicts_in_one_update_and_costs_fewer_entries() {
+    fn the_byte_route_no_longer_evicts_a_small_honest_message() {
         let base = 1_700_000_000;
         let honest = msg(9u8, base);
 
@@ -1256,12 +1291,9 @@ mod retention_security_tests {
             flood.push(big);
             i += 1;
         }
-
         assert!(
             flood.len() * 4 < MAX_MESSAGES,
-            "the byte route took {} entries against a count cap of {MAX_MESSAGES}; if it is \
-             no longer much cheaper in entries, the flood analysis in \
-             docs/buyer-conversation-persistence.md needs redoing",
+            "the byte route took {} entries against a count cap of {MAX_MESSAGES}",
             flood.len()
         );
 
@@ -1269,14 +1301,14 @@ mod retention_security_tests {
         state
             .apply_delta(&Some(vec![honest.clone()]))
             .expect("apply");
-        // ONE update. Not a sequence a watcher could interrupt.
         state.apply_delta(&Some(flood)).expect("apply");
 
         assert!(
-            !state.messages.contains(&honest),
-            "the honest message survived a full byte-budget flood, so this known gap is \
-             CLOSED -- delete this test and correct the Phase 2 argument, which currently \
-             assumes it is open"
+            state.messages.contains(&honest),
+            "an honest message was evicted by a byte-budget flood. That was true until \
+             `enforce_message_cap` began skipping rather than stopping; if the prefix walk \
+             has been restored, this test and the reasoning on `enforce_message_cap` and in \
+             docs/buyer-conversation-persistence.md all need revisiting together"
         );
     }
 
@@ -1682,28 +1714,49 @@ mod byte_budget_tests {
                 .collect()
         };
 
-        let evicts_everything = |messages: Vec<EncryptedMessage>| -> usize {
+        let cost = |messages: Vec<EncryptedMessage>, must_evict: bool| -> usize {
             let wire = crate::to_cbor(&messages).expect("cbor").len();
             let mut m = MailboxStateV1::default();
             m.apply_delta(&Some(honest.clone())).unwrap();
             m.apply_delta(&Some(messages)).unwrap();
-            for honest_nonce in honest.iter().map(|h| h.nonce) {
-                assert!(
-                    !m.messages.iter().any(|kept| kept.nonce == honest_nonce),
-                    "KNOWN GAP no longer reproduces: an honest message survived a flood. \
-                     If you just made that happen, invert these assertions."
+            let survivors = honest
+                .iter()
+                // nonce-identity-waiver: comparing FIXTURE identity in a test,
+                // not deciding "the same message" in production. The scrape
+                // skips test code; this marker is belt and braces for a reader.
+                .filter(|h| m.messages.iter().any(|kept| kept.nonce == h.nonce))
+                .count();
+            if must_evict {
+                assert_eq!(
+                    survivors, 0,
+                    "KNOWN GAP no longer reproduces: an honest message survived a COUNT-cap \
+                     flood. If you just made that happen, invert these assertions."
+                );
+            } else {
+                assert_eq!(
+                    survivors,
+                    honest.len(),
+                    "a byte-budget flood evicted honest messages again -- `enforce_message_cap` \
+                     skips rather than stopping, so they should fit in the gap it leaves"
                 );
             }
             wire
         };
 
         // Route A: fill the COUNT cap with the smallest messages there are.
-        let by_count = evicts_everything(flood(MAX_MESSAGES, 64));
-        // Route B: fill the BYTE budget with the largest.
-        let by_bytes = evicts_everything(flood(
-            MAX_MAILBOX_BYTES / MAX_MESSAGE_BYTES + 1,
-            LARGEST_BUCKET + AEAD_TAG_BYTES,
-        ));
+        // This still evicts everything; it is the route that works.
+        let by_count = cost(flood(MAX_MESSAGES, 64), true);
+        // Route B: fill the BYTE budget with the largest. Since
+        // `enforce_message_cap` began skipping rather than stopping, this no
+        // longer evicts a smaller honest message at all -- it is both more
+        // expensive AND less effective.
+        let by_bytes = cost(
+            flood(
+                MAX_MAILBOX_BYTES / MAX_MESSAGE_BYTES + 1,
+                LARGEST_BUCKET + AEAD_TAG_BYTES,
+            ),
+            false,
+        );
 
         assert!(
             by_bytes > by_count * 10,
@@ -1989,14 +2042,16 @@ mod entry_identity_tests {
     /// Note the qualification, which is load-bearing for Phase 2: this closes
     /// the free, targeted, silent route. It does NOT make a message
     /// permanently un-removable -- a funded flood still evicts it, at about
-    /// 122 KiB across 512 entries
-    /// (`known_gap_a_funded_flood_still_evicts_every_honest_message`) or, more
-    /// cheaply, 64 maximum-size entries filling the byte budget
-    /// (`known_gap_the_byte_route_evicts_in_one_update_and_costs_fewer_entries`),
-    /// taking the whole mailbox with it either way. **Both are ONE update**, so
-    /// there is no window to be quick in -- which is why Phase 2's answer is an
-    /// ordering (persist, confirm, then pay) rather than persisting fast
-    /// enough. See `docs/buyer-conversation-persistence.md`.
+    /// 122 KiB across 512 entries filling the COUNT cap
+    /// (`known_gap_a_funded_flood_still_evicts_every_honest_message`). The
+    /// byte-budget route is both more expensive and, since
+    /// `enforce_message_cap` began skipping rather than stopping, no longer
+    /// effective against a smaller message
+    /// (`the_byte_route_no_longer_evicts_a_small_honest_message`). **The count
+    /// route is ONE update**, so there is no window to be quick in -- which is
+    /// why Phase 2's answer is an ordering (persist, confirm, then pay) rather
+    /// than persisting fast enough. See
+    /// `docs/buyer-conversation-persistence.md`.
     ///
     /// This is the reason the contract computes identity for itself. In Phase
     /// 2 the seller's reply carries a pre-signed confession, and that
