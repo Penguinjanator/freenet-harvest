@@ -242,6 +242,10 @@ fn KeptConversations(store_contract_id: Vec<u8>, kept: Vec<([u8; 32], i64, bool)
                                     "On this device only."
                                 }
                             }
+                            ConversationBackupControl {
+                                store_contract_id: store_contract_id.clone(),
+                                tag: tag,
+                            }
                             if confirming() == Some(tag) {
                                 p { class: "text-warning", style: "font-size: 0.85rem;",
                                     "Forget this conversation? Your messages and the seller's "
@@ -273,21 +277,31 @@ fn KeptConversations(store_contract_id: Vec<u8>, kept: Vec<([u8; 32], i64, bool)
                 }
             }
 
-            Backup { store_contract_id: store_contract_id.clone(), has_conversations: !kept.is_empty() }
+            Restore {}
         }
     }
 }
 
-/// Making a copy of these conversations, and putting one back.
+/// Saving ONE conversation, and saying you have.
 ///
 /// # What the string is
 ///
-/// It holds the secrets themselves -- that is what makes it work on another
-/// machine, and what makes it worth exactly as much as the conversations it
-/// restores. Anyone who has it can read them and, once a seller's reply
-/// carries a pre-signed statement, file the complaint it authorizes. That is
-/// said beside the string rather than in a tooltip, because it is the whole
-/// basis on which a person decides where to put it.
+/// It holds the secret itself -- that is what makes it work on another
+/// machine, and what makes it worth exactly as much as the conversation it
+/// restores. Anyone who has it can read that conversation and, once a
+/// seller's reply carries a pre-signed statement, file the complaint it
+/// authorizes as though they were the buyer. That is said beside the string
+/// rather than in a tooltip, because it is the whole basis on which a person
+/// decides where to put it.
+///
+/// # Why one conversation at a time
+///
+/// A store-wide backup is too easy to leave out of date: taken on Monday,
+/// silently incomplete on Tuesday, with nothing about the artefact saying
+/// which conversations it covered. And a "saved" marker set from a store-wide
+/// export would falsely cover a conversation created after it. Per
+/// conversation the marker means something checkable: THIS one exists in more
+/// than one place.
 ///
 /// # Why "I have saved this" is a separate button
 ///
@@ -297,78 +311,83 @@ fn KeptConversations(store_contract_id: Vec<u8>, kept: Vec<([u8; 32], i64, bool)
 /// gates that marker for the same reason: the party that benefits from the
 /// warning stopping is not the party that loses the conversation.
 #[component]
-fn Backup(store_contract_id: Vec<u8>, has_conversations: bool) -> Element {
-    let mut paste = use_signal(String::new);
-
-    // The string, once the delegate has answered, and only for THIS store --
-    // one backup is on screen at a time and it must not be shown under
-    // another store's heading.
+fn ConversationBackupControl(store_contract_id: Vec<u8>, tag: [u8; 32]) -> Element {
+    // The string, once the delegate has answered, and only for THIS
+    // conversation -- one is on screen at a time and it must never appear
+    // under another conversation's heading.
     let backup = APP_STATE
         .read()
         .conversation_backup_on_screen
         .as_ref()
-        .filter(|backup| backup.store_contract_id == store_contract_id)
+        .filter(|backup| {
+            backup.store_contract_id == store_contract_id && backup.buyer_public_key == tag
+        })
         .map(|backup| backup.text().to_string());
 
     rsx! {
-        div { style: "margin-top: 1rem;",
-            h4 { "Backup" }
-
-            if has_conversations {
-                if let Some(backup) = backup {
-                    p { class: "text-warning", style: "font-size: 0.85rem;",
-                        "Save this somewhere only you can reach. Anyone who has it can read "
-                        "this conversation, and can use it to complain about this seller as "
-                        "though they were you. It is not a password you can change: it is the "
-                        "conversation."
-                    }
-                    textarea {
-                        class: "form-textarea",
-                        readonly: true,
-                        rows: 4,
-                        value: "{backup}",
-                    }
-                    button {
-                        class: "btn btn-primary",
-                        onclick: {
-                            let store_contract_id = store_contract_id.clone();
-                            move |_| {
-                                let mut app = APP_STATE.write();
-                                app.mark_conversations_backed_up(&store_contract_id);
-                                app.conversation_backup_on_screen = None;
-                            }
-                        },
-                        "I have saved this"
-                    }
-                    button {
-                        class: "btn",
-                        onclick: move |_| {
-                            APP_STATE.write().conversation_backup_on_screen = None;
-                        },
-                        "Hide it"
-                    }
-                } else {
-                    p { class: "text-muted", style: "font-size: 0.85rem;",
-                        "A backup is a single line of text holding the keys to your "
-                        "conversations with this store. Paste it into Harvest on another "
-                        "device to read them there."
-                    }
-                    button {
-                        class: "btn",
-                        onclick: {
-                            let store_contract_id = store_contract_id.clone();
-                            move |_| APP_STATE.write().export_conversations(&store_contract_id)
-                        },
-                        "Show my backup"
-                    }
-                }
+        if let Some(backup) = backup {
+            p { class: "text-warning", style: "font-size: 0.85rem;",
+                "Save this somewhere only you can reach. Anyone who has it can read this "
+                "conversation, and can use it to complain about this seller as though they "
+                "were you. It is not a password you can change: it is the conversation."
             }
+            textarea {
+                class: "form-textarea",
+                readonly: true,
+                rows: 3,
+                value: "{backup}",
+            }
+            button {
+                class: "btn btn-primary",
+                onclick: {
+                    let store_contract_id = store_contract_id.clone();
+                    move |_| {
+                        let mut app = APP_STATE.write();
+                        app.mark_conversation_backed_up(&store_contract_id, &tag);
+                        app.conversation_backup_on_screen = None;
+                    }
+                },
+                "I have saved this"
+            }
+            button {
+                class: "btn",
+                onclick: move |_| {
+                    APP_STATE.write().conversation_backup_on_screen = None;
+                },
+                "Hide it"
+            }
+        } else {
+            button {
+                class: "btn",
+                onclick: {
+                    let store_contract_id = store_contract_id.clone();
+                    move |_| APP_STATE.write().export_conversation(&store_contract_id, &tag)
+                },
+                "Back up this conversation"
+            }
+        }
+    }
+}
 
-            // Always offered, including on a device that holds nothing:
-            // restoring onto a new machine is the case this exists for, and
-            // there is nothing kept there to hang the control off.
-            div { class: "form-group", style: "margin-top: 1rem;",
-                label { class: "form-label", "Restore from a backup" }
+/// Putting a saved conversation back.
+///
+/// Offered even on a device holding nothing: restoring onto a new machine is
+/// the case the whole mechanism exists for, and there is nothing kept there
+/// to hang the control off. One string covers one conversation, so a buyer
+/// restoring a machine pastes several in a row.
+#[component]
+fn Restore() -> Element {
+    let mut paste = use_signal(String::new);
+
+    rsx! {
+        div { style: "margin-top: 1rem;",
+            h4 { "Restore a conversation" }
+            p { class: "text-muted", style: "font-size: 0.85rem;",
+                "A backup is a single line of text holding the key to ONE conversation. Paste "
+                "one here to read that conversation on this device; paste them one after "
+                "another if you saved several."
+            }
+            div { class: "form-group",
                 textarea {
                     class: "form-textarea",
                     rows: 3,
@@ -385,7 +404,7 @@ fn Backup(store_contract_id: Vec<u8>, has_conversations: bool) -> Element {
                     if pasted.is_empty() {
                         return;
                     }
-                    APP_STATE.write().import_conversations(pasted);
+                    APP_STATE.write().import_conversation(pasted);
                     paste.set(String::new());
                 },
                 "Restore"

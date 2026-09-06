@@ -132,10 +132,12 @@ loss of the buyer's recourse.
 buyer can get back:
 
 1. an entry that does not decode, which recalls nothing;
-2. a conversation the buyer holds a backup of, oldest first;
-3. a conversation that exists on this node and nowhere else, oldest first;
-4. lowest key, so the choice is deterministic rather than dependent on listing
-   order.
+2. a conversation that arrived by IMPORT, which the buyer demonstrably holds a
+   string for;
+3. any other conversation the buyer holds a backup of;
+4. a conversation that exists on this node and nowhere else;
+5. within each, oldest first, then lowest key so the choice is deterministic
+   rather than dependent on listing order.
 
 **`backed_up` before age is not a refinement, it is the fix for a real
 hole**, found in review. The cap is global across every store and `created_at`
@@ -147,6 +149,17 @@ one of their own. Ranking on `backed_up` composes with import marking what it
 restores as backed up -- which is true, since the buyer is holding the string
 -- and that is exactly what makes the attacker's records the eligible ones.
 Pinned by `a_conversation_that_exists_only_here_outlives_an_imported_one`.
+
+**The IMPORT tier is not a refinement of the backed-up one.** `created_at`
+travels inside the backup string and nothing signs it, so ordering by age
+alone lets the other side decide which of the buyer's records goes first --
+the same defect shape as the mailbox TTL that one forged timestamp emptied,
+and as the fold tie-break. Each time the fix was to rank on something the
+other side cannot choose, and `imported` is that: the delegate sets it from
+which CALL arrived, so no string can claim it. Once a buyer has backed up
+their own conversations too, `backed_up` alone stops separating them and this
+tier is what still does. Pinned by
+`an_imported_conversation_is_evicted_before_one_opened_here`.
 
 **And an eviction is now reported.** `BuyerConversationStored` carries what it
 discarded and whether that was backed up, so the UI can say either "you can
@@ -252,12 +265,21 @@ explicitly out of scope.
 ### The string
 
 ```
-harvest-conv-backup-v1:<base58check of CBOR>
+harvest-conv-backup-v2:<base58check of CBOR>
 ```
 
-CBOR of `{store_contract_id, conversations: [{secret, seller_public_key,
-conversation_id, created_at, backed_up}]}`, base58check-encoded, behind a
-named prefix. About 420 characters for one conversation.
+CBOR of `{store_contract_id, conversation: {secret, seller_public_key,
+conversation_id, created_at, backed_up, imported}}`, base58check-encoded,
+behind a named prefix. About 210 characters, and it covers **one
+conversation**.
+
+The version is v2 because v1 carried a whole store's conversations and this
+carries one: a change of payload is a change of name, so a v1 string is
+refused as "not one of ours" rather than decoding into something that no
+longer means what it says. There is deliberately no v1-reading code -- no v1
+string was ever produced outside this repository's tests, and a compatibility
+path for an artefact that never existed would be untested code asserting a
+scenario that cannot happen.
 
 * **The prefix, not a bare blob**, so a paste that is not a Harvest backup --
   a ghostkey PEM, a store link, half a string -- is refused with a sentence
@@ -273,23 +295,51 @@ named prefix. About 420 characters for one conversation.
   hands it back; it never parses it. So the one component that reads and
   writes the format owns it, and `harvest-common` -- compiled into all three
   contracts -- gains nothing.
-* **A paste over 64 KiB is refused before it is decoded.** Base58 decoding is
+* **A paste over 4 KiB is refused before it is decoded.** Base58 decoding is
   quadratic in the length, so an unbounded paste is an unbounded amount of the
   node's CPU; this was found by a test taking 72 seconds rather than by
-  reading the code. 64 KiB is above any honest export (256 conversations is
-  roughly 52 KiB), and the restore flow is "paste what you saved", so what
-  someone else hands the buyer is equally paste-able.
+  reading the code. 4 KiB is roughly twenty times an honest backup, which
+  carries one conversation, and the restore flow is "paste what you saved", so
+  what someone else hands the buyer is equally paste-able.
 
 ### The three questions that were settled, and why
 
-**Per store, not per conversation.** A buyer normally has ONE conversation
-with a store, because a new message continues the last one. So the two options
-differ mainly in how many actions a complete backup takes -- and a backup that
-silently omits a conversation is the expensive failure here, the same
-asymmetry that governs eviction. A buyer who wants less in one string can
-forget the conversations they do not want in it. Per-store is also the unit a
-person reasons about: everything that would be lost, for that seller, with
-that machine.
+**Per conversation, not per store. This reverses the original answer, and
+both arguments are recorded because the reversal is the interesting part.**
+
+The original answer was per STORE, on this reasoning: a buyer normally has one
+conversation with a store, because a new message continues the last one, so
+the two options differ mainly in how many actions a complete backup takes --
+and a backup that silently omits a conversation is the expensive failure,
+which is the same asymmetry that governs eviction.
+
+Ian's objection, which wins: a per-store backup is too easy to leave out of
+date. Take it on Monday, start a new conversation on Tuesday, and the buyer
+holds a snapshot they believe is complete and which silently is not.
+
+The first argument was right about which failure is expensive and wrong about
+when it happens. It optimises for completeness **at export time**; what
+actually bites is completeness **over time**, and a per-store export makes
+staleness invisible because nothing about the artefact says which
+conversations existed when it was taken.
+
+**The marker settles it, and it is about the marker rather than the export.**
+A `backed_up` marker attached to a store-wide export would falsely cover a
+conversation created after that export. That is precisely the "a third-party
+app cannot silence a warning about a key it has no backup of" property copied
+from the ghostkey vault -- reintroduced through the GRANULARITY rather than
+through the permission. Per conversation the marker means something checkable:
+*this* secret exists in more than one place. Per store it would mean "some
+snapshot was taken at some point", which is not a fact anyone can act on.
+
+That the marker was already a field of the record rather than a separate keyed
+secret is what makes this cheap: the marker was per-conversation structurally
+before it needed to be, for the unrelated reason that a keyed marker would
+outlive the conversation it describes.
+
+**Import takes one string at a time**, and a buyer restoring a machine pastes
+several in a row. Nothing is stateful between them, so the order does not
+matter and a failure part-way leaves what already landed.
 
 **Importing a conversation the node already holds KEEPS the held one.** Not
 refuse, not overwrite:
@@ -324,6 +374,10 @@ them to work out which one did not land. Pinned by
 one place. The UI warns on it, and **only the buyer saying they have saved the
 backup clears it** -- exporting is not saving, and a buyer who opens the
 panel, reads the string and closes the tab has saved nothing.
+
+It is set for ONE conversation, matching the export. A request that marked a
+set would let one saved string clear the warning on a conversation it does not
+contain; see the granularity argument above.
 
 The marker is behind `origin::authorize` **for its own reason, not because it
 sits beside the export**. The export's reason is obvious: it answers secrets.

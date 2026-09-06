@@ -366,9 +366,10 @@ The warning's marker is gated to the Harvest web app for its own reason,
 separate from the export's: silencing a warning costs the silencer nothing and
 costs the buyer everything. See `buyer-conversation-persistence.md`.
 
-**The export is per store**, so one string covers every conversation this node
-holds with that seller. A buyer who wants a smaller blast radius can forget
-the conversations they do not want in it before exporting.
+**The export is per conversation**, so one string covers exactly one thread
+with one seller -- the smallest blast radius available, and the granularity at
+which the "saved elsewhere" marker means something checkable rather than
+"some snapshot was taken at some point".
 
 ### The remaining limit: a different device is a different node
 

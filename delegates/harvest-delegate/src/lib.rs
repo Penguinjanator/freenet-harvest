@@ -371,20 +371,21 @@ mod boundary_tests {
                 buyer_public_key: [7u8; 32],
             })
             .expect("cbor"),
-            to_cbor(&HarvestDelegateRequest::ExportBuyerConversations {
+            to_cbor(&HarvestDelegateRequest::ExportBuyerConversation {
                 request_id: 1,
                 store_contract_id: vec![3u8; 32],
+                buyer_public_key: [7u8; 32],
             })
             .expect("cbor"),
-            to_cbor(&HarvestDelegateRequest::ImportBuyerConversations {
+            to_cbor(&HarvestDelegateRequest::ImportBuyerConversation {
                 request_id: 1,
-                backup: "harvest-conv-backup-v1:whatever".into(),
+                backup: "harvest-conv-backup-v2:whatever".into(),
             })
             .expect("cbor"),
-            to_cbor(&HarvestDelegateRequest::MarkConversationsBackedUp {
+            to_cbor(&HarvestDelegateRequest::MarkConversationBackedUp {
                 request_id: 1,
                 store_contract_id: vec![3u8; 32],
-                buyer_public_keys: vec![[7u8; 32]],
+                buyer_public_key: [7u8; 32],
             })
             .expect("cbor"),
         ];

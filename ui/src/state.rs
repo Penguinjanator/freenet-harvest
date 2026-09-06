@@ -156,8 +156,9 @@ pub struct AppState {
     /// buyer browsing a busy store issues one recall per notification.
     pub buyer_conversations_recalled: HashSet<Vec<u8>>,
 
-    /// `ExportBuyerConversations` and `MarkConversationsBackedUp` requests in
-    /// flight, as request id -> the store THIS browser asked about.
+    /// `ExportBuyerConversation` and `MarkConversationBackedUp` requests in
+    /// flight, as request id -> the store AND conversation THIS browser asked
+    /// about.
     ///
     /// One map for two families because both answer about a store and
     /// neither can be outstanding for the same request id. The reason they
@@ -166,7 +167,7 @@ pub struct AppState {
     /// that an answer is filed where the QUESTION says it belongs, and a
     /// principle followed in three places out of five is one the next reader
     /// concludes is optional.
-    pub pending_conversation_backups: std::collections::BTreeMap<u64, Vec<u8>>,
+    pub pending_conversation_backups: std::collections::BTreeMap<u64, (Vec<u8>, [u8; 32])>,
 
     /// `ListBuyerConversations` requests in flight, as request id -> the
     /// store THIS browser asked about.
@@ -966,6 +967,10 @@ pub fn short_conversation_tag(tag: &[u8]) -> String {
 #[derive(Clone, PartialEq)]
 pub struct ConversationBackup {
     pub store_contract_id: Vec<u8>,
+    /// Which conversation this string covers. One conversation, so the panel
+    /// shows it under that conversation and a buyer saving several can tell
+    /// them apart.
+    pub buyer_public_key: [u8; 32],
     /// The pasteable string. Kept out of `Debug` for the same reason
     /// `ConversationKeys` is: this is the one value in the app that must not
     /// reach a console log a user pastes into a bug report.
@@ -1927,23 +1932,29 @@ impl AppState {
         }
     }
 
-    /// Ask the delegate for this store's conversations as a saveable string.
-    pub fn conversations_to_export(
+    /// Ask the delegate for ONE conversation as a saveable string.
+    ///
+    /// One at a time, because a store-wide string is silently incomplete the
+    /// moment the next conversation is opened and nothing about the artefact
+    /// says so. See `docs/buyer-conversation-persistence.md`.
+    pub fn conversation_to_export(
         &mut self,
         store_contract_id: &[u8],
+        buyer_public_key: &[u8; 32],
     ) -> harvest_common::HarvestDelegateRequest {
         let request_id = self.next_messaging_request_id();
         self.pending_conversation_backups
-            .insert(request_id, store_contract_id.to_vec());
-        harvest_common::HarvestDelegateRequest::ExportBuyerConversations {
+            .insert(request_id, (store_contract_id.to_vec(), *buyer_public_key));
+        harvest_common::HarvestDelegateRequest::ExportBuyerConversation {
             request_id,
             store_contract_id: store_contract_id.to_vec(),
+            buyer_public_key: *buyer_public_key,
         }
     }
 
-    /// [`Self::conversations_to_export`], dispatched.
-    pub fn export_conversations(&mut self, store_contract_id: &[u8]) {
-        let request = self.conversations_to_export(store_contract_id);
+    /// [`Self::conversation_to_export`], dispatched.
+    pub fn export_conversation(&mut self, store_contract_id: &[u8], buyer_public_key: &[u8; 32]) {
+        let request = self.conversation_to_export(store_contract_id, buyer_public_key);
         self.send_to_harvest_delegate("back up this conversation", &request);
     }
 
@@ -1952,12 +1963,14 @@ impl AppState {
     /// It is held rather than shown-and-forgotten because the buyer has to
     /// copy it somewhere, and a string that vanished on the next render would
     /// be a backup they believe they have.
-    pub fn on_conversations_exported(&mut self, request_id: u64, result: Result<String, String>) {
-        // Filed under the store this browser asked about, and an answer
-        // nothing asked for is ignored. A backup is the strongest thing in
-        // this protocol -- putting one on screen under the wrong store's
-        // heading would invite the buyer to save it as that store's.
-        let Some(store_contract_id) = self.pending_conversation_backups.remove(&request_id) else {
+    pub fn on_conversation_exported(&mut self, request_id: u64, result: Result<String, String>) {
+        // Filed under the conversation this browser asked about, and an
+        // answer nothing asked for is ignored. A backup is the strongest
+        // thing in this protocol -- putting one on screen under the wrong
+        // heading would invite the buyer to save it as that conversation's.
+        let Some((store_contract_id, buyer_public_key)) =
+            self.pending_conversation_backups.remove(&request_id)
+        else {
             warn!("A backup arrived for request {request_id}, which nothing asked for");
             return;
         };
@@ -1965,56 +1978,49 @@ impl AppState {
             Ok(backup) => {
                 self.conversation_backup_on_screen = Some(ConversationBackup {
                     store_contract_id,
+                    buyer_public_key,
                     backup,
                 })
             }
             // Reported rather than logged: the buyer pressed a button and
-            // nothing appeared, and the reason is usually actionable ("there
-            // is nothing with this store to back up").
+            // nothing appeared, and the reason is usually actionable ("this
+            // node does not hold that conversation").
             Err(why) => {
-                warn!("Could not export this store's conversations: {why}");
+                warn!("Could not export this conversation: {why}");
                 self.notifications
                     .push(format!("That backup could not be made: {why}"));
             }
         }
     }
 
-    /// Take the buyer's word that they have saved this store's backup.
+    /// Take the buyer's word that they have saved THIS conversation's backup.
     ///
-    /// Every conversation this node holds with the store, because that is
-    /// what one backup string contains. `None` when there is nothing to mark,
-    /// so a stray click sends nothing.
-    pub fn conversations_to_mark_backed_up(
+    /// One conversation, matching the export. Marking every conversation with
+    /// the store would clear the warning on ones the saved string does not
+    /// contain, which is the granularity form of silencing a warning about a
+    /// key nobody has a backup of.
+    pub fn conversation_to_mark_backed_up(
         &mut self,
         store_contract_id: &[u8],
-    ) -> Option<harvest_common::HarvestDelegateRequest> {
-        let buyer_public_keys: Vec<[u8; 32]> = self
-            .browsing_stores
-            .get(store_contract_id)?
-            .conversations
-            .iter()
-            .map(|conversation| conversation.buyer_public_key)
-            .collect();
-        if buyer_public_keys.is_empty() {
-            return None;
-        }
+        buyer_public_key: &[u8; 32],
+    ) -> harvest_common::HarvestDelegateRequest {
         let request_id = self.next_messaging_request_id();
         self.pending_conversation_backups
-            .insert(request_id, store_contract_id.to_vec());
-        Some(
-            harvest_common::HarvestDelegateRequest::MarkConversationsBackedUp {
-                request_id,
-                store_contract_id: store_contract_id.to_vec(),
-                buyer_public_keys,
-            },
-        )
+            .insert(request_id, (store_contract_id.to_vec(), *buyer_public_key));
+        harvest_common::HarvestDelegateRequest::MarkConversationBackedUp {
+            request_id,
+            store_contract_id: store_contract_id.to_vec(),
+            buyer_public_key: *buyer_public_key,
+        }
     }
 
-    /// [`Self::conversations_to_mark_backed_up`], dispatched.
-    pub fn mark_conversations_backed_up(&mut self, store_contract_id: &[u8]) {
-        let Some(request) = self.conversations_to_mark_backed_up(store_contract_id) else {
-            return;
-        };
+    /// [`Self::conversation_to_mark_backed_up`], dispatched.
+    pub fn mark_conversation_backed_up(
+        &mut self,
+        store_contract_id: &[u8],
+        buyer_public_key: &[u8; 32],
+    ) {
+        let request = self.conversation_to_mark_backed_up(store_contract_id, buyer_public_key);
         self.send_to_harvest_delegate("record that you have saved this", &request);
     }
 
@@ -2025,18 +2031,19 @@ impl AppState {
     /// is the safe direction and is exactly what a local guess would get
     /// wrong. So this re-asks and lets the answer decide what the screen
     /// says.
-    pub fn on_conversations_marked_backed_up(
+    pub fn on_conversation_marked_backed_up(
         &mut self,
         request_id: u64,
-        result: Result<usize, String>,
+        result: Result<bool, String>,
     ) {
-        let Some(store_contract_id) = self.pending_conversation_backups.remove(&request_id) else {
+        let Some((store_contract_id, _)) = self.pending_conversation_backups.remove(&request_id)
+        else {
             warn!("A backup marking arrived for request {request_id}, which nothing asked for");
             return;
         };
         match result {
             Ok(marked) => {
-                info!("{marked} conversation(s) recorded as saved");
+                info!("conversation recorded as saved: {marked}");
                 self.re_recall_buyer_conversations(&store_contract_id);
             }
             Err(why) => self.notifications.push(format!(
@@ -2047,32 +2054,35 @@ impl AppState {
     }
 
     /// Hand a pasted backup to the delegate.
-    pub fn conversations_to_import(
+    ///
+    /// One string carries one conversation; a buyer restoring a machine
+    /// pastes several in a row, and nothing here is stateful between them.
+    pub fn conversation_to_import(
         &mut self,
         backup: String,
     ) -> harvest_common::HarvestDelegateRequest {
-        harvest_common::HarvestDelegateRequest::ImportBuyerConversations {
+        harvest_common::HarvestDelegateRequest::ImportBuyerConversation {
             request_id: self.next_messaging_request_id(),
             backup,
         }
     }
 
-    /// [`Self::conversations_to_import`], dispatched.
-    pub fn import_conversations(&mut self, backup: String) {
-        let request = self.conversations_to_import(backup);
+    /// [`Self::conversation_to_import`], dispatched.
+    pub fn import_conversation(&mut self, backup: String) {
+        let request = self.conversation_to_import(backup);
         self.send_to_harvest_delegate("restore this conversation", &request);
     }
 
     /// Fold in what a pasted backup did, and say it in full.
     ///
-    /// Per conversation rather than as a count: a conversation that was
-    /// refused is one the buyer still cannot read, and the reason is what
-    /// tells them what to do about it. Folding it into "1 of 2 restored"
-    /// leaves them to work out which one and why.
-    pub fn on_conversations_imported(
+    /// One string carries one conversation, so exactly one thing happened and
+    /// it is named: a refused conversation is one the buyer still cannot
+    /// read, and the reason is what tells them what to do about it.
+    pub fn on_conversation_imported(
         &mut self,
-        result: Result<harvest_common::ImportedConversations, String>,
+        result: Result<harvest_common::ImportedConversation, String>,
     ) {
+        use harvest_common::ImportedConversation;
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(why) => {
@@ -2082,47 +2092,31 @@ impl AppState {
             }
         };
 
-        let mut said = Vec::new();
-        if !outcome.imported.is_empty() {
-            said.push(format!(
-                "{} conversation(s) restored from that backup.",
-                outcome.imported.len()
-            ));
-        }
-        if !outcome.already_held.is_empty() {
-            said.push(format!(
-                "{} were already on this device, and were left exactly as they were.",
-                outcome.already_held.len()
-            ));
-        }
-        for (tag, why) in &outcome.refused {
-            said.push(format!(
-                "Conversation {} could NOT be restored: {why}",
-                short_conversation_tag(tag)
-            ));
-        }
-        if said.is_empty() {
-            said.push("That backup held nothing this node could use.".to_string());
-        }
-        // Said whenever anything was restored, because the restored
-        // conversation may now be the one a new message continues -- and its
-        // secret is known to whoever produced the string. Nothing here can
-        // tell an honest backup from one the buyer was handed, so the buyer
-        // is the one who has to know. See
-        // `docs/buyer-conversation-persistence.md`.
-        if !outcome.imported.is_empty() {
-            said.push(
-                "Messages you send to this store from now on may continue a restored \
-                 conversation. If you did not make that backup yourself, whoever gave it to \
-                 you can read them."
-                    .to_string(),
-            );
-        }
-        self.notifications.push(said.join(" "));
+        let tag = short_conversation_tag(&outcome.buyer_public_key());
+        self.notifications.push(match &outcome {
+            // Said whenever something IS restored, because the restored
+            // conversation may now be the one a new message continues -- and
+            // its secret is known to whoever produced the string. Nothing
+            // here can tell an honest backup from one the buyer was handed,
+            // so the buyer is the one who has to know. See
+            // `docs/buyer-conversation-persistence.md`.
+            ImportedConversation::Imported { .. } => format!(
+                "Conversation {tag} was restored from that backup. Messages you send to this \
+                 store from now on may continue it, and if you did not make that backup \
+                 yourself, whoever gave it to you can read them."
+            ),
+            ImportedConversation::AlreadyHeld { .. } => format!(
+                "Conversation {tag} was already on this device, and was left exactly as it was."
+            ),
+            ImportedConversation::Refused { why, .. } => {
+                format!("Conversation {tag} could NOT be restored: {why}")
+            }
+        });
 
         // The import wrote into the DELEGATE, not into this browser. Without
         // asking again the buyer is told it worked and sees nothing.
-        self.re_recall_buyer_conversations(&outcome.store_contract_id);
+        let store_contract_id = outcome.store_contract_id().to_vec();
+        self.re_recall_buyer_conversations(&store_contract_id);
     }
 
     /// Ask again for a store's conversations, after something changed them.
@@ -3047,19 +3041,17 @@ impl AppState {
                 self.on_buyer_conversation_forgotten(request_id, result)
             }
 
-            HarvestDelegateResponse::BuyerConversationsExported {
+            HarvestDelegateResponse::BuyerConversationExported {
                 request_id, result, ..
-            } => self.on_conversations_exported(request_id, result),
+            } => self.on_conversation_exported(request_id, result),
 
-            HarvestDelegateResponse::BuyerConversationsImported { result, .. } => {
-                self.on_conversations_imported(result)
+            HarvestDelegateResponse::BuyerConversationImported { result, .. } => {
+                self.on_conversation_imported(result)
             }
 
-            HarvestDelegateResponse::BuyerConversationsMarkedBackedUp {
-                request_id,
-                result,
-                ..
-            } => self.on_conversations_marked_backed_up(request_id, result),
+            HarvestDelegateResponse::BuyerConversationMarkedBackedUp {
+                request_id, result, ..
+            } => self.on_conversation_marked_backed_up(request_id, result),
 
             HarvestDelegateResponse::StoreRegistered {
                 ghostkey_fingerprint,
@@ -7282,7 +7274,9 @@ mod buyer_persistence_tests {
             seller_to_buyer: conversation_key_from_dh(&shared, MessageDirection::SellerToBuyer),
             created_at,
             // A conversation just handed to the delegate has not been saved
-            // anywhere by the buyer.
+            // anywhere by the buyer, and was opened here rather than
+            // restored.
+            imported: false,
             backed_up: false,
         }
     }
@@ -7869,12 +7863,12 @@ mod buyer_persistence_tests {
     }
 }
 
-/// Backup: the buyer carrying their conversation to another machine, and
-/// being told when it exists in only one place.
+/// Backup: the buyer carrying ONE conversation to another machine, and being
+/// told when it exists in only one place.
 #[cfg(test)]
 mod buyer_backup_tests {
     use super::*;
-    use harvest_common::{HarvestDelegateRequest, ImportedConversations, RecalledConversation};
+    use harvest_common::{HarvestDelegateRequest, ImportedConversation, RecalledConversation};
     use x25519_dalek::{PublicKey, StaticSecret};
 
     const STORE: &[u8] = &[1u8; 32];
@@ -7904,7 +7898,17 @@ mod buyer_backup_tests {
             buyer_to_seller: [seed; 32],
             seller_to_buyer: [seed; 32],
             created_at: 1_700_000_000 + seed as i64,
+            imported: false,
             backed_up,
+        }
+    }
+
+    /// The request id of a question this state actually asked.
+    fn asked(request: &HarvestDelegateRequest) -> u64 {
+        match request {
+            HarvestDelegateRequest::ExportBuyerConversation { request_id, .. }
+            | HarvestDelegateRequest::MarkConversationBackedUp { request_id, .. } => *request_id,
+            other => panic!("expected a backup request, got {other:?}"),
         }
     }
 
@@ -7915,15 +7919,6 @@ mod buyer_backup_tests {
             other => panic!("expected a recall to be asked for, got {other:?}"),
         }
         answer_outstanding_recall(state, conversations);
-    }
-
-    /// The request id of a question this state actually asked.
-    fn asked(request: &HarvestDelegateRequest) -> u64 {
-        match request {
-            HarvestDelegateRequest::ExportBuyerConversations { request_id, .. }
-            | HarvestDelegateRequest::MarkConversationsBackedUp { request_id, .. } => *request_id,
-            other => panic!("expected a backup request, got {other:?}"),
-        }
     }
 
     /// Answer whichever recall is in flight, whoever asked for it -- which is
@@ -7941,48 +7936,63 @@ mod buyer_backup_tests {
         });
     }
 
-    /// **A backup the buyer asked for reaches the screen.**
+    /// **A backup the buyer asked for reaches the screen, under the
+    /// conversation they asked about.**
     ///
     /// It arrives from a delegate answer long after the click, so it has to
-    /// be held somewhere the component can render from.
+    /// be held somewhere the component can render from -- and one string
+    /// covers ONE conversation, so it must not appear under another.
     #[test]
-    fn an_exported_backup_reaches_the_screen() {
+    fn an_exported_backup_reaches_the_screen_under_its_own_conversation() {
         let mut state = buyer_state();
-        let request = state.conversations_to_export(STORE);
+        let tag = recalled(5, false).buyer_public_key;
+        let request = state.conversation_to_export(STORE, &tag);
         match &request {
-            HarvestDelegateRequest::ExportBuyerConversations {
-                store_contract_id, ..
-            } => assert_eq!(store_contract_id, STORE),
-            other => panic!("expected ExportBuyerConversations, got {other:?}"),
+            HarvestDelegateRequest::ExportBuyerConversation {
+                store_contract_id,
+                buyer_public_key,
+                ..
+            } => {
+                assert_eq!(store_contract_id, STORE);
+                assert_eq!(buyer_public_key, &tag);
+            }
+            other => panic!("expected ExportBuyerConversation, got {other:?}"),
         }
 
-        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationsExported {
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationExported {
             request_id: asked(&request),
             store_contract_id: STORE.to_vec(),
-            result: Ok("harvest-conv-backup-v1:abc".to_string()),
+            buyer_public_key: tag,
+            result: Ok("harvest-conv-backup-v2:abc".to_string()),
         });
 
         let on_screen = state
             .conversation_backup_on_screen
             .as_ref()
             .expect("the backup must reach the screen, or the buyer cannot save it");
-        assert_eq!(on_screen.text(), "harvest-conv-backup-v1:abc");
+        assert_eq!(on_screen.text(), "harvest-conv-backup-v2:abc");
         assert_eq!(on_screen.store_contract_id, STORE);
+        assert_eq!(
+            on_screen.buyer_public_key, tag,
+            "a backup shown under the wrong conversation invites the buyer to save it as that \
+             conversation's"
+        );
     }
 
     /// **A backup does not print itself.**
     ///
-    /// It is a complete portable copy of every conversation with a store. A
-    /// `Debug` that printed it would put that into any console log a user
-    /// pastes into a bug report.
+    /// It is a portable copy of one conversation. A `Debug` that printed it
+    /// would put that into any console log a user pastes into a bug report.
     #[test]
     fn a_backup_on_screen_does_not_print_itself() {
         let mut state = buyer_state();
-        let request_id = asked(&state.conversations_to_export(STORE));
-        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationsExported {
+        let tag = recalled(6, false).buyer_public_key;
+        let request_id = asked(&state.conversation_to_export(STORE, &tag));
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationExported {
             request_id,
             store_contract_id: STORE.to_vec(),
-            result: Ok("harvest-conv-backup-v1:SECRETMATERIAL".to_string()),
+            buyer_public_key: tag,
+            result: Ok("harvest-conv-backup-v2:SECRETMATERIAL".to_string()),
         });
         let printed = format!("{:?}", state.conversation_backup_on_screen);
         assert!(
@@ -7996,50 +8006,46 @@ mod buyer_backup_tests {
     #[test]
     fn a_refused_export_is_reported() {
         let mut state = buyer_state();
-        let request_id = asked(&state.conversations_to_export(STORE));
-        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationsExported {
+        let tag = recalled(7, false).buyer_public_key;
+        let request_id = asked(&state.conversation_to_export(STORE, &tag));
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationExported {
             request_id,
             store_contract_id: STORE.to_vec(),
-            result: Err("there is no conversation with this store".to_string()),
+            buyer_public_key: tag,
+            result: Err("this node does not hold that conversation".to_string()),
         });
         assert!(state.conversation_backup_on_screen.is_none());
         assert!(state
             .notifications
             .last()
             .expect("a refusal must reach the buyer")
-            .contains("no conversation"));
+            .contains("does not hold"));
     }
 
-    /// **Only the buyer saying so clears the warning, and only for
-    /// conversations this node actually holds.**
+    /// **Marking names ONE conversation.**
+    ///
+    /// One saved string covers one conversation, so a request that named a
+    /// set would clear the warning on conversations the string does not
+    /// contain -- the granularity form of silencing a warning about a key
+    /// nobody has a backup of.
     #[test]
-    fn marking_asks_about_the_conversations_this_node_holds() {
+    fn marking_names_only_the_conversation_that_was_saved() {
         let mut state = buyer_state();
-        assert!(
-            state.conversations_to_mark_backed_up(STORE).is_none(),
-            "there is nothing to mark for a store with no conversations"
-        );
+        let saved = recalled(5, false);
+        let other = recalled(6, false);
+        deliver_recall(&mut state, vec![saved.clone(), other.clone()]);
 
-        let one = recalled(5, false);
-        let two = recalled(6, false);
-        deliver_recall(&mut state, vec![one.clone(), two.clone()]);
-
-        match state
-            .conversations_to_mark_backed_up(STORE)
-            .expect("must ask")
-        {
-            HarvestDelegateRequest::MarkConversationsBackedUp {
+        match state.conversation_to_mark_backed_up(STORE, &saved.buyer_public_key) {
+            HarvestDelegateRequest::MarkConversationBackedUp {
                 store_contract_id,
-                mut buyer_public_keys,
+                buyer_public_key,
                 ..
             } => {
                 assert_eq!(store_contract_id, STORE);
-                buyer_public_keys.sort();
-                let mut expected = vec![one.buyer_public_key, two.buyer_public_key];
-                expected.sort();
-                assert_eq!(buyer_public_keys, expected);
+                assert_eq!(buyer_public_key, saved.buyer_public_key);
+                assert_ne!(buyer_public_key, other.buyer_public_key);
             }
-            other => panic!("expected MarkConversationsBackedUp, got {other:?}"),
+            other => panic!("expected MarkConversationBackedUp, got {other:?}"),
         }
     }
 
@@ -8059,15 +8065,13 @@ mod buyer_backup_tests {
 
         // The whole marking round trip: the buyer says they saved it, the
         // delegate confirms, and the app asks again rather than assuming.
-        let request_id = asked(
-            &state
-                .conversations_to_mark_backed_up(STORE)
-                .expect("must ask"),
-        );
-        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationsMarkedBackedUp {
+        let request_id =
+            asked(&state.conversation_to_mark_backed_up(STORE, &conversation.buyer_public_key));
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationMarkedBackedUp {
             request_id,
             store_contract_id: STORE.to_vec(),
-            result: Ok(1),
+            buyer_public_key: conversation.buyer_public_key,
+            result: Ok(true),
         });
         answer_outstanding_recall(
             &mut state,
@@ -8093,21 +8097,20 @@ mod buyer_backup_tests {
     #[test]
     fn marking_asks_the_delegate_again_rather_than_assuming() {
         let mut state = buyer_state();
-        deliver_recall(&mut state, vec![recalled(8, false)]);
+        let conversation = recalled(8, false);
+        deliver_recall(&mut state, vec![conversation.clone()]);
         assert!(
             state.buyer_conversations_recalled.contains(STORE),
             "precondition: this store has been asked about"
         );
 
-        let request_id = asked(
-            &state
-                .conversations_to_mark_backed_up(STORE)
-                .expect("must ask"),
-        );
-        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationsMarkedBackedUp {
+        let request_id =
+            asked(&state.conversation_to_mark_backed_up(STORE, &conversation.buyer_public_key));
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationMarkedBackedUp {
             request_id,
             store_contract_id: STORE.to_vec(),
-            result: Ok(1),
+            buyer_public_key: conversation.buyer_public_key,
+            result: Ok(true),
         });
         assert!(
             !state.pending_conversation_recalls.is_empty(),
@@ -8120,7 +8123,7 @@ mod buyer_backup_tests {
     /// Import writes into the delegate, not into this browser. Without the
     /// re-ask the buyer pastes a backup, is told it worked, and sees nothing.
     #[test]
-    fn an_import_asks_for_the_restored_conversations() {
+    fn an_import_asks_for_the_restored_conversation() {
         let mut state = buyer_state();
         deliver_recall(&mut state, Vec::new());
         assert!(
@@ -8129,12 +8132,11 @@ mod buyer_backup_tests {
         );
 
         let tag = recalled(9, true).buyer_public_key;
-        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationsImported {
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationImported {
             request_id: 1,
-            result: Ok(ImportedConversations {
+            result: Ok(ImportedConversation::Imported {
                 store_contract_id: STORE.to_vec(),
-                imported: vec![tag],
-                ..ImportedConversations::default()
+                buyer_public_key: tag,
             }),
         });
 
@@ -8146,25 +8148,31 @@ mod buyer_backup_tests {
             .notifications
             .last()
             .expect("the buyer must be told what the paste did");
-        assert!(notice.contains('1'), "{notice}");
+        assert!(
+            notice.contains(&crate::state::short_conversation_tag(&tag)),
+            "the restored conversation must be named: {notice}"
+        );
+        assert!(
+            notice.contains("whoever gave it to you"),
+            "a restored conversation may be the one the next message continues, and its secret \
+             may not be the buyer's alone: {notice}"
+        );
     }
 
-    /// **A refused conversation is NAMED, not folded into a count.**
+    /// **A refused conversation is NAMED with its reason.**
     ///
-    /// A conversation that did not fit is one the buyer still cannot read. A
-    /// summary saying "1 of 2 restored" leaves them to work out which, and
-    /// the reason is what tells them what to do about it.
+    /// A conversation that did not fit is one the buyer still cannot read,
+    /// and the reason is what tells them what to do about it.
     #[test]
     fn a_refused_import_says_which_and_why() {
         let mut state = buyer_state();
         let refused = recalled(10, true).buyer_public_key;
-        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationsImported {
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationImported {
             request_id: 1,
-            result: Ok(ImportedConversations {
+            result: Ok(ImportedConversation::Refused {
                 store_contract_id: STORE.to_vec(),
-                imported: vec![recalled(11, true).buyer_public_key],
-                refused: vec![(refused, "this node is full".to_string())],
-                ..ImportedConversations::default()
+                buyer_public_key: refused,
+                why: "this node is full".to_string(),
             }),
         });
 
@@ -8178,7 +8186,7 @@ mod buyer_backup_tests {
             "the reason must survive to the buyer: {notice}"
         );
         assert!(
-            notice.contains(&bs58::encode(refused).into_string()[..8]),
+            notice.contains(&crate::state::short_conversation_tag(&refused)),
             "the refused conversation must be named: {notice}"
         );
     }
@@ -8188,7 +8196,7 @@ mod buyer_backup_tests {
     #[test]
     fn a_paste_that_could_not_be_read_is_reported() {
         let mut state = buyer_state();
-        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationsImported {
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationImported {
             request_id: 1,
             result: Err("that does not look like a Harvest conversation backup".to_string()),
         });
@@ -8199,20 +8207,38 @@ mod buyer_backup_tests {
             .contains("does not look like"));
     }
 
+    /// Pasting a backup onto the node that made it must read as success, not
+    /// as a problem.
+    #[test]
+    fn a_backup_pasted_onto_the_node_that_made_it_is_not_an_error() {
+        let mut state = buyer_state();
+        let held = recalled(12, true).buyer_public_key;
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationImported {
+            request_id: 1,
+            result: Ok(ImportedConversation::AlreadyHeld {
+                store_contract_id: STORE.to_vec(),
+                buyer_public_key: held,
+            }),
+        });
+        let notice = state.notifications.last().expect("must say something");
+        assert!(
+            notice.contains("already"),
+            "the buyer must be told nothing was wrong: {notice}"
+        );
+    }
+
     /// **A backup nothing asked for does not reach the screen.**
     ///
-    /// A backup is the strongest thing in this protocol. Showing one under a
-    /// store's heading invites the buyer to save it as that store's, so where
-    /// it belongs is decided by the question this browser asked and not by
-    /// what the answer says about itself -- the rule `BuyerConversationList`
-    /// states and this followed in neither place until it was reviewed.
+    /// Where it belongs is decided by the question this browser asked and not
+    /// by what the answer says about itself.
     #[test]
     fn a_backup_nothing_asked_for_does_not_reach_the_screen() {
         let mut state = buyer_state();
-        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationsExported {
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationExported {
             request_id: 4321,
             store_contract_id: STORE.to_vec(),
-            result: Ok("harvest-conv-backup-v1:abc".to_string()),
+            buyer_public_key: [9u8; 32],
+            result: Ok("harvest-conv-backup-v2:abc".to_string()),
         });
         assert!(
             state.conversation_backup_on_screen.is_none(),
@@ -8220,47 +8246,31 @@ mod buyer_backup_tests {
         );
     }
 
-    /// And it is filed under the store that was asked about, not the one the
-    /// answer names.
+    /// And it is filed under the conversation that was asked about, not the
+    /// one the answer names.
     #[test]
-    fn a_backup_is_filed_under_the_store_that_was_asked_about() {
+    fn a_backup_is_filed_under_the_conversation_that_was_asked_about() {
         const ANOTHER_STORE: &[u8] = &[2u8; 32];
         let mut state = buyer_state();
-        let request_id = asked(&state.conversations_to_export(STORE));
-        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationsExported {
+        let asked_about = recalled(13, false).buyer_public_key;
+        let request_id = asked(&state.conversation_to_export(STORE, &asked_about));
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationExported {
             request_id,
             store_contract_id: ANOTHER_STORE.to_vec(),
-            result: Ok("harvest-conv-backup-v1:abc".to_string()),
+            buyer_public_key: [0xFF; 32],
+            result: Ok("harvest-conv-backup-v2:abc".to_string()),
         });
+        let on_screen = state
+            .conversation_backup_on_screen
+            .as_ref()
+            .expect("on screen");
         assert_eq!(
-            state
-                .conversation_backup_on_screen
-                .as_ref()
-                .expect("on screen")
-                .store_contract_id,
-            STORE,
+            on_screen.store_contract_id, STORE,
             "a backup was filed under a store this browser never asked about"
         );
-    }
-
-    /// Pasting a backup onto the node that made it is the ordinary "restore
-    /// everything" gesture and must read as success, not as a problem.
-    #[test]
-    fn a_backup_pasted_onto_the_node_that_made_it_is_not_an_error() {
-        let mut state = buyer_state();
-        let held = recalled(12, true).buyer_public_key;
-        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationsImported {
-            request_id: 1,
-            result: Ok(ImportedConversations {
-                store_contract_id: STORE.to_vec(),
-                already_held: vec![held],
-                ..ImportedConversations::default()
-            }),
-        });
-        let notice = state.notifications.last().expect("must say something");
-        assert!(
-            notice.contains("already"),
-            "the buyer must be told nothing was wrong: {notice}"
+        assert_eq!(
+            on_screen.buyer_public_key, asked_about,
+            "a backup was filed under a conversation this browser never asked about"
         );
     }
 }

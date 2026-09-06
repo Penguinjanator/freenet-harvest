@@ -207,8 +207,10 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
                 conversation_id,
                 created_at,
                 // Never true on the way in: a conversation is backed up when
-                // the buyer says they have saved it, not when it is created.
+                // the buyer says they have saved it, not when it is created,
+                // and it was opened here rather than restored.
                 backed_up: false,
+                imported: false,
             },
         ),
 
@@ -227,24 +229,30 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
         // with the machine -- worse than never warning, because the buyer
         // stops looking. Same reasoning as the ghostkey vault gating
         // `MarkBackedUp` on the `Export` scope only it is granted.
-        HarvestDelegateRequest::ExportBuyerConversations {
+        HarvestDelegateRequest::ExportBuyerConversation {
             request_id,
             store_contract_id,
-        } => crate::messaging::export_buyer_conversations(store, request_id, &store_contract_id),
-
-        HarvestDelegateRequest::ImportBuyerConversations { request_id, backup } => {
-            crate::messaging::import_buyer_conversations(store, request_id, &backup)
-        }
-
-        HarvestDelegateRequest::MarkConversationsBackedUp {
-            request_id,
-            store_contract_id,
-            buyer_public_keys,
-        } => crate::messaging::mark_conversations_backed_up(
+            buyer_public_key,
+        } => crate::messaging::export_buyer_conversation(
             store,
             request_id,
             &store_contract_id,
-            &buyer_public_keys,
+            &buyer_public_key,
+        ),
+
+        HarvestDelegateRequest::ImportBuyerConversation { request_id, backup } => {
+            crate::messaging::import_buyer_conversation(store, request_id, &backup)
+        }
+
+        HarvestDelegateRequest::MarkConversationBackedUp {
+            request_id,
+            store_contract_id,
+            buyer_public_key,
+        } => crate::messaging::mark_conversation_backed_up(
+            store,
+            request_id,
+            &store_contract_id,
+            &buyer_public_key,
         ),
 
         HarvestDelegateRequest::ForgetBuyerConversation {
@@ -986,9 +994,10 @@ mod origin_gating_tests {
         let response = handle(
             &mut store,
             Some(&a_different_web_app()),
-            HarvestDelegateRequest::ExportBuyerConversations {
+            HarvestDelegateRequest::ExportBuyerConversation {
                 request_id: 1,
                 store_contract_id: SELLERS_STORE_ID.to_vec(),
+                buyer_public_key: tag,
             },
         );
         assert!(
@@ -999,10 +1008,10 @@ mod origin_gating_tests {
         let response = handle(
             &mut store,
             Some(&a_different_web_app()),
-            HarvestDelegateRequest::MarkConversationsBackedUp {
+            HarvestDelegateRequest::MarkConversationBackedUp {
                 request_id: 2,
                 store_contract_id: SELLERS_STORE_ID.to_vec(),
-                buyer_public_keys: vec![tag],
+                buyer_public_key: tag,
             },
         );
         assert!(
@@ -1036,9 +1045,9 @@ mod origin_gating_tests {
         let response = handle(
             &mut store,
             Some(&a_different_web_app()),
-            HarvestDelegateRequest::ImportBuyerConversations {
+            HarvestDelegateRequest::ImportBuyerConversation {
                 request_id: 3,
-                backup: "harvest-conv-backup-v1:whatever".to_string(),
+                backup: "harvest-conv-backup-v2:whatever".to_string(),
             },
         );
         assert!(refusal_message(&response).contains("Harvest web app"));
@@ -1064,33 +1073,37 @@ mod origin_gating_tests {
         let backup = match handle(
             &mut laptop,
             Some(&harvest()),
-            HarvestDelegateRequest::ExportBuyerConversations {
+            HarvestDelegateRequest::ExportBuyerConversation {
                 request_id: 1,
                 store_contract_id: SELLERS_STORE_ID.to_vec(),
+                buyer_public_key: *PublicKey::from(&buyer).as_bytes(),
             },
         ) {
-            HarvestDelegateResponse::BuyerConversationsExported { result, .. } => {
+            HarvestDelegateResponse::BuyerConversationExported { result, .. } => {
                 result.expect("must export")
             }
-            other => panic!("expected BuyerConversationsExported, got {other:?}"),
+            other => panic!("expected BuyerConversationExported, got {other:?}"),
         };
 
         let mut phone = MemSecrets::default();
         let outcome = match handle(
             &mut phone,
             Some(&harvest()),
-            HarvestDelegateRequest::ImportBuyerConversations {
+            HarvestDelegateRequest::ImportBuyerConversation {
                 request_id: 2,
                 backup,
             },
         ) {
-            HarvestDelegateResponse::BuyerConversationsImported { result, .. } => {
+            HarvestDelegateResponse::BuyerConversationImported { result, .. } => {
                 result.expect("must import")
             }
-            other => panic!("expected BuyerConversationsImported, got {other:?}"),
+            other => panic!("expected BuyerConversationImported, got {other:?}"),
         };
-        assert_eq!(outcome.imported.len(), 1);
-        assert_eq!(outcome.store_contract_id, SELLERS_STORE_ID.to_vec());
+        assert!(matches!(
+            outcome,
+            harvest_common::ImportedConversation::Imported { .. }
+        ));
+        assert_eq!(outcome.store_contract_id(), SELLERS_STORE_ID);
 
         let restored = match handle(
             &mut phone,

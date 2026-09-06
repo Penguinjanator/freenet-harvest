@@ -160,27 +160,45 @@ pub enum HarvestDelegateRequest {
     /// makes it worth having and exactly why the UI says so beside the
     /// button rather than in a tooltip.
     ///
-    /// Per STORE rather than per conversation: a buyer normally has one
-    /// conversation with a store (a new message continues the last one), so
-    /// the two differ mainly in how many actions a complete backup takes --
-    /// and a backup that silently omits a conversation is the expensive
-    /// failure here. A buyer who wants less in one string can forget the
-    /// conversations they do not want in it.
-    ExportBuyerConversations {
+    /// # Why one conversation and not one store
+    ///
+    /// This was per STORE until 2026-09-05, on the argument that a buyer
+    /// normally has one conversation with a store anyway, so the two differ
+    /// mainly in how many actions a complete backup takes -- and that a
+    /// backup silently omitting a conversation is the expensive failure. That
+    /// argument was right about the failure and wrong about when it happens:
+    /// it optimises for completeness AT EXPORT TIME, and what bites is
+    /// completeness OVER TIME. A store-wide string taken on Monday is
+    /// silently incomplete on Tuesday, and nothing about the artefact says
+    /// which conversations existed when it was taken.
+    ///
+    /// The marker settles it. A `backed_up` flag set from a store-wide export
+    /// would falsely cover a conversation created after that export -- the
+    /// "cannot silence a warning about a key it has no backup of" property,
+    /// defeated through granularity rather than through permission. Per
+    /// conversation it means something checkable: THIS secret exists in more
+    /// than one place.
+    ExportBuyerConversation {
         request_id: RequestId,
         store_contract_id: Vec<u8>,
+        /// Which conversation, by routing tag.
+        buyer_public_key: [u8; 32],
     },
 
-    /// Take a saved backup string and make its conversations readable here.
+    /// Take one saved backup string and make its conversation readable here.
+    ///
+    /// One string per call; a buyer restoring a machine pastes several in a
+    /// row. Nothing here is stateful between calls, so the order does not
+    /// matter and a failure part-way leaves what already landed.
     ///
     /// The store id is inside the string, so this needs nothing else -- a
     /// buyer on a new node has the string and nothing to relate it to.
-    ImportBuyerConversations {
+    ImportBuyerConversation {
         request_id: RequestId,
         backup: String,
     },
 
-    /// Record that the buyer holds a copy of these conversations outside this
+    /// Record that the buyer holds a copy of THIS conversation outside this
     /// node.
     ///
     /// # Why the MARKER needs the origin gate, and not only the export
@@ -201,11 +219,14 @@ pub enum HarvestDelegateRequest {
     ///
     /// Set only when the user says they have saved it -- exporting is not
     /// saving.
-    MarkConversationsBackedUp {
+    MarkConversationBackedUp {
         request_id: RequestId,
         store_contract_id: Vec<u8>,
-        /// Which conversations, by routing tag.
-        buyer_public_keys: Vec<[u8; 32]>,
+        /// Which conversation, by routing tag. One, matching the export: a
+        /// request that marked a SET would let one saved string clear the
+        /// warning on a conversation it does not contain, which is the
+        /// granularity form of the defect the gate exists to prevent.
+        buyer_public_key: [u8; 32],
     },
 
     // === Listing Management ===
@@ -335,33 +356,35 @@ pub enum HarvestDelegateResponse {
         conversations: Vec<RecalledConversation>,
     },
 
-    /// A store's conversations, as a string the buyer can save.
+    /// One conversation, as a string the buyer can save.
     ///
-    /// `Ok` carries the backup itself. It holds secrets: see
-    /// [`HarvestDelegateRequest::ExportBuyerConversations`].
-    BuyerConversationsExported {
+    /// `Ok` carries the backup itself. It holds a secret: see
+    /// [`HarvestDelegateRequest::ExportBuyerConversation`].
+    BuyerConversationExported {
         request_id: RequestId,
         store_contract_id: Vec<u8>,
+        buyer_public_key: [u8; 32],
         result: Result<String, String>,
     },
 
     /// What a pasted backup did.
-    BuyerConversationsImported {
+    BuyerConversationImported {
         request_id: RequestId,
-        result: Result<ImportedConversations, String>,
+        result: Result<ImportedConversation, String>,
     },
 
-    /// Which conversations are now marked as held outside this node.
+    /// Whether this conversation is now marked as held outside this node.
     ///
-    /// `Ok(n)` is how many of the named conversations are marked afterwards;
-    /// a tag this node does not hold contributes nothing and is not an error.
-    /// A write the node REFUSED is an `Err`, not a smaller count: the two are
-    /// different situations and the caller cannot tell them apart from a
-    /// number.
-    BuyerConversationsMarkedBackedUp {
+    /// `Ok(true)` means it is marked; `Ok(false)` means this node does not
+    /// hold that conversation, which is not an error and creates nothing. A
+    /// write the node REFUSED is an `Err`, because "not marked" and "could
+    /// not mark" are different situations and a boolean cannot tell them
+    /// apart.
+    BuyerConversationMarkedBackedUp {
         request_id: RequestId,
         store_contract_id: Vec<u8>,
-        result: Result<usize, String>,
+        buyer_public_key: [u8; 32],
+        result: Result<bool, String>,
     },
 
     /// Whether a conversation was actually removed.
@@ -505,6 +528,15 @@ pub struct RecalledConversation {
     /// a thread the buyer left open, resumed, rather than a new one beside
     /// it.
     pub created_at: i64,
+    /// Whether this conversation arrived by import rather than being opened
+    /// here.
+    ///
+    /// Set by the delegate, never carried in from a caller: it is a fact
+    /// about where the record came from, and its whole value is that the
+    /// other side cannot choose it. `created_at` CAN be chosen -- it travels
+    /// in the backup string -- so anything that must not be attacker-ordered
+    /// ranks on this first. See `make_room`'s eviction order.
+    pub imported: bool,
     /// Whether the buyer has said they hold a copy of this outside this node.
     ///
     /// `false` means the secret exists in exactly one place, and losing the
@@ -526,28 +558,68 @@ pub struct EvictedConversation {
     pub was_backed_up: bool,
 }
 
-/// What importing a backup actually did, per conversation rather than as one
-/// verdict.
+/// What pasting one backup did.
 ///
-/// # Why this is not a count and a bool
+/// # Why an enum and not counts
 ///
-/// The three outcomes are different situations for the buyer. `imported` is
-/// the restore working. `already_held` is the ordinary case of pasting a
-/// backup onto the node that made it, and is not a problem. `refused` is the
-/// one that needs saying out loud and naming: a conversation that did not fit
-/// under the node's cap is a conversation the buyer still cannot read, and a
-/// summary that folded it into "3 of 5 imported" would leave them to work out
-/// which two.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
-pub struct ImportedConversations {
-    /// The store the backup belongs to, which is inside the backup itself.
-    pub store_contract_id: Vec<u8>,
-    /// Conversations that were not held here and now are.
-    pub imported: Vec<[u8; 32]>,
-    /// Conversations this node already had. Left exactly as they were.
-    pub already_held: Vec<[u8; 32]>,
-    /// Conversations that could not be taken, each with the reason.
-    pub refused: Vec<([u8; 32], String)>,
+/// One string carries one conversation, so exactly one of these happened, and
+/// the three are different situations for the buyer. `Imported` is the
+/// restore working. `AlreadyHeld` is the ordinary case of pasting a backup
+/// onto the node that made it, and is not a problem. `Refused` is the one
+/// that needs saying out loud WITH its reason -- a conversation that did not
+/// fit under the node's cap is one the buyer still cannot read, and a bare
+/// count would leave them to work out what to do about it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub enum ImportedConversation {
+    /// Not held here before, and now is.
+    Imported {
+        /// The store the backup belongs to, from inside the backup itself.
+        store_contract_id: Vec<u8>,
+        buyer_public_key: [u8; 32],
+    },
+    /// Already here. The held record was kept, not overwritten.
+    AlreadyHeld {
+        store_contract_id: Vec<u8>,
+        buyer_public_key: [u8; 32],
+    },
+    /// Could not be taken, with the reason.
+    Refused {
+        store_contract_id: Vec<u8>,
+        buyer_public_key: [u8; 32],
+        why: String,
+    },
+}
+
+impl ImportedConversation {
+    /// The store this outcome is about, whichever it is.
+    pub fn store_contract_id(&self) -> &[u8] {
+        match self {
+            Self::Imported {
+                store_contract_id, ..
+            }
+            | Self::AlreadyHeld {
+                store_contract_id, ..
+            }
+            | Self::Refused {
+                store_contract_id, ..
+            } => store_contract_id,
+        }
+    }
+
+    /// The conversation this outcome is about.
+    pub fn buyer_public_key(&self) -> [u8; 32] {
+        match self {
+            Self::Imported {
+                buyer_public_key, ..
+            }
+            | Self::AlreadyHeld {
+                buyer_public_key, ..
+            }
+            | Self::Refused {
+                buyer_public_key, ..
+            } => *buyer_public_key,
+        }
+    }
 }
 
 /// A buyer's ephemeral X25519 secret, on the wire between the browser that

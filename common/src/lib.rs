@@ -32,7 +32,7 @@ pub use bitcoin_delegate::{
 };
 pub use delegate::{
     ConversationKey, ConversationSecret, EvictedConversation, HarvestDelegateRequest,
-    HarvestDelegateResponse, ImportedConversations, RecalledConversation, StoreRegistration,
+    HarvestDelegateResponse, ImportedConversation, RecalledConversation, StoreRegistration,
     TransactionRecord,
 };
 pub use feedback::{FeedbackCategory, FeedbackToken, FeedbackTokenMsg};
