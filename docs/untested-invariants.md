@@ -425,6 +425,66 @@ node contacted (removable, and the removal is a real deletion). See
 
 ---
 
+### The buy flow (added on `feat/buy-flow`, 2026-09-05)
+
+Recorded while the code was written, for the same reason the section above
+was. Two of these are design gaps rather than test gaps, and they are here
+because a reader of the code would otherwise take the comments around them as
+covering more than they do.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `ui/src/state.rs::AppState::payment_blockers` | A buyer will not pay a commitment that is unpublished, not the seller's, for a listing they never asked about, not awaiting payment, unanchored, off-chain, or stale. | **Yes** -- `buy_flow_tests`, one test per blocker, each mutated red by deleting the guard it names. The mutations were run and the failures recorded: dropping the kept-conversation check, the staleness check, the canonicality check, the direction filter, the signature check and the listing check each turned exactly the intended test red. |
+| same, `ConversationNotKept` | The buyer does not part with money before their node has confirmed it is keeping the key that reads the conversation. | **Yes** -- `a_buyer_does_not_pay_before_the_node_confirms_it_kept_the_conversation`, and the other half, `only_the_delegates_answer_marks_a_conversation_kept`, which drives a refusal and then a success through `on_delegate_response`. This is the Phase 2 ordering constraint from `buyer-conversation-persistence.md` applied to the thing that exists today; the confession does not exist, so nothing here holds a confession. |
+| `ui/src/state.rs::PaymentBlocker` | Adding the Phase 2 blocker is one variant and one check, and no screen can quietly ignore it. | **Yes, structurally.** `components::buy_view::is_temporary` matches the enum without a wildcard, so a new variant does not compile until somebody has said whether it means "wait" or "walk away" -- which is the sentence the buyer is shown. This fired for real while the change was being written: adding `CommitmentNotRequested` failed the build until that question was answered. |
+| `harvest_common::payment::Order::anchor` | `skip_serializing_if` keeps every pre-existing order signature verifying. | **Yes** -- `order_wire_compat_tests::an_order_that_predates_the_anchor_re_encodes_unchanged`, observed red against the naive `#[serde(default)]`-only form: `0xae` map(14) with `"anchor": null` against the `0xad` map(13) the signature was taken over. Same trap, and the same fix, as `StoreInfoV1::encryption_public_key`. |
+| `ui/src/state.rs::order_for_invoice` | A seller who cannot see the chain publishes no commitment at all. | **Yes** -- `a_seller_who_cannot_see_the_chain_cannot_issue_an_invoice`, mutated red by falling back to `anchor: None`. Without it the seller would show a bill that every buyer's software silently refuses, which is the shape of the bridge-less invoices that made every early store permanently unable to take money. |
+| `ui/src/state.rs::AppState::acceptance_for` | The buyer can read the acceptance and it names the published commitment. | **Yes** -- `accepting_a_request_tells_the_buyer_which_commitment_is_theirs`, read back through the BUYER's conversation keys rather than by inspecting what the seller composed. |
+| `ui/src/state.rs::AppState::announce_acceptance` | The acceptance actually reaches the seller's mailbox. | **No.** The dispatch is a wasm-gated `spawn_local`, the same blind spot as every other send in this repository. What is tested is everything either side: that the message is composed and recorded as the seller's own (`accepting_records_the_acceptance_as_the_sellers_own_message`), and that a buyer who receives one reads it correctly. |
+| same | The commitment is published before the buyer is told about it. | **No, and deliberately not attempted.** The two are independent fire-and-forget dispatches and may land in either order. The buy flow does not depend on the order: a buyer holding an acceptance for a commitment that has not arrived reads `CommitmentNotPublished` and does not pay, which is the same answer a seller who never published would produce. |
+| `ui/src/state.rs::PaymentBlocker::CommitmentNotRequested` | The commitment is for something this conversation asked about. | **Yes for the case it closes** -- `a_commitment_for_a_listing_never_requested_is_refused` and its converse. **The claim is narrower than it looks**, and the doc comment says so rather than overstating it: the request it compares against sits in the buyer's own thread, and direction is not authorship (`messaging::Addressing`), so a seller can insert a request the buyer never sent. What the check closes is the seller answering a cheap listing's request with a commitment against an expensive one; what it does not close is a forged request, which shows up instead as a line in the buyer's own thread they do not recognise. |
+| `ui/src/components/buy_view.rs` | Everything the buy form, the purchases panel and the accept control say on screen. | **No.** There are no component tests in this repository at all -- the same row as `message_view` above, and worth repeating here because this is the screen that tells a buyer an order is safe to pay. The *decisions* behind the words are all in `AppState` and tested; the words are not. |
+
+#### Two design gaps this change does NOT close
+
+Neither is a missing test. Both are Phase 2 work recorded in issue 8, and both
+are named here because the surrounding comments would otherwise read as
+covering them.
+
+**The commitment is not private.** `docs/design/incentive-mechanism.md` Part 5
+step 2 says an order commitment reveals "a scrambled order number, the amount,
+and a recent Bitcoin block hash" and "nothing about who Bob is or what he
+bought". What is actually published is an `AuthorizedOrder`, which carries the
+`listing_id`, the payment address and its `scriptPubKey`. So **what** was
+bought is public, and the address links the order to a chain transaction.
+
+Who bought is not published -- `buyer_fingerprint` is empty for every order
+the buy flow produces, and the buyer has no identity to name -- and the
+shipping address never leaves the AEAD. But the design's claim is stronger
+than the code, and the difference is real.
+
+It is not fixable here: the payment address must be public, because a stranger
+being able to verify the payment is the entire point of the on-chain rail.
+Closing it means separating the countable commitment from the payable invoice,
+which is what issue 8's per-seller ledger contract does.
+
+**The commitment is per-store, not per-identity.** Issue 8, point 3: one
+ghostkey may create unlimited stores, so a buyer counting a seller's
+outstanding orders from one store's state sees a fraction of what the bond
+would back. The exposure cap that makes the whole mechanism work is therefore
+not yet countable, and nothing in this change counts it -- the buy flow checks
+that the buyer's OWN commitment is published, which is the half that forces
+the seller to publish at all, and stops there. There is no bond to count
+against yet, which is why this is Phase 2 rather than a defect.
+
+#### And one thing the buy flow does not do at all
+
+**It does not send money.** Step 5 of the design is a person opening a wallet.
+Harvest shows the address and the amount once the checks pass, and the
+existing on-chain verification path takes over from there. Nothing in this
+repository moves coin, and the "Pay" surface is a payment address rather than
+a button that pays.
+
 ## The four that matter
 
 Ranked by what breaks if the claim turns out to be false, not by how easy the

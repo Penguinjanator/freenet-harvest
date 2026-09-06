@@ -1,8 +1,9 @@
 mod app;
 pub(crate) mod bitcoin_view;
+pub(crate) mod buy_view;
 mod invoice_form;
 mod listing_form;
-mod message_view;
+pub(crate) mod message_view;
 mod my_store;
 mod reputation_view;
 mod store_view;

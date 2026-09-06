@@ -582,9 +582,26 @@ Two consequences that are constraints on other work, not observations:
   (`marking_reports_a_failure_when_the_node_refuses_the_write` is the same
   shape on the marking path).
 * **Persisting the confession is a precondition of payment.** That is a
-  constraint on the Buy button, which is not built yet, and it needs to be true
-  when it is. A Buy flow that pays first and stores after satisfies every test
-  in this repository and defeats the entire argument above.
+  constraint on the Buy button. A Buy flow that pays first and stores after
+  satisfies every test in this repository and defeats the entire argument
+  above.
+
+  **Built, for the thing that exists today** (`feat/buy-flow`, 2026-09-05).
+  The Buy flow now exists, and payment is gated on
+  `state::AppState::payment_blockers`, which answers a list of
+  `state::PaymentBlocker` rather than a bool. One of them is
+  `ConversationNotKept`: the buyer's software shows no payment address until
+  the DELEGATE has answered `Ok` to keeping the conversation -- not until a
+  request was sent, which is the distinction that matters, since a refused
+  write would otherwise read exactly like a successful one.
+
+  The confession does not exist, so there is no `ConfessionNotPersisted`
+  variant yet. Adding it is one variant and one check in `payment_blockers`.
+  What makes that safe rather than hopeful is that
+  `components::buy_view::is_temporary` matches the enum with no wildcard arm,
+  so a new blocker does not compile until somebody has said whether it means
+  "wait" or "walk away" -- which is the sentence the buyer is shown. That
+  fired for real while the buy flow was being written.
 
 ### Receiving a confession must CLEAR the backed-up flag
 

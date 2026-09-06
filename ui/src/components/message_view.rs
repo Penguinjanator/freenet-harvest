@@ -563,7 +563,26 @@ fn send(
         seller_encryption_key,
         text.clone(),
     )?;
+    deliver_to_seller(store_contract_id, seller, text, sealed)
+}
 
+/// Subscribe, dispatch, and record -- everything a buyer's outgoing message
+/// needs once it is sealed.
+///
+/// Shared with the buy form rather than copied, because the subscribe is the
+/// part that is easy to leave out of a second copy: without it the buyer
+/// never fetches the mailbox again, and the seller's acceptance -- the one
+/// thing that tells them which commitment is theirs -- sits there unread.
+///
+/// `record_as` is what the buyer's own record calls this message. It is not
+/// the message: a request carries structured fields, and the local record
+/// exists to say "you wrote this", not to reproduce it.
+pub(crate) fn deliver_to_seller(
+    store_contract_id: &[u8],
+    seller: ed25519_dalek::VerifyingKey,
+    record_as: String,
+    sealed: harvest_common::mailbox::EncryptedMessage,
+) -> Result<(), String> {
     // Subscribe to the seller's mailbox, once, on the first message. This is
     // what makes a reply reachable: without it the buyer never fetches the
     // contract again and the answer sits there unread.
@@ -581,7 +600,7 @@ fn send(
 
     APP_STATE
         .write()
-        .record_sent_message(store_contract_id, text, &sealed);
+        .record_sent_message(store_contract_id, record_as, &sealed);
     Ok(())
 }
 
@@ -724,6 +743,19 @@ fn Conversation(
                 }
             }
 
+            // A request to buy is the one message in a seller's inbox that
+            // has an action attached, so it gets the control rather than
+            // leaving the seller to copy a listing id into the invoice form
+            // by hand -- which is also how the reply-to tag would get lost.
+            if let Some((listing_id, quantity)) = pending_request(&entries) {
+                super::buy_view::AcceptRequest {
+                    store_contract_id: store_contract_id.clone(),
+                    tag: tag.clone(),
+                    listing_id: listing_id,
+                    quantity: quantity,
+                }
+            }
+
             if readable {
                 div { class: "form-group", style: "margin-top: 0.5rem;",
                     textarea {
@@ -815,6 +847,37 @@ fn attribution(
         (Role::Seller, Addressing::ToSeller) => "Addressed to you",
         (Role::Seller, Addressing::ToBuyer) => "Addressed to this buyer",
     }
+}
+
+/// The request to buy this conversation is waiting on, if any.
+///
+/// Newest first, so a buyer who asked twice gets the second ask acted on
+/// rather than the first. `entries` is a seller's own inbox view, which
+/// `mailbox_entries` returns newest-first.
+///
+/// # Why direction is not checked here, and where it IS
+///
+/// This is the seller's side, and it deliberately mirrors the buyer's rule
+/// (`state::AppState::buyer_purchases`, which ignores an acceptance not
+/// addressed to the buyer) only in spirit. A request the SELLER composed
+/// would be one they wrote to themselves, which costs them their own money
+/// and nobody else's -- so the asymmetry is real rather than an oversight,
+/// and `MailboxEntry` does not carry direction anyway. What protects the
+/// buyer is that accepting publishes a commitment the buyer then has to
+/// recognise as answering their own request.
+fn pending_request(entries: &[MailboxEntry]) -> Option<(harvest_common::listing::ListingId, u32)> {
+    entries.iter().find_map(|entry| match entry {
+        MailboxEntry::Readable {
+            content:
+                MessageContent::OrderRequest {
+                    listing_id,
+                    quantity,
+                    ..
+                },
+            ..
+        } => Some((listing_id.clone(), *quantity)),
+        _ => None,
+    })
 }
 
 /// Enough of a conversation tag to tell two apart on screen, and no more --
@@ -932,5 +995,72 @@ fn describe(content: &MessageContent) -> String {
         MessageContent::OrderAccepted { order_id } => {
             format!("Accepted -- invoice {} is published.", order_id.short())
         }
+    }
+}
+
+#[cfg(test)]
+mod inbox_tests {
+    use super::*;
+    use harvest_common::listing::ListingId;
+
+    fn readable(content: MessageContent) -> MailboxEntry {
+        MailboxEntry::Readable {
+            conversation: vec![1u8; 32],
+            conversation_id: harvest_common::mailbox::ConversationId([2u8; 32]),
+            addressing: crate::messaging::Addressing::ToSeller,
+            timestamp: chrono::Utc::now(),
+            nonce: [0u8; 24],
+            digest: [0u8; 32],
+            content,
+        }
+    }
+
+    /// **The seller is offered an Accept only when there is a request to
+    /// accept.**
+    ///
+    /// An accept control on an ordinary question would publish a commitment
+    /// against an order nobody asked for.
+    #[test]
+    fn an_ordinary_message_offers_nothing_to_accept() {
+        let entries = vec![readable(MessageContent::Text("is this in stock?".into()))];
+        assert!(pending_request(&entries).is_none());
+    }
+
+    /// **A request carries the listing and quantity through to the accept
+    /// control.**
+    ///
+    /// Not merely "there is a request": the two values are what the invoice
+    /// is issued against, and a control that found the request but dropped
+    /// the listing id would invoice for something else.
+    #[test]
+    fn a_request_carries_its_listing_and_quantity() {
+        let listing = ListingId([9u8; 16]);
+        let entries = vec![
+            readable(MessageContent::Text("hello".into())),
+            readable(MessageContent::OrderRequest {
+                listing_id: listing.clone(),
+                quantity: 4,
+                shipping: "12 Example St".into(),
+                note: String::new(),
+            }),
+        ];
+        assert_eq!(pending_request(&entries), Some((listing, 4)));
+    }
+
+    /// **An unreadable entry is not a request.**
+    ///
+    /// The mailbox is open-write, so most of what arrives at a busy store is
+    /// junk; an accept control that appeared for it would invite the seller
+    /// to publish a commitment against nothing.
+    #[test]
+    fn an_unreadable_entry_is_not_a_request() {
+        let entries = vec![MailboxEntry::Unreadable {
+            conversation: vec![1u8; 32],
+            timestamp: chrono::Utc::now(),
+            nonce: [0u8; 24],
+            digest: [0u8; 32],
+            why: "not for us".to_string(),
+        }];
+        assert!(pending_request(&entries).is_none());
     }
 }

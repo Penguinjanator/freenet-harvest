@@ -921,6 +921,20 @@ pub enum PaymentBlocker {
     /// signature is not the seller's" and "the terms do not match what was
     /// signed" is worth showing.
     CommitmentNotTheSellers(String),
+    /// The commitment names a listing this conversation never asked about.
+    ///
+    /// "Confirm your own order is present" is not satisfied by an order being
+    /// present. Without this, a seller could answer a request for a cheap
+    /// listing with a commitment against an expensive one and every other
+    /// check here would pass -- the commitment being genuinely published,
+    /// genuinely signed and genuinely fresh.
+    ///
+    /// Empty when the buyer has asked for nothing in this conversation, which
+    /// is the case for a conversation that began as an ordinary question; the
+    /// check then has nothing to compare against and does not fire. That is
+    /// the honest answer rather than a refusal, since a seller may perfectly
+    /// well invoice against a conversation that never used the buy form.
+    CommitmentNotRequested,
     /// The order has already moved past awaiting payment.
     NotAwaitingPayment(harvest_common::payment::OrderStatus),
     /// The commitment carries no block anchor, so nothing in it can be dated.
@@ -971,6 +985,10 @@ impl PaymentBlocker {
             PaymentBlocker::CommitmentNotTheSellers(why) => format!(
                 "The published order is not signed by this store's seller ({why}). Do not pay."
             ),
+            PaymentBlocker::CommitmentNotRequested => "The published order is for a different \
+                 listing than the one you asked about. Do not pay it -- ask the seller what it \
+                 is for."
+                .to_string(),
             PaymentBlocker::NotAwaitingPayment(status) => format!(
                 "This order is no longer awaiting payment ({status:?}), so there is nothing \
                  to pay."
@@ -2550,6 +2568,29 @@ impl AppState {
         purchases
     }
 
+    /// Every listing this conversation has asked about.
+    ///
+    /// A set rather than the latest, because a buyer may ask about two things
+    /// in one thread and the acceptance names only an order id -- so "which
+    /// request does this answer" has no unambiguous answer, while "was this
+    /// one of the things I asked about" does.
+    fn requested_listings(
+        store: &BrowsingStore,
+        conversation: &crate::messaging::BuyerConversation,
+    ) -> Vec<harvest_common::listing::ListingId> {
+        use crate::messaging::{Addressing, MessageContent};
+
+        conversation
+            .read(&store.mailbox_messages)
+            .into_iter()
+            .filter(|message| message.addressing == Addressing::ToSeller)
+            .filter_map(|message| match message.content {
+                MessageContent::OrderRequest { listing_id, .. } => Some(listing_id),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// What stands between this buyer and paying one commitment.
     ///
     /// Ordered so the first blocker is the one worth showing first: what is
@@ -2585,6 +2626,14 @@ impl AppState {
         }
         if commitment.status != OrderStatus::AwaitingPayment {
             return vec![PaymentBlocker::NotAwaitingPayment(commitment.status)];
+        }
+        // What this conversation actually asked about. Empty for a
+        // conversation that never used the buy form, and the check then has
+        // nothing to compare against -- see
+        // `PaymentBlocker::CommitmentNotRequested`.
+        let requested = Self::requested_listings(store, conversation);
+        if !requested.is_empty() && !requested.contains(&commitment.order.listing_id) {
+            return vec![PaymentBlocker::CommitmentNotRequested];
         }
 
         let mut blockers = Vec::new();
@@ -4625,7 +4674,7 @@ pub struct BlockRow {
 /// Two consumers, and the larger wins. The Bitcoin panel renders a handful
 /// for display; [`TipView::anchor_is_canonical`] has to be able to answer
 /// about every height a FRESH anchor may name, which is the tip and the
-/// [`MAX_ANCHOR_AGE_BLOCKS`] beneath it. A window that kept fewer would
+/// [`harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS`] beneath it. A window that kept fewer would
 /// report a perfectly good anchor as unknown, and unknown reads as "do not
 /// pay" -- so the buy flow would break for no reason a user could see.
 ///
@@ -9843,6 +9892,86 @@ mod buy_flow_tests {
             state.browsing_stores[STORE].conversations.is_empty(),
             "a refused request must not leave a conversation behind"
         );
+    }
+
+    /// **A commitment for something this conversation never asked about is
+    /// refused.**
+    ///
+    /// "Confirm your own order is present" is not satisfied by an order being
+    /// present. A seller who accepted a request for a $5 listing by
+    /// publishing a commitment against a $500 one would have a buyer paying
+    /// the amount on a commitment for goods they never asked for -- and every
+    /// other check in this list would pass, because the commitment is
+    /// genuinely published, genuinely signed and genuinely fresh.
+    ///
+    /// What this rests on: the request is in the buyer's own thread, which
+    /// only the two parties can write to. Direction is not authorship (see
+    /// `messaging::Addressing`), so a seller CAN insert a request the buyer
+    /// never sent -- but it then appears in the buyer's own thread as a
+    /// request they do not recognise, which is a thing a person can see. The
+    /// check is worth having for the case it does close and is not claimed to
+    /// close more.
+    #[test]
+    fn a_commitment_for_a_listing_never_requested_is_refused() {
+        let asked_for = ListingId([3u8; 16]);
+        let published = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        assert_ne!(
+            published.order.listing_id, asked_for,
+            "the fixture must name a different listing, or this asserts nothing"
+        );
+
+        let (mut state, _) = buyer_after_acceptance(&published);
+        // Put the buyer's own request into the thread, for a different
+        // listing than the one the seller committed to.
+        let conversation = state.browsing_stores[STORE].conversations[0].clone();
+        let request = conversation
+            .request_order(&asked_for, 1, "12 Example St".into(), String::new())
+            .expect("seal the request");
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .mailbox_messages
+            .push(request);
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::CommitmentNotRequested]
+        );
+    }
+
+    /// **And the commitment for the listing that WAS asked about is fine.**
+    ///
+    /// The other half, so the rule above cannot pass by refusing everything.
+    #[test]
+    fn a_commitment_for_the_listing_that_was_requested_is_payable() {
+        let published = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut state, _) = buyer_after_acceptance(&published);
+        let conversation = state.browsing_stores[STORE].conversations[0].clone();
+        let request = conversation
+            .request_order(
+                &published.order.listing_id,
+                1,
+                "12 Example St".into(),
+                String::new(),
+            )
+            .expect("seal the request");
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .mailbox_messages
+            .push(request);
+
+        assert_eq!(purchases(&state)[0].blockers, Vec::new());
     }
 
     /// **A buyer who has been accepted has a purchase they can pay.**

@@ -175,7 +175,8 @@ pub enum MessageContent {
     /// message alone would be paying on the strength of a message it could
     /// have written itself.
     ///
-    /// The id has to be told rather than derived: [`OrderId::new`] hashes a
+    /// The id has to be told rather than derived:
+    /// `harvest_common::payment::OrderId::new` hashes a
     /// `created_at` the seller stamps, so a buyer cannot compute it.
     OrderAccepted {
         order_id: harvest_common::payment::OrderId,
