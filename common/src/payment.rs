@@ -72,7 +72,7 @@
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
 use freenet_bitcoin_common::{
-    fold_outpoint_status, BitcoinAddressParameters, BitcoinNetwork, BridgeId, Claim,
+    fold_outpoint_status, BitcoinAddressParameters, BitcoinNetwork, BlockAnchor, BridgeId, Claim,
     OutpointStatus, SignedClaim, SignedTipEntry,
 };
 use serde::{Deserialize, Serialize};
@@ -168,6 +168,37 @@ impl OrderStatus {
     }
 }
 
+/// How far behind the tip an order's [`Order::anchor`] may be and still be
+/// treated as fresh by a buyer about to pay.
+///
+/// # Why a buyer checks this at all
+///
+/// A block hash proves the commitment was signed *no earlier than* that
+/// block. It is a lower bound and nothing more, and every past block hash is
+/// public -- so a seller can anchor a fresh commitment to an old block and
+/// have readers count it as already closed, reading as zero outstanding
+/// exposure while taking money. `docs/design/incentive-mechanism.md` argues
+/// this cannot happen; it is wrong, and GitHub issue 8 records the
+/// correction. The rule that neutralises it is this one, applied by the buyer
+/// before they pay.
+///
+/// # Why the reader applies it and not the contract
+///
+/// "Is this recent?" is a question about now, and a contract has no clock. A
+/// merge that consulted one would not be a function of its inputs and
+/// replicas would diverge. The network stores the anchor; the reader forms
+/// the verdict.
+///
+/// # Why 6
+///
+/// It is the same order of magnitude as Bitcoin's customary confirmation
+/// depth: about an hour, which is long enough that an honest seller
+/// accepting an order and a buyer reading it back a few minutes later always
+/// agree, and short enough that a backdated anchor is useless. Nothing here
+/// depends on the exact number, and anything that reads it derives from it
+/// rather than repeating it -- see `harvest_ui::state::RECENT_BLOCKS_KEPT`.
+pub const MAX_ANCHOR_AGE_BLOCKS: u32 = 6;
+
 /// The immutable terms of an order, as agreed and published by the seller.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Order {
@@ -254,6 +285,54 @@ pub struct Order {
     /// Bitcoin contract could never be reflected.
     #[serde(default)]
     pub bitcoin_address_code_hash: Option<[u8; 32]>,
+    /// A recent Bitcoin block this commitment is anchored to.
+    ///
+    /// # What it is for
+    ///
+    /// The order commitment is the anti-exit-scam mechanism
+    /// (`docs/design/incentive-mechanism.md` Part 5, step 2): it makes a
+    /// seller's outstanding exposure countable by strangers, so a buyer can
+    /// see that more is staked than they are about to risk. Counting requires
+    /// deciding which commitments are still open, and that is a question
+    /// about time.
+    ///
+    /// **A contract cannot read a clock**, and a timestamp the writer chooses
+    /// is not a clock either -- it is an assertion by the one party with a
+    /// motive to lie about it. `created_at` is exactly that, which is why it
+    /// is not used for this. A block hash is the substitute: it proves the
+    /// commitment was signed *no earlier than* that block, and the reader's
+    /// own clock supplies the rest.
+    ///
+    /// # What it does NOT prove, and the direction it fails in
+    ///
+    /// It is a lower bound only. Every past block hash is public, so a seller
+    /// can anchor a fresh commitment to an old block and have readers close
+    /// it immediately -- reading as zero exposure while taking orders. The
+    /// design document is wrong where it argues otherwise, and issue 8
+    /// records the correction.
+    ///
+    /// The rule that neutralises it lives in the READER, because only a
+    /// reader has a clock: a buyer pays only if the anchor is canonical on
+    /// the chain they see and is within [`MAX_ANCHOR_AGE_BLOCKS`] of the tip.
+    /// See `harvest_ui::state::AppState::payment_blockers`. This field
+    /// carries the fact; the verdict is not a contract's to form.
+    ///
+    /// # Why `Option`, and why it skips when absent
+    ///
+    /// `None` for every order signed before this field existed.
+    /// [`AuthorizedOrder::verify_terms`] re-serializes this struct and
+    /// compares the result against the payload inside the signed
+    /// `ScopedPayload`, so a field that serialized when absent would change
+    /// the preimage of every earlier signature and the store contract would
+    /// reject the seller's own published invoices. Pinned by
+    /// `order_wire_compat_tests::an_order_that_predates_the_anchor_re_encodes_unchanged`,
+    /// which was observed red against the naive `#[serde(default)]`-only
+    /// form.
+    ///
+    /// A buyer refuses to pay an order with no anchor, so absence is the safe
+    /// direction rather than a silent downgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<BlockAnchor>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -1226,6 +1305,7 @@ mod lightning_tests {
             // with no bridge in the picture.
             trusted_bridges: Vec::new(),
             bitcoin_address_code_hash: None,
+            anchor: None,
             created_at: ts,
         }
     }
@@ -1330,5 +1410,110 @@ mod lightning_tests {
         let bytes = crate::to_cbor(&old).unwrap();
         let decoded: Order = crate::from_cbor(&bytes).expect("old orders must still decode");
         assert_eq!(decoded.payment_hash, None);
+    }
+}
+
+#[cfg(test)]
+mod order_wire_compat_tests {
+    use super::*;
+
+    /// A real pre-anchor `Order`, as CBOR, written out byte by byte.
+    ///
+    /// These bytes are the shape `Order` had before it carried a
+    /// [`BlockAnchor`] -- thirteen fields, `payment_hash` and
+    /// `bitcoin_address_code_hash` both present and null:
+    ///
+    /// ```text
+    /// ad                                  map(13)
+    ///   62 "id"                    90 ..    16-element array (serde encodes
+    ///                                       [u8; 16] as a tuple, i.e. an
+    ///                                       array of numbers, NOT a byte
+    ///                                       string), all zero
+    ///   6a "listing_id"            90 ..    16-element array, all 0x01
+    ///   71 "buyer_fingerprint"     60       empty string -- an anonymous
+    ///                                       buyer, which is what the buy
+    ///                                       flow produces
+    ///   72 "seller_fingerprint"    69 ..    "seller-fp"
+    ///   6b "amount_sats"           19 c350  50000
+    ///   67 "network"               66 ..    "Signet"
+    ///   75 "payment_script_pubkey" 82 ..    [0x51, 0x20]
+    ///   6f "payment_address"       6b ..    "tb1qexample"
+    ///   76 "required_confirmations" 01
+    ///   6c "payment_hash"          f6       null
+    ///   6f "trusted_bridges"       80       empty seq
+    ///   78 19 "bitcoin_address_code_hash" f6  null
+    ///   6a "created_at"            74 ..    "2023-11-14T22:13:20Z"
+    /// ```
+    ///
+    /// Written as a literal rather than produced by serializing a struct with
+    /// the field taken out, for the same reason as
+    /// `store::wire_compat_tests::V1_STORE_STATE_CBOR`: the point is to pin
+    /// today's decoder against bytes whose shape comes from somewhere other
+    /// than today's types. A generated fixture would move whenever the types
+    /// moved, which is exactly the change it is supposed to catch.
+    const PRE_ANCHOR_ORDER_CBOR: &[u8] = &[
+        0xad, 0x62, 0x69, 0x64, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6a, 0x6c, 0x69, 0x73, 0x74, 0x69, 0x6e, 0x67, 0x5f,
+        0x69, 0x64, 0x90, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x71, 0x62, 0x75, 0x79, 0x65, 0x72, 0x5f, 0x66, 0x69, 0x6e, 0x67,
+        0x65, 0x72, 0x70, 0x72, 0x69, 0x6e, 0x74, 0x60, 0x72, 0x73, 0x65, 0x6c, 0x6c, 0x65, 0x72,
+        0x5f, 0x66, 0x69, 0x6e, 0x67, 0x65, 0x72, 0x70, 0x72, 0x69, 0x6e, 0x74, 0x69, 0x73, 0x65,
+        0x6c, 0x6c, 0x65, 0x72, 0x2d, 0x66, 0x70, 0x6b, 0x61, 0x6d, 0x6f, 0x75, 0x6e, 0x74, 0x5f,
+        0x73, 0x61, 0x74, 0x73, 0x19, 0xc3, 0x50, 0x67, 0x6e, 0x65, 0x74, 0x77, 0x6f, 0x72, 0x6b,
+        0x66, 0x53, 0x69, 0x67, 0x6e, 0x65, 0x74, 0x75, 0x70, 0x61, 0x79, 0x6d, 0x65, 0x6e, 0x74,
+        0x5f, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x5f, 0x70, 0x75, 0x62, 0x6b, 0x65, 0x79, 0x82,
+        0x18, 0x51, 0x18, 0x20, 0x6f, 0x70, 0x61, 0x79, 0x6d, 0x65, 0x6e, 0x74, 0x5f, 0x61, 0x64,
+        0x64, 0x72, 0x65, 0x73, 0x73, 0x6b, 0x74, 0x62, 0x31, 0x71, 0x65, 0x78, 0x61, 0x6d, 0x70,
+        0x6c, 0x65, 0x76, 0x72, 0x65, 0x71, 0x75, 0x69, 0x72, 0x65, 0x64, 0x5f, 0x63, 0x6f, 0x6e,
+        0x66, 0x69, 0x72, 0x6d, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x73, 0x01, 0x6c, 0x70, 0x61, 0x79,
+        0x6d, 0x65, 0x6e, 0x74, 0x5f, 0x68, 0x61, 0x73, 0x68, 0xf6, 0x6f, 0x74, 0x72, 0x75, 0x73,
+        0x74, 0x65, 0x64, 0x5f, 0x62, 0x72, 0x69, 0x64, 0x67, 0x65, 0x73, 0x80, 0x78, 0x19, 0x62,
+        0x69, 0x74, 0x63, 0x6f, 0x69, 0x6e, 0x5f, 0x61, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73, 0x5f,
+        0x63, 0x6f, 0x64, 0x65, 0x5f, 0x68, 0x61, 0x73, 0x68, 0xf6, 0x6a, 0x63, 0x72, 0x65, 0x61,
+        0x74, 0x65, 0x64, 0x5f, 0x61, 0x74, 0x74, 0x32, 0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d,
+        0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32, 0x30, 0x5a,
+    ];
+
+    /// An order signed before the anchor existed still decodes.
+    #[test]
+    fn an_order_that_predates_the_anchor_decodes() {
+        let order: Order = crate::from_cbor(PRE_ANCHOR_ORDER_CBOR)
+            .expect("a pre-anchor order must still decode into today's type");
+        assert_eq!(order.amount_sats, 50_000);
+        assert_eq!(order.seller_fingerprint, "seller-fp");
+    }
+
+    /// **The anchor field must not change the preimage of an old signature.**
+    ///
+    /// [`AuthorizedOrder::verify_terms`] does not compare stored bytes: it
+    /// re-serializes this struct and checks the result against the payload
+    /// inside the signed `ScopedPayload`. A field that serializes when absent
+    /// therefore changes the preimage of every signature taken before it
+    /// existed, and the store contract rejects the seller's own published
+    /// invoices with "order signature invalid".
+    ///
+    /// This is the same trap `StoreInfoV1::encryption_public_key` documents,
+    /// and it is why the anchor carries `skip_serializing_if` rather than
+    /// `serde(default)` alone. Observed red against the naive
+    /// `#[serde(default)]`-only form:
+    ///
+    /// ```text
+    /// assertion `left == right` failed: an order that predates the anchor
+    /// must re-encode to the bytes its signature was taken over
+    ///   left: [174, 98, 105, 100, ...  102, 97, 110, 99, 104, 111, 114, 246, ...]
+    ///  right: [173, 98, 105, 100, ...                                        ...]
+    /// ```
+    ///
+    /// 174 is `0xae`, map(14); 173 is `0xad`, map(13). The extra pair is
+    /// `"anchor": null`.
+    #[test]
+    fn an_order_that_predates_the_anchor_re_encodes_unchanged() {
+        let order: Order = crate::from_cbor(PRE_ANCHOR_ORDER_CBOR).expect("decodes");
+        let re_encoded = crate::to_cbor(&order).expect("re-encodes");
+        assert_eq!(
+            re_encoded, PRE_ANCHOR_ORDER_CBOR,
+            "an order that predates the anchor must re-encode to the bytes its signature \
+             was taken over"
+        );
     }
 }

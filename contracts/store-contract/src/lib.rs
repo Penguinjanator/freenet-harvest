@@ -369,6 +369,7 @@ mod tests {
                 bridge_key().verifying_key().to_bytes(),
             )],
             bitcoin_address_code_hash: code_hash,
+            anchor: None,
             created_at: ts,
         }
     }

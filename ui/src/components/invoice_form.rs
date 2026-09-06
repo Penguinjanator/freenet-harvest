@@ -396,6 +396,11 @@ fn InvoiceForm(
                             buyer_fingerprint: buyer().trim().to_string(),
                             amount_sats,
                             required_confirmations,
+                            // This form writes an invoice from scratch. One
+                            // answering a buyer's request is issued from the
+                            // inbox, which is where the conversation to reply
+                            // into is known.
+                            reply_to: None,
                         });
                         amount.set(String::new());
                         buyer.set(String::new());
@@ -470,6 +475,7 @@ mod tests {
                 payment_hash: None,
                 trusted_bridges: Vec::new(),
                 bitcoin_address_code_hash: None,
+                anchor: None,
                 created_at,
             },
             scoped_payload: Vec::new(),

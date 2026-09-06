@@ -436,6 +436,7 @@ pub(super) mod __address_check_test_support {
             payment_hash: None,
             trusted_bridges: Vec::new(),
             bitcoin_address_code_hash: None,
+            anchor: None,
             created_at,
         }
     }
@@ -606,6 +607,7 @@ mod bridge_check_tests {
             payment_hash: None,
             trusted_bridges: bridges,
             bitcoin_address_code_hash: None,
+            anchor: None,
             created_at: ts,
         }
     }

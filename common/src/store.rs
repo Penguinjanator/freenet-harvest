@@ -728,6 +728,7 @@ mod order_tests {
             // seller's signature, rather than in the store's address.
             trusted_bridges: bridges(&bridge_key()),
             bitcoin_address_code_hash: None,
+            anchor: None,
             created_at: ts,
         }
     }
@@ -1970,6 +1971,7 @@ mod order_tests {
             required_confirmations: 1,
             trusted_bridges: Vec::new(),
             bitcoin_address_code_hash: None,
+            anchor: None,
             created_at: ts,
         };
         (

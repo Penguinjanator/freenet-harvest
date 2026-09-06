@@ -917,5 +917,20 @@ fn describe(content: &MessageContent) -> String {
             format!("{message}\n\n(This message also carries a blind signature, which this version of Harvest cannot act on.)")
         }
         MessageContent::Decline { reason } => format!("Declined: {reason}"),
+        MessageContent::OrderRequest {
+            quantity,
+            shipping,
+            note,
+            ..
+        } => {
+            let mut described = format!("Wants to buy {quantity}.\n\nShip to:\n{shipping}");
+            if !note.trim().is_empty() {
+                described.push_str(&format!("\n\n{note}"));
+            }
+            described
+        }
+        MessageContent::OrderAccepted { order_id } => {
+            format!("Accepted -- invoice {} is published.", order_id.short())
+        }
     }
 }

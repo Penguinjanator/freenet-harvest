@@ -120,6 +120,66 @@ pub enum MessageContent {
     },
     /// Either party declining or cancelling.
     Decline { reason: String },
+    /// A buyer asking to buy a listing.
+    ///
+    /// Step 1 of `docs/design/incentive-mechanism.md` Part 5. It rides the
+    /// ordinary sealed conversation rather than a channel of its own, so the
+    /// seller's mailbox is the one place a buyer's approach can arrive from.
+    ///
+    /// # The buyer's conversation key is not a field here
+    ///
+    /// It is the routing tag on the envelope
+    /// ([`EncryptedMessage::sender_public_key`]), carried in the clear by
+    /// every message in both directions, and the delegate files a kept
+    /// conversation under the same value. Repeating it inside the plaintext
+    /// would be a second source for one identity, and the two could disagree:
+    /// a seller replying to the field rather than to the envelope would seal
+    /// their answer under keys the buyer's thread does not read, silently.
+    /// That is the same defect as trusting an echoed conversation tag, which
+    /// this repository has already paid for once.
+    ///
+    /// # What it does NOT establish
+    ///
+    /// Nothing about the buyer. They have no ghostkey and no account, and
+    /// this message costs nothing to send -- a seller who accepts is choosing
+    /// to publish a commitment on the strength of an anonymous request. The
+    /// commitment is what has to be countable, not the request.
+    OrderRequest {
+        listing_id: harvest_common::listing::ListingId,
+        /// How many. Not multiplied by anything here: a listing's price is a
+        /// free-text `PriceInfo` in an arbitrary currency
+        /// ([`harvest_common::listing::PriceInfo`]), so no honest conversion
+        /// to satoshis exists in this crate. The seller names the amount when
+        /// they accept, and the buyer sees that amount before paying.
+        quantity: u32,
+        /// Where the goods should go, as the buyer typed it.
+        ///
+        /// This is the most identifying thing a buyer ever sends, which is
+        /// why it travels inside the AEAD and never near the commitment: the
+        /// published order must reveal nothing about who bought.
+        shipping: String,
+        /// Anything else the buyer wants to say, so a request is not a form
+        /// that forces a second message beside it.
+        note: String,
+    },
+    /// The seller has published the order commitment for a request, and this
+    /// is its id.
+    ///
+    /// # This is a pointer, not an authority
+    ///
+    /// Both parties hold both direction keys (see [`Addressing`]), so nothing
+    /// about this message proves the seller wrote it. What makes a commitment
+    /// the seller's is the ghostkey-scoped signature on the published
+    /// [`harvest_common::payment::AuthorizedOrder`], checked against the
+    /// store's own verifying key. A buyer that paid on the strength of this
+    /// message alone would be paying on the strength of a message it could
+    /// have written itself.
+    ///
+    /// The id has to be told rather than derived: [`OrderId::new`] hashes a
+    /// `created_at` the seller stamps, so a buyer cannot compute it.
+    OrderAccepted {
+        order_id: harvest_common::payment::OrderId,
+    },
 }
 
 /// Both keys of one conversation, derived from a single X25519 exchange.
@@ -200,6 +260,19 @@ pub struct BuyerConversation {
     /// [`harvest_common::ConversationSecret`].
     secret: Option<harvest_common::ConversationSecret>,
     keys: ConversationKeys,
+    /// Whether the harvest delegate has SAID it is keeping this.
+    ///
+    /// Not "a request was sent": the delegate is the only thing that knows
+    /// whether a record was written, and it can refuse -- the node can decline
+    /// the write, and the store can be at its cap. A conversation this is
+    /// false for dies with the tab, taking the seller's replies with it.
+    ///
+    /// The buy flow reads this before letting a buyer pay
+    /// (`state::PaymentBlocker::ConversationNotKept`), which is the shape
+    /// `docs/buyer-conversation-persistence.md` requires of Phase 2: persist
+    /// what protects you, confirm the persistence, and only then part with
+    /// money.
+    kept: bool,
 }
 
 impl BuyerConversation {
@@ -222,6 +295,8 @@ impl BuyerConversation {
             backed_up: false,
             secret: Some(harvest_common::ConversationSecret(secret.to_bytes())),
             keys: ConversationKeys::from_shared_secret(shared.as_bytes()),
+            // Nothing has been asked yet, let alone answered.
+            kept: false,
         })
     }
 
@@ -241,7 +316,25 @@ impl BuyerConversation {
                 to_seller: recalled.buyer_to_seller,
                 from_seller: recalled.seller_to_buyer,
             },
+            // It came OUT of the delegate's store, so there is nothing left to
+            // confirm. A returning buyer required to send a message before
+            // they could pay would be a buyer told to do something pointless.
+            kept: true,
         }
+    }
+
+    /// Whether this node's delegate has said it is keeping this conversation.
+    pub fn is_kept(&self) -> bool {
+        self.kept
+    }
+
+    /// Record that the delegate answered `Ok` to keeping this.
+    ///
+    /// Only the delegate's own answer calls this. Marking on dispatch would
+    /// mean a refused write read as a kept conversation, which is the silent
+    /// failure the whole persistence mechanism exists to prevent.
+    pub fn mark_kept(&mut self) {
+        self.kept = true;
     }
 
     /// What the delegate must be told so this conversation outlives the tab,
@@ -278,6 +371,32 @@ impl BuyerConversation {
             &self.buyer_public_key,
             &self.conversation_id,
             MessageContent::Text(text),
+        )
+    }
+
+    /// Seal a request to buy a listing.
+    ///
+    /// Deliberately a method on the conversation rather than a free function
+    /// taking keys: the request and the ordinary message must travel in the
+    /// same thread, under the same tag, or the seller's acceptance comes back
+    /// where the buyer is not reading.
+    pub fn request_order(
+        &self,
+        listing_id: &harvest_common::listing::ListingId,
+        quantity: u32,
+        shipping: String,
+        note: String,
+    ) -> Result<EncryptedMessage, String> {
+        seal(
+            &self.keys.to_seller,
+            &self.buyer_public_key,
+            &self.conversation_id,
+            MessageContent::OrderRequest {
+                listing_id: listing_id.clone(),
+                quantity,
+                shipping,
+                note,
+            },
         )
     }
 
@@ -440,6 +559,37 @@ pub fn seal_reply(
     )
 }
 
+/// Seal the seller's acceptance: the id of the commitment they just
+/// published, addressed back down the buyer's own thread.
+///
+/// Sent in the seller-to-buyer direction for a reason a reader can check:
+/// `an_acceptance_names_the_order_and_is_addressed_to_the_buyer` fails if this
+/// uses the other key, and the buyer's side ignores an acceptance addressed
+/// the other way. Both parties hold both keys, so the direction is not proof
+/// of authorship -- it only stops a buyer's own composition being read back as
+/// the seller's answer.
+pub fn seal_order_accepted(
+    keys: &ConversationKeys,
+    buyer_public_key: &[u8],
+    conversation_id: &ConversationId,
+    order_id: &harvest_common::payment::OrderId,
+) -> Result<EncryptedMessage, String> {
+    let tag: [u8; 32] = buyer_public_key.try_into().map_err(|_| {
+        format!(
+            "conversation tag is {} bytes, not 32",
+            buyer_public_key.len()
+        )
+    })?;
+    seal(
+        &keys.from_seller,
+        &tag,
+        conversation_id,
+        MessageContent::OrderAccepted {
+            order_id: order_id.clone(),
+        },
+    )
+}
+
 /// The one place a message is built, whichever direction it travels.
 ///
 /// # Why the size is checked HERE
@@ -479,6 +629,22 @@ fn seal(
         ));
     }
     Ok(message)
+}
+
+/// [`seal`], reachable from this crate's tests.
+///
+/// Exists so a test can seal a message the production paths deliberately
+/// cannot -- an acceptance in the buyer-to-seller direction, say, which is
+/// exactly what a buyer's own composition would look like and what the buyer
+/// side has to refuse.
+#[cfg(test)]
+pub(crate) fn seal_for_test(
+    key: &[u8; 32],
+    tag: &[u8; 32],
+    conversation_id: &ConversationId,
+    content: MessageContent,
+) -> Result<EncryptedMessage, String> {
+    seal(key, tag, conversation_id, content)
 }
 
 /// One message in a seller's mailbox, as far as this browser can read it.
@@ -728,23 +894,23 @@ mod tests {
     /// is what the harvest delegate holds. Deliberately NOT built out of this
     /// module's own types, so a test cannot pass because the buyer's half and
     /// the seller's half drifted together.
-    struct Seller {
+    pub(super) struct Seller {
         secret: StaticSecret,
     }
 
     impl Seller {
-        fn new(seed: u8) -> Self {
+        pub(super) fn new(seed: u8) -> Self {
             Self {
                 secret: StaticSecret::from([seed; 32]),
             }
         }
 
-        fn public_key(&self) -> [u8; 32] {
+        pub(super) fn public_key(&self) -> [u8; 32] {
             *PublicKey::from(&self.secret).as_bytes()
         }
 
         /// The keys the delegate would answer for one conversation tag.
-        fn keys_for(&self, tag: &[u8]) -> ConversationKeys {
+        pub(super) fn keys_for(&self, tag: &[u8]) -> ConversationKeys {
             let peer: [u8; 32] = tag.try_into().expect("32-byte tag");
             let shared = self
                 .secret
@@ -756,7 +922,7 @@ mod tests {
             }
         }
 
-        fn inbox(&self, messages: &[EncryptedMessage]) -> Vec<MailboxEntry> {
+        pub(super) fn inbox(&self, messages: &[EncryptedMessage]) -> Vec<MailboxEntry> {
             let mut keys = HashMap::new();
             for message in messages {
                 if message.sender_public_key.len() == 32 {
@@ -1562,5 +1728,90 @@ mod tests {
             error.contains("not usable"),
             "the refusal must say why: {error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod buy_flow_tests {
+    use super::tests::Seller;
+    use super::*;
+    use harvest_common::listing::ListingId;
+    use harvest_common::payment::OrderId;
+
+    /// **A buyer's request to buy reaches the seller intact.**
+    ///
+    /// This is step 1 of `docs/design/incentive-mechanism.md` Part 5, and it
+    /// rides the same sealed conversation as any other message -- there is no
+    /// second channel. The seller here is reconstructed from nothing but an
+    /// X25519 secret, which is all the harvest delegate holds, so a pass
+    /// cannot come from the two halves of this module drifting together.
+    #[test]
+    fn a_buyers_order_request_reaches_the_seller_intact() {
+        let seller = Seller::new(31);
+        let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+        let listing = ListingId([7u8; 16]);
+
+        let sealed = buyer
+            .request_order(&listing, 3, "12 Example St".into(), "no chilli".into())
+            .expect("seal the request");
+
+        let inbox = seller.inbox(&[sealed]);
+        match &inbox[0] {
+            MailboxEntry::Readable {
+                content:
+                    MessageContent::OrderRequest {
+                        listing_id,
+                        quantity,
+                        shipping,
+                        note,
+                    },
+                ..
+            } => {
+                assert_eq!(listing_id, &listing);
+                assert_eq!(*quantity, 3);
+                assert_eq!(shipping, "12 Example St");
+                assert_eq!(note, "no chilli");
+            }
+            other => panic!("expected an order request, got {other:?}"),
+        }
+    }
+
+    /// **The buyer learns which published commitment is theirs, and from
+    /// which direction.**
+    ///
+    /// The order id is not something a buyer can derive: `OrderId::new`
+    /// hashes a `created_at` the seller stamps. So the acceptance has to name
+    /// it, and it has to arrive addressed TO THE BUYER -- a buyer counting
+    /// their own outbound messages as acceptances would let anything they
+    /// composed point them at an order.
+    ///
+    /// This message is a POINTER and carries no authority. What makes the
+    /// commitment the seller's is the ghostkey signature on the published
+    /// order, checked in `state::AppState::payment_blockers`.
+    #[test]
+    fn an_acceptance_names_the_order_and_is_addressed_to_the_buyer() {
+        let seller = Seller::new(32);
+        let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+        let order = OrderId([9u8; 16]);
+
+        let reply = seal_order_accepted(
+            &seller.keys_for(&buyer.buyer_public_key),
+            &buyer.buyer_public_key,
+            &buyer.conversation_id,
+            &order,
+        )
+        .expect("seal the acceptance");
+
+        let thread = buyer.read(&[reply]);
+        assert_eq!(thread.len(), 1, "the buyer must be able to read it");
+        assert_eq!(
+            thread[0].addressing,
+            Addressing::ToBuyer,
+            "an acceptance the buyer wrote themselves is not an acceptance"
+        );
+        match &thread[0].content {
+            MessageContent::OrderAccepted { order_id } => assert_eq!(order_id, &order),
+            other => panic!("expected an acceptance, got {other:?}"),
+        }
     }
 }

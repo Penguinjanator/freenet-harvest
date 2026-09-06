@@ -670,6 +670,7 @@ mod tests {
             payment_hash: None,
             trusted_bridges: vec![freenet_bitcoin_common::BridgeId([3u8; 32])],
             bitcoin_address_code_hash: Some([4u8; 32]),
+            anchor: None,
             created_at,
         };
 
