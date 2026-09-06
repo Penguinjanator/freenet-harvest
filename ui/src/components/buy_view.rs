@@ -22,6 +22,15 @@
 //!   seller has admitted the debt in public; it does not say they can cover
 //!   it. Phase 2 is what adds the second half, and this screen does not
 //!   pretend to it.
+//! * **The commitment is not private, and the accept control says so.** The
+//!   design document describes a commitment carrying "the amount and a recent
+//!   Bitcoin block hash" and nothing else. What is actually published is an
+//!   `AuthorizedOrder`, which also carries the listing id and the payment
+//!   address -- so WHAT was bought is public even though WHO bought it is
+//!   not. Closing that means separating the countable commitment from the
+//!   payable invoice, which is the ledger contract in issue 8. Until then the
+//!   seller is told what they are publishing rather than reassured about it.
+//!   Recorded in `docs/untested-invariants.md`.
 
 use dioxus::prelude::*;
 use harvest_common::listing::ListingId;
@@ -180,10 +189,12 @@ pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
         div { style: "margin-top: 24px;",
             h4 { "Your purchases" }
             p { class: "text-muted",
-                "A seller has to publish an order before you can pay for it. That public "
-                "entry is what stops a seller quietly taking money for more orders than they "
-                "could ever make good on -- so your own order has to be there, and your "
-                "software checks it rather than taking anyone's word."
+                "A seller has to publish an order publicly before you can pay for it, and "
+                "your software checks that yours is there rather than taking anyone's word. "
+                "What that buys you today is that the seller cannot take your money without "
+                "first admitting in public that they owe you goods. It does not yet tell you "
+                "they can cover it: there is nothing staked behind these orders, and nothing "
+                "here counts one."
             }
             for purchase in purchases.iter() {
                 PurchaseCard {
@@ -229,7 +240,8 @@ fn PurchaseCard(purchase: BuyerPurchase, bitcoin: crate::state::BitcoinState) ->
                         if purchase.blockers.iter().all(is_temporary) {
                             "No payment details are shown while that is true. Look again in a moment."
                         } else {
-                            "No payment details are shown while that is true, and this is not                              something waiting will fix."
+                            "No payment details are shown while that is true, and this is not "
+                            "something waiting will fix."
                         }
                     }
                 },
@@ -277,9 +289,10 @@ pub fn AcceptRequest(
     rsx! {
         div { style: "margin-top: 0.75rem;",
             p { class: "text-muted", style: "font-size: 0.85rem;",
-                "Accepting publishes this order on your store, where anyone can count it. It "
-                "carries the amount and a recent block only -- not who asked, and not what "
-                "they asked for."
+                "Accepting publishes this order on your store, where anyone can see it. It "
+                "carries the amount, the listing, the payment address and a recent block. It "
+                "does NOT carry who asked or where they want it sent -- those stay in this "
+                "conversation."
             }
             div { class: "form-group",
                 label { class: "form-label", "Amount for {quantity} (satoshis)" }

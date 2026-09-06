@@ -10405,3 +10405,83 @@ mod buy_flow_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod payment_blocker_wording_tests {
+    use super::*;
+    use harvest_common::payment::OrderStatus;
+
+    /// Every variant, listed by hand so that adding one without a sentence is
+    /// a compile error rather than a silent gap.
+    ///
+    /// The `match` is what does that work: a wildcard here would let a new
+    /// blocker reach a buyer as an empty line on the screen that tells them
+    /// whether to pay.
+    fn every_blocker() -> Vec<PaymentBlocker> {
+        let sample = PaymentBlocker::CommitmentNotPublished;
+        // Exhaustive over the enum, and the value is discarded -- this exists
+        // only to fail the build when a variant is added.
+        match sample {
+            PaymentBlocker::CommitmentNotPublished
+            | PaymentBlocker::SellerIdentityUnknown
+            | PaymentBlocker::CommitmentNotTheSellers(_)
+            | PaymentBlocker::CommitmentNotRequested
+            | PaymentBlocker::NotAwaitingPayment(_)
+            | PaymentBlocker::AnchorMissing
+            | PaymentBlocker::ChainUnknown
+            | PaymentBlocker::AnchorOffChain
+            | PaymentBlocker::AnchorUnverifiable
+            | PaymentBlocker::AnchorAheadOfTip { .. }
+            | PaymentBlocker::AnchorStale { .. }
+            | PaymentBlocker::ConversationNotKept => {}
+        }
+        vec![
+            PaymentBlocker::CommitmentNotPublished,
+            PaymentBlocker::SellerIdentityUnknown,
+            PaymentBlocker::CommitmentNotTheSellers("the signature is not theirs".to_string()),
+            PaymentBlocker::CommitmentNotRequested,
+            PaymentBlocker::NotAwaitingPayment(OrderStatus::Cancelled),
+            PaymentBlocker::AnchorMissing,
+            PaymentBlocker::ChainUnknown,
+            PaymentBlocker::AnchorOffChain,
+            PaymentBlocker::AnchorUnverifiable,
+            PaymentBlocker::AnchorAheadOfTip {
+                anchor_height: 801_000,
+                tip_height: 800_000,
+            },
+            PaymentBlocker::AnchorStale {
+                anchor_height: 799_000,
+                tip_height: 800_000,
+            },
+            PaymentBlocker::ConversationNotKept,
+        ]
+    }
+
+    /// **Every blocker says something, and says it as prose.**
+    ///
+    /// These sentences are the only thing a buyer has to decide on, and they
+    /// are assembled from `\`-continued string literals -- a form where
+    /// dropping the backslash leaves a run of spaces in the middle of the
+    /// sentence and nothing complains. That happened once while this change
+    /// was being written, in `components::buy_view`, and was caught by
+    /// reading the file rather than by anything automatic. This is the
+    /// automatic part.
+    #[test]
+    fn every_blocker_reads_as_a_sentence() {
+        for blocker in every_blocker() {
+            let said = blocker.describe();
+            assert!(
+                !said.trim().is_empty(),
+                "{blocker:?} tells the buyer nothing"
+            );
+            assert!(
+                !said.contains("  "),
+                "{blocker:?} has a broken line continuation: {said}"
+            );
+            assert!(
+                said.ends_with('.'),
+                "{blocker:?} is not a finished sentence: {said}"
+            );
+        }
+    }
+}
