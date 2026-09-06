@@ -602,6 +602,17 @@ pub(crate) fn merge_store_reporting_discard(
 /// this turns up again -- one message, once, and then the data is gone for
 /// good. That is also why it names the store rather than an artifact: a seller
 /// with several stores needs to know which one.
+///
+/// # Why it says the loss was EXPECTED
+///
+/// Because it was: Ian decided on 2026-09-06 that no published store holds
+/// data worth preserving and that sellers republish. A message that describes
+/// a deliberate consequence in the language of a fault sends the seller
+/// looking for a bug, or for someone to report it to, when the only useful
+/// thing they can do is republish. The distinction between "a decision we
+/// made" and "a thing that happened to you" is carried entirely by this
+/// sentence, so it is asserted rather than left to whoever edits the copy
+/// next.
 fn describe_lost_store(lost: &StoreStateV1) -> String {
     let name = lost.info.info.store_name.trim();
     let which = if name.is_empty() {
@@ -613,8 +624,9 @@ fn describe_lost_store(lost: &StoreStateV1) -> String {
     let orders = lost.orders.orders.len();
 
     let mut said = format!(
-        "{which} could not be carried over to this version of Harvest, and what was in it is \
-         gone: its name, description and seller certificate"
+        "{which} was not carried over when Harvest upgraded. This is expected -- an upgrade \
+         moves your store to a new address and this one could not be brought across -- but it \
+         does mean the following is gone: its name, description and seller certificate"
     );
     if listings > 0 {
         said.push_str(&format!(", {listings} listing(s)"));
@@ -624,7 +636,7 @@ fn describe_lost_store(lost: &StoreStateV1) -> String {
     }
     said.push_str(
         ". Nothing was recovered and it will not be retried. Publish your store details and \
-         listings again.",
+         listings again to carry on selling.",
     );
     said
 }
@@ -1795,6 +1807,11 @@ mod uncarried_tests {
         assert!(
             said.to_lowercase().contains("publish"),
             "and what to do about it: {said}"
+        );
+        assert!(
+            said.to_lowercase().contains("expected"),
+            "and that this was a consequence of the upgrade rather than a fault -- without \
+             it the seller goes looking for a bug instead of republishing: {said}"
         );
     }
 
