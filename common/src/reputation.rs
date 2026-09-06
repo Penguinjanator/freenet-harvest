@@ -90,6 +90,10 @@ impl ReputationStateV1 {
                 .map_err(|e| format!("feedback signature invalid: {e}"))?;
 
             // Verify nonce is tracked
+            // nonce-identity-waiver: reputation keys identity on `token.nonce` and has the
+            // same defect the mailbox re-key fixed -- see
+            // `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. Parked
+            // until the reputation contract's own re-key; NOT a site to copy.
             if !self.used_nonces.contains(&entry.token.nonce) {
                 return Err(format!(
                     "feedback entry nonce not in used_nonces set: {:?}",
@@ -116,6 +120,10 @@ impl ReputationStateV1 {
         let new_entries: Vec<_> = self
             .feedback
             .iter()
+            // nonce-identity-waiver: reputation keys identity on `token.nonce` and has the
+            // same defect the mailbox re-key fixed -- see
+            // `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. Parked
+            // until the reputation contract's own re-key; NOT a site to copy.
             .filter(|e| !old_summary.contains(&e.token.nonce))
             .cloned()
             .collect();
@@ -162,6 +170,10 @@ impl ReputationStateV1 {
 
         for entry in entries {
             // Reject duplicate nonces
+            // nonce-identity-waiver: reputation keys identity on `token.nonce` and has the
+            // same defect the mailbox re-key fixed -- see
+            // `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. Parked
+            // until the reputation contract's own re-key; NOT a site to copy.
             if self.used_nonces.contains(&entry.token.nonce) || !seen.insert(entry.token.nonce) {
                 continue;
             }

@@ -481,10 +481,15 @@ pub struct MailboxStateV1 {
 /// recognise their own writing (`AppState::authored_here`), which is what
 /// stops a substitute being labelled as the buyer's own words.
 ///
-/// A source scrape,
-/// `no_production_code_compares_message_nonces_for_identity`, fails if a site
-/// starts answering the question for itself again -- it has happened four
-/// times.
+/// Four sites have answered this question for themselves --
+/// `dedupe_by_nonce`, `summarize`, the contract's state-merge arm, and
+/// `ui/src/migrate.rs::merge_mailbox` -- each in a separate change, and only
+/// the last was caught by anything other than a person. The source scrape
+/// `no_production_code_compares_message_nonces_for_identity` is the tripwire
+/// for a fifth. **Read its own doc comment before relying on it**: it is a
+/// text scrape, it was much weaker than this sentence implied until
+/// 2026-09-05, and what actually carries the property is the behavioural
+/// tests.
 ///
 /// Domain-separated, so a digest of a message can never coincide with a
 /// digest of anything else this codebase hashes.

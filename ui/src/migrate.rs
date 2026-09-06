@@ -525,6 +525,10 @@ fn merge_reputation(
     let delta: Vec<_> = other
         .feedback
         .iter()
+        // nonce-identity-waiver: reputation keys identity on `token.nonce` and has the
+        // same defect the mailbox re-key fixed -- see
+        // `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. Parked
+        // until the reputation contract's own re-key; NOT a site to copy.
         .filter(|e| !base.used_nonces.contains(&e.token.nonce))
         .cloned()
         .collect();
@@ -582,12 +586,26 @@ impl ProbeStateOps for MailboxOps {
 /// There is no comparison here any more; `apply_delta` dedups by
 /// `entry_digest`, so handing it everything is correct and idempotent.
 ///
+/// # It also used to drop an oversized message from one side only
+///
+/// `apply_delta` refuses a message over
+/// `harvest_common::mailbox::MAX_MESSAGE_BYTES`, on the INCOMING side. A fold
+/// puts the PREDECESSOR on that side, so the same message survived if it was
+/// in the successor and vanished if it was in the predecessor -- a result that
+/// depended on which side it arrived on rather than on the bytes, which is
+/// exactly the commutativity `fold_all_policy`'s ack token is minted against.
+/// The refusal is now applied to both sides here, before the merge, and what
+/// it cannot carry is reported rather than swallowed. See
+/// `merge_mailbox_reporting_drops` for why dropping is the right direction and
+/// keeping is not.
+///
 /// Folding an older generation can push the mailbox over
-/// `harvest_common::mailbox::MAX_MESSAGES`. `apply_delta` runs
-/// `enforce_message_cap` on every call, which keeps the highest-ranked
-/// `MAX_MESSAGES` by `(timestamp, nonce, entry_digest)` -- a total order and a
-/// pure function of message content, so the fold result is trimmed to exactly
-/// the subset any peer would keep from the same bytes.
+/// `harvest_common::mailbox::MAX_MESSAGES` or
+/// `harvest_common::mailbox::MAX_MAILBOX_BYTES`. `apply_delta` runs
+/// `enforce_message_cap` on every call, which enforces BOTH and keeps the
+/// highest-ranked messages by `(timestamp, nonce, entry_digest)` -- a total
+/// order and a pure function of message content, so the fold result is trimmed
+/// to exactly the subset any peer would keep from the same bytes.
 ///
 /// What that does NOT give you is a guarantee the older generation's messages
 /// survive the fold: a mailbox at the cap drops whatever ranks lowest, and both
@@ -598,12 +616,129 @@ impl ProbeStateOps for MailboxOps {
 /// keyed on timestamps an unauthenticated sender controls let one message
 /// dated far in the future evict every legitimate one. There is no age rule
 /// here any more, and nothing in this module should imply one.
-fn merge_mailbox(mut base: MailboxStateV1, other: &MailboxStateV1) -> MailboxStateV1 {
-    let snapshot = base.clone();
-    if base.apply_delta(&Some(other.messages.clone())).is_err() {
-        return snapshot;
+/// What a fold carried, and what it could not.
+///
+/// The count exists so the drop can be REPORTED. A migration whose whole
+/// purpose is to carry messages forward must never fail to carry one in
+/// silence, which is the same standard `decode_probed_state` already holds
+/// itself to for the neighbouring failure.
+pub(crate) struct MailboxFold {
+    pub(crate) state: MailboxStateV1,
+    /// Messages refused by the size bound, counted across BOTH sides.
+    pub(crate) dropped_oversized: usize,
+}
+
+impl MailboxFold {
+    /// What to tell the operator, or `None` if everything was carried.
+    ///
+    /// The text is built here rather than at the `probe_warn` call site so a
+    /// test can assert on it. **What no test observes is the emission
+    /// itself**: deleting the `probe_warn` line in [`merge_mailbox`] leaves
+    /// the whole suite green, because a log line has no consumer a test can
+    /// reach without a process-global sink -- and this repository's own rules
+    /// name a process-global sink shared across parallel tests as its own
+    /// trap. So the count and the wording are pinned and the call is not,
+    /// which is stated here rather than left to be assumed.
+    pub(crate) fn unfoldable_warning(&self) -> Option<String> {
+        (self.dropped_oversized > 0).then(|| {
+            format!(
+                "migration fold: {} message(s) exceed MAX_MESSAGE_BYTES ({}) and were NOT \
+                 carried into the new generation. They cannot be: the successor contract's \
+                 own apply_delta refuses them, so keeping one would leave this node holding \
+                 an entry no peer has. This is how a message goes missing silently.",
+                self.dropped_oversized,
+                harvest_common::mailbox::MAX_MESSAGE_BYTES
+            )
+        })
     }
-    base
+}
+
+/// [`merge_mailbox`], plus what it had to leave behind.
+///
+/// Split out from `merge_mailbox` so a test can assert on the count instead of
+/// grepping a log; `merge_mailbox` is the plain-merge shape `ProbeStateOps`
+/// wants.
+pub(crate) fn merge_mailbox_reporting_drops(
+    mut base: MailboxStateV1,
+    other: &MailboxStateV1,
+) -> MailboxFold {
+    // The size bound is applied to BOTH sides, here, before the merge.
+    //
+    // `apply_delta` applies it to the INCOMING side only, which is correct for
+    // the contract -- refusing an incoming message is recoverable, invalidating
+    // a state a peer already holds is not. It is wrong for a FOLD, because
+    // `merge_generations(newer, older)` puts the predecessor on the incoming
+    // side: the same message survived if it was in the successor and was
+    // dropped if it was in the predecessor. That is a merge whose result
+    // depends on which side a message arrived on rather than on the bytes, and
+    // commutativity is precisely what `FoldAllAck` is minted against
+    // (`fold_all_policy`, and the crate's own `assert_merge_commutative`).
+    //
+    // Symmetry could have been restored in either direction. Dropping is the
+    // right one, and the reason is convergence rather than tidiness: `verify`
+    // deliberately tolerates an over-budget state, so a folded state carrying
+    // an oversized message WOULD be accepted by `validate_state` and PUT
+    // successfully -- and then every peer that merged it would run
+    // `apply_delta`, refuse that message, and end up with a different state.
+    // This node would hold an entry no other peer has, for good, with nothing
+    // reporting it. Keeping the message is data preservation that survives
+    // exactly as far as the first merge; dropping it moves this node toward
+    // what the network actually holds.
+    //
+    // No published generation ever enforced a size limit -- `MAX_MESSAGE_BYTES`
+    // and the send-side refusal both arrive on this branch, after the commit
+    // recording V7 -- so a V1..V7 mailbox really can hold one, from a plaintext
+    // over `LARGEST_BUCKET` or from an oversized `sender_public_key`, which was
+    // an unbounded `Vec<u8>` in an open-write contract.
+    let oversized = |m: &harvest_common::mailbox::EncryptedMessage| {
+        harvest_common::mailbox::message_bytes(m) > harvest_common::mailbox::MAX_MESSAGE_BYTES
+    };
+    let before = base.messages.len() + other.messages.len();
+    base.messages.retain(|m| !oversized(m));
+    let carried: Vec<_> = other
+        .messages
+        .iter()
+        .filter(|m| !oversized(m))
+        .cloned()
+        .collect();
+    let dropped_oversized = before - (base.messages.len() + carried.len());
+
+    // `apply_delta` has no `?` and no `return Err`; it ends `Ok(())`
+    // unconditionally, so this branch is unreachable today. It is kept rather
+    // than deleted because the semantics it encodes have to be decided
+    // somewhere, and the shape it would take if `apply_delta` became fallible
+    // is not obviously right: ONE refused message would discard the WHOLE
+    // predecessor generation. That is `merge_reputation`'s deliberate
+    // behaviour and is a much harder call for a mailbox, where the
+    // predecessor may be the only copy of a conversation.
+    //
+    // So: keep-primary is the intent, and it is made LOUD. A migration that
+    // silently kept the primary and dropped a generation would look exactly
+    // like a migration that found nothing to carry.
+    let snapshot = base.clone();
+    if let Err(e) = base.apply_delta(&Some(carried)) {
+        probe_warn(&format!(
+            "migration fold: the predecessor generation was REFUSED in full and none of its \
+             messages were carried forward -- keeping the newer generation unchanged. This \
+             is how a recoverable generation goes missing silently. reason: {e}"
+        ));
+        return MailboxFold {
+            state: snapshot,
+            dropped_oversized,
+        };
+    }
+    MailboxFold {
+        state: base,
+        dropped_oversized,
+    }
+}
+
+fn merge_mailbox(base: MailboxStateV1, other: &MailboxStateV1) -> MailboxStateV1 {
+    let fold = merge_mailbox_reporting_drops(base, other);
+    if let Some(warning) = fold.unfoldable_warning() {
+        probe_warn(&warning);
+    }
+    fold.state
 }
 
 // --- policy -------------------------------------------------------------
@@ -619,14 +754,41 @@ fn merge_mailbox(mut base: MailboxStateV1, other: &MailboxStateV1) -> MailboxSta
 ///   Orders are capacity-pruned by `enforce_order_cap`, which is deterministic
 ///   and re-run inside `apply_delta`, so a fold that re-admits a pruned order
 ///   is pruned again identically.
-/// * **Reputation** -- a grow-only set keyed by nonce with no removal path
-///   whatsoever. Nothing can be resurrected because nothing is ever deleted.
-/// * **Mailbox** -- messages are keyed by nonce and capacity-pruned by
-///   `enforce_message_cap`, re-applied on every `apply_delta`. Same argument
-///   as the order cap. (This said "pruned by a TTL measured against the newest
-///   message present" until `ecbec18` deleted that rule; the soundness
-///   argument is unchanged, because it never depended on WHICH deterministic
+/// * **Reputation** -- a grow-only set keyed by `token.nonce` with no removal
+///   path whatsoever. Nothing can be resurrected because nothing is ever
+///   deleted. **That is true and it is not the whole story**: the RSA
+///   signature covers `entry.token` alone, so a second entry can be published
+///   under the SAME token carrying different words, and `merge_reputation`
+///   keeps whichever side already holds that nonce. A genuine entry is then
+///   permanently EXCLUDED by a fold, which is the same outcome as deletion by
+///   a different route -- see
+///   `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. The
+///   ack is still earned, because fold-all is no worse here than the
+///   contract's own merge, but a reader weighing it should know the exclusion
+///   exists. The repair is the reputation contract's own re-key, deliberately
+///   not on this branch.
+/// * **Mailbox** -- messages are keyed by
+///   `harvest_common::mailbox::entry_digest` over the whole entry, and
+///   capacity-pruned by `enforce_message_cap`, re-applied on every
+///   `apply_delta`. Same argument as the order cap. (This said "keyed by
+///   nonce" until 2026-09-05, which was the precise claim the entry-digest
+///   change existed to retire, still standing in the soundness argument that
+///   mints the token; and "pruned by a TTL measured against the newest message
+///   present" until `ecbec18` deleted that rule. The soundness argument
+///   survives both, because it never depended on WHICH deterministic
 ///   prune ran, only on there being one.)
+///
+/// One property of the mailbox merge that this argument DOES depend on, and
+/// that the obvious precondition test cannot see: the merge **normalises**.
+/// It prunes to the caps and refuses oversized messages, so `merge(a, a) == a`
+/// -- the strict idempotence `policy_check::assert_merge_idempotent` asserts
+/// -- is false for any state that is not already normalised. That has been
+/// true since the cap existed; a sample set of three small mailboxes simply
+/// never met it. What fold-all needs instead is commutativity, order
+/// invariance, idempotence on the merge's OWN OUTPUT, and absorption
+/// (re-folding an already-folded generation is a no-op). All four are
+/// asserted on samples that cross every bound, in
+/// `fold_all_preconditions_hold_for_a_mailbox_that_needs_normalising`.
 ///
 /// Fold-all matters here rather than being a free upgrade: Harvest has re-keyed
 /// repeatedly -- `legacy/store_contract.toml` records five superseded store

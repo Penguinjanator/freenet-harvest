@@ -74,7 +74,9 @@ impl ContractInterface for Contract {
                     // and idempotent, and there is one definition of "the same
                     // message" rather than two that can drift apart.
                     // `no_production_code_compares_message_nonces_for_identity`
-                    // fails if a fourth site starts answering it again.
+                    // is a tripwire for a fifth site answering it again -- read
+                    // its own doc for what it does and does not catch, because
+                    // it claimed more than it did for a whole round.
                     mailbox_state
                         .apply_delta(&Some(new_state.messages))
                         .map_err(|e| ContractError::InvalidUpdateWithInfo {
@@ -312,9 +314,25 @@ mod tests {
         assert!(merged.messages.contains(&retraction));
     }
 
-    /// The state the contract hands back is one it would itself accept.
+    /// The state the contract hands back is one it would itself accept -- and
+    /// `validate_state` is capable of NOT accepting one.
+    ///
+    /// **The second half is the load-bearing one, and it was missing.** As
+    /// first written this test asserted only that a merged state validates,
+    /// which a `validate_state` stubbed to return `Valid` unconditionally
+    /// satisfies identically -- verified: that mutation failed zero tests
+    /// across the whole workspace, and this is the ONLY test of this
+    /// contract's `validate_state` anywhere. What it actually pinned was that
+    /// `update_state`'s output CBOR-decodes. A test at an entry point that had
+    /// no tests at all, reporting success while measuring nothing, is the
+    /// exact shape those tests were added to end.
+    ///
+    /// The rejection case is a state carrying the same entry twice, which
+    /// `MailboxStateV1::verify` refuses -- and which is unreachable through
+    /// `update_state`, so `validate_state` is the only thing standing between
+    /// it and the network.
     #[test]
-    fn a_merged_state_validates() {
+    fn a_merged_state_validates_and_an_invalid_one_does_not() {
         let held = MailboxStateV1 {
             messages: vec![message([7u8; 24], b"one", 1_700_000_000)],
         };
@@ -333,6 +351,22 @@ mod tests {
         )
         .expect("validate");
         assert!(matches!(verdict, ValidateResult::Valid));
+
+        let duplicated = message([7u8; 24], b"one", 1_700_000_000);
+        let invalid = MailboxStateV1 {
+            messages: vec![duplicated.clone(), duplicated],
+        };
+        assert!(
+            <Contract as ContractInterface>::validate_state(
+                parameters(),
+                State::from(encoded(&invalid)),
+                RelatedContracts::default(),
+            )
+            .is_err(),
+            "validate_state accepted a state holding the same entry twice, which verify \
+             rejects -- so it is not consulting verify at all, and the assertion above \
+             means nothing"
+        );
     }
 
     /// **A peer that holds nothing yet can still be sent everything.**
@@ -385,18 +419,124 @@ mod tests {
         assert!(delta.as_ref().is_empty());
     }
 
+    /// **The summary reports what the state actually holds.**
+    ///
+    /// Found by mutation while re-checking the six tests added with this
+    /// module: stubbing `summarize_state` to return an empty summary for a
+    /// NON-empty state failed nothing. The empty-summary tests above drive
+    /// `get_state_delta` and take the summary as given, so between them they
+    /// covered the consumer and left the producer unobserved -- the same
+    /// producer/consumer split that let `on_conversation_keys` correlate
+    /// positionally for a whole round.
+    ///
+    /// Asserted as the round trip, because that is the thing the network
+    /// performs: a peer summarizes what it has, a holder answers with the
+    /// difference, and the difference must be exactly what the asker lacks.
+    #[test]
+    fn a_summary_of_what_a_peer_holds_asks_only_for_what_it_lacks() {
+        let one = message([7u8; 24], b"one", 1_700_000_000);
+        let two = message([8u8; 24], b"two", 1_700_000_001);
+
+        let partial = MailboxStateV1 {
+            messages: vec![one.clone()],
+        };
+        let complete = MailboxStateV1 {
+            messages: vec![one, two.clone()],
+        };
+
+        let summary = <Contract as ContractInterface>::summarize_state(
+            parameters(),
+            State::from(encoded(&partial)),
+        )
+        .expect("summarize");
+
+        // Against a holder of both: exactly the one message it lacks.
+        let delta = <Contract as ContractInterface>::get_state_delta(
+            parameters(),
+            State::from(encoded(&complete)),
+            summary.clone(),
+        )
+        .expect("delta");
+        let carried = from_reader::<MailboxDelta, &[u8]>(delta.as_ref()).expect("decode");
+        assert_eq!(
+            carried,
+            vec![two],
+            "the delta must carry exactly what the summary says is missing -- an empty \
+             summary here would ask for the whole mailbox on every sync, and a summary \
+             naming everything would ask for nothing and never converge"
+        );
+
+        // Against a holder of the same state: nothing.
+        let nothing = <Contract as ContractInterface>::get_state_delta(
+            parameters(),
+            State::from(encoded(&partial)),
+            summary,
+        )
+        .expect("delta");
+        assert!(
+            nothing.as_ref().is_empty(),
+            "a peer that holds exactly what the summary describes has nothing to send"
+        );
+    }
+
     /// **No production code decides "the same message" by comparing nonces.**
     ///
-    /// A source scrape, because the three call sites that drifted did so one
-    /// at a time over three separate changes -- `dedupe_by_nonce`,
-    /// `summarize`, and this contract's state-merge arm -- and each was found
-    /// by a person rather than by the suite. `entry_digest` is the one
-    /// definition of identity; this fails when a fourth site starts answering
-    /// the question for itself.
+    /// A source scrape, because the sites that drifted did so one at a time
+    /// over separate changes -- `dedupe_by_nonce`, `summarize`, this
+    /// contract's state-merge arm, and `ui/src/migrate.rs::merge_mailbox`.
+    /// The first three were each found by a person; the fourth was found by
+    /// this scrape, which is the only reason it is here. `entry_digest` is the
+    /// one definition of identity. The next one would be the fifth.
     ///
-    /// Scoped to the part of each file before its `#[cfg(test)]`, because
-    /// tests compare nonces legitimately (to assert that two entries collide,
-    /// which is the precondition of half these tests).
+    /// # What it catches, what it does not, and what it used to not catch
+    ///
+    /// **Read this before trusting it.** For one round this test was cited in
+    /// four places as failing "when a site starts answering the question for
+    /// itself", and it did nothing of the kind: it matched two literal strings
+    /// (`.nonce ==`, `== m.nonce`) over the part of each file preceding its
+    /// FIRST `#[cfg(test)]`. Review planted six rewrites of the identical
+    /// defect at the exact site the scrape is famous for finding, and it
+    /// caught one. Two of the five it missed were not hypothetical: the
+    /// `HashSet` + `contains` form is what `summarize` actually was, and the
+    /// `sort_by_key` + `dedup_by_key` form is what `dedupe_by_nonce` actually
+    /// was.
+    ///
+    /// Worse, the `#[cfg(test)]` cut was wrong rather than merely leaky.
+    /// `#[cfg(test)]` marks individual items, not only a trailing module:
+    /// `delegates/harvest-delegate/src/handlers.rs` puts one on a helper 40
+    /// lines in, so 1,098 of its 1,138 lines counted as test code and were
+    /// never read. The control-form defect, planted below that line, was
+    /// invisible; the same line planted above it was caught.
+    ///
+    /// It now:
+    ///
+    /// * strips `#[cfg(test)]` items by **brace matching** rather than
+    ///   truncating the file at the first one, and skips whole files declared
+    ///   as test modules (`#[cfg(test)] mod tests;` pulls in `tests.rs`);
+    /// * matches equality on either side of `.nonce` regardless of spacing,
+    ///   `.eq`/`.ne`, a set or map keyed on `[u8; 24]`, a `dedup*` on a line
+    ///   mentioning a nonce, and a `contains` on one;
+    /// * derives the crates to scan from the workspace `Cargo.toml` instead of
+    ///   a hardcoded list, and **fails if a directory is missing** rather than
+    ///   silently scanning nothing.
+    ///
+    /// **What it still cannot do.** It is a text scrape. It reads no types, so
+    /// a comparison spread across two lines, one hidden behind a helper
+    /// (`fn same(a, b) -> bool { a.nonce == b.nonce }` called elsewhere), or
+    /// one written through an alias will pass. Its brace matching does not
+    /// understand braces inside string literals. It is a tripwire for the
+    /// obvious rewrite, not a proof, and the behavioural tests are what
+    /// actually carry the property -- every one of the six planted rewrites
+    /// was caught by those.
+    ///
+    /// # Waivers
+    ///
+    /// The reputation contract decides identity by `token.nonce` and has the
+    /// same defect (`known_gap_two_feedback_variants_sharing_a_token_do_not_converge`).
+    /// Its re-key is deliberately not on this branch, so those sites carry an
+    /// explicit `nonce-identity-waiver:` marker naming the gap. The count is
+    /// asserted, so a SIXTH site cannot join them quietly -- which is the
+    /// whole difference between a documented gap and a spreading one.
     #[test]
     fn no_production_code_compares_message_nonces_for_identity() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -406,56 +546,266 @@ mod tests {
             .to_path_buf();
 
         let mut offenders = Vec::new();
+        let mut waived = Vec::new();
         let mut scanned = 0usize;
-        let crates = [
-            "common/src",
-            "contracts/mailbox-contract/src",
-            "contracts/store-contract/src",
-            "contracts/reputation-contract/src",
-            "ui/src",
-            "delegates/harvest-delegate/src",
-        ];
-        for dir in crates {
-            for path in rust_files(&root.join(dir)) {
-                let text = std::fs::read_to_string(&path).expect("read");
-                let production = match text.find("#[cfg(test)]") {
-                    Some(at) => &text[..at],
-                    None => &text[..],
-                };
-                scanned += 1;
-                for (number, line) in production.lines().enumerate() {
-                    let line = line.trim();
-                    if line.starts_with("//") || line.starts_with("///") {
-                        continue;
-                    }
-                    if line.contains(".nonce ==") || line.contains("== m.nonce") {
-                        offenders.push(format!("{}:{}: {line}", path.display(), number + 1));
+
+        let files = workspace_rust_files(&root);
+        let test_modules = declared_test_modules(&files);
+
+        for path in &files {
+            if test_modules.contains(path) {
+                continue;
+            }
+            let text = std::fs::read_to_string(path).expect("read");
+            scanned += 1;
+            let mut waiver_pending = false;
+            for (number, line) in strip_test_items(&text).lines().enumerate() {
+                let line = line.trim();
+                if line.contains("nonce-identity-waiver:") {
+                    waiver_pending = true;
+                    continue;
+                }
+                if line.starts_with("//") {
+                    continue;
+                }
+                let found = decides_identity_by_nonce(line);
+                if line.is_empty() {
+                    continue;
+                }
+                if found {
+                    let at = format!("{}:{}: {line}", path.display(), number + 1);
+                    if waiver_pending {
+                        waived.push(at);
+                    } else {
+                        offenders.push(at);
                     }
                 }
+                waiver_pending = false;
             }
         }
 
-        assert!(scanned > 10, "the scrape found almost no files: {scanned}");
+        assert!(scanned > 40, "the scrape found almost no files: {scanned}");
         assert!(
             offenders.is_empty(),
-            "these decide message identity by nonce rather than by `entry_digest`:\n{}",
+            "these decide identity by nonce rather than by `entry_digest`. If this is the \
+             reputation contract's known gap, add a `nonce-identity-waiver:` comment on the \
+             line above naming it, and update the expected waiver count in this test:\n{}",
             offenders.join("\n")
+        );
+        assert_eq!(
+            waived.len(),
+            5,
+            "the number of waived nonce-identity sites changed. Every one of these is the \
+             same defect the mailbox re-key fixed, parked until the reputation contract's \
+             own re-key. A new one must be a deliberate decision, not a quiet addition:\n{}",
+            waived.join("\n")
         );
     }
 
-    fn rust_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    /// Whether one line decides "the same thing" by comparing nonces.
+    ///
+    /// Whitespace is removed first, so `a.nonce == b` and `a.nonce==b` are one
+    /// case -- the shipped version treated them as two and caught only the
+    /// first.
+    ///
+    /// `.cmp(` is deliberately NOT matched: `apply_delta`'s final sort and
+    /// `enforce_message_cap`'s rank both order by nonce legitimately, and a
+    /// scrape that flagged them would be turned off within a week.
+    fn decides_identity_by_nonce(line: &str) -> bool {
+        let dense: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // Equality with `.nonce` on the left.
+        if dense.contains(".nonce==")
+            || dense.contains(".nonce!=")
+            || dense.contains(".nonce.eq(")
+            || dense.contains(".nonce.ne(")
+        {
+            return true;
+        }
+
+        // Equality with `.nonce` on the right: walk back from each `.nonce`
+        // over the path expression and see what precedes it.
+        for (at, _) in dense.match_indices(".nonce") {
+            let before = &dense[..at];
+            let head = before.trim_end_matches(|c: char| {
+                c.is_alphanumeric() || c == '_' || c == '.' || c == '&'
+            });
+            if head.ends_with("==") || head.ends_with("!=") {
+                return true;
+            }
+        }
+
+        // A set or map keyed on the 24-byte nonce -- what `summarize` was.
+        for shape in [
+            "HashSet<[u8;24]>",
+            "BTreeSet<[u8;24]>",
+            "Vec<[u8;24]>",
+            "HashMap<[u8;24],",
+        ] {
+            if dense.contains(shape) {
+                return true;
+            }
+        }
+
+        // Deduplicating or membership-testing on a nonce -- what
+        // `dedupe_by_nonce` was, and the shape a `HashSet` built on an earlier
+        // line is used through.
+        if dense.contains("nonce")
+            && (dense.contains("dedup_by_key(")
+                || dense.contains("dedup_by(")
+                || dense.contains("dedup(")
+                || dense.contains(".contains("))
+        {
+            return true;
+        }
+
+        false
+    }
+
+    /// Blank out every `#[cfg(test)]` item, by brace matching.
+    ///
+    /// NOT a truncation at the first occurrence: `#[cfg(test)]` marks
+    /// individual functions and `use`s as well as trailing modules, and
+    /// truncating there hid 97% of one file.
+    ///
+    /// Test lines are replaced by empty ones rather than removed, so the line
+    /// numbers this test reports are the file's real ones. Removing them
+    /// shifted every subsequent number, which sends the reader to the wrong
+    /// line of a file they have been told contains a security defect.
+    fn strip_test_items(text: &str) -> String {
+        let mut kept = String::new();
+        let mut lines = text.lines();
+        while let Some(line) = lines.next() {
+            let trimmed = line.trim();
+            let Some(rest) = trimmed.strip_prefix("#[cfg(test)]") else {
+                kept.push_str(line);
+                kept.push('\n');
+                continue;
+            };
+            // The attribute's own line, blanked, so numbering survives.
+            kept.push('\n');
+            // Consume the attributed item. A braced item ends when its braces
+            // balance; an unbraced one (`mod tests;`, `use ...;`) at its
+            // semicolon.
+            let mut depth = 0i32;
+            let mut opened = false;
+            let mut pending = if rest.trim().is_empty() {
+                None
+            } else {
+                Some(rest.to_string())
+            };
+            loop {
+                let current = match pending.take() {
+                    Some(held) => held,
+                    None => match lines.next() {
+                        Some(next) => next.to_string(),
+                        None => break,
+                    },
+                };
+                kept.push('\n');
+                depth += current.matches('{').count() as i32;
+                depth -= current.matches('}').count() as i32;
+                if current.contains('{') {
+                    opened = true;
+                }
+                if opened && depth <= 0 {
+                    break;
+                }
+                if !opened && current.trim_end().ends_with(';') {
+                    break;
+                }
+            }
+        }
+        kept
+    }
+
+    /// Every `.rs` file under the workspace members' `src/`, plus the
+    /// rehearsal harness, which is in the repository but not a member.
+    ///
+    /// Derived from `Cargo.toml` rather than hardcoded, because the shipped
+    /// version carried a fixed list of six directories and swallowed a missing
+    /// one: a renamed or added crate contributed nothing and the file-count
+    /// guard still passed on the rest.
+    fn workspace_rust_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let manifest =
+            std::fs::read_to_string(root.join("Cargo.toml")).expect("workspace manifest");
+        let members = manifest
+            .split("members = [")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("workspace members");
+        let mut dirs: Vec<String> = members
+            .split(',')
+            .filter_map(|entry| {
+                let entry = entry.trim().trim_matches('"');
+                (!entry.is_empty()).then(|| format!("{entry}/src"))
+            })
+            .collect();
+        assert!(
+            dirs.len() >= 6,
+            "parsed {} workspace members, which is fewer than exist -- the manifest format \
+             changed and this scrape is now reading almost nothing",
+            dirs.len()
+        );
+        dirs.push("tests/rehearsal/src".to_string());
+
         let mut found = Vec::new();
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return found;
-        };
+        for dir in dirs {
+            let path = root.join(&dir);
+            assert!(
+                path.is_dir(),
+                "{dir} is not a directory; the scrape would have skipped it in silence"
+            );
+            collect_rust_files(&path, &mut found);
+        }
+        found
+    }
+
+    /// Files pulled in as test modules by a `#[cfg(test)] mod name;`.
+    ///
+    /// `ui/src/migrate.rs` declares one, so `ui/src/migrate/tests.rs` is
+    /// entirely test code with no `#[cfg(test)]` of its own inside it.
+    fn declared_test_modules(
+        files: &[std::path::PathBuf],
+    ) -> std::collections::HashSet<std::path::PathBuf> {
+        let mut modules = std::collections::HashSet::new();
+        for path in files {
+            let text = std::fs::read_to_string(path).expect("read");
+            // The module directory for `foo.rs` is `foo/`; for `mod.rs`,
+            // `lib.rs` and `main.rs` it is the file's own directory.
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            let dir = match stem {
+                "mod" | "lib" | "main" => path.parent().map(|p| p.to_path_buf()),
+                _ => path.parent().map(|p| p.join(stem)),
+            };
+            let Some(dir) = dir else { continue };
+            for (at, _) in text.match_indices("#[cfg(test)]") {
+                let after = text[at..].lines().nth(1).unwrap_or_default().trim();
+                if let Some(name) = after
+                    .strip_prefix("mod ")
+                    .and_then(|rest| rest.strip_suffix(';'))
+                {
+                    modules.insert(dir.join(format!("{}.rs", name.trim())));
+                    modules.insert(dir.join(name.trim()).join("mod.rs"));
+                }
+            }
+        }
+        modules
+    }
+
+    fn collect_rust_files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("{} could not be read: {e}", dir.display()));
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                found.extend(rust_files(&path));
+                collect_rust_files(&path, found);
             } else if path.extension().is_some_and(|e| e == "rs") {
                 found.push(path);
             }
         }
-        found
     }
 }

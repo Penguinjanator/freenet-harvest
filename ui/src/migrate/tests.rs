@@ -1201,6 +1201,18 @@ fn fold_all_preconditions_hold_for_the_store_state() {
 /// That is sound only because the prune is deterministic and re-run on every
 /// merge, so the fold result is pruned again identically. If it were not, the
 /// order-invariance assertion here would fail.
+///
+/// **These three samples are all small in every dimension, and that is a
+/// limitation of this test rather than a property of the merge.** The
+/// mailbox merge NORMALISES -- it prunes to `MAX_MESSAGES`, to
+/// `MAX_MAILBOX_BYTES`, and (since the fold fix) refuses messages over
+/// `MAX_MESSAGE_BYTES` -- so `merge(a, a) == a` is simply false for any `a`
+/// that is not already normalised, and `assert_merge_idempotent` asserts
+/// exactly that strict form. Passing here means "these samples are already
+/// normalised", not "the merge is idempotent".
+///
+/// `fold_all_preconditions_hold_for_a_mailbox_that_needs_normalising` is the
+/// test that faces that, on samples that cross all three bounds.
 #[test]
 fn fold_all_preconditions_hold_for_the_mailbox_state() {
     let ops = MailboxOps {
@@ -1216,6 +1228,221 @@ fn fold_all_preconditions_hold_for_the_mailbox_state() {
     freenet_migrate::driver::policy_check::assert_merge_commutative(&samples, merge);
     freenet_migrate::driver::policy_check::assert_merge_idempotent(&samples, merge);
     freenet_migrate::driver::policy_check::assert_fold_order_invariant(&samples, merge);
+}
+
+/// **The `FoldAllAck` preconditions, on states that actually need
+/// normalising.**
+///
+/// The test above earns the ack token against three samples that are small in
+/// every dimension, so nothing in it exercises a prune or a refusal. That was
+/// found when the size bound made the fold non-commutative and the existing
+/// precondition test stayed green.
+///
+/// # Strict idempotence is the wrong statement here, and always was
+///
+/// `assert_merge_idempotent` asserts `merge(a, a) == a`. A normalising merge
+/// cannot satisfy that for a non-normalised `a`, and the mailbox merge has
+/// normalised since long before the size bound: hand it 517 messages and
+/// `merge(a, a)` returns 512, because `enforce_message_cap` runs on every
+/// `apply_delta`. So this is not a new weakness introduced by the size
+/// refusal -- it is a property the original sample set was too small to
+/// reveal.
+///
+/// What `FoldAll` actually needs, and what is asserted here instead:
+///
+/// * **commutativity**, on raw un-normalised samples -- the property that
+///   broke, and the only one of the three that was ever really at risk;
+/// * **order-invariance** of the fold across those same samples;
+/// * **idempotence on the merge's own output**, which is the honest form: the
+///   fold's result is a fixed point, so re-running the migration or meeting
+///   the same generation twice changes nothing;
+/// * **absorption**, `merge(merge(a, b), b) == merge(a, b)` -- folding a
+///   generation that has already been folded in is a no-op. This is the
+///   property a re-run of the migration actually depends on, and neither the
+///   crate's helpers nor the test above check it.
+#[test]
+fn fold_all_preconditions_hold_for_a_mailbox_that_needs_normalising() {
+    let ops = MailboxOps {
+        params: mailbox_params(&seller_vk()),
+    };
+    let merge = |x: MailboxStateV1, y: MailboxStateV1| ops.merge_generations(x, y);
+    let base = 1_700_000_000;
+
+    // One sample over the size bound, one over the count cap, one ordinary.
+    let over_cap: Vec<_> = (0..harvest_common::mailbox::MAX_MESSAGES + 5)
+        .map(|i| message((i % 250) as u8, base + 1_000 + i as i64))
+        .collect();
+    let samples = vec![
+        mailbox_with(vec![message(1, base)]),
+        mailbox_with(vec![oversized_message(2, base + 10)]),
+        mailbox_with(vec![message(1, base), oversized_message(3, base + 20)]),
+        mailbox_with(over_cap),
+    ];
+
+    freenet_migrate::driver::policy_check::assert_merge_commutative(&samples, merge);
+    freenet_migrate::driver::policy_check::assert_fold_order_invariant(&samples, merge);
+
+    // Idempotence on the merge's own output. `merge(a, a)` normalises; doing
+    // it again must change nothing.
+    let normalised: Vec<_> = samples
+        .iter()
+        .map(|s| merge(s.clone(), s.clone()))
+        .collect();
+    freenet_migrate::driver::policy_check::assert_merge_idempotent(&normalised, merge);
+
+    // Absorption: re-folding a generation already folded in is a no-op.
+    for (i, a) in samples.iter().enumerate() {
+        for (j, b) in samples.iter().enumerate() {
+            let once = merge(a.clone(), b.clone());
+            let twice = merge(once.clone(), b.clone());
+            assert_eq!(
+                once, twice,
+                "re-folding generation #{j} into the result of folding it with #{i} \
+                 changed the state, so re-running the migration is not safe"
+            );
+        }
+    }
+}
+
+/// A message the successor contract will not accept in a delta: one byte over
+/// `MAX_MESSAGE_BYTES`.
+///
+/// No published generation ever enforced a size limit -- `MAX_MESSAGE_BYTES`
+/// and the UI's send-side refusal both arrive on this branch, after the commit
+/// recording V7 -- so a V1..V7 mailbox may hold one, either from a plaintext
+/// over `LARGEST_BUCKET` (`pad_to_bucket` returned it unpadded rather than
+/// refusing) or from an oversized `sender_public_key`, which was an unbounded
+/// `Vec<u8>` any third party could plant in an open-write mailbox.
+fn oversized_message(nonce: u8, secs: i64) -> EncryptedMessage {
+    let mut message = message(nonce, secs);
+    let over = harvest_common::mailbox::MAX_MESSAGE_BYTES + 1;
+    let headroom = over - harvest_common::mailbox::message_bytes(&message);
+    message.ciphertext = vec![nonce; message.ciphertext.len() + headroom];
+    assert!(
+        harvest_common::mailbox::message_bytes(&message)
+            > harvest_common::mailbox::MAX_MESSAGE_BYTES,
+        "the fixture must actually cross the bound, or it cannot observe anything"
+    );
+    message
+}
+
+/// **The fold is commutative even when a message crosses the size bound.**
+///
+/// This is the `FoldAllAck` precondition, on the sample the existing
+/// precondition test could not contain. `apply_delta` refuses an oversized
+/// message on the INCOMING side only, and `merge_generations(newer, older)`
+/// puts the older generation on that side -- so before the fix,
+/// `merge(big, small)` kept the oversized message and `merge(small, big)`
+/// dropped it, which is a fold whose result depends on which side a message
+/// arrived on rather than on the bytes.
+///
+/// Asserting commutativity rather than the message count is deliberate: the
+/// count is the symptom, and the property the ack token is minted against is
+/// this one.
+///
+/// Strict idempotence is deliberately NOT asserted here -- the merge
+/// normalises, so `merge(a, a) == a` is false for any un-normalised `a`, which
+/// has been true since long before the size bound. See
+/// `fold_all_preconditions_hold_for_a_mailbox_that_needs_normalising`, which
+/// asserts the honest forms.
+#[test]
+fn folding_is_commutative_across_the_message_size_bound() {
+    let ops = MailboxOps {
+        params: mailbox_params(&seller_vk()),
+    };
+    let base = 1_700_000_000;
+    let samples = vec![
+        mailbox_with(vec![message(1, base)]),
+        mailbox_with(vec![oversized_message(2, base + 10)]),
+        mailbox_with(vec![message(1, base), oversized_message(3, base + 20)]),
+    ];
+    let merge = |x: MailboxStateV1, y: MailboxStateV1| ops.merge_generations(x, y);
+    freenet_migrate::driver::policy_check::assert_merge_commutative(&samples, merge);
+    freenet_migrate::driver::policy_check::assert_fold_order_invariant(&samples, merge);
+}
+
+/// **What the fold cannot carry, it drops from BOTH sides.**
+///
+/// The direction matters and is the reason commutativity is restored by
+/// dropping rather than by keeping. `verify` tolerates an over-budget state,
+/// so a folded state carrying an oversized message would be accepted by
+/// `validate_state` and PUT successfully -- and then every peer that merged it
+/// would run `apply_delta` and drop the message, leaving this node holding an
+/// entry no other peer has, permanently. Dropping it here moves the node
+/// toward what the network holds; keeping it would be a silent permanent
+/// divergence dressed up as data preservation.
+#[test]
+fn an_oversized_message_is_dropped_from_whichever_side_it_is_on() {
+    let ops = MailboxOps {
+        params: mailbox_params(&seller_vk()),
+    };
+    let base = 1_700_000_000;
+    let big = oversized_message(9, base + 5);
+    let small = message(1, base);
+
+    let from_older = ops.merge_generations(
+        mailbox_with(vec![small.clone()]),
+        mailbox_with(vec![big.clone()]),
+    );
+    let from_newer = ops.merge_generations(
+        mailbox_with(vec![big.clone()]),
+        mailbox_with(vec![small.clone()]),
+    );
+
+    for (which, folded) in [("older", &from_older), ("newer", &from_newer)] {
+        assert!(
+            !folded.messages.contains(&big),
+            "an oversized message on the {which} side survived the fold; the successor's \
+             own apply_delta would refuse it, so this node would hold an entry no peer has"
+        );
+        assert!(
+            folded.messages.contains(&small),
+            "the honest message was lost too"
+        );
+    }
+}
+
+/// **An unfoldable message is reported, not swallowed.**
+///
+/// The migration exists to preserve messages, so the one thing it must never
+/// do is fail to carry one without saying so. `probe_warn` is the same channel
+/// `decode_probed_state` uses for the neighbouring failure ("this is how a
+/// recoverable generation goes missing silently"), which is the register this
+/// belongs in.
+///
+/// Asserted on the returned report rather than on captured stderr, because a
+/// test that greps a log is a test of the logger.
+#[test]
+fn the_fold_says_what_it_could_not_carry() {
+    let base = 1_700_000_000;
+    let report = merge_mailbox_reporting_drops(
+        mailbox_with(vec![message(1, base), oversized_message(9, base + 5)]),
+        &mailbox_with(vec![oversized_message(8, base + 6)]),
+    );
+    assert_eq!(
+        report.dropped_oversized, 2,
+        "the fold must count what it could not carry, from both sides"
+    );
+    assert_eq!(report.state.messages.len(), 1);
+
+    let warning = report
+        .unfoldable_warning()
+        .expect("a fold that dropped messages must have something to say");
+    assert!(
+        warning.contains("2 message(s)")
+            && warning.contains(&harvest_common::mailbox::MAX_MESSAGE_BYTES.to_string()),
+        "the warning must name how many and against what bound, so an operator can \
+         tell what was lost: {warning}"
+    );
+
+    // And says nothing when there is nothing to say, so the warning is
+    // evidence rather than noise.
+    let clean = merge_mailbox_reporting_drops(
+        mailbox_with(vec![message(1, base)]),
+        &mailbox_with(vec![message(2, base + 1)]),
+    );
+    assert_eq!(clean.dropped_oversized, 0);
+    assert!(clean.unfoldable_warning().is_none());
 }
 
 /// An empty mailbox or reputation state is a miss.
