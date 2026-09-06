@@ -73,17 +73,19 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
     if owned {
         let entries = app_state.mailbox_entries(&store_contract_id);
         // The only authorship this client can establish: what it sent itself.
-        let authored: Vec<[u8; 24]> = entries
+        let authored: Vec<[u8; 32]> = entries
             .iter()
-            .map(|entry| entry.nonce())
-            .filter(|nonce| app_state.authored_here(&store_contract_id, nonce))
+            .map(|entry| entry.digest())
+            .filter(|digest| app_state.authored_here(&store_contract_id, digest))
             .collect();
+        let replaced = app_state.replaced_sent(&store_contract_id);
         drop(app_state);
         return rsx! {
             Inbox {
                 store_contract_id: store_contract_id.clone(),
                 entries: entries,
                 authored: authored,
+                replaced: replaced,
             }
         };
     }
@@ -96,6 +98,7 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
     let seller_identity = store.and_then(|s| s.seller_verifying_key);
     let thread = app_state.conversation_thread(&store_contract_id);
     let unconfirmed = app_state.unconfirmed_sent(&store_contract_id);
+    let replaced = app_state.replaced_sent(&store_contract_id);
     // What this node is keeping, which is what the buyer can ask it to
     // forget. Empty until the delegate answers, and empty for a store this
     // node has never written to.
@@ -114,10 +117,10 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
                 .collect()
         })
         .unwrap_or_default();
-    let authored_here: Vec<[u8; 24]> = thread
+    let authored_here: Vec<[u8; 32]> = thread
         .iter()
-        .map(|message| message.nonce)
-        .filter(|nonce| app_state.authored_here(&store_contract_id, nonce))
+        .map(|message| message.digest)
+        .filter(|digest| app_state.authored_here(&store_contract_id, digest))
         .collect();
     let loaded = info.is_some();
     drop(app_state);
@@ -162,10 +165,11 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
                 },
             }
 
-            if !thread.is_empty() || !unconfirmed.is_empty() {
+            if !thread.is_empty() || !unconfirmed.is_empty() || !replaced.is_empty() {
                 Thread {
                     thread: thread,
                     unconfirmed: unconfirmed,
+                    replaced: replaced,
                     authored_here: authored_here,
                 }
             }
@@ -396,9 +400,13 @@ fn Backup(store_contract_id: Vec<u8>, has_conversations: bool) -> Element {
 fn Thread(
     thread: Vec<crate::messaging::ConversationMessage>,
     unconfirmed: Vec<crate::state::SentMessage>,
-    /// Nonces this browser wrote. The ONLY authorship anything here can
-    /// establish -- see `state::AppState::authored_here`.
-    authored_here: Vec<[u8; 24]>,
+    /// Messages this browser sent whose place in the mailbox is now occupied
+    /// by something else. See `state::AppState::replaced_sent`.
+    replaced: Vec<crate::state::SentMessage>,
+    /// Entry digests this browser wrote. The ONLY authorship anything here
+    /// can establish -- see `state::AppState::authored_here`. Digests rather
+    /// than nonces because a nonce is public and a substitute shares it.
+    authored_here: Vec<[u8; 32]>,
 ) -> Element {
     rsx! {
         div { style: "margin-top: 1.5rem;",
@@ -420,7 +428,7 @@ fn Thread(
                 {
                     let when = message.timestamp.format("%Y-%m-%d %H:%M UTC").to_string();
                     let who = attribution(
-                        authored_here.contains(&message.nonce),
+                        authored_here.contains(&message.digest),
                         message.addressing,
                         Role::Buyer,
                     );
@@ -434,6 +442,28 @@ fn Thread(
                                 "Sender's timestamp: {when}"
                             }
                         }
+                    }
+                }
+            }
+
+            // Sent, arrived, and then displaced by something else under the
+            // same nonce. Shown as its own thing rather than folded into
+            // "not seen yet", because it will not arrive: what is in the
+            // mailbox now is somebody else's message in its place. See
+            // `state::AppState::replaced_sent`.
+            for message in replaced.iter() {
+                div { class: "card",
+                    style: "margin-top: 0.5rem;",
+                    p { class: "text-warning", style: "font-size: 0.8rem;",
+                        "You — replaced"
+                    }
+                    p { style: "white-space: pre-wrap;", "{message.text}" }
+                    p { class: "text-warning",
+                        style: "font-size: 0.8rem;",
+                        "This message reached the mailbox and a DIFFERENT message now stands "
+                        "in its place. Only someone holding this conversation's key can do "
+                        "that, which here means the other party. Anything shown above under "
+                        "its place was not written by you."
                     }
                 }
             }
@@ -561,7 +591,7 @@ fn send(
 
     APP_STATE
         .write()
-        .record_sent_message(store_contract_id, text, sealed.nonce);
+        .record_sent_message(store_contract_id, text, &sealed);
     Ok(())
 }
 
@@ -611,9 +641,13 @@ fn Unavailable(why: String) -> Element {
 fn Inbox(
     store_contract_id: Vec<u8>,
     entries: Vec<MailboxEntry>,
-    authored: Vec<[u8; 24]>,
+    authored: Vec<[u8; 32]>,
+    /// Replies this browser sent that something else now stands in the place
+    /// of. The buyer holds the same conversation key, so this is available to
+    /// them exactly as it is to the seller.
+    replaced: Vec<crate::state::SentMessage>,
 ) -> Element {
-    if entries.is_empty() {
+    if entries.is_empty() && replaced.is_empty() {
         return rsx! {
             div { class: "card",
                 h3 { "Messages" }
@@ -648,6 +682,17 @@ fn Inbox(
             p { class: "section-count",
                 "{entries.len()} message(s) in {conversations.len()} conversation(s)"
             }
+            for message in replaced.iter() {
+                div { class: "card", style: "margin-top: 0.5rem;",
+                    p { class: "text-warning", style: "font-size: 0.8rem;", "Your reply — replaced" }
+                    p { style: "white-space: pre-wrap;", "{message.text}" }
+                    p { class: "text-warning", style: "font-size: 0.8rem;",
+                        "This reply reached the mailbox and a DIFFERENT message now stands in "
+                        "its place. Only someone holding that conversation's key can do that, "
+                        "which here means the buyer you were replying to."
+                    }
+                }
+            }
             if unreadable > 0 {
                 p { class: "text-muted",
                     style: "font-size: 0.85rem;",
@@ -674,7 +719,7 @@ fn Conversation(
     store_contract_id: Vec<u8>,
     tag: Vec<u8>,
     entries: Vec<MailboxEntry>,
-    authored: Vec<[u8; 24]>,
+    authored: Vec<[u8; 32]>,
 ) -> Element {
     let mut draft = use_signal(String::new);
     let mut problem = use_signal(|| Option::<String>::None);
@@ -700,7 +745,7 @@ fn Conversation(
             for entry in entries.iter() {
                 MessageCard {
                     entry: entry.clone(),
-                    authored_here: authored.contains(&entry.nonce()),
+                    authored_here: authored.contains(&entry.digest()),
                 }
             }
 
@@ -828,7 +873,7 @@ fn reply(store_contract_id: &[u8], tag: &[u8], text: String) -> Result<(), Strin
     // buyer wrote in that direction.
     APP_STATE
         .write()
-        .record_sent_message(store_contract_id, text_for_record, sealed.nonce);
+        .record_sent_message(store_contract_id, text_for_record, &sealed);
     Ok(())
 }
 

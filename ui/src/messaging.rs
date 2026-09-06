@@ -344,6 +344,7 @@ impl BuyerConversation {
                         addressing,
                         timestamp: message.timestamp,
                         nonce: message.nonce,
+                        digest: harvest_common::mailbox::entry_digest(message),
                         content: plaintext.content,
                     });
                 }
@@ -397,9 +398,15 @@ pub struct ConversationMessage {
     /// [`Addressing`].
     pub addressing: Addressing,
     pub timestamp: chrono::DateTime<chrono::Utc>,
-    /// The mailbox nonce, so a caller can tell whether a message it sent has
-    /// actually appeared in the mailbox.
+    /// The mailbox nonce: the message's identity TO THE CONTRACT, and the
+    /// thing a substitute deliberately shares. Not an identity a client may
+    /// use to recognise its own writing -- see [`Self::digest`].
     pub nonce: [u8; 24],
+    /// [`harvest_common::mailbox::entry_digest`] of the entry this came from:
+    /// what a client compares against to know whether this is a message it
+    /// sent itself. The counterparty can reproduce the nonce; they cannot
+    /// reproduce this without sending the identical message.
+    pub digest: [u8; 32],
     pub content: MessageContent,
 }
 
@@ -495,10 +502,13 @@ pub enum MailboxEntry {
         /// (`a_reply_naming_another_conversation_is_not_shown`), so the only
         /// place a seller can learn the right one is a message they decrypted.
         conversation_id: ConversationId,
-        /// The mailbox nonce, which is the message's identity -- the only way
-        /// a client can recognise one it sent itself, and so the only
-        /// authorship anything here can establish.
+        /// The mailbox nonce: the message's identity to the CONTRACT. It is
+        /// public and a substitute deliberately shares it, so it is not how
+        /// a client recognises its own writing -- see `digest`.
         nonce: [u8; 24],
+        /// [`harvest_common::mailbox::entry_digest`]: the identity a client
+        /// compares against to know whether it sent this itself.
+        digest: [u8; 32],
         /// Which direction key authenticated it -- **not** who wrote it. See
         /// [`Addressing`]. A third party cannot produce either direction; the
         /// COUNTERPARTY can produce both.
@@ -510,6 +520,9 @@ pub enum MailboxEntry {
     Unreadable {
         conversation: Vec<u8>,
         nonce: [u8; 24],
+        /// As on [`Self::Readable`]: the identity a client uses to recognise
+        /// its own writing, which the nonce is not.
+        digest: [u8; 32],
         timestamp: chrono::DateTime<chrono::Utc>,
         why: String,
     },
@@ -531,10 +544,22 @@ impl MailboxEntry {
         }
     }
 
-    /// The message's identity in the mailbox.
+    /// The message's identity in the mailbox, TO THE CONTRACT.
+    ///
+    /// Public, and shared deliberately by a substitute. Use
+    /// [`Self::digest`] to recognise a message this client sent.
     pub fn nonce(&self) -> [u8; 24] {
         match self {
             MailboxEntry::Readable { nonce, .. } | MailboxEntry::Unreadable { nonce, .. } => *nonce,
+        }
+    }
+
+    /// What this client compares against to know whether it sent this entry.
+    pub fn digest(&self) -> [u8; 32] {
+        match self {
+            MailboxEntry::Readable { digest, .. } | MailboxEntry::Unreadable { digest, .. } => {
+                *digest
+            }
         }
     }
 }
@@ -561,10 +586,12 @@ pub fn read_mailbox(
         .iter()
         .map(|message| {
             let conversation = message.sender_public_key.clone();
+            let digest = harvest_common::mailbox::entry_digest(message);
             let Some(pair) = keys.get(&conversation) else {
                 return MailboxEntry::Unreadable {
                     conversation,
                     nonce: message.nonce,
+                    digest,
                     timestamp: message.timestamp,
                     why: "waiting for the key from your delegate".to_string(),
                 };
@@ -582,6 +609,7 @@ pub fn read_mailbox(
                             conversation,
                             conversation_id: plaintext.conversation_id,
                             nonce: message.nonce,
+                            digest,
                             addressing,
                             timestamp: message.timestamp,
                             content: plaintext.content,
@@ -593,6 +621,7 @@ pub fn read_mailbox(
             MailboxEntry::Unreadable {
                 conversation,
                 nonce: message.nonce,
+                digest,
                 timestamp: message.timestamp,
                 why: last_error,
             }

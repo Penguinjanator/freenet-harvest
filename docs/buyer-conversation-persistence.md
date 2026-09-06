@@ -128,8 +128,31 @@ loss of the buyer's recourse.
 
 ### What bounds it
 
-**256 records per node, across every store, evicting oldest-first by creation
-time.**
+**256 records per node, across every store.** What goes first is what the
+buyer can get back:
+
+1. an entry that does not decode, which recalls nothing;
+2. a conversation the buyer holds a backup of, oldest first;
+3. a conversation that exists on this node and nowhere else, oldest first;
+4. lowest key, so the choice is deterministic rather than dependent on listing
+   order.
+
+**`backed_up` before age is not a refinement, it is the fix for a real
+hole**, found in review. The cap is global across every store and `created_at`
+comes off the wire -- from the browser when a conversation is opened, and from
+the BACKUP STRING on the import path, where nothing signs it. A buyer handed a
+backup by somebody else could paste 253 records dated `i64::MAX`, fill the
+store to its cap, and have the next conversation they opened silently destroy
+one of their own. Ranking on `backed_up` composes with import marking what it
+restores as backed up -- which is true, since the buyer is holding the string
+-- and that is exactly what makes the attacker's records the eligible ones.
+Pinned by `a_conversation_that_exists_only_here_outlives_an_imported_one`.
+
+**And an eviction is now reported.** `BuyerConversationStored` carries what it
+discarded and whether that was backed up, so the UI can say either "you can
+restore it" or "it can no longer be read by anyone, including you". The
+expensive direction named below is silence, and a response that could not
+express a discard was that silence.
 
 The repository's count-cap-over-contract-controlled-values pattern does **not**
 apply here, and the reason is the whole point of that pattern: it bites when a
@@ -167,9 +190,12 @@ and the buyer has no way to know when they will need it.
 The two failure directions are not symmetric:
 
 * **Discarded too early** — the confession becomes unreadable and the buyer has
-  no recourse, with no error at any layer. This is the expensive direction, so
-  the cap is set well above plausible use (a buyer messaging 256 distinct
-  stores) and eviction is oldest-first rather than anything cleverer.
+  no recourse. This is the expensive direction, so the cap is set well above
+  plausible use, eviction prefers what the buyer can restore, and the discard
+  is REPORTED rather than silent. The "well above plausible use" reasoning
+  assumed records only ever arrive one per store from the buyer's own
+  messaging; import broke that assumption, which is why the ranking above
+  matters more than the size of the cap.
 * **Kept forever** — a bounded store of a few tens of KiB, plus the durable
   local record discussed below. This is the cheap direction, which is why the
   bound is generous.
@@ -247,6 +273,12 @@ named prefix. About 420 characters for one conversation.
   hands it back; it never parses it. So the one component that reads and
   writes the format owns it, and `harvest-common` -- compiled into all three
   contracts -- gains nothing.
+* **A paste over 64 KiB is refused before it is decoded.** Base58 decoding is
+  quadratic in the length, so an unbounded paste is an unbounded amount of the
+  node's CPU; this was found by a test taking 72 seconds rather than by
+  reading the code. 64 KiB is above any honest export (256 conversations is
+  roughly 52 KiB), and the restore flow is "paste what you saved", so what
+  someone else hands the buyer is equally paste-able.
 
 ### The three questions that were settled, and why
 
@@ -421,6 +453,15 @@ On the UI side:
   ("Addressed to the seller") rather than as "You, from this tab". Both are
   truthful; the second is less specific. What is at stake in this change is the
   ability to READ the thread, which is unaffected.
+* **It does not stop a pasted backup becoming the active thread.** A restored
+  conversation is sorted by its own `created_at`, which came from the string,
+  so a backup somebody else supplied can be the one the buyer's next message
+  continues -- and its secret is known to whoever supplied it. Nothing can
+  distinguish a backup the buyer made from one they were handed, so the buyer
+  is told: an import that restores anything says that messages from now on may
+  continue a restored conversation, and that whoever gave them the backup can
+  read those. Import is a deliberate act, which is why this is a warning
+  rather than a refusal.
 * **It does not close the race** where a buyer sends a first message before the
   recall answer arrives. They get a second conversation with the same store;
   the older one is still recalled and still readable, and the thread view shows

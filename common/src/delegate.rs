@@ -307,6 +307,18 @@ pub enum HarvestDelegateResponse {
     BuyerConversationStored {
         request_id: RequestId,
         result: Result<(), String>,
+        /// What had to be discarded to make room, if anything.
+        ///
+        /// A separate field rather than part of `result` because an eviction
+        /// happens BEFORE the write and stands whether or not the write then
+        /// succeeds -- reporting it only on success would lose it in exactly
+        /// the case where two things went wrong.
+        ///
+        /// Empty on almost every call. When it is not, a conversation is
+        /// permanently unreadable, and the design doc names silence here as
+        /// the expensive direction: "the confession becomes unreadable and
+        /// the buyer has no recourse, with no error at any layer".
+        evicted: Vec<EvictedConversation>,
     },
 
     /// The conversations stored for one store, as keys rather than secrets.
@@ -340,6 +352,12 @@ pub enum HarvestDelegateResponse {
     },
 
     /// Which conversations are now marked as held outside this node.
+    ///
+    /// `Ok(n)` is how many of the named conversations are marked afterwards;
+    /// a tag this node does not hold contributes nothing and is not an error.
+    /// A write the node REFUSED is an `Err`, not a smaller count: the two are
+    /// different situations and the caller cannot tell them apart from a
+    /// number.
     BuyerConversationsMarkedBackedUp {
         request_id: RequestId,
         store_contract_id: Vec<u8>,
@@ -495,6 +513,17 @@ pub struct RecalledConversation {
     /// but the user saying so can clear it. See
     /// [`HarvestDelegateRequest::MarkConversationsBackedUp`].
     pub backed_up: bool,
+}
+
+/// A conversation the delegate discarded to stay under its cap.
+///
+/// `was_backed_up` is the whole point of reporting it: a discarded
+/// conversation the buyer holds a backup of is recoverable and worth a
+/// mention, and one they do not is gone for good and worth an alarm.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct EvictedConversation {
+    pub buyer_public_key: [u8; 32],
+    pub was_backed_up: bool,
 }
 
 /// What importing a backup actually did, per conversation rather than as one

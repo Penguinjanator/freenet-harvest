@@ -315,6 +315,12 @@ mod boundary_tests {
 
     /// Every family is refused at the same point, including the migration
     /// export, which is the one that was already checked.
+    ///
+    /// **Every** means every one: a family missing from this list is one this
+    /// test silently stops covering, which is the shape of the payment-hijack
+    /// hole it was written for. Add to it whenever a variant is added to
+    /// `HarvestDelegateRequest`, `BitcoinDelegateRequest` or
+    /// `HarvestMigrationRequest`.
     #[test]
     fn every_request_family_is_refused_for_a_foreign_web_app() {
         let payloads = [
@@ -336,6 +342,49 @@ mod boundary_tests {
                 request_id: 1,
                 ghostkey_fingerprint: "fp".into(),
                 peer_public_keys: vec![vec![1u8; 32]],
+            })
+            .expect("cbor"),
+            // The buyer's half. `ListBuyerConversations` answers the keys
+            // that read this node's own side of a public mailbox;
+            // `ForgetBuyerConversation` destroys a capability that exists
+            // nowhere else; `ExportBuyerConversations` answers the secrets
+            // themselves; and `MarkConversationsBackedUp` silences the
+            // warning that one of them exists in a single place, which is the
+            // one that reads as harmless and is not.
+            to_cbor(&HarvestDelegateRequest::StoreBuyerConversation {
+                request_id: 1,
+                store_contract_id: vec![3u8; 32],
+                secret: harvest_common::ConversationSecret([4u8; 32]),
+                seller_public_key: [5u8; 32],
+                conversation_id: [6u8; 32],
+                created_at: 1_700_000_000,
+            })
+            .expect("cbor"),
+            to_cbor(&HarvestDelegateRequest::ListBuyerConversations {
+                request_id: 1,
+                store_contract_id: vec![3u8; 32],
+            })
+            .expect("cbor"),
+            to_cbor(&HarvestDelegateRequest::ForgetBuyerConversation {
+                request_id: 1,
+                store_contract_id: vec![3u8; 32],
+                buyer_public_key: [7u8; 32],
+            })
+            .expect("cbor"),
+            to_cbor(&HarvestDelegateRequest::ExportBuyerConversations {
+                request_id: 1,
+                store_contract_id: vec![3u8; 32],
+            })
+            .expect("cbor"),
+            to_cbor(&HarvestDelegateRequest::ImportBuyerConversations {
+                request_id: 1,
+                backup: "harvest-conv-backup-v1:whatever".into(),
+            })
+            .expect("cbor"),
+            to_cbor(&HarvestDelegateRequest::MarkConversationsBackedUp {
+                request_id: 1,
+                store_contract_id: vec![3u8; 32],
+                buyer_public_keys: vec![[7u8; 32]],
             })
             .expect("cbor"),
         ];

@@ -51,8 +51,8 @@
 use crate::secrets::RemovableSecrets;
 use freenet_migrate::SecretStore;
 use harvest_common::delegate::{
-    ConversationKey, ConversationSecret, HarvestDelegateResponse, ImportedConversations,
-    RecalledConversation, RequestId,
+    ConversationKey, ConversationSecret, EvictedConversation, HarvestDelegateResponse,
+    ImportedConversations, RecalledConversation, RequestId,
 };
 use harvest_common::mailbox::{conversation_key_from_dh, MessageDirection};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -345,7 +345,11 @@ pub(crate) fn store_buyer_conversation<S: SecretStore + RemovableSecrets>(
     store_contract_id: &[u8],
     record: &BuyerConversationRecord,
 ) -> HarvestDelegateResponse {
-    let stored = |result| HarvestDelegateResponse::BuyerConversationStored { request_id, result };
+    let stored = |result| HarvestDelegateResponse::BuyerConversationStored {
+        request_id,
+        result,
+        evicted: Vec::new(),
+    };
 
     if store_contract_id.len() != STORE_CONTRACT_ID_BYTES {
         return stored(Err(format!(
@@ -366,27 +370,43 @@ pub(crate) fn store_buyer_conversation<S: SecretStore + RemovableSecrets>(
     // Only a NEW key consumes a slot. Re-storing the same conversation --
     // which the UI does whenever it re-sends into a thread it already has --
     // must not evict anything.
+    let mut evicted = Vec::new();
     if !store.has_secret(&key) {
-        if let Err(why) = make_room(store) {
-            return stored(Err(why));
+        match make_room(store) {
+            Ok(discarded) => evicted = discarded,
+            // The eviction report travels with the failure too: whatever was
+            // discarded is gone whether or not the write that followed
+            // worked.
+            Err(why) => {
+                return HarvestDelegateResponse::BuyerConversationStored {
+                    request_id,
+                    result: Err(why),
+                    evicted,
+                }
+            }
         }
     }
 
-    if store.set_secret(&key, &bytes) {
-        stored(Ok(()))
+    let result = if store.set_secret(&key, &bytes) {
+        Ok(())
     } else {
         // Reported rather than swallowed: the UI has already told the buyer
         // their message was sent, and a conversation that was not kept
         // becomes unreadable the moment the tab closes.
-        stored(Err(
+        Err(
             "could not keep this conversation -- the node refused the write, so a reply \
              will not be readable after this tab closes"
                 .to_string(),
-        ))
+        )
+    };
+    HarvestDelegateResponse::BuyerConversationStored {
+        request_id,
+        result,
+        evicted,
     }
 }
 
-/// Free a slot if every one is taken, oldest first.
+/// Free a slot if every one is taken, and say what that cost.
 ///
 /// Eviction rather than refusal, because refusing would mean the conversation
 /// the buyer is having RIGHT NOW is the one that cannot be saved.
@@ -395,17 +415,45 @@ pub(crate) fn store_buyer_conversation<S: SecretStore + RemovableSecrets>(
 /// mailbox's TTL mistake at a higher cost: it would discard precisely the
 /// capability the buyer needs later, at a time the buyer has no way to
 /// predict.
-fn make_room<S: SecretStore + RemovableSecrets>(store: &mut S) -> Result<(), String> {
+///
+/// # The order, and why `backed_up` comes before age
+///
+/// Ranked ascending by `(has no backup, age, key)`, so the FIRST things
+/// discarded are the ones the buyer can get back:
+///
+/// 1. an entry that does not decode -- it recalls nothing, so discarding it
+///    costs nothing;
+/// 2. a conversation the buyer holds a backup of;
+/// 3. a conversation that exists on this node and nowhere else, oldest first;
+/// 4. the lowest key, so the choice is deterministic rather than dependent on
+///    listing order.
+///
+/// Age alone was not safe, and the way it failed is worth keeping: the cap is
+/// global across every store and `created_at` arrives from the wire -- from
+/// the browser when a conversation is opened, and **from the backup string on
+/// the import path**, where nothing signs it. A buyer handed a backup by
+/// somebody else could paste 253 records dated `i64::MAX`, fill the store to
+/// its cap, and have the next conversation they opened silently destroy one
+/// of their own. It composes the other way now: import marks what it restores
+/// as backed up, which is true, and that is exactly what makes the attacker's
+/// records the eligible ones. Pinned by
+/// `a_conversation_that_exists_only_here_outlives_an_imported_one`.
+fn make_room<S: SecretStore + RemovableSecrets>(
+    store: &mut S,
+) -> Result<Vec<EvictedConversation>, String> {
     let mut held = held_conversations(store);
+    let mut evicted = Vec::new();
     while held.len() >= MAX_BUYER_CONVERSATIONS {
-        // An undecodable entry first -- it recalls nothing, so discarding it
-        // costs nothing -- then the oldest, then the lowest key so the choice
-        // is deterministic rather than dependent on listing order.
         let Some(victim) = held
             .iter()
             .enumerate()
             .min_by_key(|(_, (key, record))| {
-                (record.as_ref().map(|record| record.created_at), key.clone())
+                (
+                    record
+                        .as_ref()
+                        .map(|record| (!record.backed_up, record.created_at)),
+                    key.clone(),
+                )
             })
             .map(|(index, _)| index)
         else {
@@ -414,7 +462,13 @@ fn make_room<S: SecretStore + RemovableSecrets>(store: &mut S) -> Result<(), Str
             // cannot turn this into a panic inside a delegate.
             break;
         };
-        let (key, _) = held.remove(victim);
+        let (key, record) = held.remove(victim);
+        if let Some(record) = &record {
+            evicted.push(EvictedConversation {
+                buyer_public_key: *PublicKey::from(&StaticSecret::from(record.secret.0)).as_bytes(),
+                was_backed_up: record.backed_up,
+            });
+        }
         if !store.remove_secret(&key) {
             // Refusing to grow past the cap is the safe direction: the
             // alternative is an unbounded secret store on a node whose host
@@ -426,7 +480,7 @@ fn make_room<S: SecretStore + RemovableSecrets>(store: &mut S) -> Result<(), Str
             );
         }
     }
-    Ok(())
+    Ok(evicted)
 }
 
 /// Recall every conversation stored for one store, as derived keys.
@@ -532,6 +586,28 @@ pub(crate) fn forget_buyer_conversation<S: SecretStore + RemovableSecrets>(
 /// recognises its own.
 pub(crate) const BUYER_CONVERSATION_BACKUP_PREFIX: &str = "harvest-conv-backup-v1:";
 
+/// The longest backup string this delegate will attempt to read.
+///
+/// # Why a length cap and not just "it will fail to decode"
+///
+/// Base58 decoding is **quadratic** in the length of the string, because it
+/// is repeated big-integer division. Found by measurement rather than by
+/// reading: a test that round-tripped 253 conversations took 72 seconds in a
+/// debug build, and nothing in the code had a bound on how long a pasted
+/// string could be. A megabyte of base58 would occupy the delegate for
+/// minutes before failing.
+///
+/// The paste comes from a person, but not necessarily from a string they
+/// produced -- the whole restore flow is "paste what you saved", and what
+/// someone else hands them is equally paste-able. The origin gate stops
+/// another web app calling this; it does not stop a string.
+///
+/// 64 KiB is comfortably above any honest export: the delegate holds at most
+/// [`MAX_BUYER_CONVERSATIONS`] conversations in total and each encodes to
+/// about 150 bytes, so a maximal backup is roughly 52 KiB of base58. Pinned
+/// by `a_backup_string_longer_than_the_cap_is_refused_without_decoding_it`.
+pub(crate) const MAX_BACKUP_STRING_BYTES: usize = 64 * 1024;
+
 /// One store's conversations, as they travel between two nodes.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
 pub(crate) struct BuyerConversationBackupV1 {
@@ -564,6 +640,16 @@ pub(crate) fn encode_backup(backup: &BuyerConversationBackupV1) -> Result<String
 /// here is whatever was on their clipboard -- a store link, a ghostkey PEM,
 /// half a backup -- and "invalid CBOR" tells them nothing they can act on.
 pub(crate) fn decode_backup(backup: &str) -> Result<BuyerConversationBackupV1, String> {
+    // Before the decode, not after: the decode is the expensive part, and its
+    // cost grows with the square of the length. See
+    // [`MAX_BACKUP_STRING_BYTES`].
+    if backup.len() > MAX_BACKUP_STRING_BYTES {
+        return Err(format!(
+            "that is {} bytes, and a Harvest conversation backup is never more than \
+             {MAX_BACKUP_STRING_BYTES} -- nothing was read",
+            backup.len()
+        ));
+    }
     let body = backup
         .trim()
         .strip_prefix(BUYER_CONVERSATION_BACKUP_PREFIX)
@@ -748,13 +834,20 @@ pub(crate) fn import_buyer_conversations<S: SecretStore + RemovableSecrets>(
 
 /// Record that the buyer holds a copy of these conversations elsewhere.
 ///
-/// Answers how many of the named conversations are marked afterwards, rather
-/// than a bare success: a tag this node does not hold contributes nothing,
-/// and a refused write leaves the warning in place, which is the safe
-/// direction. The caller can compare the count with what it asked about.
+/// Answers how many of the named conversations are marked afterwards. A tag
+/// this node does not hold contributes nothing and is not an error: it does
+/// not create anything, and a tag that is not here is not a conversation that
+/// gets one.
 ///
-/// It does not create anything. A tag that is not here is not a conversation
-/// that gets one.
+/// # A refused write is an ERROR, not a smaller count
+///
+/// It answered `Ok(marked)` unconditionally until this was reviewed, which
+/// made the caller's failure path dead code and left a refused write
+/// indistinguishable from a tag that was simply not held. The warning staying
+/// on is the safe direction either way -- but a buyer who is told nothing
+/// went wrong, and then sees the warning still there, has been given a puzzle
+/// rather than a fact. Pinned by
+/// `marking_reports_a_failure_when_the_node_refuses_the_write`.
 pub(crate) fn mark_conversations_backed_up<S: SecretStore>(
     store: &mut S,
     request_id: RequestId,
@@ -762,6 +855,7 @@ pub(crate) fn mark_conversations_backed_up<S: SecretStore>(
     buyer_public_keys: &[[u8; 32]],
 ) -> HarvestDelegateResponse {
     let mut marked = 0usize;
+    let mut refused = 0usize;
     for tag in buyer_public_keys {
         let key = buyer_conversation_key(store_contract_id, tag);
         let Some(record) = store
@@ -778,18 +872,26 @@ pub(crate) fn mark_conversations_backed_up<S: SecretStore>(
             backed_up: true,
             ..record
         };
-        let Ok(bytes) = harvest_common::to_cbor(&marked_record) else {
-            continue;
-        };
-        if store.set_secret(&key, &bytes) {
-            marked += 1;
+        match harvest_common::to_cbor(&marked_record) {
+            Ok(bytes) if store.set_secret(&key, &bytes) => marked += 1,
+            _ => refused += 1,
         }
     }
+
+    let result = if refused == 0 {
+        Ok(marked)
+    } else {
+        Err(format!(
+            "the node refused to record {refused} of {} conversation(s) as backed up, so it \
+             will keep warning you about them",
+            buyer_public_keys.len()
+        ))
+    };
 
     HarvestDelegateResponse::BuyerConversationsMarkedBackedUp {
         request_id,
         store_contract_id: store_contract_id.to_vec(),
-        result: Ok(marked),
+        result,
     }
 }
 
@@ -1410,15 +1512,28 @@ mod buyer_conversation_tests {
     /// The UI re-sends the same conversation whenever the buyer writes into a
     /// thread it already has, so a full store would otherwise shed one real
     /// conversation per message sent.
+    ///
+    /// # The fixture re-stores the NEWEST, and that is the whole test
+    ///
+    /// It re-stored the OLDEST until this was reviewed, and that could not
+    /// observe the failure it describes: the oldest held conversation is also
+    /// the eviction victim, so with the guard deleted `make_room` evicted
+    /// exactly the record about to be re-written and the eviction cancelled
+    /// itself out. The suite stayed green with the guard gone.
+    ///
+    /// The newest is also the realistic case: it is the thread the buyer is
+    /// actively writing into, so it is the one the UI re-sends.
     #[test]
     fn re_storing_a_held_conversation_evicts_nothing() {
         let mut store = MemSecrets::default();
-        let mut first = [0u8; 32];
+        let mut oldest = [0u8; 32];
+        let mut newest = [0u8; 32];
         for i in 0..MAX_BUYER_CONVERSATIONS {
             let secret = StaticSecret::from(seed_bytes(i as u32));
             if i == 0 {
-                first = *PublicKey::from(&secret).as_bytes();
+                oldest = *PublicKey::from(&secret).as_bytes();
             }
+            newest = *PublicKey::from(&secret).as_bytes();
             let record = BuyerConversationRecord {
                 secret: ConversationSecret(secret.to_bytes()),
                 seller_public_key: [7u8; 32],
@@ -1433,13 +1548,14 @@ mod buyer_conversation_tests {
             MAX_BUYER_CONVERSATIONS
         );
 
-        // The oldest one again -- which is also the one eviction would take.
-        let secret = StaticSecret::from(seed_bytes(0));
+        // The NEWEST one again: the active thread, and NOT the record an
+        // eviction would take.
+        let secret = StaticSecret::from(seed_bytes(MAX_BUYER_CONVERSATIONS as u32 - 1));
         let record = BuyerConversationRecord {
             secret: ConversationSecret(secret.to_bytes()),
             seller_public_key: [7u8; 32],
             conversation_id: [2u8; 32],
-            created_at: 1_700_000_000,
+            created_at: 1_700_000_000 + MAX_BUYER_CONVERSATIONS as i64 - 1,
             backed_up: false,
         };
         stored(&store_buyer_conversation(&mut store, 999, STORE, &record))
@@ -1453,9 +1569,10 @@ mod buyer_conversation_tests {
             "re-storing a held conversation changed how many are held"
         );
         assert!(
-            kept.iter().any(|c| c.buyer_public_key == first),
-            "re-storing a conversation evicted it"
+            kept.iter().any(|c| c.buyer_public_key == oldest),
+            "re-sending into the active thread shed a real conversation"
         );
+        assert!(kept.iter().any(|c| c.buyer_public_key == newest));
     }
 
     /// An entry whose value does not decode is evicted before a real one.
@@ -1563,6 +1680,13 @@ mod buyer_conversation_backup_tests {
                 backed_up: false,
             },
         )
+    }
+
+    fn stored(response: &HarvestDelegateResponse) -> &Result<(), String> {
+        match response {
+            HarvestDelegateResponse::BuyerConversationStored { result, .. } => result,
+            other => panic!("expected BuyerConversationStored, got {other:?}"),
+        }
     }
 
     fn exported(response: &HarvestDelegateResponse) -> &Result<String, String> {
@@ -1940,6 +2064,248 @@ mod buyer_conversation_backup_tests {
             .as_ref()
             .expect_err("an empty backup must be refused");
         assert!(message.contains("no conversation"), "{message}");
+    }
+
+    /// **A conversation that exists only on this node is the LAST thing
+    /// evicted, not the first.**
+    ///
+    /// The reproduction is the reviewer's: the buyer holds three genuine
+    /// conversations, is handed a backup string by somebody else, and pastes
+    /// it. Import refuses at the cap but fills the store right up to it, and
+    /// the next conversation the buyer opens triggers an eviction. Ranked by
+    /// age alone, the victim is one of the buyer's own -- destroyed silently,
+    /// while 253 records the attacker supplied survive.
+    ///
+    /// `backed_up` is what breaks the tie, and it is the same asymmetry that
+    /// decided import's refuse-at-the-cap rule: a record the buyer has a copy
+    /// of is exactly the safe one to discard, and one they do not is exactly
+    /// the one that must not be. It composes with import marking what it
+    /// restores as backed up -- which is true, since the buyer is holding the
+    /// string it came from, and is what makes the attacker's own records the
+    /// eligible ones.
+    #[test]
+    fn a_conversation_that_exists_only_here_outlives_an_imported_one() {
+        let mut store = MemSecrets::default();
+
+        // The buyer's own, oldest of all and backed up nowhere.
+        let mut mine = Vec::new();
+        for seed in 0..3u32 {
+            let (tag, record) = conversation(seed);
+            store_buyer_conversation(&mut store, seed as u64, STORE, &record);
+            mine.push(tag);
+        }
+
+        // Conversations the buyer has backed up, filling most of the store.
+        // These stand in for a long history; what matters is that the buyer
+        // can get them back.
+        const HOSTILE: u32 = 20;
+        for seed in 1_000..(1_000 + MAX_BUYER_CONVERSATIONS as u32 - 3 - HOSTILE) {
+            let (_, record) = conversation(seed);
+            store_buyer_conversation(
+                &mut store,
+                seed as u64,
+                STORE,
+                &BuyerConversationRecord {
+                    backed_up: true,
+                    ..record
+                },
+            );
+        }
+
+        // And a backup somebody else supplied, dated as far in the future as
+        // the field allows -- nothing signs `created_at`. Import marks what
+        // it restores as backed up, which is what makes these the eligible
+        // victims rather than the buyer's own.
+        let hostile: Vec<BuyerConversationRecord> = (100..(100 + HOSTILE))
+            .map(|seed| {
+                let (_, record) = conversation(seed);
+                BuyerConversationRecord {
+                    created_at: i64::MAX,
+                    ..record
+                }
+            })
+            .collect();
+        let paste = encode_backup(&BuyerConversationBackupV1 {
+            store_contract_id: [3u8; 32],
+            conversations: hostile,
+        })
+        .expect("encode");
+        let outcome = imported(&import_buyer_conversations(&mut store, 99, &paste))
+            .as_ref()
+            .expect("import")
+            .clone();
+        assert_eq!(
+            outcome.imported.len(),
+            HOSTILE as usize,
+            "precondition: the store is now full"
+        );
+
+        // One more conversation of the buyer's own forces an eviction.
+        let (fresh, record) = conversation(500);
+        stored(&store_buyer_conversation(&mut store, 1000, STORE, &record))
+            .as_ref()
+            .expect("must store");
+
+        let kept: Vec<[u8; 32]> = listed(&list_buyer_conversations(&store, 1, STORE))
+            .into_iter()
+            .map(|c| c.buyer_public_key)
+            .collect();
+        for tag in &mine {
+            assert!(
+                kept.contains(tag),
+                "a conversation that exists only on this node was destroyed to make room for \
+                 one the buyer could restore from the string they were given"
+            );
+        }
+        assert!(kept.contains(&fresh));
+        assert_eq!(kept.len(), MAX_BUYER_CONVERSATIONS);
+    }
+
+    /// **An eviction is reported, so the buyer can be told a conversation is
+    /// gone.**
+    ///
+    /// The design doc's own framing of the expensive direction is "the
+    /// confession becomes unreadable and the buyer has no recourse, with no
+    /// error at any layer". A response that cannot express "something was
+    /// discarded" is that no-error-at-any-layer.
+    #[test]
+    fn an_eviction_is_reported() {
+        let mut store = MemSecrets::default();
+        let mut oldest = [0u8; 32];
+        for seed in 0..(MAX_BUYER_CONVERSATIONS as u32) {
+            let (tag, record) = conversation(seed);
+            if seed == 0 {
+                oldest = tag;
+            }
+            store_buyer_conversation(&mut store, seed as u64, STORE, &record);
+        }
+
+        let (_, record) = conversation(900);
+        let response = store_buyer_conversation(&mut store, 1, STORE, &record);
+        match &response {
+            HarvestDelegateResponse::BuyerConversationStored { evicted, .. } => {
+                assert_eq!(
+                    evicted.len(),
+                    1,
+                    "a conversation was discarded and the answer did not say so"
+                );
+                assert_eq!(evicted[0].buyer_public_key, oldest);
+                assert!(
+                    !evicted[0].was_backed_up,
+                    "this one existed only here, and the buyer needs to be told that \
+                     specifically"
+                );
+            }
+            other => panic!("expected BuyerConversationStored, got {other:?}"),
+        }
+        stored(&response).as_ref().expect("must still store");
+    }
+
+    /// Nothing evicted, nothing reported -- so a report is evidence rather
+    /// than noise on every message sent.
+    #[test]
+    fn storing_without_evicting_reports_no_eviction() {
+        let mut store = MemSecrets::default();
+        let (_, record) = conversation(7);
+        match store_buyer_conversation(&mut store, 1, STORE, &record) {
+            HarvestDelegateResponse::BuyerConversationStored { evicted, .. } => {
+                assert!(evicted.is_empty())
+            }
+            other => panic!("expected BuyerConversationStored, got {other:?}"),
+        }
+    }
+
+    /// **A record whose keys cannot be derived is refused, and does not
+    /// occupy a slot.**
+    ///
+    /// Without this the record stores, `recall` silently drops it (it can
+    /// derive nothing), and the buyer has a cap slot permanently consumed by
+    /// something invisible in the list and absent from the refusals. That is
+    /// the exact outcome the guard's own comment claims it prevents, and
+    /// nothing tested it until this was reviewed.
+    #[test]
+    fn a_record_whose_keys_cannot_be_derived_is_refused_and_stores_nothing() {
+        let mut store = MemSecrets::default();
+        let (usable_tag, usable) = conversation(41);
+        let (unusable_tag, unusable) = conversation(42);
+        let paste = encode_backup(&BuyerConversationBackupV1 {
+            store_contract_id: [3u8; 32],
+            conversations: vec![
+                usable,
+                BuyerConversationRecord {
+                    // The all-zero point: a low-order key, so the shared
+                    // secret is all zeros and the "conversation key" would be
+                    // a constant anyone can compute.
+                    seller_public_key: [0u8; 32],
+                    ..unusable
+                },
+            ],
+        })
+        .expect("encode");
+
+        let outcome = imported(&import_buyer_conversations(&mut store, 1, &paste))
+            .as_ref()
+            .expect("import")
+            .clone();
+        assert_eq!(outcome.imported, vec![usable_tag]);
+        assert_eq!(outcome.refused.len(), 1, "the unusable record was accepted");
+        assert_eq!(outcome.refused[0].0, unusable_tag);
+        assert_eq!(
+            store.list_secrets(BUYER_CONVERSATION_PREFIX).len(),
+            1,
+            "a record that recalls nothing is occupying a slot"
+        );
+    }
+
+    /// **A refused write means the buyer is NOT told their backup was
+    /// recorded.**
+    ///
+    /// The warning staying on is the safe direction, but reporting success
+    /// while the record was not written would leave the buyer believing a
+    /// warning had been cleared when it had not.
+    #[test]
+    fn marking_reports_a_failure_when_the_node_refuses_the_write() {
+        let mut store = MemSecrets::default();
+        let (tag, record) = conversation(43);
+        store_buyer_conversation(&mut store, 1, STORE, &record);
+        store.writes_fail = true;
+
+        match mark_conversations_backed_up(&mut store, 2, STORE, &[tag]) {
+            HarvestDelegateResponse::BuyerConversationsMarkedBackedUp { result, .. } => {
+                let message = result.expect_err("a refused write must be reported");
+                assert!(message.contains("refused"), "{message}");
+            }
+            other => panic!("expected BuyerConversationsMarkedBackedUp, got {other:?}"),
+        }
+        assert!(
+            !listed(&list_buyer_conversations(&store, 3, STORE))[0].backed_up,
+            "the warning was cleared by a write that did not happen"
+        );
+    }
+
+    /// **A backup string longer than the cap is refused before it is
+    /// decoded.**
+    ///
+    /// Base58 decoding is quadratic in the input length, so an unbounded
+    /// paste is an unbounded amount of the node's CPU. Found by measurement:
+    /// a 253-conversation round trip took 72 seconds in a debug build.
+    #[test]
+    fn a_backup_string_longer_than_the_cap_is_refused_without_decoding_it() {
+        let mut store = MemSecrets::default();
+        let huge = format!(
+            "{BUYER_CONVERSATION_BACKUP_PREFIX}{}",
+            "1".repeat(MAX_BACKUP_STRING_BYTES + 1)
+        );
+        let before = std::time::Instant::now();
+        let response = import_buyer_conversations(&mut store, 1, &huge);
+        let message = imported(&response)
+            .as_ref()
+            .expect_err("an oversized paste must be refused");
+        assert!(message.contains("never more than"), "{message}");
+        assert!(
+            before.elapsed() < std::time::Duration::from_secs(1),
+            "the refusal took long enough that the string was probably decoded first"
+        );
     }
 
     /// **A backup is a capability, and the test says so.**

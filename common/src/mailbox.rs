@@ -440,6 +440,44 @@ pub struct MailboxStateV1 {
     pub messages: Vec<EncryptedMessage>,
 }
 
+/// What identifies one mailbox entry to a client that wrote it.
+///
+/// # Why the nonce is not enough, and what this is for
+///
+/// The nonce is the message's identity *to the contract*: it is what
+/// [`MailboxStateV1::verify`] forbids duplicating and what a summary is made
+/// of. It is also **public and forgeable as an identity**, because the
+/// mailbox is open-write and anyone reading it can submit a different message
+/// under the same nonce. The counterparty can go further: they hold the
+/// conversation key, so their substitute decrypts, and
+/// [`dedupe_by_nonce`] then keeps exactly one of the two.
+///
+/// So a client that recognises "a message I sent" by nonce alone can be made
+/// to recognise somebody else's words as its own. This digest is the
+/// discriminator the nonce is not: it covers every field, so a substitute
+/// that differs in any way -- and a substitute must differ in the ciphertext,
+/// or it is the same message -- has a different digest.
+///
+/// **This is a client-side recognition aid and NOT a defence against the
+/// substitution itself.** Nothing here stops the counterparty replacing the
+/// entry; see `docs/messaging-privacy.md`. It stops the replacement being
+/// mistaken for the original.
+///
+/// Domain-separated, so a digest of a message can never coincide with a
+/// digest of anything else this codebase hashes.
+pub fn entry_digest(message: &EncryptedMessage) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key("harvest mailbox entry digest v1");
+    hasher.update(&message.nonce);
+    hasher.update(&message.conversation_id.0);
+    hasher.update(&(message.sender_public_key.len() as u64).to_le_bytes());
+    hasher.update(&message.sender_public_key);
+    hasher.update(&(message.ciphertext.len() as u64).to_le_bytes());
+    hasher.update(&message.ciphertext);
+    hasher.update(&message.timestamp.timestamp().to_le_bytes());
+    hasher.update(&message.timestamp.timestamp_subsec_nanos().to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 /// Summary for delta computation: set of known message nonces.
 pub type MailboxSummary = HashSet<[u8; 24]>;
 
@@ -1622,5 +1660,90 @@ mod dedup_tests {
 
         assert_eq!(m.messages.len(), 8);
         m.verify().expect("valid");
+    }
+}
+
+/// The message identity a client uses to recognise its own writing.
+#[cfg(test)]
+mod entry_digest_tests {
+    use super::*;
+
+    fn message(ciphertext: &[u8]) -> EncryptedMessage {
+        EncryptedMessage {
+            conversation_id: ConversationId([1u8; 32]),
+            sender_public_key: vec![2u8; 32],
+            ciphertext: ciphertext.to_vec(),
+            timestamp: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+            nonce: [3u8; 24],
+        }
+    }
+
+    /// **A substitute sharing a nonce has a different digest.**
+    ///
+    /// This is the whole reason the digest exists: the counterparty can
+    /// submit a different message under the buyer's nonce, and a client that
+    /// recognised its own writing by nonce would call the substitute its own.
+    #[test]
+    fn a_substitute_under_the_same_nonce_has_a_different_digest() {
+        let mine = message(b"what I actually wrote");
+        let substitute = message(b"what they put in its place");
+        assert_eq!(mine.nonce, substitute.nonce, "precondition: same nonce");
+        assert_ne!(entry_digest(&mine), entry_digest(&substitute));
+    }
+
+    /// The same message digests the same, so an identical re-send is still
+    /// recognised as the sender's own.
+    #[test]
+    fn the_same_message_has_the_same_digest() {
+        assert_eq!(
+            entry_digest(&message(b"hello")),
+            entry_digest(&message(b"hello"))
+        );
+    }
+
+    /// **Every field is covered.** A field left out is a field an attacker can
+    /// vary while keeping the digest, which puts the substitution back.
+    #[test]
+    fn every_field_changes_the_digest() {
+        let base = message(b"hello");
+        let digest = entry_digest(&base);
+
+        let mut nonce_changed = base.clone();
+        nonce_changed.nonce[0] ^= 1;
+        let mut id_changed = base.clone();
+        id_changed.conversation_id.0[0] ^= 1;
+        let mut tag_changed = base.clone();
+        tag_changed.sender_public_key[0] ^= 1;
+        let mut time_changed = base.clone();
+        time_changed.timestamp = chrono::DateTime::from_timestamp(1_700_000_001, 0).expect("ts");
+        let mut subsec_changed = base.clone();
+        subsec_changed.timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 7).expect("ts");
+
+        for (what, changed) in [
+            ("nonce", nonce_changed),
+            ("conversation id", id_changed),
+            ("routing tag", tag_changed),
+            ("timestamp", time_changed),
+            ("timestamp nanos", subsec_changed),
+        ] {
+            assert_ne!(
+                digest,
+                entry_digest(&changed),
+                "changing the {what} left the digest alone"
+            );
+        }
+    }
+
+    /// Length-prefixed, so moving bytes between two variable-length fields
+    /// cannot leave the digest unchanged.
+    #[test]
+    fn a_field_boundary_cannot_be_moved_without_changing_the_digest() {
+        let mut a = message(b"");
+        a.sender_public_key = b"abcd".to_vec();
+        a.ciphertext = b"ef".to_vec();
+        let mut b = message(b"");
+        b.sender_public_key = b"abc".to_vec();
+        b.ciphertext = b"def".to_vec();
+        assert_ne!(entry_digest(&a), entry_digest(&b));
     }
 }

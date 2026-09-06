@@ -72,6 +72,88 @@ it.** The UI reports which direction a message was addressed, names only what
 the current tab sent as authored, and says on screen that direction is not
 proof of authorship.
 
+"What the current tab sent" is recognised by a digest of the whole mailbox
+entry, not by its nonce. The distinction is the subject of the next section
+and it is not a detail: the nonce is public and the counterparty can put their
+own words under it.
+
+## The counterparty can DELETE a message you sent, and take its place
+
+Found by review on 2026-09-05, demonstrated by execution, and **not fixed** —
+what changed is that the client no longer mistakes the result for your own
+words, and says out loud that it happened.
+
+The mailbox keeps **one entry per nonce**: `MailboxStateV1::verify` rejects a
+state holding a duplicate, and a summary is a set of nonces. The nonce is
+public, the contract is open-write, and the counterparty holds the
+conversation key. So they can take a message you sent, encrypt *different*
+plaintext under the same key with the **same nonce**, date it one second
+later, and submit it. `dedupe_by_nonce` keeps one of the two by a total order
+over content, and every field in that order is theirs to choose.
+
+Three things happen at once: your message is gone from a public contract, the
+substitute reads as a normal message of the conversation, and — until this was
+fixed — your own screen labelled it as something you wrote, because
+`authored_here` matched on the nonce.
+
+**Why no tiebreak fixes it.** The dedup rule must be a pure function of the
+SET of messages, or two peers that saw them in different orders keep different
+bytes forever. A function of the set has no notion of which arrived first, so
+it cannot protect the incumbent. Ranking by content instead of timestamp only
+changes the attacker's cost from "add one second" to "try a few ciphertexts
+until one sorts first" — they choose the whole plaintext, so they win about
+half of any comparison on the first attempt.
+
+**What would actually close it** is making the message's identity content-derived
+rather than chosen — deriving the nonce deterministically from the message (an
+SIV-style construction), so two different plaintexts cannot share a nonce and
+"one entry per nonce" becomes "one entry per distinct message". That is a
+change to the message crypto and to what the contract treats as identity; it
+belongs in its own change with its own review, and it would also close the
+nonce-reuse problem below. It is not attempted here.
+
+**What was done instead**, at the client, where first-hand knowledge lives:
+
+* `authored_here` matches on `entry_digest` — every field of the entry — so a
+  substitute is not credited to you. The counterparty cannot reproduce it
+  without sending the identical message, which is not a substitution.
+* `AppState::replaced_sent` reports a message whose **nonce is present with a
+  different digest**: it arrived and was displaced. That is a different thing
+  to tell someone than "not seen yet", and both are on screen. A nonce is 24
+  random bytes, so this is never an accident.
+
+It works in both directions. A buyer can put a confession in a seller's own
+inbox under the seller's nonce; the seller's screen showed it as their own
+words until this was fixed, and now shows their reply as replaced.
+
+## A deliberate nonce collision is also AES-GCM nonce reuse
+
+The same act reuses an AES-GCM (key, nonce) pair across two different
+plaintexts, which is a cryptographic problem in its own right and not only a
+UX one. Pinned as an executable fact by
+`known_limit_a_nonce_collision_reuses_the_keystream`, which asserts
+`C1 xor C2 == P1 xor P2`.
+
+Who it exposes what to:
+
+* **Not the counterparty.** They hold the conversation key, so they could
+  already read and write everything in that conversation. The reuse gives them
+  nothing new — which is why it is not a way *in*.
+* **A third party watching the mailbox** sees both entries (the original is
+  public until the substitute displaces it) and learns `P1 xor P2` **without
+  any key**. The substitute's plaintext is attacker-chosen, so anyone who
+  knows or guesses it recovers your original message. `pad_to_bucket` puts
+  both in the same size bucket, so the xor typically covers the whole message.
+* **A third party who obtains either plaintext** recovers the keystream for
+  that nonce; the repeated-nonce pair additionally permits GHASH-subkey
+  recovery, so they can forge further entries under that nonce without holding
+  the key. They cannot decrypt anything under a different nonce.
+
+Every path requires a key holder to create the collision deliberately, and a
+key holder is already inside the conversation. What the reuse adds is exposure
+to third parties. The deterministic-nonce change described above would remove
+the class entirely, since two different plaintexts could not share a nonce.
+
 ## NOT visible
 
 * **What was said.** AES-256-GCM under a key derived from an X25519 exchange
