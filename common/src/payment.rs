@@ -467,6 +467,42 @@ impl Order {
         self
     }
 
+    /// The instance id of the `BitcoinAddressContract` that observes this
+    /// order's payment destination, or `None` when the order names no
+    /// contract build.
+    ///
+    /// # Why this is HERE and not at either call site
+    ///
+    /// Two things need it and they are in different crates: the store
+    /// contract, to cross-check an order against the address contract's own
+    /// state, and the UI, so a buyer can see what has already arrived at the
+    /// address they are about to pay. A hand-maintained second copy of a
+    /// contract-address derivation is the defect this repository ranks first
+    /// in `docs/untested-invariants.md` -- `create_store_contracts` held one
+    /// for the store's own parameters, and when the copies drifted every
+    /// derived id named a contract that was never published, reported as a
+    /// clean "nothing to migrate" over a seller's entire store.
+    ///
+    /// `BLAKE3(code_hash || cbor(parameters))` is not a convention this crate
+    /// may choose: it is how Freenet forms a contract's address. A drift
+    /// leaves the UI subscribed to an address that does not exist, reporting
+    /// "no payment seen" forever.
+    ///
+    /// `None` rather than a guess when `bitcoin_address_code_hash` is absent.
+    /// A default hash would name some other contract, and a buyer would be
+    /// shown its balance under their own order.
+    pub fn bitcoin_address_instance_id(&self) -> Option<[u8; 32]> {
+        let code_hash = self.bitcoin_address_code_hash?;
+        // Infallible: `BitcoinAddressParameters` is plain data with a derived
+        // `Serialize`.
+        let params = crate::to_cbor(&self.bitcoin_params())
+            .expect("BitcoinAddressParameters always serializes to CBOR");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&code_hash);
+        hasher.update(&params);
+        Some(*hasher.finalize().as_bytes())
+    }
+
     /// Parameters of the `BitcoinAddressContract` that observes this order's
     /// payment destination.
     pub fn bitcoin_params(&self) -> BitcoinAddressParameters {
@@ -1847,6 +1883,92 @@ mod order_identity_tests {
         assert!(
             refused.contains("id"),
             "the refusal should say what is wrong: {refused}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod address_instance_tests {
+    use super::*;
+
+    fn terms(code_hash: Option<[u8; 32]>) -> Order {
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        Order {
+            id: OrderId([0u8; 16]),
+            listing_id: ListingId([1u8; 16]),
+            buyer_fingerprint: String::new(),
+            seller_fingerprint: "seller-fp".to_string(),
+            amount_sats: 50_000,
+            network: BitcoinNetwork::Signet,
+            payment_script_pubkey: vec![0x00, 0x14, 0xaa],
+            payment_address: "tb1q".to_string(),
+            required_confirmations: 1,
+            payment_hash: None,
+            trusted_bridges: Vec::new(),
+            bitcoin_address_code_hash: code_hash,
+            anchor: None,
+            order_binding: None,
+            created_at,
+        }
+        .with_derived_id()
+    }
+
+    /// **An order with no code hash names no address contract.**
+    ///
+    /// `bitcoin_address_code_hash` is optional, and the honest answer for an
+    /// order that omits it is "I cannot say", not a guess. A caller that got
+    /// an id anyway would subscribe to, and read a balance from, whatever
+    /// contract a default hash happened to name.
+    #[test]
+    fn an_order_with_no_code_hash_names_no_address_contract() {
+        assert_eq!(terms(None).bitcoin_address_instance_id(), None);
+    }
+
+    /// **The id is a function of the code hash and the order's own payment
+    /// terms.**
+    ///
+    /// Both halves asserted, because either one alone would be satisfied by
+    /// a derivation that ignored the other -- and a derivation that ignored
+    /// the script would show a buyer the balance of a different address under
+    /// their own order.
+    #[test]
+    fn the_address_contract_id_covers_the_code_hash_and_the_script() {
+        let one = terms(Some([7u8; 32]));
+        let mut other_script = one.clone();
+        other_script.payment_script_pubkey = vec![0x00, 0x14, 0xbb];
+        let other_script = other_script.with_derived_id();
+
+        assert_ne!(
+            one.bitcoin_address_instance_id(),
+            terms(Some([8u8; 32])).bitcoin_address_instance_id(),
+            "a different contract build is a different instance"
+        );
+        assert_ne!(
+            one.bitcoin_address_instance_id(),
+            other_script.bitcoin_address_instance_id(),
+            "a different destination is a different instance"
+        );
+    }
+
+    /// **It is the derivation Freenet itself performs.**
+    ///
+    /// `BLAKE3(code_hash || cbor(parameters))` is not a convention this crate
+    /// is free to choose -- it is how a contract's address is formed, and a
+    /// second derivation that drifted would have the UI subscribing to an
+    /// address that does not exist and reporting "no payment seen" forever.
+    /// Asserted against the components rather than against a copy of the
+    /// code.
+    #[test]
+    fn the_derivation_is_blake3_over_the_code_hash_and_the_parameters() {
+        let order = terms(Some([7u8; 32]));
+        let params = crate::to_cbor(&order.bitcoin_params()).expect("parameters always serialize");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&[7u8; 32]);
+        hasher.update(&params);
+
+        assert_eq!(
+            order.bitcoin_address_instance_id(),
+            Some(*hasher.finalize().as_bytes())
         );
     }
 }

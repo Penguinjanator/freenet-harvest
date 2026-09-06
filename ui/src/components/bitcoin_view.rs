@@ -343,6 +343,31 @@ pub(crate) fn live_address_for_order(
     bitcoin: &BitcoinState,
     order: &harvest_common::payment::Order,
 ) -> Option<AddressView> {
+    // The order's OWN terms first. `Order::bitcoin_address_instance_id`
+    // derives the address contract from the code hash and payment parameters
+    // the seller signed, so what is displayed is the address the order
+    // actually names.
+    //
+    // This used to go only through the watch list, and that had two problems.
+    // A buyer holds no watch -- the buy flow creates none -- so a purchase
+    // card read "Awaiting payment" however much had already arrived at the
+    // address, which is exactly the evidence a person needs to sanity-check
+    // the blockers that stop them paying the wrong order. And the watch route
+    // matches on `(network, script_pubkey)` and then trusts the `contract_id`
+    // STRING the watch carries: an identity from a different source than the
+    // terms being displayed, so where the two disagree a buyer was shown some
+    // other address's balance under this order.
+    if let Some(view) = order
+        .bitcoin_address_instance_id()
+        .and_then(|id| bitcoin.addresses.get(id.as_slice()))
+    {
+        return Some(view.clone());
+    }
+
+    // Fall back to the watch list for an order that names no contract build.
+    // `bitcoin_address_code_hash` is optional and absent on every order
+    // issued before it existed, and a seller watching their own address by
+    // hand is what the watch list is for.
     let watch = bitcoin
         .watches
         .iter()
@@ -981,5 +1006,140 @@ fn relative_time_ago(unix_secs: u32) -> String {
     } else {
         let d = delta / 86_400;
         format!("{d} day{} ago", if d == 1 { "" } else { "s" })
+    }
+}
+
+#[cfg(test)]
+mod live_address_tests {
+    use super::*;
+    use crate::state::{AddressView, BitcoinState};
+    use harvest_common::payment::Order;
+    use harvest_common::WatchedPayment;
+
+    fn order() -> Order {
+        let mut order = __address_check_test_support::order_paying(
+            "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+            vec![0x00, 0x14, 0xaa],
+        );
+        // The build's own hash, so the derived instance id is the one the
+        // real path would compute.
+        order.bitcoin_address_code_hash = Some([42u8; 32]);
+        order.with_derived_id()
+    }
+
+    /// A watch matching this order's destination, but naming some OTHER
+    /// address contract -- the disagreement this lookup used to resolve in
+    /// the watch's favour.
+    fn a_watch_pointing_at(order: &Order, contract_id: [u8; 32]) -> WatchedPayment {
+        WatchedPayment {
+            network: order.network,
+            script_pubkey: order.payment_script_pubkey.clone(),
+            address: order.payment_address.clone(),
+            label: None,
+            order_id: None,
+            expected_amount_sats: None,
+            contract_id: Some(bs58::encode(contract_id).into_string()),
+            added_at_ms: 0,
+            bridge_synced: true,
+            last_error: None,
+        }
+    }
+
+    fn a_view(confirmed_sats: u64) -> AddressView {
+        AddressView {
+            network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+            scanned_to: Some(800_000),
+            confirmed_sats,
+            pending_sats: 0,
+            txs: Vec::new(),
+        }
+    }
+
+    /// **A buyer sees the state of the address they are about to pay, with no
+    /// watch entry.**
+    ///
+    /// This is the tell the buy flow had none of. A buyer with no
+    /// `WatchedPayment` -- and the buy flow creates none -- saw "Awaiting
+    /// payment" whatever had already arrived at the address. That is bad on
+    /// its own and worse alongside the one-commitment-many-buyers hole: the
+    /// blocker that now stops the second buyer paying is a rule, and this is
+    /// the evidence a person can check it against.
+    ///
+    /// Resolved from the order's OWN signed terms, so what is displayed is
+    /// the address the order actually names.
+    #[test]
+    fn a_buyer_sees_the_address_state_without_holding_a_watch() {
+        let order = order();
+        let mut bitcoin = BitcoinState::default();
+        assert!(
+            bitcoin.watches.is_empty(),
+            "the point of this test is that there is no watch"
+        );
+        bitcoin.addresses.insert(
+            order
+                .bitcoin_address_instance_id()
+                .expect("the fixture names a build")
+                .to_vec(),
+            a_view(50_000),
+        );
+
+        assert_eq!(
+            live_address_for_order(&bitcoin, &order).map(|v| v.confirmed_sats),
+            Some(50_000)
+        );
+    }
+
+    /// **A watch whose contract id disagrees with the order's terms does not
+    /// decide what the buyer is shown.**
+    ///
+    /// The old lookup matched a watch on `(network, script_pubkey)` and then
+    /// trusted the `contract_id` string the watch carried -- an identity from
+    /// a different source than the terms being displayed. Where the two
+    /// disagree, that showed a buyer some other address's balance under this
+    /// order. The order's own parameters are the identity now, and a watch is
+    /// only consulted when they yield nothing.
+    #[test]
+    fn a_watch_pointing_elsewhere_does_not_override_the_orders_own_terms() {
+        let order = order();
+        let mut bitcoin = BitcoinState::default();
+        bitcoin
+            .watches
+            .push(a_watch_pointing_at(&order, [0x99u8; 32]));
+        bitcoin.addresses.insert(vec![0x99u8; 32], a_view(999_999));
+        bitcoin.addresses.insert(
+            order
+                .bitcoin_address_instance_id()
+                .expect("the fixture names a build")
+                .to_vec(),
+            a_view(50_000),
+        );
+
+        assert_eq!(
+            live_address_for_order(&bitcoin, &order).map(|v| v.confirmed_sats),
+            Some(50_000),
+            "the order's own terms decide which address is shown"
+        );
+    }
+
+    /// **An order naming no contract build still resolves through a watch.**
+    ///
+    /// `bitcoin_address_code_hash` is optional and absent on every order
+    /// issued before it existed, and a seller watching their own address by
+    /// hand is the case the watch list was built for. Removing that path
+    /// would be a regression dressed as a tightening.
+    #[test]
+    fn an_order_with_no_build_still_resolves_through_a_watch() {
+        let mut order = order();
+        order.bitcoin_address_code_hash = None;
+        let mut bitcoin = BitcoinState::default();
+        bitcoin
+            .watches
+            .push(a_watch_pointing_at(&order, [0x99u8; 32]));
+        bitcoin.addresses.insert(vec![0x99u8; 32], a_view(777));
+
+        assert_eq!(
+            live_address_for_order(&bitcoin, &order).map(|v| v.confirmed_sats),
+            Some(777)
+        );
     }
 }

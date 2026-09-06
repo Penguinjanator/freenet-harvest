@@ -492,6 +492,27 @@ from the network would merge to different bytes than one that reached the same
 set through deltas. Pre-existing, not touched by this branch, recorded here
 because this is where it was found.
 
+**And the tell the buy flow had none of.**
+
+Review named it beside H1 and it is the half that makes the rule checkable by
+a person: nothing registered a payment watch for a purchase, so a card read
+"Awaiting payment" however much had already arrived at the address. So it was
+not only that N buyers could pay one commitment -- none of them could see that
+anyone else had.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `harvest_common::payment::Order::bitcoin_address_instance_id` | The address contract an order names is derived from the code hash and the payment parameters the seller signed. | **Yes** -- `payment::address_instance_tests`, including that the id changes with the build AND with the script, and that it is `BLAKE3(code_hash \|\| cbor(parameters))` asserted against the components rather than against a copy of the code. It replaces a hand-written second copy in the store contract: a duplicated contract-address derivation is the shape ranked first in this document, where the copies drifted and every derived id named a contract that had never been published. |
+| `ui/src/components/bitcoin_view::live_address_for_order` | A buyer sees the state of the address they are about to pay, holding no watch. | **Yes** -- `live_address_tests`, mutated red by removing the derived-id lookup. The same change also fixed an identity mismatch: the old lookup matched a watch on `(network, script_pubkey)` and then trusted the `contract_id` STRING the watch carried, so where the two disagreed a buyer was shown some other address's balance under this order. Pinned by `a_watch_pointing_elsewhere_does_not_override_the_orders_own_terms`, and the watch fallback is pinned as still working for an order that names no build. |
+| `ui/src/state.rs::AppState::address_contracts_to_watch` | Only orders this node is party to are subscribed. | **Yes** -- `somebody_elses_order_is_not_watched`, mutated red by watching every order in the store. A store contract carries every order it ever issued, so subscribing to all of them would advertise this node's interest in every one of a busy seller's payment addresses -- the private-watch-list-as-public-record shape `harvest_common::bitcoin_delegate` refuses to build. |
+| same, dispatch | The subscription actually happens. | **No.** `watch_purchase_addresses` ends in a wasm-gated `spawn_local`, like every other send here. What is tested is which ids it asks for. |
+
+This narrows, but does not close, the "nothing takes over after payment" gap
+recorded below: the buyer can now SEE a payment arrive at the order's address,
+because the address contract is subscribed and the card reads its state.
+Nothing still constructs an `OrderPaymentProof`, so the published order never
+advances to `Paid`.
+
 **Two things the round did not close.**
 
 **`OrderId` is 16 bytes, so swapping terms costs a collision rather than
@@ -565,10 +586,12 @@ An earlier version of this paragraph said "the existing on-chain verification
 path takes over from there", which review showed was false in both halves, in
 a document whose whole purpose is not claiming more than the code does:
 
-* **No watch is registered.** `live_address_for_order` resolves through
+* **No watch is registered.** `live_address_for_order` resolved only through
   `bitcoin.watches`, and the only thing that creates one is the manual "Watch
-  address" form. So `live` is `None` for every purchase and the card reads
-  "Awaiting payment" however much has arrived.
+  address" form. So `live` was `None` for every purchase and the card read
+  "Awaiting payment" however much had arrived. **Closed** -- the lookup now
+  derives the address contract from the order's own signed terms and the buy
+  flow subscribes to it; see the round-2 section above.
 * **Nothing constructs an `OrderPaymentProof`.** Every `payment_proof` site in
   `ui/` is `None`, so a published order never advances to `Paid` and
   `NotAwaitingPayment` never fires for a real settlement.

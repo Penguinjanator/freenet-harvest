@@ -1767,6 +1767,15 @@ impl AppState {
                     // buyer never fetches is the same to them as one that
                     // was never sent.
                     self.recall_buyer_conversations(&contract_id);
+
+                    // And subscribe to the address contract of every order
+                    // this node is party to, so a payment to one becomes
+                    // visible. Here rather than on the payments tab, because
+                    // the subscription is what fills the view a purchase card
+                    // reads, and a buyer who never opens that tab still needs
+                    // to see whether the address they are about to pay has
+                    // already been paid. Idempotent per tab.
+                    self.watch_purchase_addresses(&contract_id);
                     return;
                 }
             };
@@ -2699,6 +2708,101 @@ impl AppState {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The Bitcoin address contracts this node should be watching for one
+    /// store, so a payment to an order it is party to becomes visible.
+    ///
+    /// # Why a buyer needs this at all
+    ///
+    /// `live_address_for_order` reads `bitcoin.addresses`, which is filled
+    /// only by a subscription. Nothing subscribed on a buyer's behalf, so a
+    /// purchase card read "Awaiting payment" however much had already arrived
+    /// at the address. A rule that stops the wrong payment is worth having;
+    /// the display that would have shown the buyer the money was already
+    /// there is what lets a person check the rule.
+    ///
+    /// # Why it is scoped, and not just "every order in the store"
+    ///
+    /// A store contract carries every order it ever issued. Subscribing to
+    /// all of them would advertise this node's interest in every one of a
+    /// busy seller's payment addresses, for orders it has nothing to do with
+    /// -- the shape `harvest_common::bitcoin_delegate` refuses to build when
+    /// it declines to publish a user's watch list. So: orders this node was
+    /// accepted for, and orders one of its own identities issued.
+    ///
+    /// Returns the ids rather than subscribing, so what is asked for is
+    /// decidable without a browser. [`Self::watch_purchase_addresses`] is the
+    /// half that needs one.
+    pub fn address_contracts_to_watch(&self, store_contract_id: &[u8]) -> Vec<[u8; 32]> {
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return Vec::new();
+        };
+        let mine: std::collections::HashSet<&str> = self
+            .my_stores
+            .iter()
+            .filter(|(_, stores)| {
+                stores
+                    .iter()
+                    .any(|s| s.store_contract_id == store_contract_id)
+            })
+            .map(|(fingerprint, _)| fingerprint.as_str())
+            .collect();
+        let bought: std::collections::HashSet<harvest_common::payment::OrderId> = self
+            .buyer_purchases(store_contract_id)
+            .into_iter()
+            .map(|purchase| purchase.order_id)
+            .collect();
+
+        let mut ids = Vec::new();
+        for order in &store.orders {
+            let ours = bought.contains(&order.order.id)
+                || mine.contains(order.order.seller_fingerprint.as_str());
+            if !ours {
+                continue;
+            }
+            // `None` for an order naming no contract build: there is nothing
+            // to subscribe to, and guessing would subscribe to some other
+            // contract.
+            let Some(id) = order.order.bitcoin_address_instance_id() else {
+                continue;
+            };
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// [`Self::address_contracts_to_watch`], subscribed.
+    ///
+    /// Each id once per tab: store state re-arrives on every update
+    /// notification, and re-subscribing on each would be one GET per
+    /// notification per order.
+    pub fn watch_purchase_addresses(&mut self, store_contract_id: &[u8]) {
+        for id in self.address_contracts_to_watch(store_contract_id) {
+            let bytes = id.to_vec();
+            self.bitcoin
+                .address_contract_network
+                .entry(bytes.clone())
+                .or_insert_with(|| {
+                    // Recorded so an incoming state routes to the right view
+                    // without guessing from the bytes -- the same reason
+                    // `register_watch_contract` records it.
+                    crate::gateway::bitcoin_config::default_network()
+                });
+            if !self.bitcoin.subscribed.insert(bytes.clone()) {
+                continue;
+            }
+            #[cfg(target_arch = "wasm32")]
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(e) = crate::gateway::bitcoin_ops::subscribe_contract(&bytes).await {
+                    dioxus::logger::tracing::error!(
+                        "Failed to subscribe an order's address contract: {e}"
+                    );
+                }
+            });
+        }
     }
 
     /// Whether one of the SELLER's own orders has stopped being payable and
@@ -10490,6 +10594,113 @@ mod buy_flow_tests {
         );
         let state = AppState::default();
         assert!(!state.needs_reissue(&expired));
+    }
+
+    /// **A buyer's own purchase gets its payment address watched.**
+    ///
+    /// Without this, `bitcoin.addresses` never holds an entry for the order
+    /// and the card reads "Awaiting payment" whatever has arrived. The
+    /// blockers stop the wrong payment; this is the evidence a person can
+    /// check them against -- and, in the one-commitment-many-buyers case the
+    /// binding now refuses, it is what would have shown a buyer the money was
+    /// already there.
+    #[test]
+    fn a_buyers_purchase_names_the_address_contract_to_watch() {
+        let published = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (state, _) = buyer_after_acceptance(&published);
+
+        assert_eq!(
+            state.address_contracts_to_watch(STORE),
+            vec![published
+                .order
+                .bitcoin_address_instance_id()
+                .expect("the fixture names a build")],
+        );
+    }
+
+    /// **A seller's own issued invoice is watched too.**
+    ///
+    /// The same blindness on the other side: a seller who never added a
+    /// manual watch could not see their own invoice being paid.
+    #[test]
+    fn a_sellers_own_invoice_names_the_address_contract_to_watch() {
+        let published = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let mut state = AppState::default();
+        state.begin_browsing(STORE.to_vec());
+        state.my_stores.insert(
+            "seller-fp".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+            }],
+        );
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .orders = vec![published.clone()];
+
+        assert_eq!(
+            state.address_contracts_to_watch(STORE),
+            vec![published
+                .order
+                .bitcoin_address_instance_id()
+                .expect("the fixture names a build")],
+        );
+    }
+
+    /// **A stranger's order in a store this node is only browsing is not
+    /// watched.**
+    ///
+    /// A store contract carries every order it has ever issued. Subscribing
+    /// to all of them would advertise an interest in every one of a busy
+    /// seller's payment addresses to the network, for orders this node has
+    /// nothing to do with -- which is the private-watch-list-as-public-record
+    /// shape `harvest_common::bitcoin_delegate` refuses to build.
+    #[test]
+    fn somebody_elses_order_is_not_watched() {
+        let published = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let mut state = AppState::default();
+        state.begin_browsing(STORE.to_vec());
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .orders = vec![published];
+
+        assert!(
+            state.address_contracts_to_watch(STORE).is_empty(),
+            "an order this node is neither buyer nor seller of is not ours to watch"
+        );
+    }
+
+    /// **An order naming no contract build names nothing to watch.**
+    #[test]
+    fn an_order_with_no_build_names_no_contract_to_watch() {
+        let mut published = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        published.order.bitcoin_address_code_hash = None;
+        let published = resigned(published, &seller_signing_key());
+        let (state, _) = buyer_after_acceptance(&published);
+
+        assert!(state.address_contracts_to_watch(STORE).is_empty());
     }
 
     /// **A commitment for something this conversation never asked about is
