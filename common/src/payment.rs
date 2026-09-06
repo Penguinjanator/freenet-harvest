@@ -117,18 +117,32 @@ use crate::listing::ListingId;
 /// amount and the address. A field added to [`Order`] tomorrow is inside the
 /// preimage without anybody remembering to put it there.
 ///
-/// # Residual: 16 bytes is a birthday bound, not a collision proof
+/// # Why 32 bytes and not 16
 ///
-/// Finding a SECOND PREIMAGE for an id a buyer has already accepted is 2^128
-/// work and out of reach. But the attack above needs only a COLLISION between
-/// two orders the seller chooses, which is ~2^64 -- expensive, and no longer
-/// free. Widening `OrderId` to 32 bytes would close it and is a wire change
-/// touching every order ever published; it is recorded as an open residual in
-/// `docs/untested-invariants.md` rather than done here. The buyer-side
-/// binding ([`Order::order_binding`]) does not help against it, since the
-/// seller can put the buyer's binding on both halves of a collision.
+/// It was 16, and the residual was recorded rather than fixed. That was the
+/// wrong call and it is corrected here, because of what the attack actually
+/// needs. Finding a SECOND PREIMAGE for an id a buyer already holds is 2^128
+/// and out of reach -- but the swap above needs only a COLLISION between two
+/// orders the SELLER chooses, and at 16 bytes that is ~2^64. Expensive, not
+/// impossible for a motivated party over months, against a payoff of a
+/// stolen payment sitting behind a public record that says unpaid. The
+/// buyer-side binding does not help: a seller can put the buyer's
+/// [`Order::order_binding`] on both halves of a collision.
+///
+/// At 32 bytes the collision cost is 2^128 and the question closes.
+///
+/// **The width was changed here because this is the one moment it is free.**
+/// The branch re-keys every contract, so every published order is already
+/// crossing a migration boundary; afterwards the same change would cost a
+/// re-key plus a migration of its own. What it costs at this boundary is
+/// recorded honestly in `docs/untested-invariants.md`: an order published at
+/// the old width does not decode into this type at all, so it does not
+/// survive the re-key. Orders are short-lived by construction -- they expire
+/// after [`MAX_ANCHOR_AGE_BLOCKS`] -- which is what makes that acceptable
+/// for orders and NOT what makes it acceptable for listings; see
+/// [`ListingId`].
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
-pub struct OrderId(pub [u8; 16]);
+pub struct OrderId(pub [u8; 32]);
 
 impl OrderId {
     /// The id these terms give.
@@ -138,7 +152,7 @@ impl OrderId {
     /// which is what lets [`AuthorizedOrder::verify`] demand that they match.
     pub fn from_terms(order: &Order) -> Self {
         let mut probe = order.clone();
-        probe.id = Self([0u8; 16]);
+        probe.id = Self([0u8; 32]);
         // Infallible for the same reason as `order_content_digest`: `Order`
         // derives `Serialize` over plain data with no custom fallible
         // encoding.
@@ -146,9 +160,7 @@ impl OrderId {
         let mut h = blake3::Hasher::new();
         h.update(b"harvest/order-id/v2");
         h.update(&terms);
-        let mut id = [0u8; 16];
-        id.copy_from_slice(&h.finalize().as_bytes()[..16]);
-        Self(id)
+        Self(*h.finalize().as_bytes())
     }
 
     /// Short, human-quotable form for the UI ("Order 3xK9…").
@@ -1475,7 +1487,7 @@ mod lightning_tests {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let listing_id = ListingId::from_label("Widget");
         Order {
-            id: OrderId([0u8; 16]),
+            id: OrderId([0u8; 32]),
             listing_id,
             buyer_fingerprint: "buyer".into(),
             seller_fingerprint: "seller".into(),
@@ -1584,7 +1596,7 @@ mod lightning_tests {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let listing_id = ListingId::from_label("Widget");
         let old = OldOrder {
-            id: OrderId([3u8; 16]),
+            id: OrderId([3u8; 32]),
             listing_id,
             buyer_fingerprint: "buyer".into(),
             seller_fingerprint: "seller".into(),
@@ -1605,41 +1617,14 @@ mod lightning_tests {
 mod order_wire_compat_tests {
     use super::*;
 
-    /// A real pre-anchor `Order`, as CBOR, written out byte by byte.
+    /// A real `Order` from before `OrderId` was widened to 32 bytes, as CBOR.
     ///
-    /// These bytes are the shape `Order` had before it carried a
-    /// [`BlockAnchor`] -- thirteen fields, `payment_hash` and
-    /// `bitcoin_address_code_hash` both present and null:
-    ///
-    /// ```text
-    /// ad                                  map(13)
-    ///   62 "id"                    90 ..    16-element array (serde encodes
-    ///                                       [u8; 16] as a tuple, i.e. an
-    ///                                       array of numbers, NOT a byte
-    ///                                       string), all zero
-    ///   6a "listing_id"            90 ..    16-element array, all 0x01
-    ///   71 "buyer_fingerprint"     60       empty string -- an anonymous
-    ///                                       buyer, which is what the buy
-    ///                                       flow produces
-    ///   72 "seller_fingerprint"    69 ..    "seller-fp"
-    ///   6b "amount_sats"           19 c350  50000
-    ///   67 "network"               66 ..    "Signet"
-    ///   75 "payment_script_pubkey" 82 ..    [0x51, 0x20]
-    ///   6f "payment_address"       6b ..    "tb1qexample"
-    ///   76 "required_confirmations" 01
-    ///   6c "payment_hash"          f6       null
-    ///   6f "trusted_bridges"       80       empty seq
-    ///   78 19 "bitcoin_address_code_hash" f6  null
-    ///   6a "created_at"            74 ..    "2023-11-14T22:13:20Z"
-    /// ```
-    ///
-    /// Written as a literal rather than produced by serializing a struct with
-    /// the field taken out, for the same reason as
-    /// `store::wire_compat_tests::V1_STORE_STATE_CBOR`: the point is to pin
-    /// today's decoder against bytes whose shape comes from somewhere other
-    /// than today's types. A generated fixture would move whenever the types
-    /// moved, which is exactly the change it is supposed to catch.
-    const PRE_ANCHOR_ORDER_CBOR: &[u8] = &[
+    /// `id` and `listing_id` are 16-element arrays (`0x90`); today's types
+    /// want 32 (`0x98 0x20`). Kept as a literal so the boundary this branch
+    /// crosses is pinned by a test rather than described in prose -- see
+    /// [`an_order_from_before_the_id_was_widened_does_not_decode`], which is
+    /// the honest statement of what the re-key costs.
+    const NARROW_ID_ORDER_CBOR: &[u8] = &[
         0xad, 0x62, 0x69, 0x64, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6a, 0x6c, 0x69, 0x73, 0x74, 0x69, 0x6e, 0x67, 0x5f,
         0x69, 0x64, 0x90, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
@@ -1662,21 +1647,85 @@ mod order_wire_compat_tests {
         0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32, 0x30, 0x5a,
     ];
 
-    /// An order signed before the anchor existed still decodes.
+    /// **An order published before the id was widened does not decode, and
+    /// that is what the re-key costs.**
+    ///
+    /// This test exists to be READ, not merely to pass. The migration folds a
+    /// predecessor generation by decoding its state and verifying every
+    /// record; an order at the old width fails at the first step, so the
+    /// generation is treated as absent. There is no compatibility path and
+    /// none is attempted: a type that accepted both widths would have to
+    /// decide which one an id is, which is the ambiguity the width exists to
+    /// remove.
+    ///
+    /// Orders are what makes this acceptable. One expires after
+    /// [`MAX_ANCHOR_AGE_BLOCKS`] -- about eight hours -- so an order old
+    /// enough to be in a predecessor generation is an order nobody can pay
+    /// anyway. The same is NOT true of a listing, and
+    /// `docs/untested-invariants.md` says so where it records what this
+    /// boundary costs in full.
     #[test]
-    fn an_order_that_predates_the_anchor_decodes() {
-        let order: Order = crate::from_cbor(PRE_ANCHOR_ORDER_CBOR)
-            .expect("a pre-anchor order must still decode into today's type");
-        assert_eq!(order.amount_sats, 50_000);
-        assert_eq!(order.seller_fingerprint, "seller-fp");
-        // Both fields added since these bytes were written come back absent,
-        // and absent is the answer that fails closed at every reader: a buyer
-        // refuses an order with no anchor and one with no binding.
-        assert_eq!(order.anchor, None);
-        assert_eq!(order.order_binding, None);
+    fn an_order_from_before_the_id_was_widened_does_not_decode() {
+        let refused = crate::from_cbor::<Order>(NARROW_ID_ORDER_CBOR)
+            .expect_err("a 16-byte id must not decode into a 32-byte one");
+        assert!(
+            refused.contains("invalid length 16"),
+            "the refusal should name the width: {refused}"
+        );
     }
 
-    /// **The anchor field must not change the preimage of an old signature.**
+    /// The same order at today's width, as CBOR, written out byte by byte.
+    ///
+    /// Thirteen fields; `payment_hash` and `bitcoin_address_code_hash`
+    /// present and null; `anchor` and `order_binding` ABSENT, which is the
+    /// property this pins.
+    ///
+    /// ```text
+    /// ad                                  map(13)
+    ///   62 "id"                    98 20 ..  32-element array (serde encodes
+    ///                                        [u8; 32] as a tuple, i.e. an
+    ///                                        array of numbers, NOT a byte
+    ///                                        string) -- the id these terms
+    ///                                        give
+    ///   6a "listing_id"            98 20 ..  32-element array, all 0x01
+    ///   71 "buyer_fingerprint"     60        empty -- an anonymous buyer,
+    ///                                        which is what the buy flow makes
+    ///   ... amount, network, script, address, confirmations ...
+    ///   6c "payment_hash"          f6        null
+    ///   6f "trusted_bridges"       80        empty seq
+    ///   78 19 "bitcoin_address_code_hash" f6 null
+    ///   6a "created_at"            74 ..     "2023-11-14T22:13:20Z"
+    /// ```
+    const ORDER_WITHOUT_OPTIONAL_FIELDS_CBOR: &[u8] = &[
+        0xad, 0x62, 0x69, 0x64, 0x98, 0x20, 0x18, 0x78, 0x18, 0x7f, 0x18, 0x79, 0x18, 0x3e, 0x18,
+        0x51, 0x18, 0xed, 0x18, 0xb7, 0x18, 0xed, 0x18, 0x2a, 0x13, 0x18, 0x38, 0x18, 0x95, 0x18,
+        0x23, 0x18, 0x70, 0x18, 0xd2, 0x18, 0xcd, 0x18, 0x8f, 0x18, 0xec, 0x18, 0xa7, 0x18, 0x98,
+        0x18, 0x61, 0x18, 0x8a, 0x18, 0x25, 0x18, 0x36, 0x18, 0x8c, 0x18, 0x73, 0x18, 0xbc, 0x18,
+        0x50, 0x18, 0xb6, 0x18, 0x3c, 0x18, 0xc8, 0x18, 0x28, 0x6a, 0x6c, 0x69, 0x73, 0x74, 0x69,
+        0x6e, 0x67, 0x5f, 0x69, 0x64, 0x98, 0x20, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x71, 0x62, 0x75, 0x79, 0x65, 0x72,
+        0x5f, 0x66, 0x69, 0x6e, 0x67, 0x65, 0x72, 0x70, 0x72, 0x69, 0x6e, 0x74, 0x60, 0x72, 0x73,
+        0x65, 0x6c, 0x6c, 0x65, 0x72, 0x5f, 0x66, 0x69, 0x6e, 0x67, 0x65, 0x72, 0x70, 0x72, 0x69,
+        0x6e, 0x74, 0x69, 0x73, 0x65, 0x6c, 0x6c, 0x65, 0x72, 0x2d, 0x66, 0x70, 0x6b, 0x61, 0x6d,
+        0x6f, 0x75, 0x6e, 0x74, 0x5f, 0x73, 0x61, 0x74, 0x73, 0x19, 0xc3, 0x50, 0x67, 0x6e, 0x65,
+        0x74, 0x77, 0x6f, 0x72, 0x6b, 0x66, 0x53, 0x69, 0x67, 0x6e, 0x65, 0x74, 0x75, 0x70, 0x61,
+        0x79, 0x6d, 0x65, 0x6e, 0x74, 0x5f, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x5f, 0x70, 0x75,
+        0x62, 0x6b, 0x65, 0x79, 0x82, 0x18, 0x51, 0x18, 0x20, 0x6f, 0x70, 0x61, 0x79, 0x6d, 0x65,
+        0x6e, 0x74, 0x5f, 0x61, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73, 0x6b, 0x74, 0x62, 0x31, 0x71,
+        0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x76, 0x72, 0x65, 0x71, 0x75, 0x69, 0x72, 0x65,
+        0x64, 0x5f, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x72, 0x6d, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x73,
+        0x01, 0x6c, 0x70, 0x61, 0x79, 0x6d, 0x65, 0x6e, 0x74, 0x5f, 0x68, 0x61, 0x73, 0x68, 0xf6,
+        0x6f, 0x74, 0x72, 0x75, 0x73, 0x74, 0x65, 0x64, 0x5f, 0x62, 0x72, 0x69, 0x64, 0x67, 0x65,
+        0x73, 0x80, 0x78, 0x19, 0x62, 0x69, 0x74, 0x63, 0x6f, 0x69, 0x6e, 0x5f, 0x61, 0x64, 0x64,
+        0x72, 0x65, 0x73, 0x73, 0x5f, 0x63, 0x6f, 0x64, 0x65, 0x5f, 0x68, 0x61, 0x73, 0x68, 0xf6,
+        0x6a, 0x63, 0x72, 0x65, 0x61, 0x74, 0x65, 0x64, 0x5f, 0x61, 0x74, 0x74, 0x32, 0x30, 0x32,
+        0x33, 0x2d, 0x31, 0x31, 0x2d, 0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32,
+        0x30, 0x5a,
+    ];
+
+    /// **An order carrying neither optional field re-encodes to the bytes its
+    /// signature was taken over.**
     ///
     /// [`AuthorizedOrder::verify_terms`] does not compare stored bytes: it
     /// re-serializes this struct and checks the result against the payload
@@ -1685,29 +1734,29 @@ mod order_wire_compat_tests {
     /// existed, and the store contract rejects the seller's own published
     /// invoices with "order signature invalid".
     ///
-    /// This is the same trap `StoreInfoV1::encryption_public_key` documents,
-    /// and it is why the anchor -- and, since review, `order_binding` --
-    /// carries `skip_serializing_if` rather than `serde(default)` alone. The
-    /// fixture predates both, so it pins both. Observed red against the naive
-    /// `#[serde(default)]`-only form:
+    /// That is why `anchor` and `order_binding` carry `skip_serializing_if`
+    /// rather than `serde(default)` alone -- observed red against the naive
+    /// form, as `0xae` map(14) with `"anchor": null` against the `0xad`
+    /// map(13) the signature covered. The literal is what keeps the next
+    /// optional field honest.
     ///
-    /// ```text
-    /// assertion `left == right` failed: an order that predates the anchor
-    /// must re-encode to the bytes its signature was taken over
-    ///   left: [174, 98, 105, 100, ...  102, 97, 110, 99, 104, 111, 114, 246, ...]
-    ///  right: [173, 98, 105, 100, ...                                        ...]
-    /// ```
-    ///
-    /// 174 is `0xae`, map(14); 173 is `0xad`, map(13). The extra pair is
-    /// `"anchor": null`.
+    /// The fixture is at the CURRENT id width. The one that predates the
+    /// widening is above, and it does not decode at all.
     #[test]
-    fn an_order_that_predates_the_anchor_re_encodes_unchanged() {
-        let order: Order = crate::from_cbor(PRE_ANCHOR_ORDER_CBOR).expect("decodes");
-        let re_encoded = crate::to_cbor(&order).expect("re-encodes");
+    fn an_order_without_the_optional_fields_re_encodes_unchanged() {
+        let order: Order = crate::from_cbor(ORDER_WITHOUT_OPTIONAL_FIELDS_CBOR).expect("decodes");
+        assert_eq!(order.anchor, None);
+        assert_eq!(order.order_binding, None);
+        assert_eq!(order.amount_sats, 50_000);
+        // And the id is the one these terms give, so the fixture is a record
+        // the contract would actually accept rather than a plausible fiction.
+        assert_eq!(order.id, OrderId::from_terms(&order));
+
         assert_eq!(
-            re_encoded, PRE_ANCHOR_ORDER_CBOR,
-            "an order that predates the anchor must re-encode to the bytes its signature \
-             was taken over"
+            crate::to_cbor(&order).expect("re-encodes"),
+            ORDER_WITHOUT_OPTIONAL_FIELDS_CBOR,
+            "an order with no optional fields must re-encode to the bytes its signature was \
+             taken over"
         );
     }
 }
@@ -1719,8 +1768,8 @@ mod order_identity_tests {
     fn terms(address: &str, amount_sats: u64) -> Order {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         Order {
-            id: OrderId([0u8; 16]),
-            listing_id: ListingId([1u8; 16]),
+            id: OrderId([0u8; 32]),
+            listing_id: ListingId([1u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: "seller-fp".to_string(),
             amount_sats,
@@ -1836,6 +1885,30 @@ mod order_identity_tests {
         assert_eq!(OrderId::from_terms(&order), first);
     }
 
+    /// **The id is the WHOLE digest, not a prefix of one.**
+    ///
+    /// The width is the point of the change that widened it: at 16 bytes a
+    /// collision between two orders the seller chooses costs ~2^64, and at 32
+    /// it costs 2^128. A derivation that kept the old truncation while the
+    /// type grew would leave 16 bytes of zeroes and the old cost, and nothing
+    /// else here would notice -- the ids would still be distinct, still
+    /// deterministic, still refuse a mismatched record.
+    ///
+    /// Asserted against the components rather than against a copy of the
+    /// function, so a change to the truncation fails while a change to the
+    /// domain separator or the preimage fails somewhere more specific.
+    #[test]
+    fn the_id_is_the_whole_digest() {
+        let order = terms("tb1q", 1);
+        let mut probe = order.clone();
+        probe.id = OrderId([0u8; 32]);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"harvest/order-id/v2");
+        hasher.update(&crate::to_cbor(&probe).expect("serialize"));
+
+        assert_eq!(OrderId::from_terms(&order).0, *hasher.finalize().as_bytes());
+    }
+
     /// **A record whose id is not its terms' id is rejected.**
     ///
     /// This is what makes the property hold on the network rather than only
@@ -1894,8 +1967,8 @@ mod address_instance_tests {
     fn terms(code_hash: Option<[u8; 32]>) -> Order {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         Order {
-            id: OrderId([0u8; 16]),
-            listing_id: ListingId([1u8; 16]),
+            id: OrderId([0u8; 32]),
+            listing_id: ListingId([1u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: "seller-fp".to_string(),
             amount_sats: 50_000,

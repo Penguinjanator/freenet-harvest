@@ -1156,7 +1156,7 @@ mod inbox_tests {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         harvest_common::payment::AuthorizedOrder {
             order: harvest_common::payment::Order {
-                id: harvest_common::payment::OrderId([0u8; 16]),
+                id: harvest_common::payment::OrderId([0u8; 32]),
                 listing_id,
                 buyer_fingerprint: String::new(),
                 seller_fingerprint: "seller-fp".to_string(),
@@ -1205,7 +1205,7 @@ mod inbox_tests {
     /// in when review found it.
     #[test]
     fn a_request_carries_everything_the_accept_control_publishes() {
-        let id = ListingId([9u8; 16]);
+        let id = ListingId([9u8; 32]);
         let entries = vec![
             readable(MessageContent::Text("hello".into()), [1u8; 32]),
             request(id.clone(), 4, [2u8; 32]),
@@ -1224,7 +1224,7 @@ mod inbox_tests {
     /// showing a made-up label; a placeholder here would defeat that.
     #[test]
     fn a_listing_the_store_has_not_published_has_no_title() {
-        let id = ListingId([9u8; 16]);
+        let id = ListingId([9u8; 32]);
         let found = unanswered_requests(&[request(id, 1, [2u8; 32])], &[], &[]);
         assert_eq!(found[0].listing_title, "");
     }
@@ -1258,7 +1258,7 @@ mod inbox_tests {
     /// buyer can neither forge nor withdraw.
     #[test]
     fn a_request_already_answered_is_not_offered_again() {
-        let id = ListingId([9u8; 16]);
+        let id = ListingId([9u8; 32]);
         let entries = vec![request(id.clone(), 1, [2u8; 32])];
         let listings = vec![listing(id.clone(), "Ghost Pepper")];
 
@@ -1281,7 +1281,7 @@ mod inbox_tests {
     /// different listing, leaves the request outstanding.
     #[test]
     fn another_buyers_commitment_does_not_answer_this_request() {
-        let id = ListingId([9u8; 16]);
+        let id = ListingId([9u8; 32]);
         let entries = vec![request(id.clone(), 1, [2u8; 32])];
         let listings = vec![listing(id.clone(), "Ghost Pepper")];
 
@@ -1299,7 +1299,7 @@ mod inbox_tests {
             unanswered_requests(
                 &entries,
                 &listings,
-                &[published(ListingId([8u8; 16]), Some(BINDING))]
+                &[published(ListingId([8u8; 32]), Some(BINDING))]
             )
             .len(),
             1,
@@ -1326,8 +1326,8 @@ mod inbox_tests {
     /// Both orderings of the same two entries must produce the same list.
     #[test]
     fn the_order_offered_does_not_depend_on_the_senders_clock() {
-        let cheap = ListingId([1u8; 16]);
-        let dear = ListingId([2u8; 16]);
+        let cheap = ListingId([1u8; 32]);
+        let dear = ListingId([2u8; 32]);
         let listings = vec![
             listing(cheap.clone(), "Cheap"),
             listing(dear.clone(), "Dear"),
@@ -1347,7 +1347,7 @@ mod inbox_tests {
     /// once; two controls would invite two published debts for one order.
     #[test]
     fn the_same_request_twice_is_offered_once() {
-        let id = ListingId([9u8; 16]);
+        let id = ListingId([9u8; 32]);
         let entries = vec![
             request(id.clone(), 2, [0x01; 32]),
             request(id.clone(), 2, [0x02; 32]),

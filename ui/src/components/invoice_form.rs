@@ -496,7 +496,7 @@ mod tests {
         let listing_id = ListingId::from_label("Widget");
         AuthorizedOrder {
             order: Order {
-                id: OrderId([0u8; 16]),
+                id: OrderId([0u8; 32]),
                 listing_id,
                 buyer_fingerprint: "buyer".to_string(),
                 seller_fingerprint: seller.to_string(),

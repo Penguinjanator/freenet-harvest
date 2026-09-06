@@ -1323,3 +1323,174 @@ impl<O: ProbeStateOps> ProbeSession<O> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod predecessor_generation_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use freenet_stdlib::prelude::ContractInstanceId;
+    use harvest_common::listing::{AuthorizedListing, Listing, ListingId, ListingKind};
+
+    /// The listing id derivation as it was BEFORE this branch: seller
+    /// fingerprint, creation time and title, truncated to 16 bytes.
+    ///
+    /// Written out here rather than imported, because the point is to build a
+    /// record the way a PREDECESSOR generation built it. Importing today's
+    /// function would make the test agree with itself.
+    fn v1_listing_id(
+        seller_fingerprint: &str,
+        created_at: &chrono::DateTime<chrono::Utc>,
+        title: &str,
+    ) -> ListingId {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(seller_fingerprint.as_bytes());
+        hasher.update(&created_at.timestamp_millis().to_le_bytes());
+        hasher.update(title.as_bytes());
+        // The old width, zero-extended into today's type -- which is what a
+        // record from before the widening would look like IF the decode
+        // succeeded. It does not (see
+        // `payment::order_wire_compat_tests::an_order_from_before_the_id_was_widened_does_not_decode`),
+        // so this stands in for the derivation-only half of the boundary: a
+        // record whose bytes still decode but whose id is not the one its
+        // terms give.
+        let mut id = [0u8; 32];
+        id[..16].copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+        ListingId(id)
+    }
+
+    fn signed(listing: Listing, key: &SigningKey) -> AuthorizedListing {
+        let message = harvest_common::to_cbor(&listing).expect("serialize");
+        let scoped = ghostkey_common::ScopedPayload {
+            requestor: ghostkey_common::SignatureRequestor::WebApp(
+                harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                    .parse::<ContractInstanceId>()
+                    .expect("canonical webapp id"),
+            ),
+            payload: message,
+        };
+        let scoped_payload = harvest_common::to_cbor(&scoped).expect("serialize scoped");
+        AuthorizedListing {
+            signature: key.sign(&scoped_payload).to_bytes().to_vec(),
+            listing,
+            scoped_payload,
+            certificate_pem: String::new(),
+        }
+    }
+
+    /// **KNOWN GAP: a predecessor generation's store is discarded in full,
+    /// and the seller is told only in a console log.**
+    ///
+    /// This branch made a listing's id a function of its own terms. That is
+    /// right, and it is what stops two differently-priced listings sharing an
+    /// id and diverging permanently. But it also means every listing
+    /// published under a PREVIOUS generation carries an id the current
+    /// `AuthorizedListing::verify` refuses -- and `ListingsV1::apply_delta`
+    /// returns on the first refusal, so `fold_or_keep_primary` keeps the
+    /// newer generation and drops the predecessor **entirely**: the listings,
+    /// the orders, and the store's own info with them. A seller upgrading
+    /// loses their shop.
+    ///
+    /// Three things make it worse than the loss itself, and they are why this
+    /// is pinned rather than left to the prose:
+    ///
+    /// * it is reported by `probe_warn`, which is a browser console line and
+    ///   not something a user sees;
+    /// * the fold's own message says the migration then SEALS, so the
+    ///   generation is never looked at again;
+    /// * every other test in this repository builds its fixtures with the
+    ///   NEW derivation, so none of them can see it.
+    ///
+    /// **There is no clean repair and that is why this is a decision rather
+    /// than a bug to fix here.** The id is inside what the seller signed, so
+    /// the fold cannot re-stamp a record without invalidating its signature.
+    /// Accepting the old form in `verify` would work mechanically -- the
+    /// seller's fingerprint is derivable from the verifying key `verify`
+    /// already holds -- but it reopens exactly the hole the change closed,
+    /// since a seller could still mint two listings under one old-form id.
+    /// So the options are to accept the loss loudly, or not to make the
+    /// change; both are product decisions.
+    ///
+    /// This test asserts the CURRENT behaviour. It is not an endorsement of
+    /// it: it exists so that whoever resolves the decision finds a failing
+    /// test rather than a seller finding an empty shop.
+    #[test]
+    fn known_gap_a_predecessor_generations_store_is_discarded_in_full() {
+        let key = SigningKey::from_bytes(&[51u8; 32]);
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let old = signed(
+            Listing {
+                id: v1_listing_id("seller-fp", &created_at, "Ghost Pepper"),
+                title: "Ghost Pepper".into(),
+                description: "Hot".into(),
+                kind: ListingKind::Sale,
+                price: None,
+                created_at,
+            },
+            &key,
+        );
+        assert!(
+            old.verify(&key.verifying_key()).is_err(),
+            "the premise: a predecessor's listing no longer verifies"
+        );
+
+        let mut predecessor = StoreStateV1::default();
+        predecessor.listings.listings = vec![old];
+        predecessor.info.info.store_name = "Alice's Hot Sauce".to_string();
+        predecessor.info.info.version = 1;
+
+        let outcome = merge_store_reporting_discard(
+            StoreStateV1::default(),
+            &predecessor,
+            &StoreParameters::new(key.verifying_key()),
+        );
+
+        assert!(
+            outcome.discarded,
+            "the fold refuses the predecessor in full"
+        );
+        assert!(
+            outcome.state.listings.listings.is_empty(),
+            "and carries none of its listings"
+        );
+        assert_eq!(
+            outcome.state.info.info.store_name, "",
+            "not even the store's own name, which had nothing wrong with it"
+        );
+    }
+
+    /// **A predecessor whose records DO carry their terms' ids is folded
+    /// normally.**
+    ///
+    /// The other half, so the test above is read as "this input is refused"
+    /// rather than "the fold is broken". It also pins that the refusal is
+    /// about the id and not about anything else the branch changed.
+    #[test]
+    fn a_predecessor_whose_ids_are_their_terms_is_carried_forward() {
+        let key = SigningKey::from_bytes(&[51u8; 32]);
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let good = signed(
+            Listing {
+                id: ListingId([0u8; 32]),
+                title: "Ghost Pepper".into(),
+                description: "Hot".into(),
+                kind: ListingKind::Sale,
+                price: None,
+                created_at,
+            }
+            .with_derived_id(),
+            &key,
+        );
+
+        let mut predecessor = StoreStateV1::default();
+        predecessor.listings.listings = vec![good];
+
+        let outcome = merge_store_reporting_discard(
+            StoreStateV1::default(),
+            &predecessor,
+            &StoreParameters::new(key.verifying_key()),
+        );
+
+        assert!(!outcome.discarded);
+        assert_eq!(outcome.state.listings.listings.len(), 1);
+    }
+}

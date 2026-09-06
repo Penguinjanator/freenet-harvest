@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn associate_order_attaches_to_an_existing_watch() {
         let mut watches = vec![watch(BitcoinNetwork::Signet, 1, None)];
-        let order_id = OrderId([7u8; 16]);
+        let order_id = OrderId([7u8; 32]);
         apply_associate_order(
             &mut watches,
             BitcoinNetwork::Signet,
@@ -591,7 +591,7 @@ mod tests {
             &mut watches,
             BitcoinNetwork::Signet,
             &[0x00, 0x14, 0x01],
-            OrderId([1u8; 16]),
+            OrderId([1u8; 32]),
             1,
         );
         assert!(result.is_err());
@@ -617,7 +617,7 @@ mod tests {
             watch(BitcoinNetwork::Signet, 1, Some("manual label")),
         );
 
-        let order_id = OrderId([9u8; 16]);
+        let order_id = OrderId([9u8; 32]);
         let order_watch = WatchedPayment {
             network: BitcoinNetwork::Signet,
             script_pubkey: vec![0x00, 0x14, 1],
@@ -1034,7 +1034,7 @@ mod origin_gating_tests {
                 request_id: 5,
                 network: BitcoinNetwork::Signet,
                 script_pubkey: vec![0x00, 0x14, 0x01],
-                order_id: OrderId([1u8; 16]),
+                order_id: OrderId([1u8; 32]),
                 expected_amount_sats: 1,
             },
             BitcoinDelegateRequest::ConfigureBridge {

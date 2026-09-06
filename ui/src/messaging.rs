@@ -1817,7 +1817,7 @@ mod buy_flow_tests {
     fn a_buyers_order_request_reaches_the_seller_intact() {
         let seller = Seller::new(31);
         let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
-        let listing = ListingId([7u8; 16]);
+        let listing = ListingId([7u8; 32]);
 
         let sealed = buyer
             .request_order(&listing, 3, "12 Example St".into(), "no chilli".into())
@@ -1865,7 +1865,7 @@ mod buy_flow_tests {
     fn an_acceptance_names_the_order_and_is_addressed_to_the_buyer() {
         let seller = Seller::new(32);
         let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
-        let order = OrderId([9u8; 16]);
+        let order = OrderId([9u8; 32]);
 
         let reply = seal_order_accepted(
             &seller.keys_for(&buyer.buyer_public_key),

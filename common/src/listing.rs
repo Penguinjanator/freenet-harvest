@@ -20,8 +20,31 @@ pub struct PriceInfo {
 }
 
 /// Unique listing identifier: first 16 bytes of BLAKE3(fingerprint || timestamp_ms || title).
+/// # Why 32 bytes, and why the reasoning is NOT the order's
+///
+/// Widened alongside [`crate::payment::OrderId`] while the wire was open, but
+/// the case for it is weaker and worth stating honestly rather than borrowing.
+/// A collision here buys a griefing attack -- two listings under one id, and
+/// readers permanently disagreeing about the price -- not a stolen payment.
+/// 2^64 of work for that is a poor trade, so 16 bytes was not obviously
+/// wrong.
+///
+/// It is 32 anyway for two reasons that are about the change rather than the
+/// threat. The cost is zero at this boundary and nonzero at every later one,
+/// which is the whole argument for doing the order's now. And a `ListingId`
+/// sits inside every `Order` and therefore inside the order id's own
+/// preimage, so leaving the two at different widths would invite exactly the
+/// "why is this one 16?" question at the next audit, with no answer better
+/// than "nobody widened it on the night the wire was open".
+///
+/// **What it costs is different from the order's, and it is the part to
+/// weigh.** An order published at the old width does not decode into this
+/// generation, and orders expire in hours, so losing them is survivable. A
+/// LISTING is a seller's shop and does not expire. See
+/// `docs/untested-invariants.md` for what the migration actually does with
+/// both, which is the same thing, and why only one of the two is comfortable.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
-pub struct ListingId(pub [u8; 16]);
+pub struct ListingId(pub [u8; 32]);
 
 impl ListingId {
     /// The id these terms give.
@@ -51,17 +74,14 @@ impl ListingId {
     /// The same 16-byte birthday residual applies; see that function.
     pub fn from_terms(listing: &Listing) -> Self {
         let mut probe = listing.clone();
-        probe.id = Self([0u8; 16]);
+        probe.id = Self([0u8; 32]);
         // Infallible: `Listing` derives `Serialize` over plain data with no
         // custom fallible encoding.
         let terms = crate::to_cbor(&probe).expect("Listing always serializes to CBOR");
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"harvest/listing-id/v2");
         hasher.update(&terms);
-        let hash = hasher.finalize();
-        let mut id = [0u8; 16];
-        id.copy_from_slice(&hash.as_bytes()[..16]);
-        Self(id)
+        Self(*hasher.finalize().as_bytes())
     }
 
     /// A distinct id per label, for naming a listing whose terms are not to
@@ -84,10 +104,7 @@ impl ListingId {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"harvest/listing-id/label/v1");
         hasher.update(label.as_bytes());
-        let hash = hasher.finalize();
-        let mut id = [0u8; 16];
-        id.copy_from_slice(&hash.as_bytes()[..16]);
-        Self(id)
+        Self(*hasher.finalize().as_bytes())
     }
 }
 
@@ -379,7 +396,7 @@ mod tests {
     ) -> AuthorizedListing {
         let ts = DateTime::from_timestamp(1700000000, 0).unwrap();
         let listing = Listing {
-            id: ListingId([0u8; 16]),
+            id: ListingId([0u8; 32]),
             title: "Widget".into(),
             description: "A nice widget".into(),
             kind: ListingKind::Sale,
@@ -692,7 +709,7 @@ mod listing_identity_tests {
     fn listing_priced(price: &str) -> Listing {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         Listing {
-            id: ListingId([0u8; 16]),
+            id: ListingId([0u8; 32]),
             title: "Ghost Pepper".to_string(),
             description: String::new(),
             kind: ListingKind::Sale,
@@ -748,6 +765,27 @@ mod listing_identity_tests {
             listing_priced("0.001").id,
             listing_priced("0.100").id,
             "two prices must be two listings"
+        );
+    }
+
+    /// **The id is the WHOLE digest, not a prefix of one.**
+    ///
+    /// Same reasoning as `payment::order_identity_tests::the_id_is_the_whole_digest`:
+    /// a derivation that kept the old 16-byte truncation while the type grew
+    /// would leave half the id zero and the old collision cost, and every
+    /// other test here would still pass.
+    #[test]
+    fn the_id_is_the_whole_digest() {
+        let listing = listing_priced("0.001");
+        let mut probe = listing.clone();
+        probe.id = ListingId([0u8; 32]);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"harvest/listing-id/v2");
+        hasher.update(&crate::to_cbor(&probe).expect("serialize"));
+
+        assert_eq!(
+            ListingId::from_terms(&listing).0,
+            *hasher.finalize().as_bytes()
         );
     }
 

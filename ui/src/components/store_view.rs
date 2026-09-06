@@ -516,8 +516,8 @@ mod listing_buy_gate_tests {
     /// `buyable` alone would pass while the screen was wrong.
     #[test]
     fn a_listing_whose_certificate_did_not_verify_is_not_buyable() {
-        let good = ListingId([1u8; 16]);
-        let bad = ListingId([2u8; 16]);
+        let good = ListingId([1u8; 32]);
+        let bad = ListingId([2u8; 32]);
         let mut store = crate::state::BrowsingStore {
             info: Some(harvest_common::store::StoreInfoV1 {
                 version: 1,

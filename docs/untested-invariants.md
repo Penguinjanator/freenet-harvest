@@ -513,6 +513,59 @@ because the address contract is subscribed and the card reads its state.
 Nothing still constructs an `OrderPaymentProof`, so the published order never
 advances to `Paid`.
 
+#### The id widening, and what it costs at the migration boundary
+
+`OrderId` and `ListingId` are 32 bytes as of the third round, widened at the
+team lead's direction while the wire was open. The argument is that this branch
+re-keys every contract, so every published record is already crossing a
+migration boundary: the change is free exactly once and costs a re-key plus a
+migration of its own afterwards. The threat it closes is specific -- the swap
+attack needs a COLLISION between two orders the seller chooses rather than a
+second preimage, so 16 bytes cost ~2^64 rather than 2^128, which is expensive
+rather than impossible against a payoff of a stolen payment behind a public
+record that says unpaid.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `OrderId::from_terms` / `ListingId::from_terms` | The id is the whole digest, not a prefix. | **Yes** -- `the_id_is_the_whole_digest` in both modules, mutated red by restoring the 16-byte truncation zero-extended into the wider type. Worth having as its own test: under that mutation every OTHER identity test still passed, because the ids stayed distinct, deterministic and enforced -- only the collision cost changed, and nothing else could see it. |
+| `Order` wire shape | An order published at the old id width does not decode. | **Yes, deliberately** -- `an_order_from_before_the_id_was_widened_does_not_decode`, asserting on the `invalid length 16` the decoder gives. That is the honest statement of what the re-key costs, pinned rather than described. Orders expire after `MAX_ANCHOR_AGE_BLOCKS`, so one old enough to be in a predecessor generation is one nobody could pay anyway. |
+| same | An order carrying neither optional field re-encodes to the bytes its signature covered. | **Yes** -- `an_order_without_the_optional_fields_re_encodes_unchanged`, a hand-written literal at the current width. It replaces the pre-anchor fixture, which can no longer decode; the property it protects (a future optional field must not change an old signature's preimage) is unchanged. |
+
+#### KNOWN GAP, and it needs a decision rather than a fix
+
+**A predecessor generation's store is discarded in full, and the seller is
+told only in a console log.** Pinned by
+`migrate::predecessor_generation_tests::known_gap_a_predecessor_generations_store_is_discarded_in_full`.
+
+Making a listing's id a function of its terms is right, and it is what stops
+two differently-priced listings sharing an id and diverging permanently. It
+also means every listing published under a previous generation carries an id
+`AuthorizedListing::verify` now refuses. `ListingsV1::apply_delta` returns on
+the first refusal, so `fold_or_keep_primary` keeps the newer generation and
+drops the predecessor **entirely** -- the listings, the orders, and the
+store's own info with them. A seller upgrading loses their shop.
+
+Three things make it worse than the loss:
+
+* it is reported by `probe_warn`, a browser console line, not something a user
+  sees;
+* the fold's own message says the migration then **seals**, so the generation
+  is never looked at again;
+* every other test in this repository builds its fixtures with the NEW
+  derivation, so not one of them could see it. It passed all four gates.
+
+**There is no clean repair, which is why it is recorded rather than fixed.**
+The id is inside what the seller signed, so the fold cannot re-stamp a record
+without invalidating its signature. Accepting the old form in `verify` works
+mechanically -- the seller's fingerprint is derivable from the verifying key
+`verify` already holds -- but reopens exactly the hole the change closed, since
+a seller could still mint two listings under one old-form id. So the options
+are to accept the loss loudly, or not to make the change, and both are
+decisions about whether any published store holds listings worth preserving.
+
+The asymmetry worth carrying into that decision: an ORDER expiring is fine,
+because orders expire anyway. A LISTING is a seller's shop and does not.
+
 **Two things the round did not close.**
 
 **`OrderId` is 16 bytes, so swapping terms costs a collision rather than

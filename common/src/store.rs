@@ -714,7 +714,7 @@ mod order_tests {
         let ts = timestamp(created_at_secs);
         let listing_id = ListingId::from_label("Widget");
         Order {
-            id: OrderId([0u8; 16]),
+            id: OrderId([0u8; 32]),
             listing_id,
             buyer_fingerprint: buyer_fp.into(),
             seller_fingerprint: seller_fp.into(),
@@ -1968,7 +1968,7 @@ mod order_tests {
         let ts = timestamp(created_at_secs);
         let listing_id = ListingId::from_label("Widget");
         let order = Order {
-            id: OrderId([0u8; 16]),
+            id: OrderId([0u8; 32]),
             listing_id,
             buyer_fingerprint: format!("buyer-{seed}"),
             seller_fingerprint: "seller".into(),
@@ -2315,7 +2315,7 @@ mod order_tests {
     fn make_listing(signer: &SigningKey, title: &str) -> AuthorizedListing {
         let ts = timestamp(1_700_000_000);
         let listing = crate::listing::Listing {
-            id: ListingId([0u8; 16]),
+            id: ListingId([0u8; 32]),
             title: title.into(),
             description: String::new(),
             kind: crate::listing::ListingKind::Sale,

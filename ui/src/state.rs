@@ -501,7 +501,7 @@ fn spawn_order_signature(pending: PendingOrder) {
     wasm_bindgen_futures::spawn_local(async move {
         use dioxus::prelude::{ReadableExt, WritableExt};
 
-        let queued = PendingSignature::Order(pending.clone());
+        let queued = PendingSignature::Order(Box::new(pending.clone()));
         let withdraw = |reason: String| {
             dioxus::logger::tracing::error!("{reason}");
             let mut state = crate::gateway::APP_STATE.write();
@@ -720,7 +720,11 @@ impl PendingStoreEdit {
 pub enum PendingSignature {
     Listing(PendingListing),
     StoreInfo(PendingStoreInfo),
-    Order(PendingOrder),
+    /// Boxed because it is much the largest of the three -- an `Order`
+    /// carries two 32-byte ids, a script, an address, a bridge list and two
+    /// optional 32-byte fields -- and every entry of the queue would
+    /// otherwise be sized for it.
+    Order(Box<PendingOrder>),
 }
 
 impl PendingSignature {
@@ -837,7 +841,7 @@ pub fn order_for_invoice(
     Ok(Order {
         // Stamped by `with_derived_id` below, out of the finished terms. A
         // literal here would be a second place deciding an order's identity.
-        id: harvest_common::payment::OrderId([0u8; 16]),
+        id: harvest_common::payment::OrderId([0u8; 32]),
         listing_id: pending.listing_id.clone(),
         buyer_fingerprint: pending.buyer_fingerprint.clone(),
         seller_fingerprint: pending.seller_fingerprint.clone(),
@@ -3621,7 +3625,7 @@ impl AppState {
             reply_to: invoice.reply_to,
         };
         self.pending_signatures
-            .push_back(PendingSignature::Order(pending.clone()));
+            .push_back(PendingSignature::Order(Box::new(pending.clone())));
 
         #[cfg(target_arch = "wasm32")]
         spawn_order_signature(pending);
@@ -5238,7 +5242,7 @@ mod tests {
         PendingSignature::Listing(PendingListing {
             fingerprint: FINGERPRINT.to_string(),
             listing: harvest_common::listing::Listing {
-                id: harvest_common::listing::ListingId([1u8; 16]),
+                id: harvest_common::listing::ListingId([1u8; 32]),
                 title: "Beans".to_string(),
                 description: String::new(),
                 kind: harvest_common::listing::ListingKind::Sale,
@@ -5746,7 +5750,7 @@ mod tests {
     fn listing_with(id: u8, certificate_pem: &str) -> AuthorizedListing {
         AuthorizedListing {
             listing: harvest_common::listing::Listing {
-                id: harvest_common::listing::ListingId([id; 16]),
+                id: harvest_common::listing::ListingId([id; 32]),
                 title: "Beans".to_string(),
                 description: String::new(),
                 kind: harvest_common::listing::ListingKind::Sale,
@@ -5850,11 +5854,11 @@ mod tests {
         );
 
         assert!(
-            !marked.contains(&harvest_common::listing::ListingId([1u8; 16])),
+            !marked.contains(&harvest_common::listing::ListingId([1u8; 32])),
             "a listing carrying the store's own verified certificate is verified"
         );
         assert!(
-            marked.contains(&harvest_common::listing::ListingId([2u8; 16])),
+            marked.contains(&harvest_common::listing::ListingId([2u8; 32])),
             "a listing carrying somebody else's certificate is not"
         );
     }
@@ -5873,7 +5877,7 @@ mod tests {
             &crate::ghostkey_cert::CertificateStatus::Invalid("nope".to_string()),
         );
 
-        assert!(marked.contains(&harvest_common::listing::ListingId([1u8; 16])));
+        assert!(marked.contains(&harvest_common::listing::ListingId([1u8; 32])));
     }
 
     /// State arriving after the deadline fired wins. Treating a store that
@@ -7111,7 +7115,7 @@ mod authorized_order_tests {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let listing_id = ListingId::from_label("Widget");
         Order {
-            id: OrderId([0u8; 16]),
+            id: OrderId([0u8; 32]),
             listing_id,
             buyer_fingerprint: "buyer".to_string(),
             seller_fingerprint: "seller".to_string(),
@@ -9711,7 +9715,7 @@ mod buy_flow_tests {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let listing_id = ListingId::from_label(what);
         let order = Order {
-            id: OrderId([0u8; 16]),
+            id: OrderId([0u8; 32]),
             listing_id,
             // Empty, and that is the point: a buyer has no identity to name.
             buyer_fingerprint: String::new(),
@@ -9930,7 +9934,7 @@ mod buy_flow_tests {
         let tag = buyer.buyer_public_key;
         let request = buyer
             .request_order(
-                &ListingId([3u8; 16]),
+                &ListingId([3u8; 32]),
                 2,
                 "12 Example St".into(),
                 String::new(),
@@ -9951,7 +9955,7 @@ mod buy_flow_tests {
         PendingInvoice {
             store_contract_id: STORE.to_vec(),
             seller_fingerprint: "seller-fp".to_string(),
-            listing_id: ListingId([3u8; 16]),
+            listing_id: ListingId([3u8; 32]),
             listing_title: "Widget".to_string(),
             buyer_fingerprint: String::new(),
             amount_sats: 50_000,
@@ -10117,7 +10121,7 @@ mod buy_flow_tests {
             freenet_stdlib::prelude::CodeHash::new([0xA1; 32]),
         ));
 
-        let listing = ListingId([3u8; 16]);
+        let listing = ListingId([3u8; 32]);
         let sealed = state
             .request_order(
                 STORE,
@@ -10190,7 +10194,7 @@ mod buy_flow_tests {
             .request_order(
                 STORE,
                 &seller_encryption_key(),
-                &ListingId([3u8; 16]),
+                &ListingId([3u8; 32]),
                 1,
                 "12 Example St".to_string(),
                 String::new(),
@@ -10218,7 +10222,7 @@ mod buy_flow_tests {
         let none = state.request_order(
             STORE,
             &seller_encryption_key(),
-            &ListingId([3u8; 16]),
+            &ListingId([3u8; 32]),
             0,
             "12 Example St".to_string(),
             String::new(),
@@ -10228,7 +10232,7 @@ mod buy_flow_tests {
         let nowhere = state.request_order(
             STORE,
             &seller_encryption_key(),
-            &ListingId([3u8; 16]),
+            &ListingId([3u8; 32]),
             1,
             "   ".to_string(),
             String::new(),
@@ -10722,7 +10726,7 @@ mod buy_flow_tests {
     /// close more.
     #[test]
     fn a_commitment_for_a_listing_never_requested_is_refused() {
-        let asked_for = ListingId([3u8; 16]);
+        let asked_for = ListingId([3u8; 32]);
         let published = commitment(
             &seller_signing_key(),
             Some(anchor(TIP_HEIGHT)),

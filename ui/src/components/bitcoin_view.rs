@@ -449,7 +449,7 @@ pub(super) mod __address_check_test_support {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let listing_id = ListingId::from_label("Widget");
         Order {
-            id: OrderId([0u8; 16]),
+            id: OrderId([0u8; 32]),
             listing_id,
             buyer_fingerprint: "buyer".to_string(),
             seller_fingerprint: "seller".to_string(),
@@ -622,7 +622,7 @@ mod bridge_check_tests {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let listing_id = ListingId::from_label("Widget");
         Order {
-            id: OrderId([0u8; 16]),
+            id: OrderId([0u8; 32]),
             listing_id,
             buyer_fingerprint: "buyer".into(),
             seller_fingerprint: "seller".into(),

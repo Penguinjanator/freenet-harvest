@@ -101,7 +101,7 @@ pub fn ListingForm(on_submit: EventHandler<Listing>) -> Element {
                             // one its terms give is refused by every peer
                             // (see `ListingId::from_terms`), so a literal
                             // here would be a second place deciding identity.
-                            id: ListingId([0u8; 16]),
+                            id: ListingId([0u8; 32]),
                             title: listing_title,
                             description: description().trim().to_string(),
                             kind: kind(),
