@@ -8506,15 +8506,17 @@ mod nonce_collision_tests {
     ///   under that nonce without holding the key. What they cannot do is
     ///   decrypt anything under a different nonce.
     ///
-    /// **The fix is not at this layer and is deliberately not attempted
-    /// here:** deriving the nonce deterministically from the message (an
-    /// SIV-style construction) would make two different plaintexts unable to
-    /// share a nonce, which would close the keystream reuse AND the
-    /// displacement in one move, since "one entry per nonce" would then mean
-    /// "one entry per distinct message". That is a change to the message
-    /// crypto with its own consequences (it leaks message equality) and
-    /// belongs in its own change with its own review. See
-    /// `docs/messaging-privacy.md`.
+    /// **How much it matters, and why a deterministic nonce is NOT the fix.**
+    /// A key holder can already decrypt this conversation and publish the
+    /// plaintext, so the xor leak gives them a more deniable route to a
+    /// disclosure they could make anyway; the one additional capability is
+    /// narrow (handing a third party forgery without handing over reading).
+    /// And deriving the nonce from the message would not close it: the nonce
+    /// is a field the WRITER fills in and the reader takes as given, so an
+    /// attacker simply does not follow the rule. A rule only honest clients
+    /// obey is not a defence against a dishonest one. See
+    /// `docs/messaging-privacy.md`, where the earlier, overstated version of
+    /// this is corrected rather than deleted.
     #[test]
     fn known_limit_a_nonce_collision_reuses_the_keystream() {
         let mut buyer = buyer_state();

@@ -104,13 +104,26 @@ changes the attacker's cost from "add one second" to "try a few ciphertexts
 until one sorts first" — they choose the whole plaintext, so they win about
 half of any comparison on the first attempt.
 
-**What would actually close it** is making the message's identity content-derived
-rather than chosen — deriving the nonce deterministically from the message (an
-SIV-style construction), so two different plaintexts cannot share a nonce and
-"one entry per nonce" becomes "one entry per distinct message". That is a
-change to the message crypto and to what the contract treats as identity; it
-belongs in its own change with its own review, and it would also close the
-nonce-reuse problem below. It is not attempted here.
+**What would actually close it.** The first answer written here was wrong and
+is corrected rather than deleted, because the mistake is instructive: it said
+to derive the nonce deterministically from the message (an SIV-style
+construction), so that two different plaintexts could not share a nonce.
+
+**That does not work, because nothing can enforce it.** The nonce is a field
+the writer fills in, and the reader takes it from the entry
+(`decrypt_message`, `ui/src/messaging.rs`). The contract cannot check a keyed
+derivation — it has no key — and the reader checking it comes too late,
+because the displacement already happened at the contract. An attacker who
+holds the conversation key simply does not follow the derivation rule. A rule
+only honest clients obey is not a defence against a dishonest one.
+
+What WOULD close it is making the identity **the contract itself computes**:
+key the summary, the delta, the duplicate check and the dedup on a hash of the
+whole entry rather than on the writer's nonce. Two entries that differ in any
+byte are then two entries; there is no collision to resolve, so there is
+nothing to displace. It needs no key, so the contract can enforce it. It costs
+a wire-format change to the summary and delta shape, and it is not attempted
+here.
 
 **What was done instead**, at the client, where first-hand knowledge lives:
 
@@ -149,10 +162,27 @@ Who it exposes what to:
   recovery, so they can forge further entries under that nonce without holding
   the key. They cannot decrypt anything under a different nonce.
 
-Every path requires a key holder to create the collision deliberately, and a
-key holder is already inside the conversation. What the reuse adds is exposure
-to third parties. The deterministic-nonce change described above would remove
-the class entirely, since two different plaintexts could not share a nonce.
+**How much this actually matters, stated after a second look.** Every path
+requires a key holder to create the collision deliberately — and a key holder
+can already decrypt the buyer's message and publish the plaintext directly.
+So the xor leak grants the counterparty nothing they lack; it is a more
+deniable route to a disclosure they could make anyway. The one genuinely
+additional capability is narrow: recovering the GHASH subkey lets them hand a
+third party the ability to FORGE entries in that conversation without handing
+over the ability to READ it. In a two-party conversation whose counterparty
+can already forge anything, that is exotic.
+
+An earlier version of this section stopped at "a third party learns `P1 xor
+P2` without any key", which is true and, on its own, overstates the
+consequence. It is recorded here in corrected form rather than quietly
+rewritten.
+
+**And it is not closable at this layer.** A deterministic nonce would stop
+honest clients colliding, which they were never going to do with 24 random
+bytes; it does nothing about a key holder who chooses to collide, for the same
+reason it does nothing about displacement. Nothing short of removing the
+counterparty's key removes this, and the counterparty must hold the key to
+read replies at all.
 
 ## NOT visible
 
