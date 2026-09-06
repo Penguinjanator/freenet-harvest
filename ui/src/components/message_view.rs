@@ -26,12 +26,15 @@ use crate::messaging::{MailboxEntry, MessageContent};
 ///   contract is a contract update, and the mailbox's address is derived from
 ///   the seller's identity. Anybody watching knows this node wrote to this
 ///   seller. The message CONTENT is hidden; the fact of contact is not.
-/// * **Replies work, and are lost by a reload.** The seller answers into
-///   their own mailbox and the buyer reads it out of the same contract. The
-///   buyer's keys live in the tab and nowhere else -- there is no buyer
-///   delegate and `localStorage` throws in the gateway's sandboxed iframe --
-///   so a buyer who reloads before the answer arrives can never read it. That
-///   has to be on screen BEFORE they send, not discovered afterwards.
+/// * **Replies work, and survive a reload on THIS device.** The seller
+///   answers into their own mailbox and the buyer reads it out of the same
+///   contract. The key that reads it is kept by this node's harvest delegate,
+///   because the browser has no durable storage at all here -- the gateway's
+///   sandboxed iframe has no `allow-same-origin`, so `localStorage`,
+///   `sessionStorage`, IndexedDB and cookies all throw. It does NOT follow
+///   the buyer to another device, and that has to be on screen BEFORE they
+///   send rather than discovered when they need the answer. See
+///   `docs/buyer-conversation-persistence.md`.
 /// * **Handed over, not delivered.** `update_contract` resolves when the
 ///   local node accepts the send. Nothing confirms the contract took it or
 ///   that the seller ever looks. The button is an action label and says
@@ -93,6 +96,18 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
     let seller_identity = store.and_then(|s| s.seller_verifying_key);
     let thread = app_state.conversation_thread(&store_contract_id);
     let unconfirmed = app_state.unconfirmed_sent(&store_contract_id);
+    // What this node is keeping, which is what the buyer can ask it to
+    // forget. Empty until the delegate answers, and empty for a store this
+    // node has never written to.
+    let kept: Vec<([u8; 32], i64)> = store
+        .map(|store| {
+            store
+                .conversations
+                .iter()
+                .map(|conversation| (conversation.buyer_public_key, conversation.created_at))
+                .collect()
+        })
+        .unwrap_or_default();
     let authored_here: Vec<[u8; 24]> = thread
         .iter()
         .map(|message| message.nonce)
@@ -148,6 +163,89 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
                     authored_here: authored_here,
                 }
             }
+
+            if !kept.is_empty() {
+                KeptConversations {
+                    store_contract_id: store_contract_id.clone(),
+                    kept: kept,
+                }
+            }
+        }
+    }
+}
+
+/// What this node is keeping so the seller's replies stay readable, and the
+/// control that removes it.
+///
+/// # Why this is on screen at all
+///
+/// Keeping the conversation is what makes a reply readable after the tab
+/// closes, and the same record is a durable local note that this node
+/// contacted this store. The buyer is the only person who can weigh those
+/// against each other, so the control is theirs -- and a control only a
+/// programmer can reach is not one.
+///
+/// It removes the record rather than emptying it (the delegate deletes the
+/// key, and re-reads it afterwards to check), so what is claimed here is what
+/// happens. It cannot be undone: the messages stay in the seller's mailbox
+/// and become unreadable by everyone, including the buyer.
+#[component]
+fn KeptConversations(store_contract_id: Vec<u8>, kept: Vec<([u8; 32], i64)>) -> Element {
+    // Which one is a click away from being destroyed, if any. Two steps
+    // because there is no undo and no second copy anywhere.
+    let mut confirming = use_signal(|| Option::<[u8; 32]>::None);
+
+    rsx! {
+        div { style: "margin-top: 1.5rem;",
+            h4 { "Kept on this device" }
+            p { class: "text-muted", style: "font-size: 0.85rem;",
+                "This node is keeping the key that reads {kept.len()} conversation(s) with this "
+                "store, so a reply is still readable after you close this tab. That key is on "
+                "THIS device only -- opening the store somewhere else will not bring the "
+                "conversation with it."
+            }
+            for (tag, created_at) in kept.iter() {
+                {
+                    let tag = *tag;
+                    let when = chrono::DateTime::from_timestamp(*created_at, 0)
+                        .map(|when| when.format("%Y-%m-%d %H:%M UTC").to_string())
+                        .unwrap_or_else(|| "an unknown time".to_string());
+                    let store_contract_id = store_contract_id.clone();
+                    rsx! {
+                        div { class: "card", style: "margin-top: 0.5rem;",
+                            p { class: "text-muted", style: "font-size: 0.8rem;",
+                                "Conversation {short_tag(&tag)}, started {when}"
+                            }
+                            if confirming() == Some(tag) {
+                                p { class: "text-warning", style: "font-size: 0.85rem;",
+                                    "Forget this conversation? Your messages and the seller's "
+                                    "replies stay in the seller's mailbox and become unreadable "
+                                    "by everyone, including you. This cannot be undone."
+                                }
+                                button {
+                                    class: "btn btn-primary",
+                                    onclick: move |_| {
+                                        APP_STATE.write().forget_conversation(&store_contract_id, &tag);
+                                        confirming.set(None);
+                                    },
+                                    "Yes, forget it"
+                                }
+                                button {
+                                    class: "btn",
+                                    onclick: move |_| confirming.set(None),
+                                    "Keep it"
+                                }
+                            } else {
+                                button {
+                                    class: "btn",
+                                    onclick: move |_| confirming.set(Some(tag)),
+                                    "Forget this conversation"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -167,9 +265,9 @@ fn Thread(
             h4 { "Your conversation" }
             p { class: "text-muted",
                 style: "font-size: 0.85rem;",
-                "This conversation is gone when you reload the page: the key that reads it "
-                "lives in this tab and nowhere else. A reply that arrives after a reload "
-                "cannot be read by anyone, including you."
+                "This conversation survives a reload on this device: the key that reads it is "
+                "kept by your Freenet node. It does not follow you to another browser or "
+                "another device, where the same messages cannot be read by anyone."
             }
             p { class: "text-muted",
                 style: "font-size: 0.85rem;",
@@ -241,10 +339,11 @@ fn Compose(
             "Harvest delegate. Anyone watching the network can still see that you wrote to "
             "this store, just not what you said."
         }
-        p { class: "text-warning",
+        p { class: "text-muted",
             style: "margin-bottom: 1rem;",
-            "The seller cannot reply through Harvest yet -- there is no buyer inbox to reply "
-            "to. Include a contact route in your message if you need an answer."
+            "The seller replies into the same mailbox and their answer appears here. Reading "
+            "it needs a key your node keeps for you, so it survives closing this tab but does "
+            "not follow you to another device -- come back to this one for the answer."
         }
 
         div { class: "form-group",
@@ -501,7 +600,9 @@ fn Conversation(
                 }
                 p { class: "text-muted", style: "font-size: 0.8rem;",
                     "Your reply goes into this mailbox encrypted to this buyer alone. They can "
-                    "only read it while the browser tab they wrote from is still open."
+                    "read it whenever they come back from the same device they wrote from -- "
+                    "and never from a different one, so a buyer who has changed device will "
+                    "not see it."
                 }
             } else {
                 p { class: "text-muted text-italic", style: "font-size: 0.85rem;",

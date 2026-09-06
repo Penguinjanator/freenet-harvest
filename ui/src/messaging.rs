@@ -46,15 +46,29 @@
 //!   [`harvest_common::mailbox::EncryptedMessage::sender_public_key`] and in
 //!   `docs/messaging-privacy.md`.
 //!
-//! # What this module does NOT do
+//! # Surviving a reload, and what still does not
 //!
-//! **Survive a reload.** The buyer's conversation keys live in the tab and
-//! nowhere else. There is no buyer delegate, and `localStorage` throws inside
-//! the gateway's sandboxed iframe, so there is nowhere durable to put them. A
-//! buyer who reloads before the seller answers can never read that reply --
-//! the ciphertext is in the mailbox forever and the key is gone. This is the
-//! sharpest remaining limitation and `components::message_view` says it on
-//! screen.
+//! The buyer's conversation keys used to live in the tab and nowhere else, so
+//! a buyer who reloaded before the seller answered could never read that
+//! reply. They are now kept by the harvest delegate, which is the only
+//! durable store this application has -- `localStorage`, `sessionStorage`,
+//! IndexedDB and cookies all throw inside the gateway's sandboxed iframe,
+//! which carries no `allow-same-origin`. [`BuyerConversation::open`] keeps
+//! the ephemeral secret for exactly that purpose, and
+//! `AppState::compose_to_seller` hands it to the delegate on the first
+//! message. See `docs/buyer-conversation-persistence.md`.
+//!
+//! Two limits survive that, and `components::message_view` says both on
+//! screen rather than letting a buyer discover them:
+//!
+//! * **A different device is a different node.** The secret is in one node's
+//!   delegate. A buyer who writes from a laptop and later opens the store on
+//!   a phone has a different delegate and unreadable ciphertext.
+//! * **The delegate keeps a durable local record of which stores this node
+//!   messaged.** It is removable -- "forget this conversation" deletes the
+//!   record outright rather than emptying it -- and removing it makes the
+//!   thread permanently unreadable, which is the point. See
+//!   `docs/messaging-privacy.md`.
 //!
 //! **Anything for a seller who has published no key.** `encryption_public_key`
 //! is `None` for every store created before it existed, and for a seller whose
@@ -74,7 +88,7 @@ use harvest_common::mailbox::{
     ConversationId, EncryptedMessage, MessageDirection,
 };
 use serde::{Deserialize, Serialize};
-use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
+use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
 /// A plaintext message exchanged between buyer and seller.
 /// Serialized to CBOR, padded, then encrypted.
@@ -143,12 +157,25 @@ impl std::fmt::Debug for ConversationKeys {
 
 /// The buyer's half of one conversation with one store.
 ///
-/// Opened per store per tab. The ephemeral SECRET is consumed in
-/// [`Self::open`] and never stored -- the derived keys are all that is needed
-/// afterwards, and keeping the secret would only widen what a leak costs.
+/// # Why the ephemeral secret is KEPT
 ///
-/// It does not survive a reload, and there is nowhere to put it that would:
-/// see the module docs.
+/// It was discarded in [`Self::open`], and the comment here said that was
+/// deliberate -- "keeping the secret would only widen what a leak costs".
+/// That reasoning is now wrong, and the correction is the whole point of this
+/// type: the secret is the only thing from which the conversation's keys can
+/// be re-derived after the tab is gone, and the seller's reply will, once
+/// orders exist, carry the buyer's only capability to complain about the
+/// seller they paid. Discarding it traded a small leak surface for the
+/// silent, total loss of that capability.
+///
+/// So a conversation opened here holds its secret, `AppState` hands it to the
+/// harvest delegate on the first message, and the delegate answers the two
+/// direction keys back on the next page load.
+///
+/// `secret` is `None` for a conversation RECALLED from the delegate: the
+/// delegate answers derived keys and never the secret it derived them from,
+/// so a recalled conversation can read and write its thread but cannot be
+/// re-persisted. Nothing needs it to be -- it is already stored.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BuyerConversation {
     /// The routing tag every message in this conversation carries, in both
@@ -157,13 +184,21 @@ pub struct BuyerConversation {
     /// Chosen once and echoed by the seller, so a decrypted message that
     /// names a different conversation can be rejected rather than displayed.
     pub conversation_id: ConversationId,
+    /// When this conversation was opened, in unix seconds -- the delegate's
+    /// eviction order and, on recall, which conversation with a store is the
+    /// most recent one to continue.
+    pub created_at: i64,
+    /// `Some` for a conversation opened in this tab, `None` for one recalled
+    /// from the delegate. Prints as `redacted`; see
+    /// [`harvest_common::ConversationSecret`].
+    secret: Option<harvest_common::ConversationSecret>,
     keys: ConversationKeys,
 }
 
 impl BuyerConversation {
     /// Open a conversation with the holder of `seller_public_key`.
     pub fn open(seller_public_key: &[u8; 32]) -> Result<Self, String> {
-        let secret = EphemeralSecret::random();
+        let secret = StaticSecret::random();
         let buyer_public_key = *PublicKey::from(&secret).as_bytes();
         let shared = secret.diffie_hellman(&PublicKey::from(*seller_public_key));
         if !shared.was_contributory() {
@@ -176,8 +211,55 @@ impl BuyerConversation {
         Ok(Self {
             buyer_public_key,
             conversation_id: ConversationId::random(),
+            created_at: chrono::Utc::now().timestamp(),
+            secret: Some(harvest_common::ConversationSecret(secret.to_bytes())),
             keys: ConversationKeys::from_shared_secret(shared.as_bytes()),
         })
+    }
+
+    /// Rebuild a conversation the delegate kept for this node.
+    ///
+    /// The keys were derived inside the delegate, from the stored secret and
+    /// the seller key the conversation was opened against, so this browser
+    /// never sees either.
+    pub fn recalled(recalled: &harvest_common::RecalledConversation) -> Self {
+        Self {
+            buyer_public_key: recalled.buyer_public_key,
+            conversation_id: ConversationId(recalled.conversation_id),
+            created_at: recalled.created_at,
+            secret: None,
+            keys: ConversationKeys {
+                to_seller: recalled.buyer_to_seller,
+                from_seller: recalled.seller_to_buyer,
+            },
+        }
+    }
+
+    /// What the delegate must be told so this conversation outlives the tab,
+    /// or `None` for one it is already keeping.
+    ///
+    /// The delegate files the record under the PUBLIC half of this secret, so
+    /// what is sent here decides the tag a later recall comes back under. It
+    /// is the same tag this conversation already carries -- pinned by
+    /// `the_delegate_files_a_conversation_under_the_tag_the_mailbox_carries`,
+    /// because a disagreement would file the conversation under a tag no
+    /// message in the mailbox has and nothing downstream could detect it.
+    pub fn to_persist(
+        &self,
+        store_contract_id: &[u8],
+        seller_public_key: &[u8; 32],
+        request_id: u64,
+    ) -> Option<harvest_common::HarvestDelegateRequest> {
+        Some(
+            harvest_common::HarvestDelegateRequest::StoreBuyerConversation {
+                request_id,
+                store_contract_id: store_contract_id.to_vec(),
+                secret: self.secret?,
+                seller_public_key: *seller_public_key,
+                conversation_id: self.conversation_id.0,
+                created_at: self.created_at,
+            },
+        )
     }
 
     /// Seal one message for the seller.

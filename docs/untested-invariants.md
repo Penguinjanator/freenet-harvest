@@ -174,6 +174,25 @@ is the only way this file stays a record rather than an archaeology exercise.
 | `ui/src/state.rs::BrowsingStore::seller_verifying_key` | A store the buyer is told is unverified is never one the compose box is offered for, because both come from one call. | **Yes** -- `an_unverified_store_yields_no_key_to_message_it_with`, mutated red by setting the key unconditionally. It pins the wiring; the check itself is the `ghostkey_cert` row above. |
 | `delegates/harvest-delegate/src/messaging.rs` | Everything the delegate writes is under the exported prefix. | **Yes** -- `everything_this_module_writes_is_under_the_exported_prefix`, which drives the real writer. The pre-existing `every_secret_the_delegate_writes_is_under_the_exported_prefix` stayed GREEN under the same mutation, because it reads a hand-maintained list; that is the gap the new test closes. |
 
+### Buyer conversation persistence (added 2026-09-05, same branch)
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `delegates/harvest-delegate/src/secrets.rs::RemovableSecrets` | The node genuinely deletes a removed secret -- blob, snapshots, index entry and enumeration-registry entry. | **No, and it cannot be here.** `DelegateCtx::remove_secret` is a `false`-returning stub off wasm32, like every other secret method, so the tests drive `MemSecrets`. The claim is read from freenet-core's own source (`wasm_runtime/secrets_store/store.rs::remove_secret`) and cited in the trait's doc comment; the doc comment also says, in those words, what the tests do and do not establish. Observing it needs `tests/rehearsal/` and a live node. What IS tested is that this crate asks for removal, re-reads the key, and reports a failure rather than an `Ok` when the key is still there (`a_refused_removal_is_not_reported_as_forgotten`). |
+| `delegates/harvest-delegate/src/messaging.rs::forget_buyer_conversation` | Forgetting leaves nothing behind, not an emptied value. | **Yes** -- `a_forgotten_conversation_leaves_nothing_behind`, observed red against the emptied-value form, which left `harvest:buyer_conv:{store}:{tag}` in the store with the store id still in it. That red run is the reason the key is named rather than an opaque slot: the slot design existed only to work around a deletion the platform turned out to have. |
+| `delegates/harvest-delegate/src/messaging.rs::MAX_BUYER_CONVERSATIONS` | The count cap is a byte bound, because both the key and the value are bounded. | **Yes for both halves.** The cap itself: `the_cap_bounds_the_store_and_evicts_the_oldest`, red with the cap deleted. The key half: `a_store_id_that_is_not_a_contract_id_is_refused` -- without that refusal the key is caller-sized and the cap bounds entries while bounding no bytes, which is this repository's own named trap. |
+| same | An undecodable entry is evicted before a real conversation. | **Yes** -- `an_undecodable_entry_is_evicted_before_a_real_one`, red when the ordering sorts undecodable entries last. |
+| `ui/src/state.rs::compose_to_seller` | Sending a message is what asks the node to keep the key. | **Yes** -- `sending_a_message_asks_the_node_to_keep_the_conversation`, red when the call is removed from the send path. Worth its own test because every other test around it calls `conversation_to_keep` directly and would have stayed green. |
+| `ui/src/state.rs` / `delegates/.../messaging.rs` | The tag the delegate files a conversation under is the tag the mailbox carries. | **Yes, from both sides, which is the point.** The delegate derives the tag from the secret it is sent (`a_stored_conversation_comes_back_with_usable_keys` asserts the recalled tag and both keys against a seller derived independently); the UI asserts that what it SENDS has that same public half (`the_delegate_files_a_conversation_under_the_tag_the_mailbox_carries`). The seam between the two crates is `harvest_common::mailbox::conversation_key_from_dh`, which both call and which is separately pinned by a known-answer test. The UI crate cannot depend on the delegate crate, so this pair is the strongest available statement. |
+| `ui/src/state.rs::on_buyer_conversations` | A recalled conversation reads the reply that arrived while the tab was closed. | **Yes** -- `a_reply_is_readable_after_the_tab_that_asked_is_gone`, which builds the delegate's answer from the real crypto and drives a fresh `AppState`. Red when the recall handler is inert. |
+| `ui/src/state.rs::conversation_thread` | Every conversation this node has had with the store is read, not just the active one. | **Yes** -- `every_conversation_with_a_store_is_read`, red when only the last is read. It drives the documented race (the buyer writes before the recall answers, so they hold two conversations with one store) and asserts the older thread still appears. |
+| same | A non-empty recall re-subscribes to the seller's mailbox, and an empty one subscribes to nothing. | **Yes** -- `recalling_conversations_subscribes_to_the_sellers_mailbox` and `recalling_nothing_subscribes_to_nothing`. The second is the privacy half: a reader who never wrote to a seller must not advertise an interest in their mailbox. |
+| `ui/src/state.rs::buyer_conversations_to_recall` | A store is not marked as asked before the delegate is registered. | **Yes** -- `a_store_is_not_marked_asked_before_the_delegate_is_registered` and `registering_the_delegate_asks_about_stores_already_on_screen`, both red with the guard removed. `components::app` opens a store link BEFORE registering the harvest delegate, so this ordering is the common one, not the exotic one. |
+| `ui/src/state.rs::on_buyer_conversation_forgotten` | A conversation leaves the buyer's view only when the node says the record is gone. | **Yes** -- `a_conversation_is_dropped_only_when_the_node_says_it_is_gone`, which drives the refusal first and the success second, plus `an_unasked_forget_answer_drops_nothing`. |
+| `harvest_common::delegate::ConversationSecret` | The buyer's secret does not print itself, in the `Debug`-deriving request it travels in. | **Yes** -- `a_conversation_secret_does_not_print_itself`, observed red against a derived `Debug`, which printed all 32 bytes. `a_conversation_secret_encodes_as_its_bytes` pins that the newtype is not a wire change. |
+| `ui/src/components/message_view.rs::KeptConversations` | The buyer can reach the forget control at all, and the panel says what it does. | **No.** There are still no component tests in this repository -- the same gap as the row above about everything this component says on screen. The state transition behind the button is tested; the button is not. |
+| `ui/src/state.rs::send_to_harvest_delegate` | Any of these requests actually reach the delegate. | **No.** The same wasm-gated `spawn_local` gap as `ask_for_conversation_keys`, which this now shares one implementation with. Every decision is host-tested; the send is not. |
+
 ### The guard sweep, 2026-09-05
 
 Every guard this change touched or added was deleted, one at a time, and the
@@ -205,11 +224,18 @@ pattern in the table. First, **every read path is fully host-tested and every
 write path is not**, because a write ends at a node and a read ends in a pure
 function. Second, **the component is the least-covered file in the change and
 is the one that makes claims to users**, which is the exact shape of the
-defect that produced this document. Third, **the sharpest limitation is not in
-this table at all**, because it is not a claim that could become false: a
-buyer's conversation keys die with the browser tab, so a reply that arrives
-after a reload is unreadable by anyone forever. Anything built on top of the
-reply path has to solve that first.
+defect that produced this document. Third, **the sharpest limitation was not
+in this table at all**, because it was not a claim that could become false: a
+buyer's conversation keys died with the browser tab, so a reply arriving after
+a reload was unreadable by anyone forever.
+
+That third one was closed later the same day -- the delegate now keeps the
+buyer's per-conversation secret, and the rows added below cover it. What
+replaces it is narrower and is stated wherever it matters: the secret is in
+ONE node's delegate, so a buyer who changes device still loses the
+conversation, and the keyed record is a durable local note of which stores this
+node contacted (removable, and the removal is a real deletion). See
+`docs/buyer-conversation-persistence.md`.
 
 ---
 

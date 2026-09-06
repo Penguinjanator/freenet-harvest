@@ -28,9 +28,31 @@
 //! `harvest-common`, which is compiled into all three contracts. Moving it
 //! there would put `aes-gcm` in every contract's WASM to serve code no
 //! contract executes. One crypto path, in the UI, is the trade that was made.
+//!
+//! # The buyer's half, which is not symmetrical with the seller's
+//!
+//! The second half of this module keeps the BUYER's per-conversation
+//! ephemeral secrets, and it exists for a different reason. The seller's
+//! secret is here because it must outlive a page load or no buyer could ever
+//! reach them. The buyer's is here because there is nowhere else at all: the
+//! Freenet webapp iframe carries no `allow-same-origin`, so the page runs on
+//! an opaque origin where `localStorage`, `sessionStorage`, IndexedDB and
+//! cookies all throw. Without this the buyer's keys die with the tab, and the
+//! seller's reply -- which after Phase 2 carries the buyer's only capability
+//! to complain against the seller's bond -- becomes unreadable by anyone,
+//! including the buyer who asked for it.
+//!
+//! Nothing here is keyed by a ghostkey fingerprint, because the buyer has no
+//! identity to key by. See `docs/buyer-conversation-persistence.md` for the
+//! whole design, including the two things it does not solve: a buyer who
+//! changes device, and the durable local record this leaves of who they
+//! contacted.
 
+use crate::secrets::RemovableSecrets;
 use freenet_migrate::SecretStore;
-use harvest_common::delegate::{ConversationKey, HarvestDelegateResponse, RequestId};
+use harvest_common::delegate::{
+    ConversationKey, ConversationSecret, HarvestDelegateResponse, RecalledConversation, RequestId,
+};
 use harvest_common::mailbox::{conversation_key_from_dh, MessageDirection};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -161,6 +183,317 @@ pub(crate) fn derive_conversation_keys<S: SecretStore>(
         ghostkey_fingerprint: ghostkey_fingerprint.to_string(),
         result: Ok(derived),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The buyer's half: conversation secrets that outlive a browser tab.
+// ---------------------------------------------------------------------------
+
+/// How many buyer conversations one node keeps, across every store.
+///
+/// # Why a COUNT is a real bound here, unlike in the mailbox
+///
+/// This repository has the count-cap-over-contract-controlled-values pattern
+/// written up, and the reflex on seeing a count cap is to call it a fake
+/// bound. It is worth saying why that reflex does not apply here rather than
+/// making the next reader re-derive it.
+///
+/// That pattern bites when a count caps entries whose values are
+/// **contract-controlled and variable** -- the mailbox, where `ciphertext`
+/// was attacker-supplied and unbounded, so 512 entries meant nothing about
+/// bytes. Here both halves are bounded:
+///
+/// * the VALUE is three 32-byte arrays and an `i64`, so its CBOR is a fixed
+///   shape a caller cannot inflate;
+/// * the KEY is `harvest:buyer_conv:` plus two base58 32-byte values, because
+///   [`store_buyer_conversation`] refuses a `store_contract_id` that is not
+///   32 bytes. Without that refusal the key would be caller-sized and this
+///   cap would bound entries while bounding no bytes at all -- which is
+///   exactly the pattern above. Pinned by
+///   `a_store_id_that_is_not_a_contract_id_is_refused`.
+///
+/// So this is about 60 KiB at the cap, and the cap is what stops a page
+/// opening conversations in a loop from growing the secret store without
+/// limit.
+pub(crate) const MAX_BUYER_CONVERSATIONS: usize = 256;
+
+/// A contract instance id, which is what a store is named by.
+const STORE_CONTRACT_ID_BYTES: usize = 32;
+
+const BUYER_CONVERSATION_PREFIX_STR: &str = "harvest:buyer_conv:";
+
+/// Every buyer conversation this delegate holds, whichever store it is with.
+///
+/// Under `harvest:` like everything else the delegate writes, because the
+/// migration export is defined by that prefix. A re-key that left these
+/// behind would destroy every buyer's ability to read a reply -- the same
+/// loss this whole mechanism exists to prevent, arriving by another route.
+/// Pinned by `buyer_conversations_are_under_the_exported_prefix`.
+pub(crate) const BUYER_CONVERSATION_PREFIX: &[u8] = BUYER_CONVERSATION_PREFIX_STR.as_bytes();
+
+/// Where one buyer conversation lives:
+/// `harvest:buyer_conv:{store id}:{routing tag}`, both base58.
+///
+/// # Why the key names both halves
+///
+/// Because both are recoverable after a reload and nothing else is. The store
+/// id is in the URL the buyer followed, and the tag is the buyer's ephemeral
+/// public key, which every message in the conversation carries in the clear.
+/// Naming them makes recall a prefix listing rather than a scan of every
+/// secret the delegate holds.
+///
+/// The `:` terminator matters: it is not in the base58 alphabet, so one
+/// store's prefix cannot be a prefix of another store's keys, and
+/// [`list_buyer_conversations`] cannot hand back a neighbouring store's
+/// conversations. Pinned by `conversations_are_scoped_to_their_store`.
+///
+/// **What this leaves behind is deliberate and is documented rather than
+/// hidden.** The key records that this node held a conversation with that
+/// store, so the record is a durable local artefact of who the buyer
+/// contacted -- see `docs/messaging-privacy.md`. It is removable:
+/// [`forget_buyer_conversation`] deletes the key outright rather than
+/// emptying it.
+pub(crate) fn buyer_conversation_key(
+    store_contract_id: &[u8],
+    buyer_public_key: &[u8; 32],
+) -> Vec<u8> {
+    let mut key = buyer_conversation_store_prefix(store_contract_id);
+    key.extend_from_slice(bs58::encode(buyer_public_key).into_string().as_bytes());
+    key
+}
+
+/// Every conversation held for ONE store.
+fn buyer_conversation_store_prefix(store_contract_id: &[u8]) -> Vec<u8> {
+    format!(
+        "{BUYER_CONVERSATION_PREFIX_STR}{}:",
+        bs58::encode(store_contract_id).into_string()
+    )
+    .into_bytes()
+}
+
+/// What is kept for one conversation.
+///
+/// The routing tag is NOT a field: it is the public half of `secret`, so
+/// [`recall`] derives it. A stored copy would be a second source for one
+/// value that could disagree with the key it is filed under, and a
+/// conversation recalled under a tag no mailbox message carries would read as
+/// an empty thread with nothing to explain it.
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
+pub(crate) struct BuyerConversationRecord {
+    /// The buyer's ephemeral X25519 secret. Prints as `redacted`; see
+    /// [`ConversationSecret`].
+    pub(crate) secret: ConversationSecret,
+    /// The seller key this conversation was opened against. [`recall`]
+    /// derives with THIS rather than with anything a caller supplies, so the
+    /// recall path is not a Diffie-Hellman oracle against stored secrets.
+    pub(crate) seller_public_key: [u8; 32],
+    pub(crate) conversation_id: [u8; 32],
+    /// Unix seconds, as the buyer's browser reported them, used only for
+    /// eviction order. See `HarvestDelegateRequest::StoreBuyerConversation`
+    /// for why the delegate does not read the host clock here.
+    pub(crate) created_at: i64,
+}
+
+/// Every conversation the delegate holds, with whichever store, as
+/// `(key, record)`.
+///
+/// A key whose value does not decode is reported with `None` rather than
+/// dropped: it still occupies a key, so the cap has to be able to see it --
+/// and it is the first thing evicted, since it recalls nothing.
+fn held_conversations<S: SecretStore>(
+    store: &S,
+) -> Vec<(Vec<u8>, Option<BuyerConversationRecord>)> {
+    store
+        .list_secrets(BUYER_CONVERSATION_PREFIX)
+        .into_iter()
+        .map(|key| {
+            let record = store.get_secret(&key).and_then(|bytes| {
+                harvest_common::from_cbor::<BuyerConversationRecord>(&bytes).ok()
+            });
+            (key, record)
+        })
+        .collect()
+}
+
+/// Keep a buyer's conversation, evicting the oldest if every slot is taken.
+///
+/// The routing tag is derived from the secret, so what is answered and what
+/// is filed can never disagree about which conversation this is.
+pub(crate) fn store_buyer_conversation<S: SecretStore + RemovableSecrets>(
+    store: &mut S,
+    request_id: RequestId,
+    store_contract_id: &[u8],
+    record: &BuyerConversationRecord,
+) -> HarvestDelegateResponse {
+    let stored = |result| HarvestDelegateResponse::BuyerConversationStored { request_id, result };
+
+    if store_contract_id.len() != STORE_CONTRACT_ID_BYTES {
+        return stored(Err(format!(
+            "a store is named by a {STORE_CONTRACT_ID_BYTES}-byte contract id, and this one is \
+             {} bytes -- refusing to keep a conversation under a name that is not a store",
+            store_contract_id.len()
+        )));
+    }
+
+    let bytes = match harvest_common::to_cbor(record) {
+        Ok(bytes) => bytes,
+        Err(e) => return stored(Err(format!("could not serialize the conversation: {e}"))),
+    };
+
+    let buyer_public_key = *PublicKey::from(&StaticSecret::from(record.secret.0)).as_bytes();
+    let key = buyer_conversation_key(store_contract_id, &buyer_public_key);
+
+    // Only a NEW key consumes a slot. Re-storing the same conversation --
+    // which the UI does whenever it re-sends into a thread it already has --
+    // must not evict anything.
+    if !store.has_secret(&key) {
+        if let Err(why) = make_room(store) {
+            return stored(Err(why));
+        }
+    }
+
+    if store.set_secret(&key, &bytes) {
+        stored(Ok(()))
+    } else {
+        // Reported rather than swallowed: the UI has already told the buyer
+        // their message was sent, and a conversation that was not kept
+        // becomes unreadable the moment the tab closes.
+        stored(Err(
+            "could not keep this conversation -- the node refused the write, so a reply \
+             will not be readable after this tab closes"
+                .to_string(),
+        ))
+    }
+}
+
+/// Free a slot if every one is taken, oldest first.
+///
+/// Eviction rather than refusal, because refusing would mean the conversation
+/// the buyer is having RIGHT NOW is the one that cannot be saved.
+///
+/// There is deliberately no age-based expiry anywhere here. That would be the
+/// mailbox's TTL mistake at a higher cost: it would discard precisely the
+/// capability the buyer needs later, at a time the buyer has no way to
+/// predict.
+fn make_room<S: SecretStore + RemovableSecrets>(store: &mut S) -> Result<(), String> {
+    let mut held = held_conversations(store);
+    while held.len() >= MAX_BUYER_CONVERSATIONS {
+        // An undecodable entry first -- it recalls nothing, so discarding it
+        // costs nothing -- then the oldest, then the lowest key so the choice
+        // is deterministic rather than dependent on listing order.
+        let Some(victim) = held
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (key, record))| {
+                (record.as_ref().map(|record| record.created_at), key.clone())
+            })
+            .map(|(index, _)| index)
+        else {
+            // Unreachable while `held.len() >= MAX_BUYER_CONVERSATIONS`, and
+            // a `break` rather than an `expect` so a future change to the cap
+            // cannot turn this into a panic inside a delegate.
+            break;
+        };
+        let (key, _) = held.remove(victim);
+        if !store.remove_secret(&key) {
+            // Refusing to grow past the cap is the safe direction: the
+            // alternative is an unbounded secret store on a node whose host
+            // is already refusing writes.
+            return Err(
+                "could not make room for this conversation -- the node refused to remove an \
+                 older one, so a reply will not be readable after this tab closes"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Recall every conversation stored for one store, as derived keys.
+///
+/// The keys are derived here, from the stored secret and the SELLER key the
+/// conversation was opened against, so the secret never leaves. Deriving
+/// against a caller-supplied key instead would make this a Diffie-Hellman
+/// oracle against every secret the node holds.
+pub(crate) fn list_buyer_conversations<S: SecretStore>(
+    store: &S,
+    store_contract_id: &[u8],
+) -> HarvestDelegateResponse {
+    let prefix = buyer_conversation_store_prefix(store_contract_id);
+    let conversations = store
+        .list_secrets(&prefix)
+        .into_iter()
+        .filter_map(|key| store.get_secret(&key))
+        .filter_map(|bytes| harvest_common::from_cbor::<BuyerConversationRecord>(&bytes).ok())
+        .filter_map(|record| recall(&record))
+        .collect();
+
+    HarvestDelegateResponse::BuyerConversationList {
+        store_contract_id: store_contract_id.to_vec(),
+        conversations,
+    }
+}
+
+/// One stored record as the two keys that read its thread.
+fn recall(record: &BuyerConversationRecord) -> Option<RecalledConversation> {
+    let secret = StaticSecret::from(record.secret.0);
+    let shared = secret.diffie_hellman(&PublicKey::from(record.seller_public_key));
+    // The same refusal as the seller's side: a low-order peer makes the
+    // shared secret all zeros, so the "conversation key" would be a constant
+    // anyone can compute.
+    if !shared.was_contributory() {
+        return None;
+    }
+    let shared = shared.to_bytes();
+
+    Some(RecalledConversation {
+        buyer_public_key: *PublicKey::from(&secret).as_bytes(),
+        conversation_id: record.conversation_id,
+        buyer_to_seller: conversation_key_from_dh(&shared, MessageDirection::BuyerToSeller),
+        seller_to_buyer: conversation_key_from_dh(&shared, MessageDirection::SellerToBuyer),
+        created_at: record.created_at,
+    })
+}
+
+/// Discard one conversation, permanently.
+///
+/// # Why this deletes rather than empties
+///
+/// This is the buyer's control over the record their node keeps of who they
+/// contacted, and the key itself carries the store id. Emptying the value
+/// would leave that key in place, so a "forget" that emptied would be a
+/// control that lies: the conversation would stop being readable while the
+/// evidence of it stayed. `SecretStore` cannot express deletion, which is why
+/// this takes the extra [`RemovableSecrets`] bound -- see that trait for what
+/// the node actually does with the request.
+///
+/// The answer is checked rather than assumed: the key is re-read afterwards
+/// and a key that is still there is reported as a failure. A buyer stops
+/// being careful on the strength of a control like this, so it must not
+/// report a success it cannot stand behind.
+pub(crate) fn forget_buyer_conversation<S: SecretStore + RemovableSecrets>(
+    store: &mut S,
+    request_id: RequestId,
+    store_contract_id: &[u8],
+    buyer_public_key: &[u8; 32],
+) -> HarvestDelegateResponse {
+    let key = buyer_conversation_key(store_contract_id, buyer_public_key);
+
+    let result = if !store.has_secret(&key) {
+        // Already gone. Reported as success: the buyer asked for it not to be
+        // there, and it is not there.
+        Ok(())
+    } else if store.remove_secret(&key) && !store.has_secret(&key) {
+        Ok(())
+    } else {
+        Err(
+            "could not forget this conversation -- the node refused to remove it, so it is \
+             still stored here"
+                .to_string(),
+        )
+    };
+
+    HarvestDelegateResponse::BuyerConversationForgotten { request_id, result }
 }
 
 #[cfg(test)]
@@ -436,5 +769,464 @@ mod tests {
             message.contains("no encryption key"),
             "the error must say what is missing: {message}"
         );
+    }
+}
+
+/// The buyer's conversation store: the thing that makes a reply readable
+/// after the tab that sent the question is gone.
+#[cfg(test)]
+mod buyer_conversation_tests {
+    use super::*;
+    use crate::secrets::MemSecrets;
+
+    const STORE: &[u8] = &[3u8; 32];
+    const OTHER_STORE: &[u8] = &[4u8; 32];
+
+    /// One buyer's side of a conversation, plus the seller who can read it.
+    struct Opened {
+        seller: StaticSecret,
+        buyer_public_key: [u8; 32],
+        record: BuyerConversationRecord,
+    }
+
+    fn open(seed: u8) -> Opened {
+        let secret = StaticSecret::from(seed_bytes(seed as u32));
+        let seller = StaticSecret::from([200u8.wrapping_sub(seed); 32]);
+        Opened {
+            buyer_public_key: *PublicKey::from(&secret).as_bytes(),
+            record: BuyerConversationRecord {
+                secret: ConversationSecret(secret.to_bytes()),
+                seller_public_key: *PublicKey::from(&seller).as_bytes(),
+                conversation_id: [seed; 32],
+                created_at: 1_700_000_000 + seed as i64,
+            },
+            seller,
+        }
+    }
+
+    /// A distinct 32-byte seed per index, so the cap test can build more than
+    /// [`MAX_BUYER_CONVERSATIONS`] different buyers.
+    fn seed_bytes(i: u32) -> [u8; 32] {
+        let mut seed = [1u8; 32];
+        seed[..4].copy_from_slice(&i.to_be_bytes());
+        seed
+    }
+
+    fn stored(response: &HarvestDelegateResponse) -> &Result<(), String> {
+        match response {
+            HarvestDelegateResponse::BuyerConversationStored { result, .. } => result,
+            other => panic!("expected BuyerConversationStored, got {other:?}"),
+        }
+    }
+
+    fn forgotten(response: &HarvestDelegateResponse) -> &Result<(), String> {
+        match response {
+            HarvestDelegateResponse::BuyerConversationForgotten { result, .. } => result,
+            other => panic!("expected BuyerConversationForgotten, got {other:?}"),
+        }
+    }
+
+    fn listed(response: &HarvestDelegateResponse) -> Vec<RecalledConversation> {
+        match response {
+            HarvestDelegateResponse::BuyerConversationList { conversations, .. } => {
+                conversations.clone()
+            }
+            other => panic!("expected BuyerConversationList, got {other:?}"),
+        }
+    }
+
+    /// The whole point: a conversation stored now is recallable later, with
+    /// the keys that read it.
+    ///
+    /// The keys are checked against what the SELLER derives, from the seller's
+    /// own secret, rather than against the delegate's own arithmetic repeated
+    /// -- a recalled conversation whose keys only agree with themselves would
+    /// read nothing out of the mailbox.
+    #[test]
+    fn a_stored_conversation_comes_back_with_usable_keys() {
+        let mut store = MemSecrets::default();
+        let opened = open(9);
+
+        stored(&store_buyer_conversation(
+            &mut store,
+            1,
+            STORE,
+            &opened.record,
+        ))
+        .as_ref()
+        .expect("must store");
+
+        let back = listed(&list_buyer_conversations(&store, STORE));
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].conversation_id, opened.record.conversation_id);
+        assert_eq!(back[0].created_at, opened.record.created_at);
+
+        // The routing tag has to be the one the mailbox carries, which is the
+        // public half of the stored secret.
+        assert_eq!(back[0].buyer_public_key, opened.buyer_public_key);
+
+        let shared = opened
+            .seller
+            .diffie_hellman(&PublicKey::from(opened.buyer_public_key))
+            .to_bytes();
+        assert_eq!(
+            back[0].buyer_to_seller,
+            conversation_key_from_dh(&shared, MessageDirection::BuyerToSeller)
+        );
+        assert_eq!(
+            back[0].seller_to_buyer,
+            conversation_key_from_dh(&shared, MessageDirection::SellerToBuyer)
+        );
+    }
+
+    /// **The secret itself never comes back.**
+    ///
+    /// Recall answers derived keys, the same shape as the seller's side. A
+    /// secret handed to the UI on every reload would be a secret in every
+    /// browser log and bug report, for no gain: the UI needs the keys.
+    #[test]
+    fn the_secret_never_leaves_the_delegate() {
+        let mut store = MemSecrets::default();
+        let opened = open(11);
+        store_buyer_conversation(&mut store, 1, STORE, &opened.record);
+
+        let response = list_buyer_conversations(&store, STORE);
+        let encoded = harvest_common::to_cbor(&response).expect("cbor");
+        let secret = opened.record.secret.0;
+        assert!(
+            !encoded.windows(secret.len()).any(|window| window == secret),
+            "the conversation secret appeared in the recall answer"
+        );
+    }
+
+    /// Conversations are scoped to their store, so browsing one store does
+    /// not hand back the keys for another.
+    #[test]
+    fn conversations_are_scoped_to_their_store() {
+        let mut store = MemSecrets::default();
+        let here = open(21);
+        let elsewhere = open(22);
+
+        store_buyer_conversation(&mut store, 1, STORE, &here.record);
+        store_buyer_conversation(&mut store, 2, OTHER_STORE, &elsewhere.record);
+
+        let recalled = listed(&list_buyer_conversations(&store, STORE));
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].buyer_public_key, here.buyer_public_key);
+    }
+
+    /// **A failed write is reported, not swallowed.**
+    ///
+    /// By the time this runs the UI has told the buyer their message was
+    /// sent. If the secret was not kept, the seller's reply becomes
+    /// unreadable after a reload -- and that is exactly the failure this
+    /// whole mechanism exists to prevent, so it must not happen quietly.
+    #[test]
+    fn a_failed_write_is_reported() {
+        let mut store = MemSecrets::refusing_writes();
+        let opened = open(13);
+
+        let response = store_buyer_conversation(&mut store, 7, STORE, &opened.record);
+        let message = stored(&response)
+            .as_ref()
+            .expect_err("a refused write must be reported");
+        assert!(
+            message.contains("readable"),
+            "the error must say what the buyer loses: {message}"
+        );
+    }
+
+    /// **A store id that is not a contract id is refused, and nothing is
+    /// written.**
+    ///
+    /// The id is base58-encoded into the secret's key, so a caller-sized id
+    /// would be a caller-sized key -- and then [`MAX_BUYER_CONVERSATIONS`]
+    /// would bound entries while bounding no bytes, which is the exact
+    /// count-cap-over-variable-values trap this codebase has been bitten by.
+    #[test]
+    fn a_store_id_that_is_not_a_contract_id_is_refused() {
+        let mut store = MemSecrets::default();
+        let opened = open(29);
+
+        let response = store_buyer_conversation(&mut store, 1, &[7u8; 4096], &opened.record);
+        let message = stored(&response)
+            .as_ref()
+            .expect_err("an oversized store id must be refused");
+        assert!(message.contains("32-byte"), "{message}");
+        assert!(store.is_empty(), "a refused store id still wrote a secret");
+    }
+
+    /// **Forgetting leaves NOTHING behind, not an emptied value.**
+    ///
+    /// The key names the store, so a "forget" that emptied the value would
+    /// stop the conversation being readable while leaving a durable record
+    /// that this node talked to that store. A control that lies about what it
+    /// does is worse than no control, because the buyer stops being careful
+    /// on the strength of it.
+    #[test]
+    fn a_forgotten_conversation_leaves_nothing_behind() {
+        let mut store = MemSecrets::default();
+        let opened = open(15);
+        store_buyer_conversation(&mut store, 1, STORE, &opened.record);
+        assert_eq!(listed(&list_buyer_conversations(&store, STORE)).len(), 1);
+
+        forgotten(&forget_buyer_conversation(
+            &mut store,
+            2,
+            STORE,
+            &opened.buyer_public_key,
+        ))
+        .as_ref()
+        .expect("must forget");
+
+        assert!(
+            listed(&list_buyer_conversations(&store, STORE)).is_empty(),
+            "a forgotten conversation was still recalled"
+        );
+        assert!(
+            store.list_secrets(BUYER_CONVERSATION_PREFIX).is_empty(),
+            "the key survived the forget, so the node still records which store this was: {:?}",
+            store
+                .list_secrets(BUYER_CONVERSATION_PREFIX)
+                .iter()
+                .map(|key| String::from_utf8_lossy(key).into_owned())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A removal the node refuses is reported as a failure, and the
+    /// conversation is still there afterwards.
+    ///
+    /// The buyer must not be told a record is gone while it is on their disk.
+    #[test]
+    fn a_refused_removal_is_not_reported_as_forgotten() {
+        let mut store = MemSecrets::default();
+        let opened = open(16);
+        store_buyer_conversation(&mut store, 1, STORE, &opened.record);
+        store.removals_fail = true;
+
+        let response = forget_buyer_conversation(&mut store, 2, STORE, &opened.buyer_public_key);
+        let message = forgotten(&response)
+            .as_ref()
+            .expect_err("a refused removal must be reported");
+        assert!(message.contains("still stored"), "{message}");
+        assert_eq!(
+            listed(&list_buyer_conversations(&store, STORE)).len(),
+            1,
+            "the conversation should still be there, since removal failed"
+        );
+    }
+
+    /// Forgetting one conversation forgets exactly that one.
+    #[test]
+    fn forgetting_one_conversation_leaves_the_others() {
+        let mut store = MemSecrets::default();
+        let kept = open(31);
+        let discarded = open(32);
+        let elsewhere = open(33);
+        store_buyer_conversation(&mut store, 1, STORE, &kept.record);
+        store_buyer_conversation(&mut store, 2, STORE, &discarded.record);
+        store_buyer_conversation(&mut store, 3, OTHER_STORE, &elsewhere.record);
+
+        forgotten(&forget_buyer_conversation(
+            &mut store,
+            4,
+            STORE,
+            &discarded.buyer_public_key,
+        ))
+        .as_ref()
+        .expect("must forget");
+
+        let here = listed(&list_buyer_conversations(&store, STORE));
+        assert_eq!(here.len(), 1);
+        assert_eq!(here[0].buyer_public_key, kept.buyer_public_key);
+        assert_eq!(
+            listed(&list_buyer_conversations(&store, OTHER_STORE)).len(),
+            1,
+            "another store's conversation was forgotten too"
+        );
+    }
+
+    /// Forgetting something that is not there is success: the buyer asked for
+    /// it not to be there, and it is not there.
+    #[test]
+    fn forgetting_a_conversation_that_is_not_there_is_success() {
+        let mut store = MemSecrets::default();
+        forgotten(&forget_buyer_conversation(&mut store, 1, STORE, &[9u8; 32]))
+            .as_ref()
+            .expect("must report success");
+    }
+
+    /// **The cap bounds the store, and evicts the OLDEST.**
+    ///
+    /// Eviction rather than refusal: refusing would mean the conversation the
+    /// buyer is having right now is the one that cannot be saved, which is
+    /// the wrong one to lose.
+    #[test]
+    fn the_cap_bounds_the_store_and_evicts_the_oldest() {
+        let mut store = MemSecrets::default();
+
+        let mut oldest = [0u8; 32];
+        let mut newest = [0u8; 32];
+        for i in 0..(MAX_BUYER_CONVERSATIONS + 8) {
+            let secret = StaticSecret::from(seed_bytes(i as u32));
+            let buyer_public_key = *PublicKey::from(&secret).as_bytes();
+            let record = BuyerConversationRecord {
+                secret: ConversationSecret(secret.to_bytes()),
+                seller_public_key: [7u8; 32],
+                conversation_id: [1u8; 32],
+                created_at: 1_700_000_000 + i as i64,
+            };
+            if i == 0 {
+                oldest = buyer_public_key;
+            }
+            newest = buyer_public_key;
+            stored(&store_buyer_conversation(
+                &mut store, i as u64, STORE, &record,
+            ))
+            .as_ref()
+            .expect("must store");
+        }
+
+        let kept = listed(&list_buyer_conversations(&store, STORE));
+        assert_eq!(
+            kept.len(),
+            MAX_BUYER_CONVERSATIONS,
+            "the cap did not bound the store"
+        );
+        assert!(
+            !kept.iter().any(|c| c.buyer_public_key == oldest),
+            "the oldest conversation should have been the one evicted"
+        );
+        // And the newest survives, so the assertion above is not passing
+        // because everything was discarded.
+        assert!(
+            kept.iter().any(|c| c.buyer_public_key == newest),
+            "the conversation the buyer is having right now was the one dropped"
+        );
+    }
+
+    /// Re-storing a conversation the delegate already holds evicts nothing.
+    ///
+    /// The UI re-sends the same conversation whenever the buyer writes into a
+    /// thread it already has, so a full store would otherwise shed one real
+    /// conversation per message sent.
+    #[test]
+    fn re_storing_a_held_conversation_evicts_nothing() {
+        let mut store = MemSecrets::default();
+        let mut first = [0u8; 32];
+        for i in 0..MAX_BUYER_CONVERSATIONS {
+            let secret = StaticSecret::from(seed_bytes(i as u32));
+            if i == 0 {
+                first = *PublicKey::from(&secret).as_bytes();
+            }
+            let record = BuyerConversationRecord {
+                secret: ConversationSecret(secret.to_bytes()),
+                seller_public_key: [7u8; 32],
+                conversation_id: [1u8; 32],
+                created_at: 1_700_000_000 + i as i64,
+            };
+            store_buyer_conversation(&mut store, i as u64, STORE, &record);
+        }
+        assert_eq!(
+            listed(&list_buyer_conversations(&store, STORE)).len(),
+            MAX_BUYER_CONVERSATIONS
+        );
+
+        // The oldest one again -- which is also the one eviction would take.
+        let secret = StaticSecret::from(seed_bytes(0));
+        let record = BuyerConversationRecord {
+            secret: ConversationSecret(secret.to_bytes()),
+            seller_public_key: [7u8; 32],
+            conversation_id: [2u8; 32],
+            created_at: 1_700_000_000,
+        };
+        stored(&store_buyer_conversation(&mut store, 999, STORE, &record))
+            .as_ref()
+            .expect("must store");
+
+        let kept = listed(&list_buyer_conversations(&store, STORE));
+        assert_eq!(
+            kept.len(),
+            MAX_BUYER_CONVERSATIONS,
+            "re-storing a held conversation changed how many are held"
+        );
+        assert!(
+            kept.iter().any(|c| c.buyer_public_key == first),
+            "re-storing a conversation evicted it"
+        );
+    }
+
+    /// An entry whose value does not decode is evicted before a real one.
+    ///
+    /// It recalls nothing, so discarding it costs nothing -- and it still
+    /// occupies a key, so something has to be able to reclaim it or the cap
+    /// slowly fills with rubbish that cannot be read or removed.
+    #[test]
+    fn an_undecodable_entry_is_evicted_before_a_real_one() {
+        let mut store = MemSecrets::default();
+        let junk = buyer_conversation_key(STORE, &[0xAAu8; 32]);
+        store.set_secret(&junk, b"not a conversation");
+
+        let mut oldest = [0u8; 32];
+        for i in 0..(MAX_BUYER_CONVERSATIONS - 1) {
+            let secret = StaticSecret::from(seed_bytes(i as u32));
+            if i == 0 {
+                oldest = *PublicKey::from(&secret).as_bytes();
+            }
+            let record = BuyerConversationRecord {
+                secret: ConversationSecret(secret.to_bytes()),
+                seller_public_key: [7u8; 32],
+                conversation_id: [1u8; 32],
+                created_at: 1_700_000_000 + i as i64,
+            };
+            store_buyer_conversation(&mut store, i as u64, STORE, &record);
+        }
+
+        // One more, which must displace the junk rather than a conversation.
+        let secret = StaticSecret::from(seed_bytes(9_000));
+        let record = BuyerConversationRecord {
+            secret: ConversationSecret(secret.to_bytes()),
+            seller_public_key: [7u8; 32],
+            conversation_id: [1u8; 32],
+            created_at: 1_800_000_000,
+        };
+        stored(&store_buyer_conversation(&mut store, 1, STORE, &record))
+            .as_ref()
+            .expect("must store");
+
+        assert!(
+            !store
+                .list_secrets(BUYER_CONVERSATION_PREFIX)
+                .contains(&junk),
+            "the undecodable entry survived"
+        );
+        assert!(
+            listed(&list_buyer_conversations(&store, STORE))
+                .iter()
+                .any(|c| c.buyer_public_key == oldest),
+            "a real conversation was evicted while rubbish was kept"
+        );
+    }
+
+    /// Everything this writes is under the exported prefix, so a delegate
+    /// re-key carries it. Without that, a re-key destroys every buyer's
+    /// ability to read a reply -- the same loss the whole mechanism exists to
+    /// prevent, arriving by a different route.
+    #[test]
+    fn buyer_conversations_are_under_the_exported_prefix() {
+        let mut store = MemSecrets::default();
+        let opened = open(17);
+        store_buyer_conversation(&mut store, 1, STORE, &opened.record);
+
+        let everything = store.list_secrets(b"");
+        assert!(!everything.is_empty(), "precondition");
+        for key in everything {
+            assert!(
+                key.starts_with(b"harvest:"),
+                "the delegate wrote {}, which no export would carry",
+                String::from_utf8_lossy(&key)
+            );
+        }
     }
 }

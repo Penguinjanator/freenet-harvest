@@ -218,16 +218,56 @@ paid-for flood holds the mailbox indefinitely with no further spend.
 
 ## The one that limits the mechanism rather than leaking from it
 
-**A buyer's conversation does not survive a page reload.** The keys live in
-the tab. There is no buyer delegate, and `localStorage` throws inside the
-gateway's sandboxed iframe (no `allow-same-origin`), so there is nowhere
-durable to put them. A buyer who reloads before the seller answers can never
-read that reply: the ciphertext sits in the mailbox forever and the key is
-gone.
+**A buyer's conversation used to die with the browser tab, and no longer
+does.** That paragraph stood here until 2026-09-05, when the harvest delegate
+started keeping the buyer's per-conversation secret; the full design is in
+`buyer-conversation-persistence.md`. The limitation it described was real and
+sharp: if a seller's reply is later made to carry something the buyer *needs*
+— an authorization, a receipt, a signed statement — then losing the key loses
+that thing, silently, with the ciphertext still visibly present.
 
-This matters beyond convenience. If a seller's reply is later made to carry
-something the buyer *needs* — an authorization, a receipt, a signed statement
-— then losing the key loses that thing, silently, with the ciphertext still
-visibly present. Any such use needs a durable buyer key first, and the options
-(a recovery string the buyer saves, a passphrase-derived keypair, a buyer-side
-delegate) are all design decisions this document does not make.
+Two limits replace it, and one of them is a new privacy cost rather than a
+leftover.
+
+### The new cost: a durable local record of who this node messaged
+
+The delegate now holds, per conversation, a secret keyed by store id and
+routing tag. So "this node has a conversation with store X" **persists**,
+where before it did not. It is on the buyer's own node, in the delegate's
+secret store (encrypted at rest by the node), and reachable only by the
+Harvest webapp — but a buyer's pseudonymity gains a local artefact, and a node
+inspected or seized reveals which stores its owner contacted.
+
+Nothing about this leaks to the network. It is a trade between two things the
+buyer cares about, and it was made in the direction of recourse: losing the
+key loses the ability to complain about a seller they paid, and that is worse.
+
+**The buyer can undo it, and the control does what it says.** "Forget this
+conversation" DELETES the record rather than emptying it. That distinction is
+the whole point: emptying the value would stop the conversation being readable
+while leaving a key that still names the store, so the control would be a lie.
+The delegate re-reads the key afterwards and reports a failure rather than a
+success it cannot stand behind, and the UI keeps the thread on screen until
+the node says the record is gone. Forgetting cannot be undone: the messages
+stay in the seller's mailbox and become unreadable by everyone, including the
+buyer.
+
+What is NOT verified from this repository is that the node performs the
+deletion. `DelegateCtx::remove_secret` is a stub off wasm32, so the tests
+drive an in-memory store; the node's own implementation is read from
+freenet-core's source (`wasm_runtime/secrets_store/store.rs::remove_secret`,
+which removes the blob, its snapshots, the index entry and the enumeration
+registry entry). See `docs/untested-invariants.md`.
+
+### The remaining limit: a different device is a different node
+
+The secret is in ONE node's delegate. A buyer who writes from a laptop and
+later opens the same store on a phone has a different node and ciphertext
+nobody can read — exactly the loss described above, moved from "closed the
+tab" to "changed device". There is no fix within the current design: closing
+it needs something the buyer carries (a recovery string they save, or a
+passphrase-derived keypair), which changes what a buyer is asked to do and is
+a product decision rather than an implementation one.
+
+It is said on screen before the buyer sends rather than left to be discovered
+when they need the answer.

@@ -24,6 +24,42 @@
 use freenet_migrate::SecretStore;
 use freenet_stdlib::prelude::DelegateCtx;
 
+/// Removal, which [`SecretStore`] does not have and the host does.
+///
+/// # Why this trait exists at all
+///
+/// `freenet-migrate`'s `SecretStore` is `list`/`get`/`has`/`set` and nothing
+/// else, so code written against it can only ever EMPTY a value. That is not
+/// good enough for one caller: `messaging::forget_buyer_conversation` is the
+/// buyer's control over the record their node keeps of who they messaged, and
+/// a key left behind with an empty value still says "this node held a
+/// conversation with that store" for as long as the delegate lives.
+///
+/// The platform can genuinely delete. `DelegateCtx::remove_secret`
+/// (freenet-stdlib 0.8.5, `delegate_host.rs:424`) reaches
+/// `__frnt__delegate__remove_secret`, and the node's implementation
+/// (freenet-core `wasm_runtime/secrets_store/store.rs::remove_secret`)
+/// removes the encrypted blob, removes its snapshot history, drops the key
+/// from the persistent index, and de-registers the raw key from the
+/// enumeration registry that backs `list_secrets`. So the deletion is real at
+/// every layer this application can see.
+///
+/// It is a separate trait rather than an addition to `SecretStore` because
+/// `SecretStore` belongs to another crate, and separate because most of this
+/// delegate genuinely does not need removal: only the code that must be able
+/// to promise a buyer something is gone takes the extra bound.
+///
+/// **Not exercisable off wasm32.** Like every other `DelegateCtx` secret
+/// method, `remove_secret` is a `false`-returning stub on native
+/// (`delegate_host.rs:424`, the `#[cfg(not(target_family = "wasm"))]` arm),
+/// so [`MemSecrets`] is what the tests drive. What the tests can therefore
+/// state is that this crate asks for removal and reports honestly on the
+/// answer -- not that the node performed it.
+pub(crate) trait RemovableSecrets {
+    /// Remove `key` outright. Answers whether the key is gone afterwards.
+    fn remove_secret(&mut self, key: &[u8]) -> bool;
+}
+
 /// The host's secret store, with writes enabled.
 ///
 /// Distinct from `migration::CtxStore`, whose `set_secret` is deliberately
@@ -48,6 +84,12 @@ impl SecretStore for CtxSecrets<'_> {
     }
 }
 
+impl RemovableSecrets for CtxSecrets<'_> {
+    fn remove_secret(&mut self, key: &[u8]) -> bool {
+        self.0.remove_secret(key)
+    }
+}
+
 /// An in-memory stand-in for the host's store, for tests.
 #[cfg(test)]
 #[derive(Default)]
@@ -55,6 +97,10 @@ pub(crate) struct MemSecrets {
     map: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
     /// Set to make every write fail, standing in for a host that refuses.
     pub(crate) writes_fail: bool,
+    /// Set to make every removal fail, standing in for a host that refuses --
+    /// the case where "forget this conversation" must report a failure rather
+    /// than a success the buyer would rely on.
+    pub(crate) removals_fail: bool,
 }
 
 #[cfg(test)]
@@ -84,8 +130,30 @@ impl SecretStore for MemSecrets {
     }
 }
 
+/// Removal, standing in for the host's. `removals_fail` is the counterpart of
+/// [`MemSecrets::writes_fail`]: a host that refuses is the case where a
+/// "forget" must not report success.
+#[cfg(test)]
+impl RemovableSecrets for MemSecrets {
+    fn remove_secret(&mut self, key: &[u8]) -> bool {
+        if self.removals_fail {
+            return false;
+        }
+        self.map.remove(key);
+        !self.map.contains_key(key)
+    }
+}
+
 #[cfg(test)]
 impl MemSecrets {
+    /// A store whose host refuses every write.
+    pub(crate) fn refusing_writes() -> Self {
+        Self {
+            writes_fail: true,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.map.is_empty()
     }

@@ -79,6 +79,72 @@ pub enum HarvestDelegateRequest {
         peer_public_keys: Vec<Vec<u8>>,
     },
 
+    /// Keep a buyer's conversation secret so it outlives the browser tab.
+    ///
+    /// # Why the delegate, and why this shape
+    ///
+    /// The buyer has no identity, so nothing here is keyed by a ghostkey
+    /// fingerprint. And there is no browser-side storage to use instead: the
+    /// Freenet webapp iframe carries no `allow-same-origin`, so the page runs
+    /// on an opaque origin where `localStorage`, `sessionStorage`, IndexedDB
+    /// and cookies all throw. The delegate is the only durable store this
+    /// application has. See `docs/buyer-conversation-persistence.md`.
+    ///
+    /// The record binds the seller public key it was opened against, so
+    /// [`Self::ListBuyerConversations`] derives with THAT key rather than one
+    /// a caller supplies. The secret therefore never leaves the delegate, and
+    /// the recall path cannot be pointed at an arbitrary peer.
+    ///
+    /// **There is no `buyer_public_key` field.** The conversation's routing
+    /// tag is the public half of [`Self::StoreBuyerConversation::secret`], so
+    /// the delegate derives it rather than being told it. A field would be a
+    /// second source for one value, and the two could disagree -- storing a
+    /// conversation under a tag no message in the mailbox carries, which
+    /// nothing downstream could detect.
+    StoreBuyerConversation {
+        request_id: RequestId,
+        /// The store this conversation is with, as a 32-byte contract
+        /// instance id. Recoverable after a reload because it is in the URL
+        /// the buyer followed.
+        ///
+        /// A wrong length is refused rather than stored: this value is
+        /// base58-encoded into the secret's KEY, so a caller-sized id would
+        /// be a caller-sized key, and the delegate's cap on how many
+        /// conversations it keeps would stop bounding how many BYTES they
+        /// come to.
+        store_contract_id: Vec<u8>,
+        /// The buyer's ephemeral X25519 secret for this conversation.
+        secret: ConversationSecret,
+        /// The seller key this conversation was opened against.
+        seller_public_key: [u8; 32],
+        conversation_id: [u8; 32],
+        /// Unix seconds, from the buyer's own browser, used for one thing:
+        /// which conversation is evicted when the cap is reached.
+        ///
+        /// The delegate does not read the host clock for this.
+        /// `freenet_stdlib::time::now()` is a `MaybeUninit` transmute off
+        /// wasm32 (`time.rs:7`), so a delegate that called it could not be
+        /// exercised by `cargo test` without undefined behaviour -- and this
+        /// value orders nothing but the caller's own records, so a skewed
+        /// clock costs the caller an eviction of their own choosing.
+        created_at: i64,
+    },
+
+    /// Recall every conversation stored for a store, as derived keys.
+    ListBuyerConversations { store_contract_id: Vec<u8> },
+
+    /// Discard one, permanently.
+    ///
+    /// The buyer's own control over the record this leaves on their node --
+    /// see `docs/messaging-privacy.md`. Discarding is not reversible and
+    /// makes the conversation unreadable, which is the point.
+    ForgetBuyerConversation {
+        request_id: RequestId,
+        store_contract_id: Vec<u8>,
+        /// Which conversation, by its routing tag.
+        buyer_public_key: [u8; 32],
+    },
+
     // === Listing Management ===
     /// Create and sign a new listing using the seller's ghostkey.
     CreateListing {
@@ -168,6 +234,34 @@ pub enum HarvestDelegateResponse {
         /// key on this wire is one, and a length mismatch is then a message
         /// the UI can report rather than a decode failure with no context.
         x25519_public_key: Vec<u8>,
+    },
+
+    /// Whether a buyer conversation was stored.
+    ///
+    /// A failure matters and is reported rather than swallowed: the UI has
+    /// just told a buyer their message was sent, and if the secret was not
+    /// kept then the seller's reply will be unreadable after a reload.
+    BuyerConversationStored {
+        request_id: RequestId,
+        result: Result<(), String>,
+    },
+
+    /// The conversations stored for one store, as keys rather than secrets.
+    BuyerConversationList {
+        store_contract_id: Vec<u8>,
+        conversations: Vec<RecalledConversation>,
+    },
+
+    /// Whether a conversation was actually removed.
+    ///
+    /// `Ok(())` means the record is gone from the node's secret store, not
+    /// merely emptied -- the delegate re-reads the key afterwards and reports
+    /// a failure rather than an `Ok` it cannot stand behind. A control that
+    /// says "forgotten" and leaves the record is worse than no control,
+    /// because the buyer stops being careful on the strength of it.
+    BuyerConversationForgotten {
+        request_id: RequestId,
+        result: Result<(), String>,
     },
 
     /// Conversation keys for the peer public keys that were asked about.
@@ -274,6 +368,57 @@ pub struct ConversationKey {
     pub seller_to_buyer: [u8; 32],
 }
 
+/// One recalled buyer conversation: enough to read the thread, and not the
+/// secret it was derived from.
+///
+/// The secret stays in the delegate. What the buyer's browser needs in order
+/// to read and continue a conversation is the two direction keys, and a
+/// secret handed back on every reload would be a secret in every browser log
+/// and bug report for no gain. Pinned by
+/// `the_secret_never_leaves_the_delegate`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct RecalledConversation {
+    /// The conversation's routing tag, which is what matches it to messages
+    /// in the mailbox.
+    pub buyer_public_key: [u8; 32],
+    pub conversation_id: [u8; 32],
+    /// Encrypts what the buyer writes.
+    pub buyer_to_seller: [u8; 32],
+    /// Encrypts what the seller writes back.
+    pub seller_to_buyer: [u8; 32],
+    /// When the buyer opened it, in unix seconds, as they reported it.
+    ///
+    /// Carried back so a browser that recalls several conversations with one
+    /// store can continue the most recent rather than picking arbitrarily --
+    /// a thread the buyer left open, resumed, rather than a new one beside
+    /// it.
+    pub created_at: i64,
+}
+
+/// A buyer's ephemeral X25519 secret, on the wire between the browser that
+/// generated it and the delegate that keeps it.
+///
+/// # Why a newtype rather than `[u8; 32]`
+///
+/// `HarvestDelegateRequest` derives `Debug`, and the responses are logged
+/// verbatim (`gateway::response_handler::apply_delegate_response`). A bare
+/// array would print, so the one secret in this protocol that a buyer cannot
+/// replace would land in any console log pasted into a bug report. This type
+/// prints as `ConversationSecret(redacted)` instead; pinned by
+/// `a_conversation_secret_does_not_print_itself`.
+///
+/// `#[serde(transparent)]` so the wire encoding is exactly the 32 bytes --
+/// the newtype is a compile-time and log-time property, not a format change.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct ConversationSecret(pub [u8; 32]);
+
+impl core::fmt::Debug for ConversationSecret {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ConversationSecret(redacted)")
+    }
+}
+
 /// A store's contract IDs, registered with the delegate for notifications.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct StoreRegistration {
@@ -297,4 +442,55 @@ pub struct TransactionRecord {
     /// The blind signature we received (None until counterparty signs).
     pub blind_signature: Option<Vec<u8>>,
     pub created_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A conversation secret must not print itself.**
+    ///
+    /// It travels inside a `Debug`-deriving request enum, and the UI logs
+    /// delegate traffic verbatim. This is the one secret in the protocol a
+    /// buyer cannot replace -- lose it and the seller's reply, which after
+    /// Phase 2 carries their only capability to complain, is unreadable
+    /// forever.
+    #[test]
+    fn a_conversation_secret_does_not_print_itself() {
+        let secret = ConversationSecret([7u8; 32]);
+        let printed = format!("{secret:?}");
+        assert_eq!(printed, "ConversationSecret(redacted)");
+
+        // And inside the request it travels in, which is the shape that
+        // actually reaches a log.
+        let request = HarvestDelegateRequest::StoreBuyerConversation {
+            request_id: 1,
+            store_contract_id: vec![3u8; 32],
+            secret,
+            seller_public_key: [9u8; 32],
+            conversation_id: [5u8; 32],
+            created_at: 1_700_000_000,
+        };
+        let printed = format!("{request:?}");
+        assert!(
+            !printed.contains(", 7, 7,"),
+            "the secret's bytes appeared in a printed request: {printed}"
+        );
+        assert!(printed.contains("redacted"), "{printed}");
+    }
+
+    /// The newtype is a compile-time and log-time property, not a wire
+    /// change: it encodes as the bare 32 bytes.
+    ///
+    /// Worth pinning because the alternative -- a one-field map -- would be a
+    /// silent format break for any record already written by a build that
+    /// used the array.
+    #[test]
+    fn a_conversation_secret_encodes_as_its_bytes() {
+        let bytes = [11u8; 32];
+        assert_eq!(
+            crate::to_cbor(&ConversationSecret(bytes)).expect("cbor"),
+            crate::to_cbor(&bytes).expect("cbor"),
+        );
+    }
 }

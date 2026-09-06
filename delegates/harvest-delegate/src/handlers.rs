@@ -1,3 +1,4 @@
+use crate::secrets::RemovableSecrets;
 use freenet_migrate::SecretStore;
 use freenet_stdlib::prelude::MessageOrigin;
 use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey, EncodeRsaPublicKey};
@@ -49,6 +50,7 @@ pub(crate) fn all_secret_key_shapes(fp: &str, tx_id: &str) -> Vec<Vec<u8>> {
         crate::bitcoin::BITCOIN_BRIDGE_KEY.to_vec(),
         crate::bitcoin::BITCOIN_PAYMENT_XPUB_KEY.to_vec(),
         crate::markers::marker_secret_key("v1.store.aa.bb"),
+        crate::messaging::buyer_conversation_key(&[3u8; 32], &[4u8; 32]),
     ]
 }
 
@@ -90,7 +92,7 @@ fn save_tx_index<S: SecretStore>(store: &mut S, index: &[String]) {
 /// No caller outside the Harvest web app is broken by this, because none
 /// exists: this delegate is Harvest's own, and nothing else is expected to
 /// speak `HarvestDelegateRequest`.
-pub fn handle<S: SecretStore>(
+pub fn handle<S: SecretStore + RemovableSecrets>(
     store: &mut S,
     origin: Option<&MessageOrigin>,
     request: HarvestDelegateRequest,
@@ -177,6 +179,49 @@ pub fn handle<S: SecretStore>(
             request_id,
             &ghostkey_fingerprint,
             &peer_public_keys,
+        ),
+
+        // The buyer's half of messaging: the secrets that make a seller's
+        // reply readable after the tab that asked the question is gone.
+        //
+        // Gated like everything else, and it matters here in a direction the
+        // seller's half does not have. `ListBuyerConversations` answers the
+        // conversation keys for every conversation this node has had with a
+        // store, so an ungated caller could read a buyer's private
+        // correspondence out of a public mailbox; `ForgetBuyerConversation`
+        // destroys a capability that exists nowhere else.
+        HarvestDelegateRequest::StoreBuyerConversation {
+            request_id,
+            store_contract_id,
+            secret,
+            seller_public_key,
+            conversation_id,
+            created_at,
+        } => crate::messaging::store_buyer_conversation(
+            store,
+            request_id,
+            &store_contract_id,
+            &crate::messaging::BuyerConversationRecord {
+                secret,
+                seller_public_key,
+                conversation_id,
+                created_at,
+            },
+        ),
+
+        HarvestDelegateRequest::ListBuyerConversations { store_contract_id } => {
+            crate::messaging::list_buyer_conversations(store, &store_contract_id)
+        }
+
+        HarvestDelegateRequest::ForgetBuyerConversation {
+            request_id,
+            store_contract_id,
+            buyer_public_key,
+        } => crate::messaging::forget_buyer_conversation(
+            store,
+            request_id,
+            &store_contract_id,
+            &buyer_public_key,
         ),
 
         HarvestDelegateRequest::RegisterStore {
@@ -709,5 +754,167 @@ mod origin_gating_tests {
             },
         );
         assert!(!store.is_empty(), "the seller could not seal their marker");
+    }
+
+    /// The buyer's conversations, reached the way the UI reaches them.
+    ///
+    /// `handle` is what the wire arrives at, so this is the boundary that
+    /// matters: a store that only ever exercised `messaging`'s functions
+    /// directly would say nothing about whether the request variants are
+    /// routed at all.
+    fn store_conversation(secret: [u8; 32], seller: [u8; 32]) -> HarvestDelegateRequest {
+        HarvestDelegateRequest::StoreBuyerConversation {
+            request_id: 1,
+            store_contract_id: SELLERS_STORE_ID.to_vec(),
+            secret: harvest_common::ConversationSecret(secret),
+            seller_public_key: seller,
+            conversation_id: [5u8; 32],
+            created_at: 1_700_000_000,
+        }
+    }
+
+    /// A 32-byte store id, which `StoreBuyerConversation` requires -- the
+    /// 4-byte ids the registration tests use are deliberately not contract
+    /// ids.
+    const SELLERS_STORE_ID: [u8; 32] = [0xbb; 32];
+
+    fn buyer_conversations(store: &MemSecrets) -> Vec<Vec<u8>> {
+        store.list_secrets(crate::messaging::BUYER_CONVERSATION_PREFIX)
+    }
+
+    /// **A buyer's conversation survives the round trip through `handle`.**
+    ///
+    /// Stored through the handler, recalled through the handler, and the keys
+    /// that come back are the ones the SELLER derives -- which is what makes
+    /// them able to read the thread rather than merely well-formed.
+    #[test]
+    fn a_buyer_conversation_is_stored_and_recalled_through_the_handler() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let mut store = MemSecrets::default();
+        let buyer = StaticSecret::from([23u8; 32]);
+        let seller = StaticSecret::from([77u8; 32]);
+        let seller_public = *PublicKey::from(&seller).as_bytes();
+
+        match handle(
+            &mut store,
+            Some(&harvest()),
+            store_conversation(buyer.to_bytes(), seller_public),
+        ) {
+            HarvestDelegateResponse::BuyerConversationStored { result, .. } => {
+                result.expect("must store")
+            }
+            other => panic!("expected BuyerConversationStored, got {other:?}"),
+        }
+
+        let recalled = match handle(
+            &mut store,
+            Some(&harvest()),
+            HarvestDelegateRequest::ListBuyerConversations {
+                store_contract_id: SELLERS_STORE_ID.to_vec(),
+            },
+        ) {
+            HarvestDelegateResponse::BuyerConversationList { conversations, .. } => conversations,
+            other => panic!("expected BuyerConversationList, got {other:?}"),
+        };
+        assert_eq!(recalled.len(), 1);
+
+        let shared = seller
+            .diffie_hellman(&PublicKey::from(recalled[0].buyer_public_key))
+            .to_bytes();
+        assert_eq!(
+            recalled[0].buyer_to_seller,
+            harvest_common::mailbox::conversation_key_from_dh(
+                &shared,
+                harvest_common::mailbox::MessageDirection::BuyerToSeller
+            ),
+            "the recalled key is not the one the seller derives, so it reads nothing"
+        );
+
+        // And forgetting it, through the handler, removes it.
+        match handle(
+            &mut store,
+            Some(&harvest()),
+            HarvestDelegateRequest::ForgetBuyerConversation {
+                request_id: 2,
+                store_contract_id: SELLERS_STORE_ID.to_vec(),
+                buyer_public_key: recalled[0].buyer_public_key,
+            },
+        ) {
+            HarvestDelegateResponse::BuyerConversationForgotten { result, .. } => {
+                result.expect("must forget")
+            }
+            other => panic!("expected BuyerConversationForgotten, got {other:?}"),
+        }
+        assert!(
+            buyer_conversations(&store).is_empty(),
+            "the conversation survived a forget issued through the handler"
+        );
+    }
+
+    /// **A foreign web app can neither read nor destroy a buyer's
+    /// conversations.**
+    ///
+    /// Sharper than the seller-side reads this module already covers.
+    /// `ListBuyerConversations` hands back the keys that decrypt this buyer's
+    /// half of a public mailbox, and `ForgetBuyerConversation` destroys a
+    /// capability that exists in exactly one place -- after Phase 2, the
+    /// buyer's only means of complaining about the seller they paid.
+    ///
+    /// Mutated red by removing the `authorize` call from `handle`.
+    #[test]
+    fn another_web_app_cannot_read_or_destroy_a_buyers_conversations() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let mut store = MemSecrets::default();
+        let buyer = StaticSecret::from([31u8; 32]);
+        let tag = *PublicKey::from(&buyer).as_bytes();
+        handle(
+            &mut store,
+            Some(&harvest()),
+            store_conversation(buyer.to_bytes(), [3u8; 32]),
+        );
+        assert_eq!(buyer_conversations(&store).len(), 1, "precondition");
+
+        // A conversation of the attacker's own, which must not be kept.
+        let response = handle(
+            &mut store,
+            Some(&a_different_web_app()),
+            store_conversation([41u8; 32], [3u8; 32]),
+        );
+        assert!(refusal_message(&response).contains("Harvest web app"));
+        assert_eq!(
+            buyer_conversations(&store).len(),
+            1,
+            "a foreign web app wrote a buyer conversation"
+        );
+
+        let response = handle(
+            &mut store,
+            Some(&a_different_web_app()),
+            HarvestDelegateRequest::ListBuyerConversations {
+                store_contract_id: SELLERS_STORE_ID.to_vec(),
+            },
+        );
+        assert!(
+            refusal_message(&response).contains("Harvest web app"),
+            "a foreign web app read a buyer's conversation keys"
+        );
+
+        let response = handle(
+            &mut store,
+            Some(&a_different_web_app()),
+            HarvestDelegateRequest::ForgetBuyerConversation {
+                request_id: 9,
+                store_contract_id: SELLERS_STORE_ID.to_vec(),
+                buyer_public_key: tag,
+            },
+        );
+        assert!(refusal_message(&response).contains("Harvest web app"));
+        assert_eq!(
+            buyer_conversations(&store).len(),
+            1,
+            "a foreign web app destroyed a buyer's only copy of their conversation key"
+        );
     }
 }
