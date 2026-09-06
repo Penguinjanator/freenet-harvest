@@ -51,7 +51,8 @@
 use crate::secrets::RemovableSecrets;
 use freenet_migrate::SecretStore;
 use harvest_common::delegate::{
-    ConversationKey, ConversationSecret, HarvestDelegateResponse, RecalledConversation, RequestId,
+    ConversationKey, ConversationSecret, HarvestDelegateResponse, ImportedConversations,
+    RecalledConversation, RequestId,
 };
 use harvest_common::mailbox::{conversation_key_from_dh, MessageDirection};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -292,6 +293,25 @@ pub(crate) struct BuyerConversationRecord {
     /// eviction order. See `HarvestDelegateRequest::StoreBuyerConversation`
     /// for why the delegate does not read the host clock here.
     pub(crate) created_at: i64,
+    /// Whether the buyer has said they hold a copy of this outside this node.
+    ///
+    /// # Why this is a field and not a key of its own
+    ///
+    /// The ghostkey vault keeps its equivalent as a separate secret
+    /// (`gk:backedup:{fingerprint}`), and that shape is wrong here for a
+    /// reason specific to what these records are. A marker keyed by store and
+    /// tag would OUTLIVE the conversation it describes: forgetting a
+    /// conversation would leave behind a key still naming the store, which is
+    /// precisely the durable local record `forget_buyer_conversation` exists
+    /// to remove. Inside the value it is deleted with the thing it describes,
+    /// counts against the same cap, and cannot drift out of step with it.
+    /// Pinned by `forgetting_a_conversation_leaves_no_backup_marker_behind`.
+    ///
+    /// `serde(default)` so a record written before this field existed decodes
+    /// as not-backed-up, which is the safe direction: the warning appears
+    /// until the buyer says otherwise.
+    #[serde(default)]
+    pub(crate) backed_up: bool,
 }
 
 /// Every conversation the delegate holds, with whichever store, as
@@ -417,6 +437,7 @@ fn make_room<S: SecretStore + RemovableSecrets>(store: &mut S) -> Result<(), Str
 /// oracle against every secret the node holds.
 pub(crate) fn list_buyer_conversations<S: SecretStore>(
     store: &S,
+    request_id: RequestId,
     store_contract_id: &[u8],
 ) -> HarvestDelegateResponse {
     let prefix = buyer_conversation_store_prefix(store_contract_id);
@@ -429,6 +450,7 @@ pub(crate) fn list_buyer_conversations<S: SecretStore>(
         .collect();
 
     HarvestDelegateResponse::BuyerConversationList {
+        request_id,
         store_contract_id: store_contract_id.to_vec(),
         conversations,
     }
@@ -452,6 +474,7 @@ fn recall(record: &BuyerConversationRecord) -> Option<RecalledConversation> {
         buyer_to_seller: conversation_key_from_dh(&shared, MessageDirection::BuyerToSeller),
         seller_to_buyer: conversation_key_from_dh(&shared, MessageDirection::SellerToBuyer),
         created_at: record.created_at,
+        backed_up: record.backed_up,
     })
 }
 
@@ -494,6 +517,280 @@ pub(crate) fn forget_buyer_conversation<S: SecretStore + RemovableSecrets>(
     };
 
     HarvestDelegateResponse::BuyerConversationForgotten { request_id, result }
+}
+
+// ---------------------------------------------------------------------------
+// Backup: the same conversation secrets, in a form the buyer can carry.
+// ---------------------------------------------------------------------------
+
+/// What a backup string starts with.
+///
+/// A prefix rather than a bare base58 blob so a paste that is not a Harvest
+/// backup -- a ghostkey PEM, a store link, half a string -- is refused with a
+/// sentence the buyer can act on instead of a decoding error. The version is
+/// in the prefix, so a later format changes the prefix and this one still
+/// recognises its own.
+pub(crate) const BUYER_CONVERSATION_BACKUP_PREFIX: &str = "harvest-conv-backup-v1:";
+
+/// One store's conversations, as they travel between two nodes.
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
+pub(crate) struct BuyerConversationBackupV1 {
+    /// Which store these are with. In the backup rather than asked for on
+    /// import, because a buyer restoring onto a new node has the string and
+    /// nothing to relate it to.
+    pub(crate) store_contract_id: [u8; 32],
+    pub(crate) conversations: Vec<BuyerConversationRecord>,
+}
+
+/// A backup as a string the buyer can paste.
+///
+/// Base58Check inside the prefix, which is this repository's convention for
+/// anything a person handles, and which carries a checksum: a string that
+/// lost its tail in a copy is refused here rather than restoring a
+/// conversation with a corrupt secret at the moment the buyer believes they
+/// have their recourse back.
+pub(crate) fn encode_backup(backup: &BuyerConversationBackupV1) -> Result<String, String> {
+    let bytes = harvest_common::to_cbor(backup)
+        .map_err(|e| format!("could not encode this backup: {e}"))?;
+    Ok(format!(
+        "{BUYER_CONVERSATION_BACKUP_PREFIX}{}",
+        bs58::encode(&bytes).with_check().into_string()
+    ))
+}
+
+/// The reverse, refusing anything that is not one of ours.
+///
+/// Every refusal names what was expected, because the thing a buyer pastes
+/// here is whatever was on their clipboard -- a store link, a ghostkey PEM,
+/// half a backup -- and "invalid CBOR" tells them nothing they can act on.
+pub(crate) fn decode_backup(backup: &str) -> Result<BuyerConversationBackupV1, String> {
+    let body = backup
+        .trim()
+        .strip_prefix(BUYER_CONVERSATION_BACKUP_PREFIX)
+        .ok_or_else(|| {
+            format!(
+                "that does not look like a Harvest conversation backup -- one starts with \
+                 `{BUYER_CONVERSATION_BACKUP_PREFIX}`"
+            )
+        })?;
+    let bytes = bs58::decode(body)
+        .with_check(None)
+        .into_vec()
+        .map_err(|e| {
+            format!(
+                "that Harvest conversation backup is damaged -- it did not survive its own \
+                 checksum, so some of it was lost in copying ({e})"
+            )
+        })?;
+    harvest_common::from_cbor::<BuyerConversationBackupV1>(&bytes)
+        .map_err(|e| format!("that Harvest conversation backup could not be read: {e}"))
+}
+
+/// Hand back one store's conversations as a string the buyer can save.
+pub(crate) fn export_buyer_conversations<S: SecretStore>(
+    store: &S,
+    request_id: RequestId,
+    store_contract_id: &[u8],
+) -> HarvestDelegateResponse {
+    let exported = |result| HarvestDelegateResponse::BuyerConversationsExported {
+        request_id,
+        store_contract_id: store_contract_id.to_vec(),
+        result,
+    };
+
+    let Ok(id) = <[u8; 32]>::try_from(store_contract_id) else {
+        return exported(Err(format!(
+            "a store is named by a {STORE_CONTRACT_ID_BYTES}-byte contract id, and this one is \
+             {} bytes",
+            store_contract_id.len()
+        )));
+    };
+
+    let prefix = buyer_conversation_store_prefix(store_contract_id);
+    let conversations: Vec<BuyerConversationRecord> = store
+        .list_secrets(&prefix)
+        .into_iter()
+        .filter_map(|key| store.get_secret(&key))
+        .filter_map(|bytes| harvest_common::from_cbor::<BuyerConversationRecord>(&bytes).ok())
+        .collect();
+
+    // Refused rather than answered as an empty string. An empty backup looks
+    // exactly like a real one once it is saved, and the buyer finds out it
+    // was empty at the moment they need it.
+    if conversations.is_empty() {
+        return exported(Err(
+            "there is no conversation with this store on this node, so there is nothing to \
+             back up"
+                .to_string(),
+        ));
+    }
+
+    exported(encode_backup(&BuyerConversationBackupV1 {
+        store_contract_id: id,
+        conversations,
+    }))
+}
+
+/// Take a saved backup and make its conversations readable here.
+///
+/// # Three outcomes, reported per conversation
+///
+/// * **imported** -- not held here, now is.
+/// * **already held** -- the held record is KEPT, not overwritten. Pasting a
+///   backup onto the node that made it is the ordinary "restore everything"
+///   gesture and must not be an error; and an imported record sharing a
+///   routing tag can only DISAGREE with the held one if it was hand-built,
+///   since the tag is the public half of the secret. A different
+///   `conversation_id` under the same tag would make a readable thread stop
+///   reading, silently, which is the worse of the two mistakes.
+/// * **refused** -- named, with the reason. A conversation that did not fit
+///   is one the buyer still cannot read, and folding it into a count would
+///   leave them to work out which.
+///
+/// **At the cap this refuses rather than evicting**, which inverts what
+/// storing does. The inversion is the point: the conversation being imported
+/// is provably backed up, because the buyer is holding the string it came
+/// from, while the conversation eviction would take may exist only here.
+pub(crate) fn import_buyer_conversations<S: SecretStore + RemovableSecrets>(
+    store: &mut S,
+    request_id: RequestId,
+    backup: &str,
+) -> HarvestDelegateResponse {
+    let imported =
+        |result| HarvestDelegateResponse::BuyerConversationsImported { request_id, result };
+
+    let backup = match decode_backup(backup) {
+        Ok(backup) => backup,
+        Err(why) => return imported(Err(why)),
+    };
+
+    let mut outcome = ImportedConversations {
+        store_contract_id: backup.store_contract_id.to_vec(),
+        ..ImportedConversations::default()
+    };
+    let mut held = held_conversations(store).len();
+
+    for record in backup.conversations {
+        let secret = StaticSecret::from(record.secret.0);
+        let tag = *PublicKey::from(&secret).as_bytes();
+        let key = buyer_conversation_key(&backup.store_contract_id, &tag);
+
+        // A record whose keys cannot be derived would occupy a slot and
+        // recall nothing, so it is refused where the buyer can see it rather
+        // than accepted and silently invisible.
+        if !secret
+            .diffie_hellman(&PublicKey::from(record.seller_public_key))
+            .was_contributory()
+        {
+            outcome.refused.push((
+                tag,
+                "this conversation's keys cannot be derived -- the seller key it names is not \
+                 usable, so it would read nothing"
+                    .to_string(),
+            ));
+            continue;
+        }
+
+        // Held AND readable is the case that is kept. Held and undecodable is
+        // not: it reads nothing, so keeping it would refuse a restore in
+        // favour of rubbish.
+        let occupied = store.has_secret(&key);
+        if occupied
+            && store
+                .get_secret(&key)
+                .and_then(|bytes| harvest_common::from_cbor::<BuyerConversationRecord>(&bytes).ok())
+                .is_some()
+        {
+            outcome.already_held.push(tag);
+            continue;
+        }
+
+        if !occupied && held >= MAX_BUYER_CONVERSATIONS {
+            outcome.refused.push((
+                tag,
+                format!(
+                    "this node is full: it already keeps {MAX_BUYER_CONVERSATIONS} conversations, \
+                     and nothing was discarded to make room because what it holds may exist \
+                     nowhere else. Forget a conversation you no longer need and paste this again."
+                ),
+            ));
+            continue;
+        }
+
+        // Backed up by construction: the buyer is holding the string it came
+        // from. Warning about it would teach them to ignore the warning.
+        let restored = BuyerConversationRecord {
+            backed_up: true,
+            ..record
+        };
+        let Ok(bytes) = harvest_common::to_cbor(&restored) else {
+            outcome
+                .refused
+                .push((tag, "this conversation could not be re-encoded".to_string()));
+            continue;
+        };
+        if store.set_secret(&key, &bytes) {
+            if !occupied {
+                held += 1;
+            }
+            outcome.imported.push(tag);
+        } else {
+            outcome.refused.push((
+                tag,
+                "the node refused the write, so this conversation is still not readable here"
+                    .to_string(),
+            ));
+        }
+    }
+
+    imported(Ok(outcome))
+}
+
+/// Record that the buyer holds a copy of these conversations elsewhere.
+///
+/// Answers how many of the named conversations are marked afterwards, rather
+/// than a bare success: a tag this node does not hold contributes nothing,
+/// and a refused write leaves the warning in place, which is the safe
+/// direction. The caller can compare the count with what it asked about.
+///
+/// It does not create anything. A tag that is not here is not a conversation
+/// that gets one.
+pub(crate) fn mark_conversations_backed_up<S: SecretStore>(
+    store: &mut S,
+    request_id: RequestId,
+    store_contract_id: &[u8],
+    buyer_public_keys: &[[u8; 32]],
+) -> HarvestDelegateResponse {
+    let mut marked = 0usize;
+    for tag in buyer_public_keys {
+        let key = buyer_conversation_key(store_contract_id, tag);
+        let Some(record) = store
+            .get_secret(&key)
+            .and_then(|bytes| harvest_common::from_cbor::<BuyerConversationRecord>(&bytes).ok())
+        else {
+            continue;
+        };
+        if record.backed_up {
+            marked += 1;
+            continue;
+        }
+        let marked_record = BuyerConversationRecord {
+            backed_up: true,
+            ..record
+        };
+        let Ok(bytes) = harvest_common::to_cbor(&marked_record) else {
+            continue;
+        };
+        if store.set_secret(&key, &bytes) {
+            marked += 1;
+        }
+    }
+
+    HarvestDelegateResponse::BuyerConversationsMarkedBackedUp {
+        request_id,
+        store_contract_id: store_contract_id.to_vec(),
+        result: Ok(marked),
+    }
 }
 
 #[cfg(test)]
@@ -799,6 +1096,7 @@ mod buyer_conversation_tests {
                 seller_public_key: *PublicKey::from(&seller).as_bytes(),
                 conversation_id: [seed; 32],
                 created_at: 1_700_000_000 + seed as i64,
+                backed_up: false,
             },
             seller,
         }
@@ -856,7 +1154,7 @@ mod buyer_conversation_tests {
         .as_ref()
         .expect("must store");
 
-        let back = listed(&list_buyer_conversations(&store, STORE));
+        let back = listed(&list_buyer_conversations(&store, 1, STORE));
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].conversation_id, opened.record.conversation_id);
         assert_eq!(back[0].created_at, opened.record.created_at);
@@ -890,7 +1188,7 @@ mod buyer_conversation_tests {
         let opened = open(11);
         store_buyer_conversation(&mut store, 1, STORE, &opened.record);
 
-        let response = list_buyer_conversations(&store, STORE);
+        let response = list_buyer_conversations(&store, 1, STORE);
         let encoded = harvest_common::to_cbor(&response).expect("cbor");
         let secret = opened.record.secret.0;
         assert!(
@@ -910,7 +1208,7 @@ mod buyer_conversation_tests {
         store_buyer_conversation(&mut store, 1, STORE, &here.record);
         store_buyer_conversation(&mut store, 2, OTHER_STORE, &elsewhere.record);
 
-        let recalled = listed(&list_buyer_conversations(&store, STORE));
+        let recalled = listed(&list_buyer_conversations(&store, 1, STORE));
         assert_eq!(recalled.len(), 1);
         assert_eq!(recalled[0].buyer_public_key, here.buyer_public_key);
     }
@@ -968,7 +1266,7 @@ mod buyer_conversation_tests {
         let mut store = MemSecrets::default();
         let opened = open(15);
         store_buyer_conversation(&mut store, 1, STORE, &opened.record);
-        assert_eq!(listed(&list_buyer_conversations(&store, STORE)).len(), 1);
+        assert_eq!(listed(&list_buyer_conversations(&store, 1, STORE)).len(), 1);
 
         forgotten(&forget_buyer_conversation(
             &mut store,
@@ -980,7 +1278,7 @@ mod buyer_conversation_tests {
         .expect("must forget");
 
         assert!(
-            listed(&list_buyer_conversations(&store, STORE)).is_empty(),
+            listed(&list_buyer_conversations(&store, 1, STORE)).is_empty(),
             "a forgotten conversation was still recalled"
         );
         assert!(
@@ -1011,7 +1309,7 @@ mod buyer_conversation_tests {
             .expect_err("a refused removal must be reported");
         assert!(message.contains("still stored"), "{message}");
         assert_eq!(
-            listed(&list_buyer_conversations(&store, STORE)).len(),
+            listed(&list_buyer_conversations(&store, 1, STORE)).len(),
             1,
             "the conversation should still be there, since removal failed"
         );
@@ -1037,11 +1335,11 @@ mod buyer_conversation_tests {
         .as_ref()
         .expect("must forget");
 
-        let here = listed(&list_buyer_conversations(&store, STORE));
+        let here = listed(&list_buyer_conversations(&store, 1, STORE));
         assert_eq!(here.len(), 1);
         assert_eq!(here[0].buyer_public_key, kept.buyer_public_key);
         assert_eq!(
-            listed(&list_buyer_conversations(&store, OTHER_STORE)).len(),
+            listed(&list_buyer_conversations(&store, 1, OTHER_STORE)).len(),
             1,
             "another store's conversation was forgotten too"
         );
@@ -1076,6 +1374,7 @@ mod buyer_conversation_tests {
                 seller_public_key: [7u8; 32],
                 conversation_id: [1u8; 32],
                 created_at: 1_700_000_000 + i as i64,
+                backed_up: false,
             };
             if i == 0 {
                 oldest = buyer_public_key;
@@ -1088,7 +1387,7 @@ mod buyer_conversation_tests {
             .expect("must store");
         }
 
-        let kept = listed(&list_buyer_conversations(&store, STORE));
+        let kept = listed(&list_buyer_conversations(&store, 1, STORE));
         assert_eq!(
             kept.len(),
             MAX_BUYER_CONVERSATIONS,
@@ -1125,11 +1424,12 @@ mod buyer_conversation_tests {
                 seller_public_key: [7u8; 32],
                 conversation_id: [1u8; 32],
                 created_at: 1_700_000_000 + i as i64,
+                backed_up: false,
             };
             store_buyer_conversation(&mut store, i as u64, STORE, &record);
         }
         assert_eq!(
-            listed(&list_buyer_conversations(&store, STORE)).len(),
+            listed(&list_buyer_conversations(&store, 1, STORE)).len(),
             MAX_BUYER_CONVERSATIONS
         );
 
@@ -1140,12 +1440,13 @@ mod buyer_conversation_tests {
             seller_public_key: [7u8; 32],
             conversation_id: [2u8; 32],
             created_at: 1_700_000_000,
+            backed_up: false,
         };
         stored(&store_buyer_conversation(&mut store, 999, STORE, &record))
             .as_ref()
             .expect("must store");
 
-        let kept = listed(&list_buyer_conversations(&store, STORE));
+        let kept = listed(&list_buyer_conversations(&store, 1, STORE));
         assert_eq!(
             kept.len(),
             MAX_BUYER_CONVERSATIONS,
@@ -1179,6 +1480,7 @@ mod buyer_conversation_tests {
                 seller_public_key: [7u8; 32],
                 conversation_id: [1u8; 32],
                 created_at: 1_700_000_000 + i as i64,
+                backed_up: false,
             };
             store_buyer_conversation(&mut store, i as u64, STORE, &record);
         }
@@ -1190,6 +1492,7 @@ mod buyer_conversation_tests {
             seller_public_key: [7u8; 32],
             conversation_id: [1u8; 32],
             created_at: 1_800_000_000,
+            backed_up: false,
         };
         stored(&store_buyer_conversation(&mut store, 1, STORE, &record))
             .as_ref()
@@ -1202,7 +1505,7 @@ mod buyer_conversation_tests {
             "the undecodable entry survived"
         );
         assert!(
-            listed(&list_buyer_conversations(&store, STORE))
+            listed(&list_buyer_conversations(&store, 1, STORE))
                 .iter()
                 .any(|c| c.buyer_public_key == oldest),
             "a real conversation was evicted while rubbish was kept"
@@ -1228,5 +1531,431 @@ mod buyer_conversation_tests {
                 String::from_utf8_lossy(&key)
             );
         }
+    }
+}
+
+/// Backup: carrying a conversation to another node, and knowing whether one
+/// exists in only one place.
+#[cfg(test)]
+mod buyer_conversation_backup_tests {
+    use super::*;
+    use crate::secrets::MemSecrets;
+
+    const STORE: &[u8] = &[3u8; 32];
+    const OTHER_STORE: &[u8] = &[4u8; 32];
+
+    fn seed_bytes(i: u32) -> [u8; 32] {
+        let mut seed = [1u8; 32];
+        seed[..4].copy_from_slice(&i.to_be_bytes());
+        seed
+    }
+
+    /// One conversation, and the tag it is filed under.
+    fn conversation(seed: u32) -> ([u8; 32], BuyerConversationRecord) {
+        let secret = StaticSecret::from(seed_bytes(seed));
+        (
+            *PublicKey::from(&secret).as_bytes(),
+            BuyerConversationRecord {
+                secret: ConversationSecret(secret.to_bytes()),
+                seller_public_key: *PublicKey::from(&StaticSecret::from([9u8; 32])).as_bytes(),
+                conversation_id: [seed as u8; 32],
+                created_at: 1_700_000_000 + seed as i64,
+                backed_up: false,
+            },
+        )
+    }
+
+    fn exported(response: &HarvestDelegateResponse) -> &Result<String, String> {
+        match response {
+            HarvestDelegateResponse::BuyerConversationsExported { result, .. } => result,
+            other => panic!("expected BuyerConversationsExported, got {other:?}"),
+        }
+    }
+
+    fn imported(response: &HarvestDelegateResponse) -> &Result<ImportedConversations, String> {
+        match response {
+            HarvestDelegateResponse::BuyerConversationsImported { result, .. } => result,
+            other => panic!("expected BuyerConversationsImported, got {other:?}"),
+        }
+    }
+
+    fn listed(response: &HarvestDelegateResponse) -> Vec<RecalledConversation> {
+        match response {
+            HarvestDelegateResponse::BuyerConversationList { conversations, .. } => {
+                conversations.clone()
+            }
+            other => panic!("expected BuyerConversationList, got {other:?}"),
+        }
+    }
+
+    fn export(store: &MemSecrets, store_contract_id: &[u8]) -> String {
+        exported(&export_buyer_conversations(store, 1, store_contract_id))
+            .as_ref()
+            .expect("must export")
+            .clone()
+    }
+
+    /// **The whole point: a conversation carried to another node reads its
+    /// thread there.**
+    ///
+    /// Two independent stores, as two machines would be. The keys the second
+    /// one derives must be the ones the SELLER derives, or the restored
+    /// conversation reads nothing and the buyer is no better off than before
+    /// they saved anything.
+    #[test]
+    fn a_conversation_carried_to_another_node_reads_its_thread() {
+        let mut laptop = MemSecrets::default();
+        let (tag, record) = conversation(1);
+        store_buyer_conversation(&mut laptop, 1, STORE, &record);
+
+        let backup = export(&laptop, STORE);
+
+        let mut phone = MemSecrets::default();
+        let outcome = imported(&import_buyer_conversations(&mut phone, 2, &backup))
+            .as_ref()
+            .expect("must import")
+            .clone();
+        assert_eq!(outcome.imported, vec![tag]);
+        assert_eq!(outcome.store_contract_id, STORE);
+
+        let here = listed(&list_buyer_conversations(&phone, 1, STORE));
+        let there = listed(&list_buyer_conversations(&laptop, 1, STORE));
+        assert_eq!(here.len(), 1);
+        assert_eq!(
+            here[0].buyer_to_seller, there[0].buyer_to_seller,
+            "the restored conversation derives different keys, so it reads nothing"
+        );
+        assert_eq!(here[0].seller_to_buyer, there[0].seller_to_buyer);
+        assert_eq!(here[0].conversation_id, there[0].conversation_id);
+        assert_eq!(
+            here[0].created_at, there[0].created_at,
+            "a restored conversation must keep its age, or eviction order is wrong on the new node"
+        );
+    }
+
+    /// A backup names itself, so a paste that is not one is refused with
+    /// something the buyer can act on.
+    #[test]
+    fn a_paste_that_is_not_a_backup_is_refused_by_name() {
+        let mut store = MemSecrets::default();
+        for junk in [
+            "",
+            "hello",
+            "-----BEGIN GHOSTKEY CERTIFICATE-----",
+            "harvest-conv-backup-v2:abc",
+        ] {
+            let response = import_buyer_conversations(&mut store, 1, junk);
+            let message = imported(&response)
+                .as_ref()
+                .expect_err("must refuse {junk}");
+            assert!(
+                message.contains("Harvest conversation backup"),
+                "the refusal must name what was expected, for {junk:?}: {message}"
+            );
+        }
+        assert!(store.is_empty(), "a refused paste wrote something");
+    }
+
+    /// **A truncated backup is refused rather than half-imported.**
+    ///
+    /// The string is long, unremarkable and copied by hand, so losing the end
+    /// of it is the ordinary accident. The checksum is what turns that into a
+    /// refusal instead of a conversation restored with a corrupt secret --
+    /// which would read nothing, at a moment the buyer believes they have
+    /// recovered their recourse.
+    #[test]
+    fn a_truncated_backup_is_refused() {
+        let mut laptop = MemSecrets::default();
+        let (_, record) = conversation(2);
+        store_buyer_conversation(&mut laptop, 1, STORE, &record);
+        let backup = export(&laptop, STORE);
+
+        let mut phone = MemSecrets::default();
+        let truncated = &backup[..backup.len() - 4];
+        let response = import_buyer_conversations(&mut phone, 2, truncated);
+        imported(&response)
+            .as_ref()
+            .expect_err("a truncated backup must be refused");
+        assert!(phone.is_empty(), "a truncated backup wrote something");
+
+        // And the whole string still works, so the refusal above is about the
+        // truncation and not about the format.
+        imported(&import_buyer_conversations(&mut phone, 3, &backup))
+            .as_ref()
+            .expect("the untruncated backup must import");
+    }
+
+    /// Exporting one store exports that store, not everything the node holds.
+    #[test]
+    fn a_backup_carries_one_stores_conversations() {
+        let mut store = MemSecrets::default();
+        let (here, here_record) = conversation(3);
+        let (_, elsewhere_record) = conversation(4);
+        store_buyer_conversation(&mut store, 1, STORE, &here_record);
+        store_buyer_conversation(&mut store, 2, OTHER_STORE, &elsewhere_record);
+
+        let backup = export(&store, STORE);
+        let mut fresh = MemSecrets::default();
+        let outcome = imported(&import_buyer_conversations(&mut fresh, 3, &backup))
+            .as_ref()
+            .expect("must import")
+            .clone();
+        assert_eq!(outcome.imported, vec![here]);
+        assert!(
+            listed(&list_buyer_conversations(&fresh, 1, OTHER_STORE)).is_empty(),
+            "the backup carried another store's conversation"
+        );
+    }
+
+    /// **Importing a conversation this node already holds keeps the held
+    /// one.**
+    ///
+    /// Pasting a whole backup onto the node that made it is the ordinary
+    /// "restore everything" gesture, so it must not be an error. Overwriting
+    /// is the other tempting answer and is worse: the held record is the one
+    /// this node's thread is being read with, and an imported record with the
+    /// same routing tag can only DIFFER if it was hand-built -- a different
+    /// `conversation_id` under the same tag would make a readable thread stop
+    /// reading, silently.
+    #[test]
+    fn importing_a_held_conversation_keeps_the_held_one() {
+        let mut store = MemSecrets::default();
+        let (tag, record) = conversation(5);
+        store_buyer_conversation(&mut store, 1, STORE, &record);
+        let backup = export(&store, STORE);
+
+        // A hand-built backup naming the same conversation with a different
+        // id, which is the only way the two can disagree.
+        let mut hostile = BuyerConversationRecord {
+            conversation_id: [0xEE; 32],
+            ..record.clone()
+        };
+        hostile.created_at = 1;
+        let hostile_backup = encode_backup(&BuyerConversationBackupV1 {
+            store_contract_id: [3u8; 32],
+            conversations: vec![hostile],
+        })
+        .expect("encode");
+
+        for paste in [backup, hostile_backup] {
+            let outcome = imported(&import_buyer_conversations(&mut store, 2, &paste))
+                .as_ref()
+                .expect("must not be an error")
+                .clone();
+            assert_eq!(outcome.already_held, vec![tag]);
+            assert!(outcome.imported.is_empty());
+        }
+
+        let kept = listed(&list_buyer_conversations(&store, 1, STORE));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0].conversation_id, record.conversation_id,
+            "an imported record overwrote the one this node reads its thread with"
+        );
+    }
+
+    /// A held entry whose value does not decode IS replaced, because it reads
+    /// nothing -- keeping it would refuse a restore in favour of rubbish.
+    #[test]
+    fn importing_over_an_undecodable_entry_restores_it() {
+        let mut laptop = MemSecrets::default();
+        let (tag, record) = conversation(6);
+        store_buyer_conversation(&mut laptop, 1, STORE, &record);
+        let backup = export(&laptop, STORE);
+
+        let mut phone = MemSecrets::default();
+        phone.set_secret(&buyer_conversation_key(STORE, &tag), b"corrupt");
+
+        let outcome = imported(&import_buyer_conversations(&mut phone, 2, &backup))
+            .as_ref()
+            .expect("must import")
+            .clone();
+        assert_eq!(outcome.imported, vec![tag]);
+        assert_eq!(listed(&list_buyer_conversations(&phone, 1, STORE)).len(), 1);
+    }
+
+    /// **At the cap, an import refuses and names what it refused.**
+    ///
+    /// The opposite of what STORING does, and deliberately: the conversation
+    /// being imported is provably backed up -- the buyer is holding the
+    /// string -- while the conversation eviction would take may exist only
+    /// here. So the safe direction inverts. Naming the refusals is what lets
+    /// the buyer forget something and retry rather than guess which of them
+    /// did not land.
+    #[test]
+    fn an_import_at_the_cap_refuses_rather_than_evicting() {
+        let mut phone = MemSecrets::default();
+        let mut oldest = [0u8; 32];
+        for i in 0..MAX_BUYER_CONVERSATIONS {
+            let (tag, record) = conversation(1_000 + i as u32);
+            if i == 0 {
+                oldest = tag;
+            }
+            store_buyer_conversation(&mut phone, i as u64, STORE, &record);
+        }
+
+        let mut laptop = MemSecrets::default();
+        let (carried, record) = conversation(7);
+        store_buyer_conversation(&mut laptop, 1, STORE, &record);
+        let backup = export(&laptop, STORE);
+
+        let outcome = imported(&import_buyer_conversations(&mut phone, 2, &backup))
+            .as_ref()
+            .expect("a full node is not an error")
+            .clone();
+        assert!(outcome.imported.is_empty());
+        assert_eq!(outcome.refused.len(), 1);
+        assert_eq!(outcome.refused[0].0, carried);
+        assert!(
+            outcome.refused[0].1.contains("full"),
+            "the refusal must say why: {}",
+            outcome.refused[0].1
+        );
+        assert!(
+            listed(&list_buyer_conversations(&phone, 1, STORE))
+                .iter()
+                .any(|c| c.buyer_public_key == oldest),
+            "an import evicted a conversation that may exist only on this node"
+        );
+    }
+
+    /// **An imported conversation is already backed up**, because the buyer
+    /// is holding the string it came from. Warning about it would train them
+    /// to ignore the warning.
+    #[test]
+    fn an_imported_conversation_is_marked_as_backed_up() {
+        let mut laptop = MemSecrets::default();
+        let (_, record) = conversation(8);
+        store_buyer_conversation(&mut laptop, 1, STORE, &record);
+        let backup = export(&laptop, STORE);
+
+        let mut phone = MemSecrets::default();
+        import_buyer_conversations(&mut phone, 2, &backup);
+        let restored = listed(&list_buyer_conversations(&phone, 1, STORE));
+        assert!(
+            restored[0].backed_up,
+            "a conversation the buyer just pasted in was reported as existing in one place only"
+        );
+    }
+
+    /// A freshly opened conversation is NOT backed up, and stays that way
+    /// until the buyer says otherwise.
+    ///
+    /// Exporting is not saving: a buyer who opens the panel, reads the
+    /// string, and closes the tab has saved nothing.
+    #[test]
+    fn a_new_conversation_is_not_backed_up_and_exporting_does_not_change_that() {
+        let mut store = MemSecrets::default();
+        let (_, record) = conversation(9);
+        store_buyer_conversation(&mut store, 1, STORE, &record);
+        assert!(!listed(&list_buyer_conversations(&store, 1, STORE))[0].backed_up);
+
+        let _ = export(&store, STORE);
+        assert!(
+            !listed(&list_buyer_conversations(&store, 1, STORE))[0].backed_up,
+            "exporting a conversation reported it as saved"
+        );
+    }
+
+    /// The buyer saying they have saved it is what clears the warning.
+    #[test]
+    fn marking_a_conversation_backed_up_clears_the_warning() {
+        let mut store = MemSecrets::default();
+        let (tag, record) = conversation(10);
+        let (other_tag, other) = conversation(11);
+        store_buyer_conversation(&mut store, 1, STORE, &record);
+        store_buyer_conversation(&mut store, 2, STORE, &other);
+
+        match mark_conversations_backed_up(&mut store, 3, STORE, &[tag]) {
+            HarvestDelegateResponse::BuyerConversationsMarkedBackedUp { result, .. } => {
+                assert_eq!(result.expect("must mark"), 1)
+            }
+            other => panic!("expected BuyerConversationsMarkedBackedUp, got {other:?}"),
+        }
+
+        let recalled = listed(&list_buyer_conversations(&store, 1, STORE));
+        let marked: Vec<bool> = recalled
+            .iter()
+            .map(|c| {
+                if c.buyer_public_key == tag {
+                    c.backed_up
+                } else {
+                    assert_eq!(c.buyer_public_key, other_tag);
+                    !c.backed_up
+                }
+            })
+            .collect();
+        assert_eq!(
+            marked,
+            vec![true, true],
+            "marking one conversation as saved marked the wrong set"
+        );
+    }
+
+    /// Marking must not resurrect a conversation, or bring one into being.
+    #[test]
+    fn marking_a_conversation_that_is_not_here_stores_nothing() {
+        let mut store = MemSecrets::default();
+        match mark_conversations_backed_up(&mut store, 1, STORE, &[[7u8; 32]]) {
+            HarvestDelegateResponse::BuyerConversationsMarkedBackedUp { result, .. } => {
+                assert_eq!(result.expect("not an error"), 0)
+            }
+            other => panic!("expected BuyerConversationsMarkedBackedUp, got {other:?}"),
+        }
+        assert!(store.is_empty(), "marking created a conversation");
+    }
+
+    /// **Forgetting a conversation leaves no backup marker behind.**
+    ///
+    /// The reason the marker is a field of the record rather than a key of
+    /// its own, as the ghostkey vault has it: a marker keyed by store and tag
+    /// would outlive the record it describes, which is exactly the durable
+    /// local note that `forget_buyer_conversation` exists to remove.
+    #[test]
+    fn forgetting_a_conversation_leaves_no_backup_marker_behind() {
+        let mut store = MemSecrets::default();
+        let (tag, record) = conversation(12);
+        store_buyer_conversation(&mut store, 1, STORE, &record);
+        mark_conversations_backed_up(&mut store, 2, STORE, &[tag]);
+
+        forget_buyer_conversation(&mut store, 3, STORE, &tag);
+        assert!(
+            store.is_empty(),
+            "forgetting left something behind: {:?}",
+            store
+                .list_secrets(b"")
+                .iter()
+                .map(|k| String::from_utf8_lossy(k).into_owned())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A backup for a store with nothing in it is refused rather than
+    /// handing back an empty string that looks like a saved backup.
+    #[test]
+    fn exporting_a_store_with_no_conversations_is_refused() {
+        let store = MemSecrets::default();
+        let response = export_buyer_conversations(&store, 1, STORE);
+        let message = exported(&response)
+            .as_ref()
+            .expect_err("an empty backup must be refused");
+        assert!(message.contains("no conversation"), "{message}");
+    }
+
+    /// **A backup is a capability, and the test says so.**
+    ///
+    /// It contains the secrets themselves -- that is what makes it work on
+    /// another machine, and what makes it worth as much as the conversation
+    /// it restores. Pinned so that a future "safer" export that omitted them
+    /// fails here rather than in a buyer's hands.
+    #[test]
+    fn a_backup_contains_the_secrets_themselves() {
+        let mut store = MemSecrets::default();
+        let (_, record) = conversation(13);
+        store_buyer_conversation(&mut store, 1, STORE, &record);
+
+        let backup = export(&store, STORE);
+        let decoded = decode_backup(&backup).expect("decode");
+        assert_eq!(decoded.conversations[0].secret, record.secret);
     }
 }

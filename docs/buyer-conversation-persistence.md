@@ -3,7 +3,10 @@
 **Status: built.** Written as a proposal on 2026-09-05 at `ee0f41f`, and
 rewritten on the same day to describe what was actually built, on
 `feat/messaging`. Where the built thing differs from the proposal, the
-difference is called out rather than quietly edited away.
+difference is called out rather than quietly edited away. The **Backup**
+section below was added after the rest, at Ian's direction, and is the reason
+the "Cross-device recovery" section is now a correction rather than a
+limitation.
 
 ## The problem, stated at its cost
 
@@ -208,22 +211,144 @@ removal and reports honestly on the answer. The node's own behaviour is read
 from its source, cited above, and would need `tests/rehearsal/` and a live node
 to observe.
 
-## Cross-device recovery: NO
+## Backup: the buyer can carry a conversation to another machine
 
-The secret is in one node's delegate. A buyer who messages from a laptop and
-later opens the store on a phone has a different node, a different delegate,
-and ciphertext nobody can read. **This is a hard limitation of storing the
-secret node-side and it does not have a fix within this design.**
+Added after the persistence above, at Ian's direction: *"a purchase is not
+something a person should lose because they changed laptop"*, and *"similar to
+how GhostKey lets you make a backup"*.
 
-It is on screen rather than left to be discovered: the compose box, the
-thread, the "kept on this device" panel and the seller's reply box all say that
-the conversation does not follow the buyer to another device.
+The shape follows the ghostkey vault deliberately, so a future common backup
+system across delegates has two consistent examples to generalise from rather
+than two inventions. What is NOT attempted is sync between a user's own peers
+-- whether that belongs in freenet-core or in each delegate is unsettled and
+explicitly out of scope.
 
-A **recovery string** — the 32-byte secret, base58, shown once for the buyer to
-save — would close it, and is roughly forty lines. It is deliberately not part
-of this change: it changes what a buyer is *asked to do*, which is a product
-decision rather than an implementation one, and it introduces a secret the
-buyer can paste into the wrong place.
+### The string
+
+```
+harvest-conv-backup-v1:<base58check of CBOR>
+```
+
+CBOR of `{store_contract_id, conversations: [{secret, seller_public_key,
+conversation_id, created_at, backed_up}]}`, base58check-encoded, behind a
+named prefix. About 420 characters for one conversation.
+
+* **The prefix, not a bare blob**, so a paste that is not a Harvest backup --
+  a ghostkey PEM, a store link, half a string -- is refused with a sentence
+  the buyer can act on instead of a decoding error. The version lives in the
+  prefix, so a later format changes it and this one still recognises its own.
+* **Base58Check, not base58**, so a string that lost its tail in a copy is
+  refused rather than restoring a conversation with a corrupt secret at the
+  moment the buyer believes they have their recourse back. Pinned by
+  `a_truncated_backup_is_refused`.
+* **The store id is inside it**, so import needs nothing else. A buyer
+  restoring onto a new node has the string and nothing to relate it to.
+* **The format lives entirely in the delegate.** The UI shows the string and
+  hands it back; it never parses it. So the one component that reads and
+  writes the format owns it, and `harvest-common` -- compiled into all three
+  contracts -- gains nothing.
+
+### The three questions that were settled, and why
+
+**Per store, not per conversation.** A buyer normally has ONE conversation
+with a store, because a new message continues the last one. So the two options
+differ mainly in how many actions a complete backup takes -- and a backup that
+silently omits a conversation is the expensive failure here, the same
+asymmetry that governs eviction. A buyer who wants less in one string can
+forget the conversations they do not want in it. Per-store is also the unit a
+person reasons about: everything that would be lost, for that seller, with
+that machine.
+
+**Importing a conversation the node already holds KEEPS the held one.** Not
+refuse, not overwrite:
+
+* Refusing would break the obvious "paste my whole backup back" gesture, which
+  is the flow a frightened user actually performs.
+* Overwriting is worse than it looks. The routing tag is the public half of
+  the secret, so an imported record sharing a tag can only *disagree* with the
+  held one if it was hand-built -- and a different `conversation_id` under the
+  same tag would make a readable thread stop reading, silently. The held
+  record is the one this node's thread is being read with.
+
+So the held one wins, and the outcome is reported as `already_held` rather
+than as an error. The single exception is a held entry whose value does not
+decode: it reads nothing, so keeping it would refuse a restore in favour of
+rubbish. Pinned by `importing_a_held_conversation_keeps_the_held_one` and
+`importing_over_an_undecodable_entry_restores_it`.
+
+**At the cap, an import REFUSES and names what it refused.** This inverts what
+storing does, and the inversion is the point: the conversation being imported
+is provably backed up, because the buyer is holding the string it came from,
+while the conversation eviction would take may exist only on this node.
+Refusing is the safe direction here for exactly the reason evicting is the
+safe direction there. The refusal names the conversation and says the node is
+full, so the buyer can forget something and paste again -- a count would leave
+them to work out which one did not land. Pinned by
+`an_import_at_the_cap_refuses_rather_than_evicting`.
+
+### The backed-up marker, and why it is gated
+
+`RecalledConversation::backed_up` is `false` when the secret exists in exactly
+one place. The UI warns on it, and **only the buyer saying they have saved the
+backup clears it** -- exporting is not saving, and a buyer who opens the
+panel, reads the string and closes the tab has saved nothing.
+
+The marker is behind `origin::authorize` **for its own reason, not because it
+sits beside the export**. The export's reason is obvious: it answers secrets.
+The marker writes no secret and answers none, so it reads as harmless -- and
+what it does is stop the UI saying "this exists only on this device" about a
+conversation nobody has a copy of. Silence costs the buyer everything and
+costs the app nothing, which is the shape that needs a gate. This is the
+property worth copying from the ghostkey vault, where `MarkBackedUp` is gated
+on the `Export` scope that only the vault is ever granted
+(`ghostkey-delegate/src/handlers.rs::handle_mark_backed_up`). Pinned by
+`another_web_app_cannot_export_or_silence_a_buyers_backup_warning`.
+
+**Where the marker lives is a deliberate deviation from ghostkey.** The vault
+keeps it as a separate secret, `gk:backedup:{fingerprint}`. Here it is a field
+of the record, because a marker keyed by store and tag would OUTLIVE the
+conversation it describes -- forgetting a conversation would leave a key still
+naming the store, which is precisely the durable local record
+`forget_buyer_conversation` exists to remove. Inside the value it is deleted
+with the thing it describes, counts against the same cap, and cannot drift out
+of step with it. Pinned by
+`forgetting_a_conversation_leaves_no_backup_marker_behind`, which fails when
+the marker is written as a key of its own.
+
+An **imported** conversation is marked backed up on arrival: the buyer is
+demonstrably holding the string it came from, and warning about it would teach
+them to ignore the warning.
+
+### What the buyer is told
+
+Beside the string, before they copy it: it holds the keys themselves, anyone
+who has it can read the conversation and can complain about the seller as
+though they were the buyer, and it is not a password that can be changed --
+it is the conversation. That is the basis on which a person decides where to
+put it, so it is on screen rather than in a tooltip.
+
+## Cross-device recovery: NOT AUTOMATIC
+
+**Corrected.** This section said cross-device recovery was impossible and had
+no fix within the design. That was true of the persistence alone, and the
+backup above is exactly the "recovery string" it named as its deliberate
+omission -- built later the same day, once Ian asked for it.
+
+What remains true is that **nothing happens by itself**. The secret is in one
+node's delegate. A buyer who messages from a laptop and later opens the store
+on a phone has a different node and ciphertext nobody can read *unless they
+carried a backup across*. The question that was deferred -- whether a buyer
+should be asked to save a string at all -- has been answered: they are offered
+one, and told what it is worth.
+
+So the limitation is now a step the buyer must take, not a wall. It is on
+screen rather than left to be discovered: the compose box, the thread, the
+"kept on this device" panel and the seller's reply box all say the
+conversation does not follow the buyer to another device on its own.
+
+Sync between a user's own peers would remove the step. Whether that belongs in
+freenet-core or in each delegate is unsettled, and it is explicitly not
+attempted here.
 
 ## Two consequences that were weighed, and stand
 
@@ -244,11 +369,19 @@ conversations rather than being roughly constant. Pinned by
 
 ## The shape of the change, as built
 
-Three request families on the harvest delegate, behind the same
+Six request families on the harvest delegate, behind the same
 `origin::authorize` gate every other family passes through:
-`StoreBuyerConversation`, `ListBuyerConversations`, `ForgetBuyerConversation`.
-The cap is **in the delegate**, not the UI: a cap enforced by the caller is not
-a cap.
+`StoreBuyerConversation`, `ListBuyerConversations`, `ForgetBuyerConversation`,
+and then `ExportBuyerConversations`, `ImportBuyerConversations`,
+`MarkConversationsBackedUp`. The cap is **in the delegate**, not the UI: a cap
+enforced by the caller is not a cap.
+
+`ListBuyerConversations` carries a request id and the UI files the answer
+under the store IT asked about rather than the one the answer echoes. That is
+not decoration: it is the same lesson as the echoed conversation tag on the
+seller's side, where trusting position instead of the echo handed one buyer's
+key to another buyer's messages. Here the equivalent mistake would put one
+store's conversation keys against another store's mailbox.
 
 On the UI side:
 
@@ -269,6 +402,16 @@ On the UI side:
   storefront deliberately does not, since a subscription advertises a standing
   interest; a non-empty recall is exactly the evidence that this node has
   already written to that seller, so it tells the network nothing new.
+* The backup panel sits under the thread: the warning for conversations that
+  exist in one place only, "Show my backup" and "I have saved this", and a
+  paste box that is offered **even on a device holding nothing**, since
+  restoring onto a new machine is the case the whole thing exists for and
+  there is nothing there to hang the control off.
+* Marking and importing both **re-ask the delegate** rather than updating the
+  screen from what they assume happened. The delegate is the only thing that
+  knows whether a record was written; a refused write leaves the warning in
+  place, which is the safe direction and exactly what a local guess gets
+  wrong.
 
 ## What this does not do
 
@@ -282,5 +425,10 @@ On the UI side:
   recall answer arrives. They get a second conversation with the same store;
   the older one is still recalled and still readable, and the thread view shows
   both in time order.
-* **It does not survive the buyer's node being replaced**, for the same reason
-  cross-device recovery is impossible.
+* **It does not sync between a buyer's own devices.** A backup is a string
+  the buyer moves by hand. Automatic sync between a user's peers is a real
+  question and an unsettled one -- whether it belongs in freenet-core or in
+  each delegate -- and is deliberately not attempted here.
+* **It does not make a common backup format across delegates.** It follows
+  the ghostkey vault's shape closely enough that a future common system has
+  two consistent examples to generalise from, which is as far as this goes.

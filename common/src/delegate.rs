@@ -131,7 +131,10 @@ pub enum HarvestDelegateRequest {
     },
 
     /// Recall every conversation stored for a store, as derived keys.
-    ListBuyerConversations { store_contract_id: Vec<u8> },
+    ListBuyerConversations {
+        request_id: RequestId,
+        store_contract_id: Vec<u8>,
+    },
 
     /// Discard one, permanently.
     ///
@@ -143,6 +146,66 @@ pub enum HarvestDelegateRequest {
         store_contract_id: Vec<u8>,
         /// Which conversation, by its routing tag.
         buyer_public_key: [u8; 32],
+    },
+
+    /// Hand back this store's conversation secrets in a form the buyer can
+    /// save, and paste into another node.
+    ///
+    /// # What this answers is a capability, not a copy
+    ///
+    /// The string contains the X25519 secrets themselves. Anyone holding it
+    /// can read that conversation, and -- once a seller's reply carries a
+    /// pre-signed statement -- can file the complaint it authorizes. It is
+    /// the buyer's recourse in a form they can lose, which is exactly what
+    /// makes it worth having and exactly why the UI says so beside the
+    /// button rather than in a tooltip.
+    ///
+    /// Per STORE rather than per conversation: a buyer normally has one
+    /// conversation with a store (a new message continues the last one), so
+    /// the two differ mainly in how many actions a complete backup takes --
+    /// and a backup that silently omits a conversation is the expensive
+    /// failure here. A buyer who wants less in one string can forget the
+    /// conversations they do not want in it.
+    ExportBuyerConversations {
+        request_id: RequestId,
+        store_contract_id: Vec<u8>,
+    },
+
+    /// Take a saved backup string and make its conversations readable here.
+    ///
+    /// The store id is inside the string, so this needs nothing else -- a
+    /// buyer on a new node has the string and nothing to relate it to.
+    ImportBuyerConversations {
+        request_id: RequestId,
+        backup: String,
+    },
+
+    /// Record that the buyer holds a copy of these conversations outside this
+    /// node.
+    ///
+    /// # Why the MARKER needs the origin gate, and not only the export
+    ///
+    /// The export's reason is obvious: it answers secrets. The marker's is
+    /// the one that looks harmless and is not. It **silences a warning** --
+    /// "this conversation exists only on this device" -- and the party that
+    /// benefits from the silence is not the party that bears the loss. An app
+    /// that could set this without the user holding a backup would make the
+    /// warning stop for a conversation about to be lost with the machine,
+    /// which is worse than never having warned: the buyer stops looking.
+    ///
+    /// So it is behind `origin::authorize` deliberately, for its own reason,
+    /// and not merely because it sits beside the export. This mirrors the
+    /// ghostkey vault, where `MarkBackedUp` is gated on the `Export` scope
+    /// that only the vault is ever granted, for the same stated reason
+    /// (`ghostkey-delegate/src/handlers.rs::handle_mark_backed_up`).
+    ///
+    /// Set only when the user says they have saved it -- exporting is not
+    /// saving.
+    MarkConversationsBackedUp {
+        request_id: RequestId,
+        store_contract_id: Vec<u8>,
+        /// Which conversations, by routing tag.
+        buyer_public_keys: Vec<[u8; 32]>,
     },
 
     // === Listing Management ===
@@ -247,9 +310,40 @@ pub enum HarvestDelegateResponse {
     },
 
     /// The conversations stored for one store, as keys rather than secrets.
+    ///
+    /// The `request_id` is what pairs this with the question, and the caller
+    /// files the answer under the store IT asked about rather than the one
+    /// echoed here. Same lesson as [`ConversationKey::peer_public_key`]: a
+    /// consumer that trusts the payload's own idea of where it belongs will,
+    /// the first time the two disagree, file one store's conversation keys
+    /// against another store's mailbox.
     BuyerConversationList {
+        request_id: RequestId,
         store_contract_id: Vec<u8>,
         conversations: Vec<RecalledConversation>,
+    },
+
+    /// A store's conversations, as a string the buyer can save.
+    ///
+    /// `Ok` carries the backup itself. It holds secrets: see
+    /// [`HarvestDelegateRequest::ExportBuyerConversations`].
+    BuyerConversationsExported {
+        request_id: RequestId,
+        store_contract_id: Vec<u8>,
+        result: Result<String, String>,
+    },
+
+    /// What a pasted backup did.
+    BuyerConversationsImported {
+        request_id: RequestId,
+        result: Result<ImportedConversations, String>,
+    },
+
+    /// Which conversations are now marked as held outside this node.
+    BuyerConversationsMarkedBackedUp {
+        request_id: RequestId,
+        store_contract_id: Vec<u8>,
+        result: Result<usize, String>,
     },
 
     /// Whether a conversation was actually removed.
@@ -393,6 +487,38 @@ pub struct RecalledConversation {
     /// a thread the buyer left open, resumed, rather than a new one beside
     /// it.
     pub created_at: i64,
+    /// Whether the buyer has said they hold a copy of this outside this node.
+    ///
+    /// `false` means the secret exists in exactly one place, and losing the
+    /// machine loses the conversation -- and, after Phase 2, the buyer's only
+    /// recourse against the seller they paid. The UI warns on this; nothing
+    /// but the user saying so can clear it. See
+    /// [`HarvestDelegateRequest::MarkConversationsBackedUp`].
+    pub backed_up: bool,
+}
+
+/// What importing a backup actually did, per conversation rather than as one
+/// verdict.
+///
+/// # Why this is not a count and a bool
+///
+/// The three outcomes are different situations for the buyer. `imported` is
+/// the restore working. `already_held` is the ordinary case of pasting a
+/// backup onto the node that made it, and is not a problem. `refused` is the
+/// one that needs saying out loud and naming: a conversation that did not fit
+/// under the node's cap is a conversation the buyer still cannot read, and a
+/// summary that folded it into "3 of 5 imported" would leave them to work out
+/// which two.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+pub struct ImportedConversations {
+    /// The store the backup belongs to, which is inside the backup itself.
+    pub store_contract_id: Vec<u8>,
+    /// Conversations that were not held here and now are.
+    pub imported: Vec<[u8; 32]>,
+    /// Conversations this node already had. Left exactly as they were.
+    pub already_held: Vec<[u8; 32]>,
+    /// Conversations that could not be taken, each with the reason.
+    pub refused: Vec<([u8; 32], String)>,
 }
 
 /// A buyer's ephemeral X25519 secret, on the wire between the browser that

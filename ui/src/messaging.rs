@@ -188,6 +188,13 @@ pub struct BuyerConversation {
     /// eviction order and, on recall, which conversation with a store is the
     /// most recent one to continue.
     pub created_at: i64,
+    /// Whether the buyer has said they hold a copy outside this node.
+    ///
+    /// `false` means the key that reads this conversation exists in exactly
+    /// one place, so losing the machine loses it -- and, after Phase 2, the
+    /// buyer's recourse against the seller they paid. Only the buyer saying
+    /// so clears it; exporting is not saving.
+    pub backed_up: bool,
     /// `Some` for a conversation opened in this tab, `None` for one recalled
     /// from the delegate. Prints as `redacted`; see
     /// [`harvest_common::ConversationSecret`].
@@ -212,6 +219,7 @@ impl BuyerConversation {
             buyer_public_key,
             conversation_id: ConversationId::random(),
             created_at: chrono::Utc::now().timestamp(),
+            backed_up: false,
             secret: Some(harvest_common::ConversationSecret(secret.to_bytes())),
             keys: ConversationKeys::from_shared_secret(shared.as_bytes()),
         })
@@ -227,6 +235,7 @@ impl BuyerConversation {
             buyer_public_key: recalled.buyer_public_key,
             conversation_id: ConversationId(recalled.conversation_id),
             created_at: recalled.created_at,
+            backed_up: recalled.backed_up,
             secret: None,
             keys: ConversationKeys {
                 to_seller: recalled.buyer_to_seller,

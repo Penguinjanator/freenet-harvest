@@ -99,12 +99,18 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
     // What this node is keeping, which is what the buyer can ask it to
     // forget. Empty until the delegate answers, and empty for a store this
     // node has never written to.
-    let kept: Vec<([u8; 32], i64)> = store
+    let kept: Vec<([u8; 32], i64, bool)> = store
         .map(|store| {
             store
                 .conversations
                 .iter()
-                .map(|conversation| (conversation.buyer_public_key, conversation.created_at))
+                .map(|conversation| {
+                    (
+                        conversation.buyer_public_key,
+                        conversation.created_at,
+                        conversation.backed_up,
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -164,11 +170,9 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
                 }
             }
 
-            if !kept.is_empty() {
-                KeptConversations {
-                    store_contract_id: store_contract_id.clone(),
-                    kept: kept,
-                }
+            KeptConversations {
+                store_contract_id: store_contract_id.clone(),
+                kept: kept,
             }
         }
     }
@@ -190,23 +194,32 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
 /// happens. It cannot be undone: the messages stay in the seller's mailbox
 /// and become unreadable by everyone, including the buyer.
 #[component]
-fn KeptConversations(store_contract_id: Vec<u8>, kept: Vec<([u8; 32], i64)>) -> Element {
+fn KeptConversations(store_contract_id: Vec<u8>, kept: Vec<([u8; 32], i64, bool)>) -> Element {
     // Which one is a click away from being destroyed, if any. Two steps
     // because there is no undo and no second copy anywhere.
     let mut confirming = use_signal(|| Option::<[u8; 32]>::None);
+    let unsaved = kept.iter().filter(|(_, _, backed_up)| !backed_up).count();
 
     rsx! {
         div { style: "margin-top: 1.5rem;",
-            h4 { "Kept on this device" }
-            p { class: "text-muted", style: "font-size: 0.85rem;",
-                "This node is keeping the key that reads {kept.len()} conversation(s) with this "
-                "store, so a reply is still readable after you close this tab. That key is on "
-                "THIS device only -- opening the store somewhere else will not bring the "
-                "conversation with it."
+            if !kept.is_empty() {
+                h4 { "Kept on this device" }
+                p { class: "text-muted", style: "font-size: 0.85rem;",
+                    "This node is keeping the key that reads {kept.len()} conversation(s) with "
+                    "this store, so a reply is still readable after you close this tab."
+                }
+                if unsaved > 0 {
+                    p { class: "text-warning", style: "font-size: 0.85rem;",
+                        "{unsaved} of them exist on this device and nowhere else. If you lose "
+                        "this machine you lose the conversation, and anything the seller sent "
+                        "you in it. Make a backup you can keep somewhere else."
+                    }
+                }
             }
-            for (tag, created_at) in kept.iter() {
+            for (tag, created_at, backed_up) in kept.iter() {
                 {
                     let tag = *tag;
+                    let backed_up = *backed_up;
                     let when = chrono::DateTime::from_timestamp(*created_at, 0)
                         .map(|when| when.format("%Y-%m-%d %H:%M UTC").to_string())
                         .unwrap_or_else(|| "an unknown time".to_string());
@@ -215,6 +228,15 @@ fn KeptConversations(store_contract_id: Vec<u8>, kept: Vec<([u8; 32], i64)>) -> 
                         div { class: "card", style: "margin-top: 0.5rem;",
                             p { class: "text-muted", style: "font-size: 0.8rem;",
                                 "Conversation {short_tag(&tag)}, started {when}"
+                            }
+                            if backed_up {
+                                p { class: "text-muted", style: "font-size: 0.8rem;",
+                                    "You have said you hold a copy of this elsewhere."
+                                }
+                            } else {
+                                p { class: "text-warning", style: "font-size: 0.8rem;",
+                                    "On this device only."
+                                }
                             }
                             if confirming() == Some(tag) {
                                 p { class: "text-warning", style: "font-size: 0.85rem;",
@@ -245,6 +267,124 @@ fn KeptConversations(store_contract_id: Vec<u8>, kept: Vec<([u8; 32], i64)>) -> 
                         }
                     }
                 }
+            }
+
+            Backup { store_contract_id: store_contract_id.clone(), has_conversations: !kept.is_empty() }
+        }
+    }
+}
+
+/// Making a copy of these conversations, and putting one back.
+///
+/// # What the string is
+///
+/// It holds the secrets themselves -- that is what makes it work on another
+/// machine, and what makes it worth exactly as much as the conversations it
+/// restores. Anyone who has it can read them and, once a seller's reply
+/// carries a pre-signed statement, file the complaint it authorizes. That is
+/// said beside the string rather than in a tooltip, because it is the whole
+/// basis on which a person decides where to put it.
+///
+/// # Why "I have saved this" is a separate button
+///
+/// Showing a backup is not saving one. A buyer who opens the panel, reads the
+/// string and closes the tab has saved nothing, so revealing it must not
+/// clear the warning -- only the buyer saying they have it does. The delegate
+/// gates that marker for the same reason: the party that benefits from the
+/// warning stopping is not the party that loses the conversation.
+#[component]
+fn Backup(store_contract_id: Vec<u8>, has_conversations: bool) -> Element {
+    let mut paste = use_signal(String::new);
+
+    // The string, once the delegate has answered, and only for THIS store --
+    // one backup is on screen at a time and it must not be shown under
+    // another store's heading.
+    let backup = APP_STATE
+        .read()
+        .conversation_backup_on_screen
+        .as_ref()
+        .filter(|backup| backup.store_contract_id == store_contract_id)
+        .map(|backup| backup.text().to_string());
+
+    rsx! {
+        div { style: "margin-top: 1rem;",
+            h4 { "Backup" }
+
+            if has_conversations {
+                if let Some(backup) = backup {
+                    p { class: "text-warning", style: "font-size: 0.85rem;",
+                        "Save this somewhere only you can reach. Anyone who has it can read "
+                        "this conversation, and can use it to complain about this seller as "
+                        "though they were you. It is not a password you can change: it is the "
+                        "conversation."
+                    }
+                    textarea {
+                        class: "form-textarea",
+                        readonly: true,
+                        rows: 4,
+                        value: "{backup}",
+                    }
+                    button {
+                        class: "btn btn-primary",
+                        onclick: {
+                            let store_contract_id = store_contract_id.clone();
+                            move |_| {
+                                let mut app = APP_STATE.write();
+                                app.mark_conversations_backed_up(&store_contract_id);
+                                app.conversation_backup_on_screen = None;
+                            }
+                        },
+                        "I have saved this"
+                    }
+                    button {
+                        class: "btn",
+                        onclick: move |_| {
+                            APP_STATE.write().conversation_backup_on_screen = None;
+                        },
+                        "Hide it"
+                    }
+                } else {
+                    p { class: "text-muted", style: "font-size: 0.85rem;",
+                        "A backup is a single line of text holding the keys to your "
+                        "conversations with this store. Paste it into Harvest on another "
+                        "device to read them there."
+                    }
+                    button {
+                        class: "btn",
+                        onclick: {
+                            let store_contract_id = store_contract_id.clone();
+                            move |_| APP_STATE.write().export_conversations(&store_contract_id)
+                        },
+                        "Show my backup"
+                    }
+                }
+            }
+
+            // Always offered, including on a device that holds nothing:
+            // restoring onto a new machine is the case this exists for, and
+            // there is nothing kept there to hang the control off.
+            div { class: "form-group", style: "margin-top: 1rem;",
+                label { class: "form-label", "Restore from a backup" }
+                textarea {
+                    class: "form-textarea",
+                    rows: 3,
+                    placeholder: "Paste a Harvest conversation backup here.",
+                    value: "{paste}",
+                    oninput: move |event| paste.set(event.value()),
+                }
+            }
+            button {
+                class: "btn",
+                disabled: paste().trim().is_empty(),
+                onclick: move |_| {
+                    let pasted = paste().trim().to_string();
+                    if pasted.is_empty() {
+                        return;
+                    }
+                    APP_STATE.write().import_conversations(pasted);
+                    paste.set(String::new());
+                },
+                "Restore"
             }
         }
     }
@@ -659,9 +799,12 @@ fn attribution(
 
 /// Enough of a conversation tag to tell two apart on screen, and no more --
 /// the whole thing is 44 characters of base58 that means nothing to a reader.
+///
+/// One implementation, in `state`, because the same shortening appears in
+/// notifications this component does not render: two would drift, and a
+/// buyer matching a warning against a line on screen needs them identical.
 fn short_tag(tag: &[u8]) -> String {
-    let encoded = bs58::encode(tag).into_string();
-    encoded.chars().take(8).collect()
+    crate::state::short_conversation_tag(tag)
 }
 
 /// Seal a seller's reply and hand it to the node.

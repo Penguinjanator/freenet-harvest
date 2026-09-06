@@ -259,15 +259,46 @@ freenet-core's source (`wasm_runtime/secrets_store/store.rs::remove_secret`,
 which removes the blob, its snapshots, the index entry and the enumeration
 registry entry). See `docs/untested-invariants.md`.
 
+### The new surface: a backup is a portable capability
+
+A buyer can now export their conversations with a store as a single string and
+paste it into Harvest on another machine. That string holds the X25519 secrets
+themselves, which is what makes it work — and what makes it worth exactly as
+much as the conversations it restores. **Anyone holding it can read them, and
+once a seller's reply carries a pre-signed statement, can file the complaint
+that statement authorizes, as though they were the buyer.**
+
+It is not a password. There is nothing to rotate: the secret IS the
+conversation, so a leaked backup cannot be revoked, only forgotten — and
+forgetting it makes the conversation unreadable to the buyer too.
+
+Three things follow, and all three are on screen rather than in a doc:
+
+* the string is shown only when asked for, and hidden again on request;
+* what holding it means is stated beside it, before the buyer copies it,
+  because that is the basis on which a person decides where to put it;
+* a conversation with no copy anywhere else is **warned about**, and only the
+  buyer saying they have saved it clears the warning. Exporting is not saving.
+
+The warning's marker is gated to the Harvest web app for its own reason,
+separate from the export's: silencing a warning costs the silencer nothing and
+costs the buyer everything. See `buyer-conversation-persistence.md`.
+
+**The export is per store**, so one string covers every conversation this node
+holds with that seller. A buyer who wants a smaller blast radius can forget
+the conversations they do not want in it before exporting.
+
 ### The remaining limit: a different device is a different node
 
 The secret is in ONE node's delegate. A buyer who writes from a laptop and
 later opens the same store on a phone has a different node and ciphertext
-nobody can read — exactly the loss described above, moved from "closed the
-tab" to "changed device". There is no fix within the current design: closing
-it needs something the buyer carries (a recovery string they save, or a
-passphrase-derived keypair), which changes what a buyer is asked to do and is
-a product decision rather than an implementation one.
+nobody can read — **unless they carried a backup across**, which is what the
+section above is for. Nothing happens by itself, and a buyer who saved nothing
+is in the same position as one who closed the tab used to be.
 
 It is said on screen before the buyer sends rather than left to be discovered
 when they need the answer.
+
+Automatic sync between a user's own peers would remove the step. Whether that
+belongs in freenet-core or in each delegate is unsettled and is not attempted
+here.
