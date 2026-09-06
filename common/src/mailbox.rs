@@ -440,28 +440,51 @@ pub struct MailboxStateV1 {
     pub messages: Vec<EncryptedMessage>,
 }
 
-/// What identifies one mailbox entry to a client that wrote it.
+/// **What the contract treats as one message.**
 ///
-/// # Why the nonce is not enough, and what this is for
+/// # Why identity is the whole entry and not the nonce
 ///
-/// The nonce is the message's identity *to the contract*: it is what
-/// [`MailboxStateV1::verify`] forbids duplicating and what a summary is made
-/// of. It is also **public and forgeable as an identity**, because the
-/// mailbox is open-write and anyone reading it can submit a different message
-/// under the same nonce. The counterparty can go further: they hold the
-/// conversation key, so their substitute decrypts, and
-/// [`dedupe_by_nonce`] then keeps exactly one of the two.
+/// The nonce is a field the WRITER fills in. It is public, the mailbox is
+/// open-write, and the counterparty holds the conversation key -- so anyone
+/// can submit a different message under somebody else's nonce, and their
+/// substitute decrypts. While the nonce was the identity, that was a
+/// deletion primitive: `verify` forbade a duplicate nonce, so the dedup had
+/// to discard one of the two, and every field it ranked on was the writer's
+/// to choose.
 ///
-/// So a client that recognises "a message I sent" by nonce alone can be made
-/// to recognise somebody else's words as its own. This digest is the
-/// discriminator the nonce is not: it covers every field, so a substitute
-/// that differs in any way -- and a substitute must differ in the ciphertext,
-/// or it is the same message -- has a different digest.
+/// In Phase 2 that is not a nuisance. The seller's reply carries a pre-signed
+/// confession which is the buyer's SOLE capability to file against the
+/// seller's bond, and the seller knows its nonce -- so the bonded seller
+/// could send it, wait for payment, and retract it.
 ///
-/// **This is a client-side recognition aid and NOT a defence against the
-/// substitution itself.** Nothing here stops the counterparty replacing the
-/// entry; see `docs/messaging-privacy.md`. It stops the replacement being
-/// mistaken for the original.
+/// Hashing the whole entry ends it: two entries that differ in any byte are
+/// two entries, so there is no collision to resolve and nothing to displace.
+/// The contract can compute this without any key, which is what makes it
+/// enforceable -- a rule that only honest clients follow (deriving the nonce
+/// from the message, say) binds nobody who matters.
+///
+/// # What it does NOT do
+///
+/// It does not stop the counterparty WRITING. They hold the key, so they can
+/// always add a message to the conversation, and a substitute now sits beside
+/// the original rather than in place of it. Nor does it make a message
+/// permanently un-removable: a funded flood can still evict it under the cap
+/// (`known_gap_a_funded_flood_still_evicts_every_honest_message`). What
+/// changed is that retraction stopped being free, targeted and silent.
+///
+/// # Where it is used
+///
+/// Everywhere "the same message" is decided: [`MailboxStateV1::verify`],
+/// [`MailboxStateV1::summarize`], [`MailboxStateV1::delta`],
+/// `dedupe_identical_entries`, and the mailbox contract's own update arms,
+/// which delegate rather than deciding for themselves. Clients also use it to
+/// recognise their own writing (`AppState::authored_here`), which is what
+/// stops a substitute being labelled as the buyer's own words.
+///
+/// A source scrape,
+/// `no_production_code_compares_message_nonces_for_identity`, fails if a site
+/// starts answering the question for itself again -- it has happened four
+/// times.
 ///
 /// Domain-separated, so a digest of a message can never coincide with a
 /// digest of anything else this codebase hashes.
@@ -483,12 +506,26 @@ pub fn entry_digest(message: &EncryptedMessage) -> [u8; 32] {
 /// # This was a set of NONCES, and the name changed with the payload
 ///
 /// `MailboxSummary` carried `[u8; 24]` nonces until 2026-09-05. The rename is
-/// deliberate: a change of payload is a change of name, and the two shapes
-/// must never be confused for one another. They cannot be, in practice --
-/// a 24-element array does not deserialize as a 32-element one, so an old
-/// summary meeting new code is a decode error rather than a misparse. Nothing
-/// needs to read the old shape: this branch is unmerged and no mailbox
-/// contract carrying it has ever been published.
+/// deliberate: a change of payload is a change of name.
+///
+/// **Two things an earlier version of this comment claimed, corrected after
+/// review, because both were wrong and both are the kind of premise a later
+/// decision gets built on.**
+///
+/// It said no contract carrying the old shape had ever been published. False:
+/// `legacy/mailbox_contract.toml` records seven published generations and
+/// every one of them shipped the 24-byte summary. What actually makes the old
+/// shape unreachable is that the contract is content-addressed, so this change
+/// re-keys it -- a V7 peer and a V8 summary never meet, because they are
+/// different contracts.
+///
+/// It also said the two shapes "cannot be confused on the wire". Measured
+/// through this crate's own `to_cbor`/`from_cbor`, that holds in one direction
+/// and not the other: a non-empty 24-byte summary read as 32-byte fails with
+/// "invalid length 24"; an EMPTY one decodes cleanly as an empty set; and a
+/// 32-byte summary read by old code is silently TRUNCATED to 24-byte prefixes,
+/// so it would answer "I hold these" for digests it has never seen. The
+/// re-key is what makes that unreachable, not the encoding.
 ///
 /// The change is what makes a message unretractable. While the summary was a
 /// set of nonces, a peer that held ONE of two entries sharing a nonce
@@ -501,38 +538,6 @@ pub type MailboxSummaryV2 = HashSet<[u8; 32]>;
 /// messages, and only what counts as "already held" moved.
 pub type MailboxDelta = Vec<EncryptedMessage>;
 
-/// Drop the lowest-ranked messages until `messages` satisfies BOTH
-/// [`MAX_MESSAGES`] and [`MAX_MAILBOX_BYTES`].
-///
-/// Rank is `(timestamp, nonce)`, highest kept. Both fields are chosen by
-/// whoever wrote the message, so this ordering is grindable and is not offered
-/// as a defence -- see [`MailboxStateV1::apply_delta`] for what the caps do
-/// and do not buy. What it has to be is *total* and a pure function of
-/// message content, so that two replicas holding the same set of messages keep
-/// the same subset. Ranking by anything else available here has the same
-/// property and the same weakness, and `(timestamp, nonce)` at least leaves a
-/// mailbox carrying only honest traffic behaving as a recency window, which is
-/// what the age-based rule it replaces was for.
-///
-/// # Why both caps are one pass, and why the kept set is a PREFIX
-///
-/// The kept set is the longest prefix of that ranking which satisfies both
-/// budgets: the walk stops at the first message that does not fit rather than
-/// skipping it and trying smaller ones behind it. Packing greedily would keep
-/// more bytes, and it would also mean a lower-ranked message could survive
-/// while a higher-ranked one was dropped -- a rule that is still
-/// deterministic, but whose convergence argument is a bin-packing walk rather
-/// than "both peers keep the same prefix of the same total order". The
-/// simpler argument is worth more here than the extra bytes, because
-/// divergence in this function is silent and permanent.
-///
-/// A prefix rule has one failure mode, and it is closed elsewhere rather than
-/// here: if the FIRST message did not fit, nothing would be kept at all. That
-/// is why [`MAX_MESSAGE_BYTES`] is far below [`MAX_MAILBOX_BYTES`] and why
-/// [`MailboxStateV1::apply_delta`] refuses an oversized message on the way in
-/// -- an attacker can put their message at the top of this ranking for free,
-/// so "one message empties the mailbox" would have been cheaper and more
-/// total than the unbounded growth the budget exists to stop.
 /// Keep one copy of each distinct message.
 ///
 /// # Why this exists at all
@@ -566,24 +571,72 @@ pub type MailboxDelta = Vec<EncryptedMessage>;
 /// replacing it. The mailbox is open-write, so an attacker could always add
 /// an entry; what they can no longer do is remove one. See
 /// `docs/messaging-privacy.md`.
-/// # This sort is where convergence comes from
+/// # Convergence rests on this sort OR on `apply_delta`'s final tiebreak
 ///
-/// Not the cap's ranking, and not the normalisation at the end of
-/// `apply_delta`. Sorting by digest imposes a TOTAL order on the whole
-/// collection -- two entries that tie on it are the same entry -- and every
-/// later sort is stable, so ties keep this order. Two peers given the same
-/// set in different orders therefore hold the same bytes.
+/// **Corrected on 2026-09-05 after review; the first version of this comment
+/// claimed the property lived here alone and cited a measurement that does
+/// not reproduce.** What the mutation matrix actually shows:
 ///
-/// Measured, not assumed: with this line replaced by an order-dependent
-/// dedup, `two_different_messages_sharing_a_nonce_converge_and_both_survive`
-/// and two neighbours fail. With the digest tiebreaks removed from either of
-/// the later sorts, nothing fails -- which is the evidence that the property
-/// lives here and not there.
+/// * replacing this with an order-dependent dedup (`retain` + a `HashSet`,
+///   first-wins, input order preserved) alone: **everything still passes**,
+///   because `apply_delta`'s final `(nonce, entry_digest)` sort re-normalises
+///   whatever order this leaves behind;
+/// * removing that final tiebreak alone: **everything still passes**, because
+///   this sort already ordered them;
+/// * doing BOTH: **three tests fail**, including
+///   `two_different_messages_sharing_a_nonce_converge_and_both_survive`.
+///
+/// So the two are mutually redundant and neither is individually observable.
+/// The earlier inference -- "the tiebreaks survive their own mutation, so the
+/// property lives here" -- was invalid, because THIS survives its own
+/// mutation too; single-mutation survival is symmetric and cannot attribute
+/// anything.
+///
+/// **Do not delete both.** Each of the two comments is individually true and
+/// together they would authorise exactly that, which is a silent permanent
+/// divergence with a green suite.
+///
+/// (`enforce_message_cap`'s digest tiebreak is a third and is redundant to
+/// both: removing the two above kills the suite whether or not it is
+/// present.)
 fn dedupe_identical_entries(messages: &mut Vec<EncryptedMessage>) {
     messages.sort_by_key(entry_digest);
     messages.dedup_by_key(|message| entry_digest(message));
 }
 
+/// Drop the lowest-ranked messages until `messages` satisfies BOTH
+/// [`MAX_MESSAGES`] and [`MAX_MAILBOX_BYTES`].
+///
+/// Rank is `(timestamp, nonce, entry_digest)`, highest kept. Every field is
+/// chosen by whoever wrote the message, so this ordering is grindable and is
+/// not offered
+/// as a defence -- see [`MailboxStateV1::apply_delta`] for what the caps do
+/// and do not buy. What it has to be is *total* and a pure function of
+/// message content, so that two replicas holding the same set of messages keep
+/// the same subset. Ranking by anything else available here has the same
+/// property and the same weakness, and `(timestamp, nonce)` at least leaves a
+/// mailbox carrying only honest traffic behaving as a recency window, which is
+/// what the age-based rule it replaces was for.
+///
+/// # Why both caps are one pass, and why the kept set is a PREFIX
+///
+/// The kept set is the longest prefix of that ranking which satisfies both
+/// budgets: the walk stops at the first message that does not fit rather than
+/// skipping it and trying smaller ones behind it. Packing greedily would keep
+/// more bytes, and it would also mean a lower-ranked message could survive
+/// while a higher-ranked one was dropped -- a rule that is still
+/// deterministic, but whose convergence argument is a bin-packing walk rather
+/// than "both peers keep the same prefix of the same total order". The
+/// simpler argument is worth more here than the extra bytes, because
+/// divergence in this function is silent and permanent.
+///
+/// A prefix rule has one failure mode, and it is closed elsewhere rather than
+/// here: if the FIRST message did not fit, nothing would be kept at all. That
+/// is why [`MAX_MESSAGE_BYTES`] is far below [`MAX_MAILBOX_BYTES`] and why
+/// [`MailboxStateV1::apply_delta`] refuses an oversized message on the way in
+/// -- an attacker can put their message at the top of this ranking for free,
+/// so "one message empties the mailbox" would have been cheaper and more
+/// total than the unbounded growth the budget exists to stop.
 fn enforce_message_cap(messages: &mut Vec<EncryptedMessage>) {
     let over_count = messages.len() > MAX_MESSAGES;
     let over_bytes = messages.iter().map(message_bytes).sum::<usize>() > MAX_MAILBOX_BYTES;
@@ -594,13 +647,12 @@ fn enforce_message_cap(messages: &mut Vec<EncryptedMessage>) {
     // Descending. `(timestamp, nonce)` stopped being a total order the moment
     // two entries could share both, so the digest is appended to close it.
     //
-    // **This tiebreak is NOT what makes pruning converge, and no test fails
-    // without it**, because `dedupe_identical_entries` has already sorted the
-    // whole collection by digest and this sort is stable. It is here so that
-    // the ranking is self-sufficient rather than resting on an invisible
-    // precondition about what ran before it -- verified by removing it and
-    // seeing the suite stay green, which is why this says so instead of
-    // claiming the property.
+    // No test fails without this tiebreak, and it is redundant to BOTH of the
+    // mechanisms named on `dedupe_identical_entries` -- removing those two
+    // kills the suite whether or not this one is present. It is here so the
+    // ranking is self-sufficient rather than resting on a precondition about
+    // what ran before it. Kept, unobservable, and saying so rather than
+    // claiming a property it does not carry.
     messages.sort_by(|a, b| {
         b.timestamp
             .cmp(&a.timestamp)
@@ -785,24 +837,24 @@ impl MailboxStateV1 {
         dedupe_identical_entries(&mut self.messages);
         enforce_message_cap(&mut self.messages);
 
-        // Normalisation, NOT the thing that makes the state converge. This
-        // line's comment used to say "sort deterministically by nonce for
-        // CRDT convergence", and that stopped being true when
-        // `dedupe_by_nonce` arrived: it already sorts by nonce, and
-        // `enforce_message_cap` either preserves that order or imposes its
-        // own deterministic one, so both peers agree on the byte order
-        // without this. Deleting it passes the whole workspace.
+        // Normalisation, and ONE OF TWO mechanisms that make a same-nonce
+        // pair converge -- see `dedupe_identical_entries` for the other and
+        // for the mutation matrix. Deleting this alone passes the whole
+        // workspace; deleting both fails three tests.
         //
-        // It stays because it normalises the over-cap case back to one
-        // stored order rather than two. What it must not do is carry the
-        // claim, because a comment attributing a property to the wrong
+        // This comment has been wrong twice, in opposite directions, which is
+        // why it is careful now. It first said "sort deterministically by
+        // nonce for CRDT convergence" (it was not the only such mechanism),
+        // then said it carried nothing at all (it is one of the two that
+        // do). A comment attributing a property to the wrong
         // mechanism is how the next person deletes the mechanism that
         // actually provides it.
         //
-        // The digest tiebreak is here for the same reason it is in the cap's
-        // ranking, and with the same caveat: nonce alone no longer
-        // distinguishes two entries, and no test fails without this, because
-        // dedup already ordered them. Self-sufficiency, not the mechanism.
+        // The digest tiebreak makes this a total order, and it is one of the
+        // TWO mechanisms that carry convergence for a same-nonce pair -- see
+        // `dedupe_identical_entries`, which is the other. Either alone is
+        // sufficient, so removing this one alone passes; removing both fails
+        // three tests. Do not delete both.
         self.messages.sort_by(|a, b| {
             a.nonce
                 .cmp(&b.nonce)
@@ -1306,10 +1358,11 @@ mod byte_budget_tests {
     /// Every one of them uses an over-cap fixture, so all four exercise
     /// `enforce_message_cap`'s ordering and none exercises the under-cap
     /// path. That gap was found by mutation: deleting `apply_delta`'s final
-    /// sort left the entire workspace green, because `dedupe_by_nonce` also
-    /// orders by nonce -- true, but the tests could not distinguish which
+    /// sort left the entire workspace green, because the dedup also orders
+    /// the collection -- true, but the tests could not distinguish which
     /// mechanism was doing the work, which is the same thing as not testing
-    /// either.
+    /// either. That redundancy still holds, and is written up on
+    /// `dedupe_identical_entries`.
     #[test]
     fn merging_converges_when_neither_cap_binds() {
         let base = 1_700_000_000;
@@ -1842,8 +1895,16 @@ mod entry_identity_tests {
         state
     }
 
-    /// **The message a bond rests on cannot be retracted by the party who
-    /// sent it.**
+    /// **A message cannot be retracted by submitting another under its
+    /// nonce.**
+    ///
+    /// Note the qualification, which is load-bearing for Phase 2: this closes
+    /// the free, targeted, silent route. It does NOT make a message
+    /// permanently un-removable -- a funded flood still evicts it, at about
+    /// 122 KiB and taking the whole mailbox with it
+    /// (`known_gap_a_funded_flood_still_evicts_every_honest_message`). If the
+    /// buyer's recourse must survive a seller willing to spend that, the
+    /// confession needs a home outside the mailbox.
     ///
     /// This is the reason the contract computes identity for itself. In Phase
     /// 2 the seller's reply carries a pre-signed confession, and that

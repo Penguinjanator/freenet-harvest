@@ -564,15 +564,30 @@ impl ProbeStateOps for MailboxOps {
     }
 }
 
-/// The mailbox contract's own merge: add messages we do not hold, then let
-/// `apply_delta` re-apply its message cap.
+/// The mailbox contract's own merge: hand everything to `apply_delta` and let
+/// it decide what is already held and what the cap keeps.
+///
+/// # It used to decide "already held" here, by nonce
+///
+/// It filtered on `held.nonce == m.nonce`, which was right while the nonce
+/// WAS the identity and silently wrong once `verify`, `summarize`, `delta`
+/// and the dedup moved to `entry_digest`. This is the sharpest place for that
+/// mistake to live: the fold runs during a RE-KEY, carrying a buyer's
+/// messages forward from a superseded generation, so a message dropped here
+/// is dropped at the moment the whole migration exists to preserve it.
+///
+/// It was the FOURTH site with this shape, and the first found by the source
+/// scrape rather than by a person -- see
+/// `mailbox-contract`'s `no_production_code_compares_message_nonces_for_identity`.
+/// There is no comparison here any more; `apply_delta` dedups by
+/// `entry_digest`, so handing it everything is correct and idempotent.
 ///
 /// Folding an older generation can push the mailbox over
 /// `harvest_common::mailbox::MAX_MESSAGES`. `apply_delta` runs
 /// `enforce_message_cap` on every call, which keeps the highest-ranked
-/// `MAX_MESSAGES` by `(timestamp, nonce)` -- a total order and a pure function
-/// of message content, so the fold result is trimmed to exactly the subset any
-/// peer would keep from the same bytes.
+/// `MAX_MESSAGES` by `(timestamp, nonce, entry_digest)` -- a total order and a
+/// pure function of message content, so the fold result is trimmed to exactly
+/// the subset any peer would keep from the same bytes.
 ///
 /// What that does NOT give you is a guarantee the older generation's messages
 /// survive the fold: a mailbox at the cap drops whatever ranks lowest, and both
@@ -585,13 +600,7 @@ impl ProbeStateOps for MailboxOps {
 /// here any more, and nothing in this module should imply one.
 fn merge_mailbox(mut base: MailboxStateV1, other: &MailboxStateV1) -> MailboxStateV1 {
     let snapshot = base.clone();
-    let delta: Vec<_> = other
-        .messages
-        .iter()
-        .filter(|m| !base.messages.iter().any(|held| held.nonce == m.nonce))
-        .cloned()
-        .collect();
-    if base.apply_delta(&Some(delta)).is_err() {
+    if base.apply_delta(&Some(other.messages.clone())).is_err() {
         return snapshot;
     }
     base

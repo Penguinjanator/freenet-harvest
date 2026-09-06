@@ -147,8 +147,20 @@ Four consequences, all deliberate:
 
 * **A substitute now sits BESIDE the original.** The mailbox is open-write, so
   an attacker could always ADD an entry; what they can no longer do is remove
-  one. The buyer sees both, their own marked as theirs and the other
-  unattributed.
+  one **by submitting a colliding message**. The buyer sees both, their own
+  marked as theirs and the other unattributed.
+
+  **This is not "a message can never be removed", and the difference matters
+  for Phase 2.** A funded flood still evicts it: 512 entries dated later fill
+  the cap and take every honest message with them, measured at about 122 KiB
+  in a single update — see `known_gap_a_funded_flood_still_evicts_every_honest_message`
+  and "The flood, and what bounds it" below. What changed is that retraction
+  went from **free, targeted and silent** (one message's worth of bytes, aimed
+  at one entry, leaving no trace) to **expensive, indiscriminate and loud** (a
+  full cap's worth of bytes, destroying the seller's whole mailbox with it,
+  which for a bonded seller is self-incriminating). If a buyer's recourse must
+  survive a seller willing to spend that, the confession needs a home outside
+  the mailbox — a Phase 2 design decision this change does not settle.
 * **`MailboxSummary` became `MailboxSummaryV2`** and carries 32-byte digests
   instead of 24-byte nonces. A change of payload is a change of name. The two
   cannot be confused on the wire — a 24-element array does not deserialize as
@@ -165,19 +177,26 @@ Four consequences, all deliberate:
   tampering notice an outsider can trigger against a seller they have never
   dealt with is worse than none.
 
-**What was done instead**, at the client, where first-hand knowledge lives:
+**What was done at the client, before the contract fix landed**, and what
+survives it:
 
 * `authored_here` matches on `entry_digest` — every field of the entry — so a
   substitute is not credited to you. The counterparty cannot reproduce it
-  without sending the identical message, which is not a substitution.
-* `AppState::replaced_sent` reports a message whose **nonce is present with a
-  different digest**: it arrived and was displaced. That is a different thing
-  to tell someone than "not seen yet", and both are on screen. A nonce is 24
-  random bytes, so this is never an accident.
+  without sending the identical message, which is not a substitution. This
+  still matters after the contract fix: they can still WRITE, so their words
+  still appear; what they cannot do is have them appear as yours.
+* There was also an `AppState::replaced_sent`, reporting a message whose nonce
+  was present under a different digest — it had arrived and been displaced.
+  **That was deleted when the contract fix landed**, because the state can no
+  longer arise. It was not repointed at "an entry shares your nonce", because
+  that signal is forgeable by any third party: the mailbox is open-write and
+  the nonce is public, so an outsider could plant an unreadable entry under it
+  and trigger a "somebody tampered" notice against a seller they have never
+  dealt with.
 
-It works in both directions. A buyer can put a confession in a seller's own
-inbox under the seller's nonce; the seller's screen showed it as their own
-words until this was fixed, and now shows their reply as replaced.
+It works in both directions. A buyer could put a confession in a seller's own
+inbox under the seller's nonce, and the seller's own screen showed it as their
+words until `authored_here` moved to the digest.
 
 ## A deliberate nonce collision is also AES-GCM nonce reuse
 

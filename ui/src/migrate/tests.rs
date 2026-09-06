@@ -1450,3 +1450,52 @@ fn the_wildcard_outcome_arm_retries() {
          this code has never seen."
     );
 }
+
+/// **The fold must not drop a message because something in the newer
+/// generation shares its nonce.**
+///
+/// Found by the source scrape added with the contract's identity re-key, not
+/// by review: this was a FOURTH site deciding "already held" by nonce, after
+/// `dedupe_by_nonce`, `summarize` and the contract's state-merge arm. It is
+/// the one with the sharpest consequence, because it runs during a re-key --
+/// the buyer's messages are being carried forward from a superseded
+/// generation, and a message dropped here is dropped at the moment the whole
+/// migration exists to preserve it.
+///
+/// The fix is the same as the contract's: no comparison at all.
+/// `apply_delta` decides, and it decides by `entry_digest`.
+#[test]
+fn folding_keeps_a_message_whose_nonce_the_newer_generation_shares() {
+    let mut confession = message(7, 1_700_000_000);
+    confession.ciphertext = b"I confess".to_vec();
+    let mut retraction = message(7, 1_700_000_001);
+    retraction.ciphertext = b"I said no such thing".to_vec();
+    assert_eq!(
+        confession.nonce, retraction.nonce,
+        "precondition: the two share a nonce"
+    );
+
+    let folded = super::merge_mailbox(
+        mailbox_with(vec![retraction.clone()]),
+        &mailbox_with(vec![confession.clone()]),
+    );
+
+    assert!(
+        folded.messages.contains(&confession),
+        "the fold dropped a message from the older generation because the newer one held \
+         something sharing its nonce"
+    );
+    assert!(folded.messages.contains(&retraction));
+    folded
+        .verify()
+        .expect("the fold must produce a valid state");
+}
+
+/// Folding a generation this one already holds entirely changes nothing.
+#[test]
+fn folding_an_identical_generation_changes_nothing() {
+    let held = mailbox_with(vec![message(1, 1_700_000_000), message(2, 1_700_000_001)]);
+    let folded = super::merge_mailbox(held.clone(), &held);
+    assert_eq!(folded.messages.len(), 2);
+    folded.verify().expect("valid");
+}

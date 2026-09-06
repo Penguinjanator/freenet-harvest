@@ -543,7 +543,7 @@ pub struct RecalledConversation {
     /// machine loses the conversation -- and, after Phase 2, the buyer's only
     /// recourse against the seller they paid. The UI warns on this; nothing
     /// but the user saying so can clear it. See
-    /// [`HarvestDelegateRequest::MarkConversationsBackedUp`].
+    /// [`HarvestDelegateRequest::MarkConversationBackedUp`].
     pub backed_up: bool,
 }
 

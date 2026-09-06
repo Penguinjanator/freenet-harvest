@@ -875,7 +875,8 @@ pub struct BrowsingStore {
     pub seller_verifying_key: Option<[u8; 32]>,
     /// Listings whose own certificate did not verify against this store.
     ///
-    /// Keyed by [`ListingId`] rather than by position, so it cannot drift out
+    /// Keyed by [`harvest_common::listing::ListingId`] rather than by position,
+    /// so it cannot drift out
     /// of step with `listings` when a merge reorders them.
     pub unverified_listings: HashSet<harvest_common::listing::ListingId>,
     /// Orders placed against this store (buyer or seller side -- the store
@@ -2769,7 +2770,7 @@ impl AppState {
         spawn_order_signature(pending);
     }
 
-    /// A creation time whose resulting [`OrderId`] is not one we already hold.
+    /// A creation time whose resulting `OrderId` is not one we already hold.
     ///
     /// # Why this is needed at all
     ///
@@ -8290,10 +8291,14 @@ mod nonce_collision_tests {
 
     /// **The attack.** Take a message the buyer sent, put different plaintext
     /// under the SAME nonce and the same conversation key, and date it one
-    /// second later so `dedupe_by_nonce` prefers it.
+    /// second later -- which is what the contract's dedup used to prefer,
+    /// before identity moved to `entry_digest` and the two stopped colliding
+    /// at all.
     ///
     /// Built here rather than through `messaging::seal`, which draws a fresh
-    /// nonce -- that is exactly what an attacker declines to do.
+    /// nonce -- that is exactly what an attacker declines to do. The attempt
+    /// is still worth driving: it no longer displaces anything, and these
+    /// tests are what say so.
     fn substitute(original: &EncryptedMessage, text: &str) -> EncryptedMessage {
         let keys = seller_keys(&original.sender_public_key);
         let plaintext = crate::messaging::PlaintextMessage {
@@ -8452,6 +8457,42 @@ mod nonce_collision_tests {
         assert!(
             buyer.unconfirmed_sent(STORE).is_empty(),
             "the buyer's message is in the mailbox and was reported as not yet arrived"
+        );
+    }
+
+    /// **A message that is NOT in the mailbox stays unconfirmed, even when
+    /// something else holds its nonce.**
+    ///
+    /// The neighbouring test puts BOTH entries in the mailbox, so the nonce
+    /// rule and the digest rule agree and it cannot see the difference --
+    /// the same fixture shape that let the re-store guard go unpinned. This
+    /// one puts only the substitute there.
+    ///
+    /// The failure it forbids is narrow and composes with the one retraction
+    /// route still open: the buyer's message lands, a funded flood evicts it
+    /// while a same-nonce entry planted earlier survives, and the UI reports
+    /// the message as delivered when it is gone.
+    #[test]
+    fn a_message_absent_from_the_mailbox_is_unconfirmed_even_if_its_nonce_is_there() {
+        let mut buyer = buyer_state();
+        let mine = buyer
+            .compose_to_seller(STORE, &seller_public(), "please cancel my order".into())
+            .expect("compose");
+        buyer.record_sent_message(STORE, "please cancel my order".into(), &mine);
+
+        // Only THEIRS reaches the mailbox: same nonce, different bytes.
+        let theirs = substitute(&mine, "actually, never mind, cancel it");
+        buyer
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("store")
+            .mailbox_messages = mailbox_after(vec![theirs]);
+
+        assert_eq!(
+            buyer.unconfirmed_sent(STORE).len(),
+            1,
+            "a message that is not in the mailbox was reported as delivered, because \
+             something else holds its nonce"
         );
     }
 

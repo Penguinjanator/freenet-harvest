@@ -53,24 +53,33 @@ impl ContractInterface for Contract {
                 UpdateData::State(new_state) => {
                     let new_state = from_reader::<MailboxStateV1, &[u8]>(new_state.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
-                    // Merge: add messages we don't have
-                    let delta: MailboxDelta = new_state
-                        .messages
-                        .into_iter()
-                        .filter(|m| {
-                            !mailbox_state
-                                .messages
-                                .iter()
-                                .any(|existing| existing.nonce == m.nonce)
-                        })
-                        .collect();
-                    if !delta.is_empty() {
-                        mailbox_state.apply_delta(&Some(delta)).map_err(|e| {
-                            ContractError::InvalidUpdateWithInfo {
-                                reason: e.to_string(),
-                            }
+                    // Everything, and `apply_delta` decides what is already
+                    // held.
+                    //
+                    // # This arm used to answer that question itself, and got
+                    // it wrong
+                    //
+                    // It filtered on `existing.nonce == m.nonce`, which was
+                    // right while the nonce WAS the identity and silently
+                    // wrong after `verify`, `summarize`, `delta` and the dedup
+                    // moved to `entry_digest`. A PUT or a resync arrives here,
+                    // so a peer merging a full state discarded a message
+                    // because something else shared its nonce -- which is the
+                    // retraction the re-key exists to prevent, by a different
+                    // door.
+                    //
+                    // The fix is not a corrected comparison. It is that this
+                    // arm no longer HAS a comparison: `apply_delta` dedups by
+                    // `entry_digest`, so handing it everything is both correct
+                    // and idempotent, and there is one definition of "the same
+                    // message" rather than two that can drift apart.
+                    // `no_production_code_compares_message_nonces_for_identity`
+                    // fails if a fourth site starts answering it again.
+                    mailbox_state
+                        .apply_delta(&Some(new_state.messages))
+                        .map_err(|e| ContractError::InvalidUpdateWithInfo {
+                            reason: e.to_string(),
                         })?;
-                    }
                 }
                 UpdateData::Delta(d) => {
                     if d.as_ref().is_empty() {
@@ -137,5 +146,252 @@ impl ContractInterface for Contract {
             }
             None => Ok(StateDelta::from(vec![])),
         }
+    }
+}
+
+/// The contract's own entry points, which had no tests until 2026-09-05.
+///
+/// That absence is why the state-merge arm below kept deciding "already
+/// held" by nonce for a whole review round after `verify`, `summarize`,
+/// `delta` and the dedup had all moved to `entry_digest`: nothing exercised
+/// it.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harvest_common::mailbox::{ConversationId, EncryptedMessage};
+
+    fn message(nonce: [u8; 24], ciphertext: &[u8], seconds: i64) -> EncryptedMessage {
+        EncryptedMessage {
+            conversation_id: ConversationId([1u8; 32]),
+            sender_public_key: vec![2u8; 32],
+            ciphertext: ciphertext.to_vec(),
+            timestamp: chrono::DateTime::from_timestamp(seconds, 0).expect("timestamp"),
+            nonce,
+        }
+    }
+
+    fn encoded(state: &MailboxStateV1) -> Vec<u8> {
+        let mut bytes = vec![];
+        into_writer(state, &mut bytes).expect("encode");
+        bytes
+    }
+
+    fn parameters() -> Parameters<'static> {
+        let mut bytes = vec![];
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]).verifying_key();
+        into_writer(&MailboxParameters::new(owner), &mut bytes).expect("encode");
+        Parameters::from(bytes)
+    }
+
+    /// Put `data` through the contract and read back the state it produced.
+    fn update(state: &MailboxStateV1, data: Vec<UpdateData<'static>>) -> MailboxStateV1 {
+        let modification = <Contract as ContractInterface>::update_state(
+            parameters(),
+            State::from(encoded(state)),
+            data,
+        )
+        .expect("the contract must accept this update");
+        let bytes = match modification {
+            UpdateModification {
+                new_state: Some(s), ..
+            } => s.as_ref().to_vec(),
+            other => panic!("expected a new state, got {other:?}"),
+        };
+        from_reader::<MailboxStateV1, &[u8]>(bytes.as_ref()).expect("decode")
+    }
+
+    /// **A whole-state merge must not drop a message because something else
+    /// shares its nonce.**
+    ///
+    /// This is the same defect as the one the re-key fixed, at the one site
+    /// the re-key missed. A PUT and a resync both arrive as
+    /// `UpdateData::State`, so a peer merging a full state would silently
+    /// discard the confession and keep the retraction -- the contract's
+    /// identity rule says they are two messages, and this arm said they were
+    /// one.
+    #[test]
+    fn a_state_merge_keeps_a_message_whose_nonce_something_else_shares() {
+        let confession = message([7u8; 24], b"I confess", 1_700_000_000);
+        let retraction = message([7u8; 24], b"I said no such thing", 1_700_000_001);
+
+        // A peer that already holds the retraction merges a state carrying
+        // the confession.
+        let held = MailboxStateV1 {
+            messages: vec![retraction.clone()],
+        };
+        let incoming = MailboxStateV1 {
+            messages: vec![confession.clone()],
+        };
+
+        let merged = update(
+            &held,
+            vec![UpdateData::State(State::from(encoded(&incoming)))],
+        );
+
+        assert!(
+            merged.messages.contains(&confession),
+            "a whole-state merge dropped a message because another shared its nonce"
+        );
+        assert!(merged.messages.contains(&retraction));
+        merged
+            .verify()
+            .expect("the contract must accept its own result");
+    }
+
+    /// And the same in the other direction, since a merge is not symmetric in
+    /// its inputs.
+    #[test]
+    fn a_state_merge_keeps_the_held_message_too() {
+        let confession = message([7u8; 24], b"I confess", 1_700_000_000);
+        let retraction = message([7u8; 24], b"I said no such thing", 1_700_000_001);
+
+        let held = MailboxStateV1 {
+            messages: vec![confession.clone()],
+        };
+        let incoming = MailboxStateV1 {
+            messages: vec![retraction.clone()],
+        };
+
+        let merged = update(
+            &held,
+            vec![UpdateData::State(State::from(encoded(&incoming)))],
+        );
+        assert!(merged.messages.contains(&confession));
+        assert!(merged.messages.contains(&retraction));
+    }
+
+    /// A merge of a state this peer already holds entirely changes nothing,
+    /// and in particular does not duplicate anything.
+    #[test]
+    fn merging_a_state_already_held_changes_nothing() {
+        let held = MailboxStateV1 {
+            messages: vec![
+                message([7u8; 24], b"one", 1_700_000_000),
+                message([8u8; 24], b"two", 1_700_000_001),
+            ],
+        };
+
+        let merged = update(&held, vec![UpdateData::State(State::from(encoded(&held)))]);
+        assert_eq!(merged.messages.len(), 2);
+        merged.verify().expect("valid");
+    }
+
+    /// The delta arm carries whole messages and always did; this is here so
+    /// the two arms are covered by the same fixture rather than one of them
+    /// being assumed.
+    #[test]
+    fn a_delta_keeps_a_message_whose_nonce_something_else_shares() {
+        let confession = message([7u8; 24], b"I confess", 1_700_000_000);
+        let retraction = message([7u8; 24], b"I said no such thing", 1_700_000_001);
+
+        let held = MailboxStateV1 {
+            messages: vec![retraction.clone()],
+        };
+        let mut delta_bytes = vec![];
+        into_writer(&vec![confession.clone()], &mut delta_bytes).expect("encode");
+
+        let merged = update(
+            &held,
+            vec![UpdateData::Delta(StateDelta::from(delta_bytes))],
+        );
+        assert!(merged.messages.contains(&confession));
+        assert!(merged.messages.contains(&retraction));
+    }
+
+    /// The state the contract hands back is one it would itself accept.
+    #[test]
+    fn a_merged_state_validates() {
+        let held = MailboxStateV1 {
+            messages: vec![message([7u8; 24], b"one", 1_700_000_000)],
+        };
+        let incoming = MailboxStateV1 {
+            messages: vec![message([7u8; 24], b"two", 1_700_000_001)],
+        };
+        let merged = update(
+            &held,
+            vec![UpdateData::State(State::from(encoded(&incoming)))],
+        );
+
+        let verdict = <Contract as ContractInterface>::validate_state(
+            parameters(),
+            State::from(encoded(&merged)),
+            RelatedContracts::default(),
+        )
+        .expect("validate");
+        assert!(matches!(verdict, ValidateResult::Valid));
+    }
+
+    /// **No production code decides "the same message" by comparing nonces.**
+    ///
+    /// A source scrape, because the three call sites that drifted did so one
+    /// at a time over three separate changes -- `dedupe_by_nonce`,
+    /// `summarize`, and this contract's state-merge arm -- and each was found
+    /// by a person rather than by the suite. `entry_digest` is the one
+    /// definition of identity; this fails when a fourth site starts answering
+    /// the question for itself.
+    ///
+    /// Scoped to the part of each file before its `#[cfg(test)]`, because
+    /// tests compare nonces legitimately (to assert that two entries collide,
+    /// which is the precondition of half these tests).
+    #[test]
+    fn no_production_code_compares_message_nonces_for_identity() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .to_path_buf();
+
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        let crates = [
+            "common/src",
+            "contracts/mailbox-contract/src",
+            "contracts/store-contract/src",
+            "contracts/reputation-contract/src",
+            "ui/src",
+            "delegates/harvest-delegate/src",
+        ];
+        for dir in crates {
+            for path in rust_files(&root.join(dir)) {
+                let text = std::fs::read_to_string(&path).expect("read");
+                let production = match text.find("#[cfg(test)]") {
+                    Some(at) => &text[..at],
+                    None => &text[..],
+                };
+                scanned += 1;
+                for (number, line) in production.lines().enumerate() {
+                    let line = line.trim();
+                    if line.starts_with("//") || line.starts_with("///") {
+                        continue;
+                    }
+                    if line.contains(".nonce ==") || line.contains("== m.nonce") {
+                        offenders.push(format!("{}:{}: {line}", path.display(), number + 1));
+                    }
+                }
+            }
+        }
+
+        assert!(scanned > 10, "the scrape found almost no files: {scanned}");
+        assert!(
+            offenders.is_empty(),
+            "these decide message identity by nonce rather than by `entry_digest`:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    fn rust_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(rust_files(&path));
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                found.push(path);
+            }
+        }
+        found
     }
 }
