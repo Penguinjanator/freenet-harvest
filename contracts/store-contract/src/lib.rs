@@ -355,7 +355,7 @@ mod tests {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let listing_id = ListingId::new("seller-fp", &ts, "Widget");
         Order {
-            id: OrderId::new("seller-fp", &listing_id, &ts, "buyer-fp"),
+            id: OrderId([0u8; 16]),
             listing_id,
             buyer_fingerprint: "buyer-fp".into(),
             seller_fingerprint: "seller-fp".into(),
@@ -370,8 +370,10 @@ mod tests {
             )],
             bitcoin_address_code_hash: code_hash,
             anchor: None,
+            order_binding: None,
             created_at: ts,
         }
+        .with_derived_id()
     }
 
     fn make_paid_order(seller: &SigningKey, bridge: &SigningKey, order: Order) -> AuthorizedOrder {

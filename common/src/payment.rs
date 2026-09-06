@@ -79,24 +79,73 @@ use serde::{Deserialize, Serialize};
 
 use crate::listing::ListingId;
 
-/// Unique order identifier: first 16 bytes of
-/// `BLAKE3(seller_fingerprint || listing_id || created_at_ms || buyer_fingerprint)`.
+/// Unique order identifier: the first 16 bytes of a hash of the order's own
+/// TERMS.
+///
+/// # Why the identity is the content
+///
+/// It used to be `BLAKE3(seller_fingerprint || listing_id || created_at_ms ||
+/// buyer_fingerprint)` -- and **nothing else**. Not the amount, not the
+/// script, not the payment address. So one seller could sign two
+/// differently-termed, individually valid orders that shared an id, and they
+/// collided on one key of [`crate::store::OrdersV1`]'s map.
+///
+/// The collision was not a draw. `merge_order` resolves an equal-rank tie by
+/// keeping the lexicographically SMALLER CBOR encoding, which is
+/// deterministic -- and directional. A seller could publish the larger
+/// encoding, let it propagate and be read, then publish the smaller one,
+/// which wins on every replica and permanently. Applied to the buy flow that
+/// reads: show the buyer an order at address A, wait for them to pay it, then
+/// replace the terms with address B. The public record ends up describing a
+/// destination that never received anything, so the payment is unprovable and
+/// the declared debt the buyer relied on describes a different transaction.
+///
+/// The smaller-CBOR rule is not the defect and must not be changed to fix
+/// this -- it exists so that a third party cannot win a tie by PADDING a
+/// payment proof, and it is correct for that. The defect is that two
+/// different things were allowed to be one thing. Deriving the id from the
+/// terms makes them two orders, so there is no tie to resolve, and it is the
+/// same remedy the mailbox needed when message identity moved to
+/// `entry_digest`: **identity is the content, or something will eventually
+/// change under it.**
+///
+/// # What it covers, and why there is no list
+///
+/// The whole encoded struct, with the id blanked. Written that way rather
+/// than as a chosen list of fields because a list is a thing somebody adds a
+/// field beside -- which is exactly how the old preimage came to omit the
+/// amount and the address. A field added to [`Order`] tomorrow is inside the
+/// preimage without anybody remembering to put it there.
+///
+/// # Residual: 16 bytes is a birthday bound, not a collision proof
+///
+/// Finding a SECOND PREIMAGE for an id a buyer has already accepted is 2^128
+/// work and out of reach. But the attack above needs only a COLLISION between
+/// two orders the seller chooses, which is ~2^64 -- expensive, and no longer
+/// free. Widening `OrderId` to 32 bytes would close it and is a wire change
+/// touching every order ever published; it is recorded as an open residual in
+/// `docs/untested-invariants.md` rather than done here. The buyer-side
+/// binding ([`Order::order_binding`]) does not help against it, since the
+/// seller can put the buyer's binding on both halves of a collision.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct OrderId(pub [u8; 16]);
 
 impl OrderId {
-    pub fn new(
-        seller_fingerprint: &str,
-        listing_id: &ListingId,
-        created_at: &DateTime<Utc>,
-        buyer_fingerprint: &str,
-    ) -> Self {
+    /// The id these terms give.
+    ///
+    /// Idempotent: the id field is blanked before hashing, so computing this
+    /// on an order that already carries the answer gives the same answer --
+    /// which is what lets [`AuthorizedOrder::verify`] demand that they match.
+    pub fn from_terms(order: &Order) -> Self {
+        let mut probe = order.clone();
+        probe.id = Self([0u8; 16]);
+        // Infallible for the same reason as `order_content_digest`: `Order`
+        // derives `Serialize` over plain data with no custom fallible
+        // encoding.
+        let terms = crate::to_cbor(&probe).expect("Order always serializes to CBOR");
         let mut h = blake3::Hasher::new();
-        h.update(b"harvest/order-id/v1");
-        h.update(seller_fingerprint.as_bytes());
-        h.update(&listing_id.0);
-        h.update(&created_at.timestamp_millis().to_le_bytes());
-        h.update(buyer_fingerprint.as_bytes());
+        h.update(b"harvest/order-id/v2");
+        h.update(&terms);
         let mut id = [0u8; 16];
         id.copy_from_slice(&h.finalize().as_bytes()[..16]);
         Self(id)
@@ -333,10 +382,57 @@ pub struct Order {
     /// direction rather than a silent downgrade.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<BlockAnchor>,
+    /// What makes this commitment ONE buyer's rather than anyone's.
+    ///
+    /// # The hole this closes
+    ///
+    /// Nothing else here names a particular buyer -- `buyer_fingerprint` is
+    /// empty for every order the buy flow produces, because a buyer has no
+    /// identity. So without this a seller could accept one order, publish one
+    /// commitment, and send its id down any number of conversations: every
+    /// buyer's software found it published, signed, fresh and for a listing
+    /// they had asked about, and showed them all the same payment address.
+    /// One declared debt collecting unbounded money inverts the mechanism the
+    /// commitment exists for, since a count that does not bound the money is
+    /// not a count.
+    ///
+    /// This is `H(n)` from `docs/design/incentive-mechanism.md` and issue 8:
+    /// the buyer sends it with the request, the seller copies it here, and
+    /// the buyer refuses to pay a commitment that does not carry the value
+    /// their own node derives. See
+    /// [`crate::mailbox::order_binding_from_secret`] for where `n` comes
+    /// from, why the seller cannot compute it, and why publishing `H(n)`
+    /// reveals nothing.
+    ///
+    /// # Why `Option`, and why it skips when absent
+    ///
+    /// Exactly as for [`Self::anchor`], and for the same signature reason:
+    /// [`AuthorizedOrder::verify_terms`] re-serializes this struct, so a
+    /// field that encoded when absent would break every signature taken
+    /// before it existed.
+    ///
+    /// A buyer refuses an unbound commitment, so `None` fails closed rather
+    /// than matching everyone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_binding: Option<[u8; 32]>,
     pub created_at: DateTime<Utc>,
 }
 
 impl Order {
+    /// Stamp this order with the id its own terms give.
+    ///
+    /// Every producer of an `Order` must go through this, because
+    /// [`AuthorizedOrder::verify_terms`] refuses a record whose id is not the
+    /// one its terms give -- so an order built any other way is one no peer
+    /// will accept. Taking `self` and returning it makes the stamping part of
+    /// construction rather than a step a caller can forget after filling the
+    /// struct in.
+    #[must_use]
+    pub fn with_derived_id(mut self) -> Self {
+        self.id = OrderId::from_terms(&self);
+        self
+    }
+
     /// Parameters of the `BitcoinAddressContract` that observes this order's
     /// payment destination.
     pub fn bitcoin_params(&self) -> BitcoinAddressParameters {
@@ -956,7 +1052,27 @@ impl AuthorizedOrder {
             &self.signature,
             seller_key,
             &self.order,
-        )
+        )?;
+        // The id has to be the one these terms give, or two differently-termed
+        // orders could share a key and the later one would displace the
+        // earlier under `merge_order`'s tie-break -- see [`OrderId`] for the
+        // attack that made this necessary.
+        //
+        // AFTER the signature, and that ordering is about the message rather
+        // than about security -- both are refusals. A record with terms
+        // altered since signing fails both checks, and "the seller did not
+        // sign this" is the more useful of the two things to be told; the id
+        // check is what catches a record that is genuinely self-consistent
+        // and self-signed but filed under somebody else's id, which is the
+        // case only this check can see.
+        let expected = OrderId::from_terms(&self.order);
+        if self.order.id != expected {
+            return Err(format!(
+                "order id {} is not the id these terms give ({expected})",
+                self.order.id
+            ));
+        }
+        Ok(())
     }
 
     /// Which of the optional fields each status actually consults.
@@ -1289,7 +1405,7 @@ mod lightning_tests {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let listing_id = ListingId::new("seller", &ts, "Widget");
         Order {
-            id: OrderId::new("seller", &listing_id, &ts, "buyer"),
+            id: OrderId([0u8; 16]),
             listing_id,
             buyer_fingerprint: "buyer".into(),
             seller_fingerprint: "seller".into(),
@@ -1306,8 +1422,10 @@ mod lightning_tests {
             trusted_bridges: Vec::new(),
             bitcoin_address_code_hash: None,
             anchor: None,
+            order_binding: None,
             created_at: ts,
         }
+        .with_derived_id()
     }
 
     #[test]
@@ -1396,7 +1514,7 @@ mod lightning_tests {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let listing_id = ListingId::new("seller", &ts, "Widget");
         let old = OldOrder {
-            id: OrderId::new("seller", &listing_id, &ts, "buyer"),
+            id: OrderId([3u8; 16]),
             listing_id,
             buyer_fingerprint: "buyer".into(),
             seller_fingerprint: "seller".into(),
@@ -1481,6 +1599,11 @@ mod order_wire_compat_tests {
             .expect("a pre-anchor order must still decode into today's type");
         assert_eq!(order.amount_sats, 50_000);
         assert_eq!(order.seller_fingerprint, "seller-fp");
+        // Both fields added since these bytes were written come back absent,
+        // and absent is the answer that fails closed at every reader: a buyer
+        // refuses an order with no anchor and one with no binding.
+        assert_eq!(order.anchor, None);
+        assert_eq!(order.order_binding, None);
     }
 
     /// **The anchor field must not change the preimage of an old signature.**
@@ -1493,8 +1616,9 @@ mod order_wire_compat_tests {
     /// invoices with "order signature invalid".
     ///
     /// This is the same trap `StoreInfoV1::encryption_public_key` documents,
-    /// and it is why the anchor carries `skip_serializing_if` rather than
-    /// `serde(default)` alone. Observed red against the naive
+    /// and it is why the anchor -- and, since review, `order_binding` --
+    /// carries `skip_serializing_if` rather than `serde(default)` alone. The
+    /// fixture predates both, so it pins both. Observed red against the naive
     /// `#[serde(default)]`-only form:
     ///
     /// ```text
@@ -1514,6 +1638,181 @@ mod order_wire_compat_tests {
             re_encoded, PRE_ANCHOR_ORDER_CBOR,
             "an order that predates the anchor must re-encode to the bytes its signature \
              was taken over"
+        );
+    }
+}
+
+#[cfg(test)]
+mod order_identity_tests {
+    use super::*;
+
+    fn terms(address: &str, amount_sats: u64) -> Order {
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        Order {
+            id: OrderId([0u8; 16]),
+            listing_id: ListingId([1u8; 16]),
+            buyer_fingerprint: String::new(),
+            seller_fingerprint: "seller-fp".to_string(),
+            amount_sats,
+            network: BitcoinNetwork::Signet,
+            payment_script_pubkey: address.as_bytes().to_vec(),
+            payment_address: address.to_string(),
+            required_confirmations: 1,
+            payment_hash: None,
+            trusted_bridges: Vec::new(),
+            bitcoin_address_code_hash: None,
+            anchor: None,
+            order_binding: None,
+            created_at,
+        }
+    }
+
+    /// A commitment whose id is the one its own terms give.
+    fn commitment(order: Order, signing_key: &ed25519_dalek::SigningKey) -> AuthorizedOrder {
+        use ed25519_dalek::Signer;
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let mut order = order;
+        order.id = OrderId::from_terms(&order);
+        let message = crate::to_cbor(&order).expect("serialize");
+        let scoped = ghostkey_common::ScopedPayload {
+            requestor: ghostkey_common::SignatureRequestor::WebApp(
+                crate::HARVEST_WEBAPP_CONTRACT_ID
+                    .parse::<ContractInstanceId>()
+                    .expect("canonical webapp id"),
+            ),
+            payload: message,
+        };
+        let scoped_payload = crate::to_cbor(&scoped).expect("serialize scoped");
+        let signature = signing_key.sign(&scoped_payload).to_bytes().to_vec();
+        AuthorizedOrder {
+            order,
+            scoped_payload,
+            signature,
+            status: OrderStatus::AwaitingPayment,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        }
+    }
+
+    /// **A seller cannot swap the payment address under one order id.**
+    ///
+    /// The hole this closes, found in review. `OrderId` used to hash
+    /// `(seller, listing, created_at_ms, buyer)` and nothing else -- not the
+    /// amount, not the script, not the address -- so one seller could sign
+    /// two differently-termed, individually valid orders sharing one id.
+    /// `merge_order` resolves an equal-rank collision by smaller-CBOR-wins,
+    /// which is deterministic and DIRECTIONAL: publish the larger encoding,
+    /// let the buyer read and pay it, then publish the smaller, which wins
+    /// everywhere and permanently. The public record then shows an order
+    /// whose payment destination never received anything.
+    ///
+    /// Deriving the id from the terms makes the two orders two DIFFERENT
+    /// orders, so there is no collision to resolve and nothing to displace.
+    #[test]
+    fn two_differently_termed_orders_cannot_share_an_id() {
+        let shown = terms("tb1q_shown_to_the_buyer", 50_000);
+        let swapped = terms("tb1q_swapped_afterwards", 50_000);
+        assert_ne!(
+            OrderId::from_terms(&shown),
+            OrderId::from_terms(&swapped),
+            "two payment destinations must be two orders"
+        );
+
+        let dearer = terms("tb1q_shown_to_the_buyer", 500_000);
+        assert_ne!(
+            OrderId::from_terms(&shown),
+            OrderId::from_terms(&dearer),
+            "two amounts must be two orders"
+        );
+    }
+
+    /// **The id covers every field of the terms, by construction.**
+    ///
+    /// Written as a serialization of the whole struct with the id blanked,
+    /// rather than as a list of fields to hash: a list is a thing somebody
+    /// adds a field beside. So this test does not enumerate fields either --
+    /// it asserts the property that makes enumeration unnecessary, that two
+    /// orders with identical ids have identical encodings.
+    #[test]
+    fn an_id_determines_the_terms_it_was_derived_from() {
+        let one = terms("tb1q", 1);
+        let mut two = one.clone();
+        two.id = OrderId::from_terms(&one);
+        let mut three = two.clone();
+        three.anchor = Some(freenet_bitcoin_common::BlockAnchor {
+            height: 1,
+            hash: freenet_bitcoin_common::BlockHash([2u8; 32]),
+        });
+        assert_ne!(
+            OrderId::from_terms(&two),
+            OrderId::from_terms(&three),
+            "a field added since this test was written must still change the id"
+        );
+    }
+
+    /// **The id does not depend on what it currently holds.**
+    ///
+    /// The derivation blanks the id before hashing, so computing it twice --
+    /// once on a fresh order and once on the order carrying the result --
+    /// gives the same answer. Without that it would not be a fixed point and
+    /// `verify` could never be satisfied.
+    #[test]
+    fn deriving_an_id_is_idempotent() {
+        let mut order = terms("tb1q", 1);
+        let first = OrderId::from_terms(&order);
+        order.id = first.clone();
+        assert_eq!(OrderId::from_terms(&order), first);
+    }
+
+    /// **A record whose id is not its terms' id is rejected.**
+    ///
+    /// This is what makes the property hold on the network rather than only
+    /// in the issuer: the store contract runs `verify` on every order in
+    /// every state it validates, so a hand-built record filed under somebody
+    /// else's id never becomes state anywhere.
+    #[test]
+    fn a_record_whose_id_is_not_its_terms_is_rejected() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[31u8; 32]);
+        let honest = commitment(terms("tb1q", 1), &signing_key);
+        honest
+            .verify(&signing_key.verifying_key())
+            .expect("an order carrying its own terms' id verifies");
+
+        // Re-sign a record whose id names a different order's terms, so the
+        // signature is genuine and the ID is the only thing wrong.
+        let mut forged = terms("tb1q", 1);
+        forged.id = OrderId::from_terms(&terms("tb1q_elsewhere", 1));
+        let forged = {
+            use ed25519_dalek::Signer;
+            use freenet_stdlib::prelude::ContractInstanceId;
+            let message = crate::to_cbor(&forged).expect("serialize");
+            let scoped = ghostkey_common::ScopedPayload {
+                requestor: ghostkey_common::SignatureRequestor::WebApp(
+                    crate::HARVEST_WEBAPP_CONTRACT_ID
+                        .parse::<ContractInstanceId>()
+                        .expect("canonical webapp id"),
+                ),
+                payload: message,
+            };
+            let scoped_payload = crate::to_cbor(&scoped).expect("serialize scoped");
+            AuthorizedOrder {
+                signature: signing_key.sign(&scoped_payload).to_bytes().to_vec(),
+                order: forged,
+                scoped_payload,
+                status: OrderStatus::AwaitingPayment,
+                payment_proof: None,
+                status_scoped_payload: None,
+                status_signature: None,
+            }
+        };
+        let refused = forged
+            .verify(&signing_key.verifying_key())
+            .expect_err("an order whose id is not its terms' id must be refused");
+        assert!(
+            refused.contains("id"),
+            "the refusal should say what is wrong: {refused}"
         );
     }
 }

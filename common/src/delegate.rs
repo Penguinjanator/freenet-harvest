@@ -521,6 +521,25 @@ pub struct RecalledConversation {
     pub buyer_to_seller: [u8; 32],
     /// Encrypts what the seller writes back.
     pub seller_to_buyer: [u8; 32],
+    /// The value this buyer's order commitments must carry, so that a
+    /// commitment published for somebody else does not read as theirs.
+    ///
+    /// Derived by the delegate from the stored conversation secret via
+    /// [`crate::mailbox::order_binding_from_secret`], because that secret
+    /// never leaves the delegate and is the only durable, buyer-only secret
+    /// this application has. See that function for what the binding closes and
+    /// what it deliberately does not.
+    ///
+    /// This is a COMMITMENT, not the secret: it is safe in a browser and safe
+    /// to publish. The preimage stays in the delegate, which is where Phase 2
+    /// filing will need it.
+    ///
+    /// `serde(default)` so a delegate answer produced before this field
+    /// existed decodes; it comes back as all-zeros, which no honest
+    /// commitment carries, so the buyer's check fails closed rather than
+    /// matching everything.
+    #[serde(default)]
+    pub order_binding: [u8; 32],
     /// When the buyer opened it, in unix seconds, as they reported it.
     ///
     /// Carried back so a browser that recalls several conversations with one

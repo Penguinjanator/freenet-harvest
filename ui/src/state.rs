@@ -772,6 +772,20 @@ pub struct PendingInvoice {
     /// acceptance is sent from the same place the commitment is published --
     /// not left to a second action the seller has to remember.
     pub reply_to: Option<[u8; 32]>,
+    /// The value the buyer's request asked to have published, so that no
+    /// other buyer reads the commitment as theirs.
+    ///
+    /// `None` for an invoice written unprompted, which no buyer will pay
+    /// through the buy flow -- see
+    /// [`PaymentBlocker::CommitmentNotForThisBuyer`] -- but which is still a
+    /// perfectly good invoice for somebody paying a link by hand.
+    ///
+    /// Taken from the request in the seller's own mailbox, and that is not a
+    /// weakness: the value belongs to the buyer, a seller who altered it
+    /// would publish a commitment matching nobody, and the party who checks
+    /// it checks against what their OWN node derives rather than against
+    /// anything in a message.
+    pub order_binding: Option<[u8; 32]>,
 }
 
 /// A fully-formed invoice awaiting the seller's signature.
@@ -806,7 +820,7 @@ pub fn order_for_invoice(
     anchor: Option<freenet_bitcoin_common::BlockAnchor>,
     created_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<harvest_common::payment::Order, String> {
-    use harvest_common::payment::{Order, OrderId};
+    use harvest_common::payment::Order;
 
     let trusted_bridges = crate::gateway::bitcoin_config::default_trusted_bridges(derived.network)?;
     // Refused rather than published without, and refused HERE rather than at
@@ -821,12 +835,9 @@ pub fn order_for_invoice(
          data to load and issue it again.",
     )?;
     Ok(Order {
-        id: OrderId::new(
-            &pending.seller_fingerprint,
-            &pending.listing_id,
-            &created_at,
-            &pending.buyer_fingerprint,
-        ),
+        // Stamped by `with_derived_id` below, out of the finished terms. A
+        // literal here would be a second place deciding an order's identity.
+        id: harvest_common::payment::OrderId([0u8; 16]),
         listing_id: pending.listing_id.clone(),
         buyer_fingerprint: pending.buyer_fingerprint.clone(),
         seller_fingerprint: pending.seller_fingerprint.clone(),
@@ -841,8 +852,12 @@ pub fn order_for_invoice(
         trusted_bridges,
         bitcoin_address_code_hash: crate::gateway::bitcoin_config::address_contract_code_hash(),
         anchor: Some(anchor),
+        // Copied from the request verbatim. An invoice written unprompted has
+        // none, and no buyer will pay one through the buy flow.
+        order_binding: pending.order_binding,
         created_at,
-    })
+    }
+    .with_derived_id())
 }
 
 /// The message a `SignResult`'s scoped payload was built around, i.e. the
@@ -921,6 +936,35 @@ pub enum PaymentBlocker {
     /// signature is not the seller's" and "the terms do not match what was
     /// signed" is worth showing.
     CommitmentNotTheSellers(String),
+    /// The commitment does not carry the value that makes it THIS buyer's.
+    ///
+    /// # Why this is the check the whole flow rests on
+    ///
+    /// Nothing else in a commitment names a particular buyer:
+    /// `buyer_fingerprint` is empty for every order the buy flow produces,
+    /// because a buyer has no identity. Without this, a seller could accept
+    /// one order, publish one commitment, and send its id down any number of
+    /// conversations -- every buyer would find it published, signed, fresh
+    /// and for a listing they had asked about, and all would pay the same
+    /// address. One declared debt would collect unbounded money, which
+    /// inverts the mechanism the commitment exists for: a count that does not
+    /// bound the money is not a count.
+    ///
+    /// The comparison is against
+    /// [`crate::messaging::BuyerConversation::order_binding`] -- what this
+    /// node derives from its own conversation secret -- and never against the
+    /// binding in the request sitting in the mailbox. Direction is not
+    /// authorship, so a seller can seal a request into the buyer's own
+    /// thread; comparing against that copy would let the seller supply the
+    /// value it is checked against and the check would pass for everyone at
+    /// once. Pinned by
+    /// `a_forged_request_cannot_supply_the_binding_the_check_uses`.
+    ///
+    /// Covers three cases with one sentence, deliberately: bound to somebody
+    /// else, bound to nothing at all, and (for a conversation recalled from a
+    /// delegate that predates the field) bound to all-zeros. All three mean
+    /// the same thing to the buyer, and none is safe.
+    CommitmentNotForThisBuyer,
     /// The commitment names a listing this conversation never asked about.
     ///
     /// "Confirm your own order is present" is not satisfied by an order being
@@ -985,6 +1029,11 @@ impl PaymentBlocker {
             PaymentBlocker::CommitmentNotTheSellers(why) => format!(
                 "The published order is not signed by this store's seller ({why}). Do not pay."
             ),
+            PaymentBlocker::CommitmentNotForThisBuyer => "The published order was not issued \
+                 to you. Anyone can read it, but paying it would be paying somebody else's \
+                 bill -- and the seller would still owe only the one order they published. \
+                 Do not pay it."
+                .to_string(),
             PaymentBlocker::CommitmentNotRequested => "The published order is for a different \
                  listing than the one you asked about. Do not pay it -- ask the seller what it \
                  is for."
@@ -2627,6 +2676,14 @@ impl AppState {
         if commitment.status != OrderStatus::AwaitingPayment {
             return vec![PaymentBlocker::NotAwaitingPayment(commitment.status)];
         }
+        // Bound to THIS buyer, and checked before anything else about the
+        // terms: an order issued to somebody else is not this buyer's
+        // business, whatever its listing or anchor says. Compared against
+        // what this node derives, never against a value carried in a message
+        // -- see `PaymentBlocker::CommitmentNotForThisBuyer`.
+        if commitment.order.order_binding != Some(conversation.order_binding()) {
+            return vec![PaymentBlocker::CommitmentNotForThisBuyer];
+        }
         // What this conversation actually asked about. Empty for a
         // conversation that never used the buy form, and the check then has
         // nothing to compare against -- see
@@ -3283,7 +3340,17 @@ impl AppState {
             return;
         };
 
-        let created_at = self.unused_invoice_timestamp(&invoice, chrono::Utc::now());
+        // Plain `now`. There used to be a collision dance here, because
+        // `OrderId` hashed only `(seller, listing, created_at_ms, buyer)` and
+        // two invoices for one listing in a single millisecond were the same
+        // order as far as the contract was concerned -- one silently
+        // displacing the other under `merge_order`'s tie-break, taking a
+        // derivation index and an address already shown to somebody. The id
+        // is now derived from the whole terms, and every invoice carries a
+        // distinct payment address from the delegate's own index, so two
+        // invoices in one millisecond are simply two orders. That old comment
+        // named this as the structural answer and deferred it; this is it.
+        let created_at = chrono::Utc::now();
         // The seller's own view of the chain, which is the only anchor they
         // have. A seller whose tip contract has not answered cannot issue an
         // invoice at all -- `order_for_invoice` says so, and says why.
@@ -3319,78 +3386,6 @@ impl AppState {
 
         #[cfg(target_arch = "wasm32")]
         spawn_order_signature(pending);
-    }
-
-    /// A creation time whose resulting `OrderId` is not one we already hold.
-    ///
-    /// # Why this is needed at all
-    ///
-    /// `OrderId::new` hashes `(seller, listing, created_at_ms, buyer)` -- and
-    /// nothing else. Not the amount, not the script, not the derivation index.
-    /// So two invoices for the same listing, with the same buyer field, whose
-    /// timestamps land in the same MILLISECOND are the same order as far as
-    /// the contract is concerned, and `merge_order` keeps whichever has the
-    /// greater CBOR bytes at equal rank. The loser disappears with no error
-    /// anywhere, taking a derivation index and a payment address that has
-    /// already been shown to somebody.
-    ///
-    /// It is not far-fetched. The buyer field is explicitly optional -- the
-    /// form offers leaving it blank as the normal way to write an invoice
-    /// anyone may pay -- and the timestamp is stamped when the delegate's
-    /// answer is HANDLED, so two invoices issued minutes apart collide if
-    /// their two `OrderAddress` responses arrive in one batch.
-    ///
-    /// Advancing by a millisecond is the cheap fix, and it is a fix rather
-    /// than a mitigation because the id then genuinely differs. The structural
-    /// answer is to fold the derivation index into `OrderId::new`, which the
-    /// delegate guarantees unique -- but that is in `harvest-common`, so it
-    /// re-keys all four artifacts and belongs in a generation of its own.
-    ///
-    /// It only sees invoices THIS client knows about: ones it has queued for
-    /// signing, and ones already in the store state it has loaded. A collision
-    /// with an order issued by another client of the same store is not
-    /// reachable here -- only the same seller can issue on a store, so it
-    /// would take one seller running two clients within a millisecond.
-    fn unused_invoice_timestamp(
-        &self,
-        invoice: &PendingInvoice,
-        from: chrono::DateTime<chrono::Utc>,
-    ) -> chrono::DateTime<chrono::Utc> {
-        use harvest_common::payment::OrderId;
-
-        let known: std::collections::HashSet<OrderId> = self
-            .pending_signatures
-            .iter()
-            .filter_map(|pending| match pending {
-                PendingSignature::Order(order) => Some(order.order.id.clone()),
-                _ => None,
-            })
-            .chain(
-                self.browsing_stores
-                    .get(&invoice.store_contract_id)
-                    .into_iter()
-                    .flat_map(|store| store.orders.iter().map(|o| o.order.id.clone())),
-            )
-            .collect();
-
-        let mut at = from;
-        // Bounded rather than `loop`: a full second of consecutive collisions
-        // is not a state this can reach, and spinning forever in a response
-        // handler would be a worse failure than the one being prevented.
-        for _ in 0..1_000 {
-            let id = OrderId::new(
-                &invoice.seller_fingerprint,
-                &invoice.listing_id,
-                &at,
-                &invoice.buyer_fingerprint,
-            );
-            if !known.contains(&id) {
-                return at;
-            }
-            at += chrono::Duration::milliseconds(1);
-        }
-        warn!("Could not find a free invoice timestamp within a second of {from}");
-        at
     }
 
     /// Publish a new store's contracts, once every input creation needs has
@@ -6275,6 +6270,7 @@ mod invoice_tests {
             listing_title: "Widget".to_string(),
             buyer_fingerprint: "buyer-fp".to_string(),
             reply_to: None,
+            order_binding: None,
             amount_sats: 50_000,
             required_confirmations: 1,
         }
@@ -6794,63 +6790,54 @@ mod invoice_tests {
         );
     }
 
-    /// The same guard has to see orders already published to the store, not
-    /// just ones queued locally -- a page that has loaded the store's state
-    /// knows about invoices from earlier sessions, and re-issuing one of their
-    /// ids would replace a live invoice rather than adding one.
+    /// **Two invoices for one listing are two orders, because their
+    /// destinations differ.**
+    ///
+    /// This replaces three tests of `unused_invoice_timestamp`, a
+    /// collision-avoidance dance that is now deleted. It existed because
+    /// `OrderId` hashed only `(seller, listing, created_at_ms, buyer)`, so two
+    /// invoices for one listing in one millisecond WERE one order and one of
+    /// them silently vanished on merge -- taking a derivation index and an
+    /// address already shown to somebody. The id now covers the whole terms,
+    /// and the delegate hands out a distinct payment address per invoice, so
+    /// the collision it guarded is not reachable and the guard's own
+    /// timestamp-advancing behaviour is no longer a thing to test.
+    ///
+    /// Asserted at the same instant, which is the case the old guard existed
+    /// for.
     #[test]
-    fn an_id_already_on_the_store_is_avoided() {
-        let mut state = seller_with_a_store();
+    fn two_invoices_at_one_instant_are_two_orders() {
         let mut anonymous = invoice();
         anonymous.buyer_fingerprint = String::new();
-
-        // An order already on the store, carrying exactly the id a new
-        // invoice stamped at `now` would take.
         let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
-        let published =
+
+        let one =
             order_for_invoice(&anonymous, &derived(0), Some(anchor(800_000)), now).expect("build");
-        let collides = published.id.clone();
-        state
-            .browsing_stores
-            .entry(anonymous.store_contract_id.clone())
-            .or_default()
-            .orders
-            .push(authorize_new_order(published, Vec::new(), Vec::new()));
+        let other =
+            order_for_invoice(&anonymous, &derived(1), Some(anchor(800_000)), now).expect("build");
 
-        let at = state.unused_invoice_timestamp(&anonymous, now);
-
-        assert_ne!(at, now, "the guard must move off a timestamp already taken");
+        assert_ne!(one.payment_address, other.payment_address);
         assert_ne!(
-            harvest_common::payment::OrderId::new(
-                &anonymous.seller_fingerprint,
-                &anonymous.listing_id,
-                &at,
-                &anonymous.buyer_fingerprint,
-            ),
-            collides
+            one.id, other.id,
+            "two invoices sharing an id means one of them silently vanishes on merge"
         );
     }
 
-    /// A store we have never loaded, or an unrelated one, must not constrain
-    /// the timestamp -- otherwise the guard would be scanning the wrong set
-    /// and would look like it worked while checking nothing.
+    /// **An issued invoice carries the id its own terms give.**
+    ///
+    /// The seller's half of the rule the contract enforces: an order stamped
+    /// any other way is one `AuthorizedOrder::verify` refuses, so it would be
+    /// signed, published and then rejected by every peer with nothing on the
+    /// seller's screen saying why.
     #[test]
-    fn an_unrelated_stores_orders_do_not_move_the_timestamp() {
-        let mut state = seller_with_a_store();
-        let mut anonymous = invoice();
-        anonymous.buyer_fingerprint = String::new();
-
+    fn an_issued_invoice_carries_the_id_its_terms_give() {
         let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
-        let published =
-            order_for_invoice(&anonymous, &derived(0), Some(anchor(800_000)), now).expect("build");
-        state
-            .browsing_stores
-            .entry(vec![77u8; 32])
-            .or_default()
-            .orders
-            .push(authorize_new_order(published, Vec::new(), Vec::new()));
-
-        assert_eq!(state.unused_invoice_timestamp(&anonymous, now), now);
+        let order =
+            order_for_invoice(&invoice(), &derived(0), Some(anchor(800_000)), now).expect("build");
+        assert_eq!(
+            order.id,
+            harvest_common::payment::OrderId::from_terms(&order)
+        );
     }
 
     /// A rejected key is reported verbatim: every rejection the delegate can
@@ -6885,7 +6872,7 @@ mod authorized_order_tests {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let listing_id = ListingId::new("seller", &created_at, "Widget");
         Order {
-            id: OrderId::new("seller", &listing_id, &created_at, "buyer"),
+            id: OrderId([0u8; 16]),
             listing_id,
             buyer_fingerprint: "buyer".to_string(),
             seller_fingerprint: "seller".to_string(),
@@ -6898,8 +6885,10 @@ mod authorized_order_tests {
             trusted_bridges: vec![freenet_bitcoin_common::BridgeId([3u8; 32])],
             bitcoin_address_code_hash: None,
             anchor: None,
+            order_binding: None,
             created_at,
         }
+        .with_derived_id()
     }
 
     /// A seller may say what is owed and where; they may NOT say it was paid.
@@ -8026,6 +8015,7 @@ mod buyer_persistence_tests {
             conversation_id,
             buyer_to_seller: conversation_key_from_dh(&shared, MessageDirection::BuyerToSeller),
             seller_to_buyer: conversation_key_from_dh(&shared, MessageDirection::SellerToBuyer),
+            order_binding: harvest_common::mailbox::order_binding_from_secret(&secret.to_bytes()),
             created_at,
             // A conversation just handed to the delegate has not been saved
             // anywhere by the buyer, and was opened here rather than
@@ -8655,6 +8645,7 @@ mod buyer_backup_tests {
             conversation_id: [seed; 32],
             buyer_to_seller: [seed; 32],
             seller_to_buyer: [seed; 32],
+            order_binding: harvest_common::mailbox::order_binding_from_secret(&[seed; 32]),
             created_at: 1_700_000_000 + seed as i64,
             imported: false,
             backed_up,
@@ -9432,13 +9423,14 @@ mod buy_flow_tests {
         signing_key: &SigningKey,
         anchor_at: Option<freenet_bitcoin_common::BlockAnchor>,
         status: OrderStatus,
+        order_binding: Option<[u8; 32]>,
     ) -> AuthorizedOrder {
         use freenet_stdlib::prelude::ContractInstanceId;
 
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let listing_id = ListingId::new("seller-fp", &created_at, what);
         let order = Order {
-            id: OrderId::new("seller-fp", &listing_id, &created_at, ""),
+            id: OrderId([0u8; 16]),
             listing_id,
             // Empty, and that is the point: a buyer has no identity to name.
             buyer_fingerprint: String::new(),
@@ -9452,8 +9444,10 @@ mod buy_flow_tests {
             trusted_bridges: vec![freenet_bitcoin_common::BridgeId([3u8; 32])],
             bitcoin_address_code_hash: Some([4u8; 32]),
             anchor: anchor_at,
+            order_binding,
             created_at,
-        };
+        }
+        .with_derived_id();
         let message = harvest_common::to_cbor(&order).expect("serialize order");
         let scoped = ghostkey_common::ScopedPayload {
             requestor: ghostkey_common::SignatureRequestor::WebApp(
@@ -9476,13 +9470,55 @@ mod buy_flow_tests {
         }
     }
 
-    /// [`commitment_for`] with the listing every single-order test uses.
+    /// [`commitment_for`] with a binding of the caller's choosing.
+    fn commitment_bound_to(
+        signing_key: &SigningKey,
+        anchor_at: Option<freenet_bitcoin_common::BlockAnchor>,
+        status: OrderStatus,
+        order_binding: Option<[u8; 32]>,
+    ) -> AuthorizedOrder {
+        commitment_for("Widget", signing_key, anchor_at, status, order_binding)
+    }
+
+    /// The conversation every single-buyer test uses.
+    ///
+    /// Fixed rather than random so a commitment fixture can be bound to it
+    /// without threading the conversation through every call.
+    fn the_buyers_conversation() -> BuyerConversation {
+        BuyerConversation::opened_from_secret_for_test(&[41u8; 32], &seller_encryption_key())
+            .expect("open")
+    }
+
+    /// [`commitment_for`] with the listing every single-order test uses,
+    /// bound to [`the_buyers_conversation`].
     fn commitment(
         signing_key: &SigningKey,
         anchor_at: Option<freenet_bitcoin_common::BlockAnchor>,
         status: OrderStatus,
     ) -> AuthorizedOrder {
-        commitment_for("Widget", signing_key, anchor_at, status)
+        commitment_for(
+            "Widget",
+            signing_key,
+            anchor_at,
+            status,
+            Some(the_buyers_conversation().order_binding()),
+        )
+    }
+
+    /// An `AppState` browsing `STORE`, and a conversation with a fresh
+    /// ephemeral secret. The state does not yet hold the conversation --
+    /// [`buyer_holding`] is what puts them together.
+    fn buyer_conversation() -> (AppState, BuyerConversation) {
+        let mut state = AppState::default();
+        state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
+        state.begin_browsing(STORE.to_vec());
+        (
+            state,
+            BuyerConversation::open(&seller_encryption_key()).expect("open"),
+        )
     }
 
     /// Move a commitment to `Cancelled`, signed the way the contract demands
@@ -9506,8 +9542,54 @@ mod buy_flow_tests {
         order.status_scoped_payload = Some(scoped_payload);
     }
 
+    /// Put a buyer, their conversation and one published commitment together,
+    /// with the seller's acceptance already in the mailbox.
+    ///
+    /// `kept` is whether this node's delegate has confirmed it is keeping the
+    /// conversation. It is a parameter rather than something a test pokes
+    /// afterwards, so `mark_kept` stays reachable only from the delegate's
+    /// own answer.
+    fn buyer_holding_with(
+        mut state: AppState,
+        mut conversation: BuyerConversation,
+        published: &AuthorizedOrder,
+        kept: bool,
+    ) -> AppState {
+        let tag = conversation.buyer_public_key;
+        if kept {
+            conversation.mark_kept();
+        }
+        let acceptance = crate::messaging::seal_order_accepted(
+            &seller_keys_for(&tag),
+            &tag,
+            &conversation.conversation_id,
+            &published.order.id,
+        )
+        .expect("the seller seals their acceptance");
+
+        let store = state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("begin_browsing creates it");
+        store.seller_verifying_key = Some(seller_signing_key().verifying_key().to_bytes());
+        store.orders = vec![published.clone()];
+        store.conversations = vec![conversation];
+        store.mailbox_messages = vec![acceptance];
+        state
+    }
+
+    /// [`buyer_holding_with`] for the ordinary case: the node has confirmed
+    /// it is keeping the conversation.
+    fn buyer_holding(
+        state: AppState,
+        conversation: BuyerConversation,
+        published: &AuthorizedOrder,
+    ) -> AppState {
+        buyer_holding_with(state, conversation, published, true)
+    }
+
     /// A buyer who has asked to buy, been accepted, and whose node has
-    /// confirmed it is keeping the conversation. Everything each test then
+    /// confirmed it is keeping the conversation. Everything each test below
     /// does is to take one of those away.
     fn buyer_after_acceptance(commitment: &AuthorizedOrder) -> (AppState, [u8; 32]) {
         buyer_after_acceptance_with(commitment, true)
@@ -9517,37 +9599,13 @@ mod buy_flow_tests {
         commitment: &AuthorizedOrder,
         kept: bool,
     ) -> (AppState, [u8; 32]) {
-        let mut state = AppState::default();
-        state
-            .bitcoin
-            .tips
-            .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
-
-        let mut conversation =
-            BuyerConversation::open(&seller_encryption_key()).expect("open a conversation");
+        let (state, _) = buyer_conversation();
+        let conversation = the_buyers_conversation();
         let tag = conversation.buyer_public_key;
-        if kept {
-            conversation.mark_kept();
-        }
-
-        let acceptance = crate::messaging::seal_order_accepted(
-            &seller_keys_for(&tag),
-            &tag,
-            &conversation.conversation_id,
-            &commitment.order.id,
+        (
+            buyer_holding_with(state, conversation, commitment, kept),
+            tag,
         )
-        .expect("the seller seals their acceptance");
-
-        state.begin_browsing(STORE.to_vec());
-        let store = state
-            .browsing_stores
-            .get_mut(STORE)
-            .expect("begin_browsing creates it");
-        store.seller_verifying_key = Some(seller_signing_key().verifying_key().to_bytes());
-        store.orders = vec![commitment.clone()];
-        store.conversations = vec![conversation];
-        store.mailbox_messages = vec![acceptance];
-        (state, tag)
     }
 
     fn purchases(state: &AppState) -> Vec<BuyerPurchase> {
@@ -9611,6 +9669,7 @@ mod buy_flow_tests {
             amount_sats: 50_000,
             required_confirmations: 1,
             reply_to: Some(tag),
+            order_binding: Some(the_buyers_conversation().order_binding()),
         }
     }
 
@@ -9892,6 +9951,168 @@ mod buy_flow_tests {
             state.browsing_stores[STORE].conversations.is_empty(),
             "a refused request must not leave a conversation behind"
         );
+    }
+
+    /// **One published commitment is payable by exactly one buyer.**
+    ///
+    /// The hole this closes, found in review: nothing in the commitment named
+    /// anything only one buyer could satisfy, so a seller could accept one
+    /// order, publish one commitment, and send the same `OrderAccepted` down
+    /// any number of conversations. Every buyer's software cleared every
+    /// check and showed them the same payment address. One declared debt
+    /// collected unbounded money -- which inverts the mechanism the
+    /// commitment exists for, since a count that does not bound the money is
+    /// not a count of anything.
+    ///
+    /// Alice and Bob are separate `AppState`s with separate conversations and
+    /// separate ephemeral secrets, both pointed at the one commitment. The
+    /// commitment is bound to Alice.
+    #[test]
+    fn one_commitment_is_payable_by_exactly_one_buyer() {
+        let (alice, alice_conversation) = buyer_conversation();
+        let published = commitment_bound_to(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+            Some(alice_conversation.order_binding()),
+        );
+
+        let alice = buyer_holding(alice, alice_conversation, &published);
+        let (bob, bob_conversation) = buyer_conversation();
+        let bob = buyer_holding(bob, bob_conversation, &published);
+
+        assert_eq!(
+            purchases(&alice)[0].blockers,
+            Vec::new(),
+            "the buyer it was issued to can pay it"
+        );
+        assert_eq!(
+            purchases(&bob)[0].blockers,
+            vec![PaymentBlocker::CommitmentNotForThisBuyer],
+            "and nobody else can"
+        );
+    }
+
+    /// **A commitment carrying no binding at all is refused.**
+    ///
+    /// Absence must not read as "matches". `Order::order_binding` is
+    /// `Option` for the same wire-compatibility reason the anchor is, so the
+    /// unbound case is reachable and has to fail closed.
+    #[test]
+    fn a_commitment_with_no_binding_is_refused() {
+        let (state, conversation) = buyer_conversation();
+        let published = commitment_bound_to(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+            None,
+        );
+        let state = buyer_holding(state, conversation, &published);
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::CommitmentNotForThisBuyer]
+        );
+    }
+
+    /// **The binding the buyer checks against is their own, not the one in
+    /// the mailbox.**
+    ///
+    /// Direction is not authorship, so a seller can seal a request into the
+    /// buyer's own thread -- the weakness `CommitmentNotRequested` already
+    /// documents. If the check compared the commitment against the binding in
+    /// that request, the seller would simply forge a request carrying the
+    /// binding they published, and the check would pass for every buyer at
+    /// once. It has to compare against the value this node derives from its
+    /// own conversation secret, which no message can influence.
+    #[test]
+    fn a_forged_request_cannot_supply_the_binding_the_check_uses() {
+        let (alice, alice_conversation) = buyer_conversation();
+        let (_, other_conversation) = buyer_conversation();
+        let published = commitment_bound_to(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+            // Bound to somebody else entirely.
+            Some(other_conversation.order_binding()),
+        );
+        let tag = alice_conversation.buyer_public_key;
+        let conversation_id = alice_conversation.conversation_id.clone();
+        let mut alice = buyer_holding(alice, alice_conversation, &published);
+
+        // The seller seals a request into Alice's thread, in the
+        // buyer-to-seller direction, carrying the binding they published.
+        let forged = crate::messaging::seal_for_test(
+            &seller_keys_for(&tag).to_seller,
+            &tag,
+            &conversation_id,
+            crate::messaging::MessageContent::OrderRequest {
+                listing_id: published.order.listing_id.clone(),
+                quantity: 1,
+                shipping: "anywhere".into(),
+                note: String::new(),
+                order_binding: other_conversation.order_binding(),
+            },
+        )
+        .expect("seal");
+        alice
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .mailbox_messages
+            .push(forged);
+
+        assert_eq!(
+            purchases(&alice)[0].blockers,
+            vec![PaymentBlocker::CommitmentNotForThisBuyer],
+            "a request the seller wrote must not decide what the buyer compares against"
+        );
+    }
+
+    /// **The binding this browser computes is the shared derivation, applied
+    /// to the secret it just generated.**
+    ///
+    /// The other half of the cross-crate seam lives in the delegate
+    /// (`recall_answers_the_binding_the_shared_derivation_gives`). Neither
+    /// side tests the other -- they cannot, they are different crates on
+    /// different machines -- so each is pinned to
+    /// `harvest_common::mailbox::order_binding_from_secret`, which has a
+    /// known-answer test against `b3sum`. A drift on either side turns one of
+    /// the three red.
+    ///
+    /// This matters because the failure is silent: the buyer computes the
+    /// binding here from a secret it has just generated, and after a reload
+    /// the delegate computes it from the copy it kept. If those disagree,
+    /// nothing errors -- the buyer simply finds their own commitment
+    /// unrecognisable and can never pay it.
+    #[test]
+    fn the_browsers_binding_is_the_shared_derivation() {
+        let (_, conversation) = buyer_conversation();
+        assert_eq!(
+            conversation.order_binding(),
+            harvest_common::mailbox::order_binding_from_secret(&conversation.secret_for_test()),
+        );
+    }
+
+    /// **A conversation the delegate hands back keeps the binding it was
+    /// given.**
+    ///
+    /// The UI's half of the recall path: whatever the delegate computed has
+    /// to survive into the conversation the buyer's checks read.
+    #[test]
+    fn a_recalled_conversation_keeps_its_binding() {
+        let recalled =
+            crate::messaging::BuyerConversation::recalled(&harvest_common::RecalledConversation {
+                buyer_public_key: [5u8; 32],
+                conversation_id: [6u8; 32],
+                buyer_to_seller: [7u8; 32],
+                seller_to_buyer: [8u8; 32],
+                order_binding: [9u8; 32],
+                created_at: 1,
+                imported: false,
+                backed_up: false,
+            });
+        assert_eq!(recalled.order_binding(), [9u8; 32]);
     }
 
     /// **A commitment for something this conversation never asked about is
@@ -10273,6 +10494,7 @@ mod buy_flow_tests {
             conversation_id: [6u8; 32],
             buyer_to_seller: [7u8; 32],
             seller_to_buyer: [8u8; 32],
+            order_binding: [9u8; 32],
             created_at: 1,
             imported: false,
             backed_up: false,
@@ -10365,6 +10587,7 @@ mod buy_flow_tests {
             &seller_signing_key(),
             Some(anchor(TIP_HEIGHT - MAX_ANCHOR_AGE_BLOCKS - 1)),
             OrderStatus::AwaitingPayment,
+            Some(the_buyers_conversation().order_binding()),
         );
         assert_ne!(fresh.order.id, stale.order.id, "two distinct orders");
 
@@ -10425,6 +10648,7 @@ mod payment_blocker_wording_tests {
             PaymentBlocker::CommitmentNotPublished
             | PaymentBlocker::SellerIdentityUnknown
             | PaymentBlocker::CommitmentNotTheSellers(_)
+            | PaymentBlocker::CommitmentNotForThisBuyer
             | PaymentBlocker::CommitmentNotRequested
             | PaymentBlocker::NotAwaitingPayment(_)
             | PaymentBlocker::AnchorMissing
@@ -10439,6 +10663,7 @@ mod payment_blocker_wording_tests {
             PaymentBlocker::CommitmentNotPublished,
             PaymentBlocker::SellerIdentityUnknown,
             PaymentBlocker::CommitmentNotTheSellers("the signature is not theirs".to_string()),
+            PaymentBlocker::CommitmentNotForThisBuyer,
             PaymentBlocker::CommitmentNotRequested,
             PaymentBlocker::NotAwaitingPayment(OrderStatus::Cancelled),
             PaymentBlocker::AnchorMissing,

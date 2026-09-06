@@ -399,8 +399,13 @@ fn InvoiceForm(
                             // This form writes an invoice from scratch. One
                             // answering a buyer's request is issued from the
                             // inbox, which is where the conversation to reply
-                            // into is known.
+                            // into is known -- and where the buyer's binding
+                            // is. An invoice with no binding matches no
+                            // buyer's check, so it is payable only by
+                            // somebody following the address by hand, which
+                            // is what this form is for.
                             reply_to: None,
+                            order_binding: None,
                         });
                         amount.set(String::new());
                         buyer.set(String::new());
@@ -463,7 +468,7 @@ mod tests {
         let listing_id = ListingId::new(seller, &created_at, "Widget");
         AuthorizedOrder {
             order: Order {
-                id: OrderId::new(seller, &listing_id, &created_at, "buyer"),
+                id: OrderId([0u8; 16]),
                 listing_id,
                 buyer_fingerprint: "buyer".to_string(),
                 seller_fingerprint: seller.to_string(),
@@ -476,8 +481,10 @@ mod tests {
                 trusted_bridges: Vec::new(),
                 bitcoin_address_code_hash: None,
                 anchor: None,
+                order_binding: None,
                 created_at,
-            },
+            }
+            .with_derived_id(),
             scoped_payload: Vec::new(),
             signature: Vec::new(),
             status: OrderStatus::AwaitingPayment,

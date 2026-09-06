@@ -565,6 +565,11 @@ fn recall(record: &BuyerConversationRecord) -> Option<RecalledConversation> {
         conversation_id: record.conversation_id,
         buyer_to_seller: conversation_key_from_dh(&shared, MessageDirection::BuyerToSeller),
         seller_to_buyer: conversation_key_from_dh(&shared, MessageDirection::SellerToBuyer),
+        // From the STORED secret, not from the shared secret and not from
+        // anything a caller supplies: the binding's whole value is that the
+        // seller cannot compute it, and the shared secret is a value the
+        // seller holds.
+        order_binding: harvest_common::mailbox::order_binding_from_secret(&record.secret.0),
         created_at: record.created_at,
         imported: record.imported,
         backed_up: record.backed_up,
@@ -1282,6 +1287,47 @@ mod buyer_conversation_tests {
     /// -- a recalled conversation whose keys only agree with themselves would
     /// read nothing out of the mailbox.
     #[test]
+    fn recall_answers_the_binding_the_shared_derivation_gives() {
+        let opened = open(11);
+        let back = recall(&opened.record).expect("a usable record recalls");
+
+        assert_eq!(
+            back.order_binding,
+            harvest_common::mailbox::order_binding_from_secret(&opened.record.secret.0),
+            "a drift here leaves a returning buyer unable to recognise their own commitment, \
+             silently"
+        );
+
+        // Derived from the buyer's own secret, and NOT from the shared
+        // secret: the seller holds the shared secret, and a binding they
+        // could compute would let one commitment be published for every buyer
+        // at once, which is the hole this closes.
+        let shared = StaticSecret::from(opened.record.secret.0)
+            .diffie_hellman(&PublicKey::from(opened.record.seller_public_key))
+            .to_bytes();
+        assert_ne!(
+            back.order_binding,
+            harvest_common::mailbox::order_binding_from_secret(&shared),
+            "the seller must not be able to compute a buyer's binding"
+        );
+    }
+
+    /// **Two buyers of the same seller get different bindings.**
+    ///
+    /// The property, stated where the delegate produces it, rather than left
+    /// to the derivation's own test: this is what stops one published
+    /// commitment being payable by everyone who was shown it.
+    #[test]
+    fn two_conversations_recall_different_bindings() {
+        let one = open(12);
+        let two = open(13);
+        assert_ne!(
+            recall(&one.record).expect("recalls").order_binding,
+            recall(&two.record).expect("recalls").order_binding,
+        );
+    }
+
+    #[test]
     fn a_stored_conversation_comes_back_with_usable_keys() {
         let mut store = MemSecrets::default();
         let opened = open(9);
@@ -1303,6 +1349,14 @@ mod buyer_conversation_tests {
         // The routing tag has to be the one the mailbox carries, which is the
         // public half of the stored secret.
         assert_eq!(back[0].buyer_public_key, opened.buyer_public_key);
+
+        // And the order binding has to be the shared derivation over the
+        // STORED secret. See `recall_answers_the_binding_the_shared_derivation_gives`
+        // for why this is the half that matters.
+        assert_eq!(
+            back[0].order_binding,
+            harvest_common::mailbox::order_binding_from_secret(&opened.record.secret.0)
+        );
 
         let shared = opened
             .seller

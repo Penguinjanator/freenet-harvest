@@ -161,6 +161,21 @@ pub enum MessageContent {
         /// Anything else the buyer wants to say, so a request is not a form
         /// that forces a second message beside it.
         note: String,
+        /// What the seller must publish in the commitment so that no OTHER
+        /// buyer reads it as theirs.
+        ///
+        /// [`harvest_common::mailbox::order_binding_from_secret`] over this
+        /// conversation's own secret. Sending it costs the buyer nothing --
+        /// it is a hash of a value only they hold -- and without it one
+        /// published commitment is payable by every buyer who was shown it.
+        ///
+        /// **The buyer does not check the commitment against THIS field.**
+        /// Direction is not authorship, so a seller can seal a request into
+        /// the buyer's own thread; a check against the mailbox copy would let
+        /// the seller supply the value it is compared with. The buyer
+        /// compares against what their own node derives. See
+        /// `state::AppState::payment_blockers`.
+        order_binding: [u8; 32],
     },
     /// The seller has published the order commitment for a request, and this
     /// is its id.
@@ -274,12 +289,38 @@ pub struct BuyerConversation {
     /// what protects you, confirm the persistence, and only then part with
     /// money.
     kept: bool,
+    /// The value a commitment must carry to be THIS buyer's.
+    ///
+    /// Computed here from the ephemeral secret when the conversation is
+    /// opened, and answered by the harvest delegate from its stored copy on
+    /// recall -- both through
+    /// [`harvest_common::mailbox::order_binding_from_secret`], which is the
+    /// only place the derivation exists. See that function for the hole it
+    /// closes.
+    order_binding: [u8; 32],
 }
 
 impl BuyerConversation {
     /// Open a conversation with the holder of `seller_public_key`.
     pub fn open(seller_public_key: &[u8; 32]) -> Result<Self, String> {
-        let secret = StaticSecret::random();
+        Self::opened_from(StaticSecret::random(), seller_public_key)
+    }
+
+    /// [`Self::open`] from a chosen secret, for this crate's tests.
+    ///
+    /// Exists so a fixture can hold ONE buyer across several helpers -- a
+    /// commitment has to be bound to a particular conversation, and a
+    /// conversation with a random secret cannot be named by a fixture built
+    /// before it.
+    #[cfg(test)]
+    pub(crate) fn opened_from_secret_for_test(
+        secret: &[u8; 32],
+        seller_public_key: &[u8; 32],
+    ) -> Result<Self, String> {
+        Self::opened_from(StaticSecret::from(*secret), seller_public_key)
+    }
+
+    fn opened_from(secret: StaticSecret, seller_public_key: &[u8; 32]) -> Result<Self, String> {
         let buyer_public_key = *PublicKey::from(&secret).as_bytes();
         let shared = secret.diffie_hellman(&PublicKey::from(*seller_public_key));
         if !shared.was_contributory() {
@@ -298,6 +339,7 @@ impl BuyerConversation {
             keys: ConversationKeys::from_shared_secret(shared.as_bytes()),
             // Nothing has been asked yet, let alone answered.
             kept: false,
+            order_binding: harvest_common::mailbox::order_binding_from_secret(&secret.to_bytes()),
         })
     }
 
@@ -321,7 +363,31 @@ impl BuyerConversation {
             // confirm. A returning buyer required to send a message before
             // they could pay would be a buyer told to do something pointless.
             kept: true,
+            // The delegate derived this from the secret it kept, which this
+            // browser no longer holds -- so it is carried rather than
+            // recomputed. A record written before the field existed answers
+            // all-zeros, which no honest commitment carries, so the buyer's
+            // check fails closed.
+            order_binding: recalled.order_binding,
         }
+    }
+
+    /// The value a commitment must carry to be this buyer's.
+    pub fn order_binding(&self) -> [u8; 32] {
+        self.order_binding
+    }
+
+    /// The ephemeral secret, for this crate's tests only.
+    ///
+    /// Exists so a test can check that the binding computed here is the
+    /// SHARED derivation applied to this conversation's own secret -- the
+    /// browser half of a seam whose delegate half lives in another crate and
+    /// whose failure mode is silence.
+    #[cfg(test)]
+    pub(crate) fn secret_for_test(&self) -> [u8; 32] {
+        self.secret
+            .expect("a conversation opened in this tab holds its secret")
+            .0
     }
 
     /// Whether this node's delegate has said it is keeping this conversation.
@@ -397,6 +463,7 @@ impl BuyerConversation {
                 quantity,
                 shipping,
                 note,
+                order_binding: self.order_binding,
             },
         )
     }
@@ -1765,6 +1832,7 @@ mod buy_flow_tests {
                         quantity,
                         shipping,
                         note,
+                        order_binding,
                     },
                 ..
             } => {
@@ -1772,6 +1840,10 @@ mod buy_flow_tests {
                 assert_eq!(*quantity, 3);
                 assert_eq!(shipping, "12 Example St");
                 assert_eq!(note, "no chilli");
+                // The value that makes the seller's commitment this buyer's
+                // and nobody else's -- see
+                // `harvest_common::mailbox::order_binding_from_secret`.
+                assert_eq!(order_binding, &buyer.order_binding());
             }
             other => panic!("expected an order request, got {other:?}"),
         }

@@ -424,7 +424,7 @@ pub(super) mod __address_check_test_support {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let listing_id = ListingId::new("seller", &created_at, "Widget");
         Order {
-            id: OrderId::new("seller", &listing_id, &created_at, "buyer"),
+            id: OrderId([0u8; 16]),
             listing_id,
             buyer_fingerprint: "buyer".to_string(),
             seller_fingerprint: "seller".to_string(),
@@ -437,8 +437,10 @@ pub(super) mod __address_check_test_support {
             trusted_bridges: Vec::new(),
             bitcoin_address_code_hash: None,
             anchor: None,
+            order_binding: None,
             created_at,
         }
+        .with_derived_id()
     }
 }
 
@@ -595,7 +597,7 @@ mod bridge_check_tests {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let listing_id = ListingId::new("seller", &ts, "Widget");
         Order {
-            id: OrderId::new("seller", &listing_id, &ts, "buyer"),
+            id: OrderId([0u8; 16]),
             listing_id,
             buyer_fingerprint: "buyer".into(),
             seller_fingerprint: "seller".into(),
@@ -608,8 +610,10 @@ mod bridge_check_tests {
             trusted_bridges: bridges,
             bitcoin_address_code_hash: None,
             anchor: None,
+            order_binding: None,
             created_at: ts,
         }
+        .with_derived_id()
     }
 
     fn known_bridge() -> BridgeId {

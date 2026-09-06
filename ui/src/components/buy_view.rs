@@ -262,6 +262,12 @@ pub fn AcceptRequest(
     store_contract_id: Vec<u8>,
     tag: Vec<u8>,
     listing_id: ListingId,
+    /// The listing's title as this seller's own store publishes it, or empty
+    /// when the store's listings have not arrived. Empty is shown as a
+    /// refusal rather than as a blank: a seller pricing an item the screen
+    /// cannot name is signing for something they cannot see.
+    listing_title: String,
+    order_binding: [u8; 32],
     quantity: u32,
 ) -> Element {
     let mut amount = use_signal(String::new);
@@ -286,8 +292,22 @@ pub fn AcceptRequest(
         };
     }
 
+    // No title means this store's listings have not arrived, so the screen
+    // cannot say what is being priced. Withhold the control rather than
+    // showing one whose only label is a quantity: signing an amount against a
+    // listing id nobody has read is exactly the thing this says it is not.
+    if listing_title.trim().is_empty() {
+        return rsx! {
+            p { class: "text-warning",
+                "A buyer has asked to buy {quantity} of a listing this page cannot name yet. "
+                "Wait for your store's listings to load before pricing it."
+            }
+        };
+    }
+
     rsx! {
         div { style: "margin-top: 0.75rem;",
+            h5 { style: "margin-bottom: 0.25rem;", "{quantity} x {listing_title}" }
             p { class: "text-muted", style: "font-size: 0.85rem;",
                 "Accepting publishes this order on your store, where anyone can see it. It "
                 "carries the amount, the listing, the payment address and a recent block. It "
@@ -295,7 +315,9 @@ pub fn AcceptRequest(
                 "conversation."
             }
             div { class: "form-group",
-                label { class: "form-label", "Amount for {quantity} (satoshis)" }
+                label { class: "form-label",
+                    "Amount for {quantity} x {listing_title} (satoshis)"
+                }
                 input {
                     class: "form-input",
                     r#type: "number",
@@ -330,6 +352,8 @@ pub fn AcceptRequest(
                         &store_contract_id,
                         &tag,
                         &listing_id,
+                        listing_title.clone(),
+                        order_binding,
                         amount_sats,
                         required_confirmations,
                     ) {
@@ -355,6 +379,8 @@ fn accept(
     store_contract_id: &[u8],
     tag: &[u8],
     listing_id: &ListingId,
+    listing_title: String,
+    order_binding: [u8; 32],
     amount_sats: u64,
     required_confirmations: u32,
 ) -> Result<(), String> {
@@ -366,18 +392,6 @@ fn accept(
     let seller_fingerprint = state
         .store_owner_fingerprint(store_contract_id)
         .ok_or("this store is not one of yours")?;
-    let listing_title = state
-        .browsing_stores
-        .get(store_contract_id)
-        .and_then(|store| {
-            store
-                .listings
-                .iter()
-                .find(|listing| listing.listing.id == *listing_id)
-                .map(|listing| listing.listing.title.clone())
-        })
-        .unwrap_or_else(|| "this listing".to_string());
-
     state.issue_invoice(crate::state::PendingInvoice {
         store_contract_id: store_contract_id.to_vec(),
         seller_fingerprint,
@@ -390,6 +404,9 @@ fn accept(
         amount_sats,
         required_confirmations,
         reply_to: Some(reply_to),
+        // The buyer's own value, carried from their request. Without it the
+        // commitment matches nobody's check and the buyer will not pay it.
+        order_binding: Some(order_binding),
     })
 }
 
@@ -407,6 +424,7 @@ pub fn is_temporary(blocker: &PaymentBlocker) -> bool {
         | PaymentBlocker::ConversationNotKept => true,
         PaymentBlocker::SellerIdentityUnknown
         | PaymentBlocker::CommitmentNotTheSellers(_)
+        | PaymentBlocker::CommitmentNotForThisBuyer
         | PaymentBlocker::CommitmentNotRequested
         | PaymentBlocker::NotAwaitingPayment(_)
         | PaymentBlocker::AnchorMissing
