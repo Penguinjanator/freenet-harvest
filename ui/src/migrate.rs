@@ -374,6 +374,43 @@ pub fn current_id(code_hash: &[u8; 32], params: &Parameters<'_>) -> ContractInst
 
 // --- state semantics ----------------------------------------------------
 
+thread_local! {
+    /// What a migration could not carry forward, waiting to be told to the
+    /// person who lost it.
+    ///
+    /// # Why a collector rather than a return value
+    ///
+    /// The fold's outcome reaches the UI through `ProbeStateOps`, whose
+    /// methods are `freenet_migrate`'s and return only the merged state --
+    /// there is nowhere in that signature to put "and here is what I refused".
+    /// The alternative is threading a handle through a foreign generic
+    /// session type, which is more moving parts than the thing being
+    /// reported.
+    ///
+    /// `thread_local` rather than a `Mutex`: this is single-threaded in the
+    /// browser, and per-thread is what keeps `cargo test`'s parallel tests
+    /// from seeing each other's reports -- the cross-test interference this
+    /// project has a rule about.
+    static UNCARRIED: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record that a migration could not carry something forward.
+///
+/// Beside [`probe_warn`], not instead of it: the log line is for whoever is
+/// debugging, and this is for the person whose data it was.
+pub(crate) fn record_uncarried(what: String) {
+    UNCARRIED.with(|lost| lost.borrow_mut().push(what));
+}
+
+/// Take everything a migration could not carry, clearing it.
+///
+/// Draining is what stops one migration's loss being announced again on every
+/// later notification, which would teach a seller the message means nothing.
+pub fn take_uncarried() -> Vec<String> {
+    UNCARRIED.with(|lost| std::mem::take(&mut *lost.borrow_mut()))
+}
+
 /// Say something the operator needs to hear, from a file that is compiled
 /// twice.
 ///
@@ -457,11 +494,11 @@ impl ProbeStateOps for StoreOps {
     }
 
     fn merge_with_local(&self, recovered: Self::State, local: &Self::State) -> Self::State {
-        merge_store(recovered, local, &self.params)
+        merge_store(recovered, local, &self.params, DiscardedSide::LocalSnapshot)
     }
 
     fn merge_generations(&self, newer: Self::State, older: Self::State) -> Self::State {
-        merge_store(newer, &older, &self.params)
+        merge_store(newer, &older, &self.params, DiscardedSide::Predecessor)
     }
 }
 
@@ -527,8 +564,38 @@ pub(crate) struct FoldOutcome<S> {
     pub(crate) discarded: bool,
 }
 
-fn merge_store(base: StoreStateV1, other: &StoreStateV1, params: &StoreParameters) -> StoreStateV1 {
-    merge_store_reporting_discard(base, other, params).state
+/// Which side of a fold `other` is, so a discard is described truthfully.
+///
+/// # Why the message cannot be unconditional
+///
+/// `merge_store_reporting_discard` has two callers and `other` means a
+/// different thing in each: for `merge_generations` it is the PREDECESSOR,
+/// which is what the upgrade wording is written for; for `merge_with_local`
+/// it is this node's own CURRENT-generation snapshot.
+///
+/// Telling a seller that the store already at the new address "was not
+/// carried over when Harvest upgraded" and that they should republish it
+/// would be false, and would send them re-publishing data that is fine.
+/// Reachability is low -- a local snapshot's listings are current-derivation
+/// by construction, so the merge should not refuse them -- but this message
+/// is seen once and then the data is gone, which is the standard that forbids
+/// relying on "should not".
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum DiscardedSide {
+    /// An older generation, refused while being carried forward.
+    Predecessor,
+    /// This node's own snapshot of the current generation, refused while
+    /// being merged with what was recovered.
+    LocalSnapshot,
+}
+
+fn merge_store(
+    base: StoreStateV1,
+    other: &StoreStateV1,
+    params: &StoreParameters,
+    side: DiscardedSide,
+) -> StoreStateV1 {
+    merge_store_reporting_discard(base, other, params, side).state
 }
 
 /// [`merge_store`], saying whether it discarded the predecessor wholesale.
@@ -541,10 +608,86 @@ pub(crate) fn merge_store_reporting_discard(
     base: StoreStateV1,
     other: &StoreStateV1,
     params: &StoreParameters,
+    side: DiscardedSide,
 ) -> FoldOutcome<StoreStateV1> {
     use freenet_scaffold::ComposableState;
     let snapshot = base.clone();
-    fold_or_keep_primary("store", base, |base| base.merge(&snapshot, params, other))
+    let outcome = fold_or_keep_primary("store", base, |base| base.merge(&snapshot, params, other));
+    if outcome.discarded {
+        // Named specifically, and here rather than in `fold_or_keep_primary`,
+        // because this is the only place that still holds the refused side
+        // and can say WHAT was in it. "Migration incomplete" is not something a
+        // seller can act on; "your store's name and two listings were not
+        // carried, republish them" is.
+        record_uncarried(describe_lost_store(other, side));
+    }
+    outcome
+}
+
+/// What a seller lost when a predecessor store generation was refused.
+///
+/// # Why this is a whole function
+///
+/// It is the only thing the person affected ever sees about it. The migration
+/// SEALS after a fold, so there is no second attempt and no later screen where
+/// this turns up again -- one message, once, and then the data is gone for
+/// good. That is also why it names the store rather than an artifact: a seller
+/// with several stores needs to know which one.
+///
+/// # Why it says the loss was EXPECTED
+///
+/// Because it was: Ian decided on 2026-09-06 that no published store holds
+/// data worth preserving and that sellers republish. A message that describes
+/// a deliberate consequence in the language of a fault sends the seller
+/// looking for a bug, or for someone to report it to, when the only useful
+/// thing they can do is republish. The distinction between "a decision we
+/// made" and "a thing that happened to you" is carried entirely by this
+/// sentence, so it is asserted rather than left to whoever edits the copy
+/// next.
+fn describe_lost_store(lost: &StoreStateV1, side: DiscardedSide) -> String {
+    let name = lost.info.info.store_name.trim();
+    let which = if name.is_empty() {
+        "One of your stores".to_string()
+    } else {
+        format!("Your store \"{name}\"")
+    };
+    let listings = lost.listings.listings.len();
+    let orders = lost.orders.orders.len();
+
+    let mut said = match side {
+        DiscardedSide::Predecessor => format!(
+            "{which} was not carried over when Harvest upgraded. This is expected -- an \
+             upgrade moves your store to a new address and this one could not be brought \
+             across -- but it does mean the following is gone: its name, description and \
+             seller certificate"
+        ),
+        // Deliberately different: this store is at the new address and is not
+        // going anywhere. What failed is the merge, not the store, so
+        // "republish it" would send the seller re-publishing data that is
+        // fine.
+        DiscardedSide::LocalSnapshot => format!(
+            "{which} could not be merged with what was recovered from an earlier version of \
+             Harvest. Your store here is intact; what could not be brought in alongside it \
+             is: its name, description and seller certificate"
+        ),
+    };
+    if listings > 0 {
+        said.push_str(&format!(", {listings} listing(s)"));
+    }
+    if orders > 0 {
+        said.push_str(&format!(", {orders} order(s)"));
+    }
+    said.push_str(match side {
+        DiscardedSide::Predecessor => {
+            ". Nothing was recovered and it will not be retried. Publish your store details \
+             and listings again to carry on selling."
+        }
+        DiscardedSide::LocalSnapshot => {
+            ". Nothing from the earlier version was recovered and it will not be retried. \
+             Your current store is unaffected."
+        }
+    });
+    said
 }
 
 /// Merge rules for a reputation contract's state.
@@ -1323,3 +1466,520 @@ impl<O: ProbeStateOps> ProbeSession<O> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod predecessor_generation_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use freenet_stdlib::prelude::ContractInstanceId;
+    use harvest_common::listing::{AuthorizedListing, Listing, ListingId, ListingKind};
+
+    /// The listing id derivation as it was BEFORE this branch: seller
+    /// fingerprint, creation time and title, truncated to 16 bytes.
+    ///
+    /// Written out here rather than imported, because the point is to build a
+    /// record the way a PREDECESSOR generation built it. Importing today's
+    /// function would make the test agree with itself.
+    fn v1_listing_id(
+        seller_fingerprint: &str,
+        created_at: &chrono::DateTime<chrono::Utc>,
+        title: &str,
+    ) -> ListingId {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(seller_fingerprint.as_bytes());
+        hasher.update(&created_at.timestamp_millis().to_le_bytes());
+        hasher.update(title.as_bytes());
+        // The old width, zero-extended into today's type -- which is what a
+        // record from before the widening would look like IF the decode
+        // succeeded. It does not (see
+        // `payment::order_wire_compat_tests::an_order_from_before_the_id_was_widened_does_not_decode`),
+        // so this stands in for the derivation-only half of the boundary: a
+        // record whose bytes still decode but whose id is not the one its
+        // terms give.
+        let mut id = [0u8; 32];
+        id[..16].copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+        ListingId(id)
+    }
+
+    fn signed(listing: Listing, key: &SigningKey) -> AuthorizedListing {
+        let message = harvest_common::to_cbor(&listing).expect("serialize");
+        let scoped = ghostkey_common::ScopedPayload {
+            requestor: ghostkey_common::SignatureRequestor::WebApp(
+                harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                    .parse::<ContractInstanceId>()
+                    .expect("canonical webapp id"),
+            ),
+            payload: message,
+        };
+        let scoped_payload = harvest_common::to_cbor(&scoped).expect("serialize scoped");
+        AuthorizedListing {
+            signature: key.sign(&scoped_payload).to_bytes().to_vec(),
+            listing,
+            scoped_payload,
+            certificate_pem: String::new(),
+        }
+    }
+
+    /// **KNOWN GAP: a predecessor generation's store is discarded in full,
+    /// and the seller is told only in a console log.**
+    ///
+    /// This branch made a listing's id a function of its own terms. That is
+    /// right, and it is what stops two differently-priced listings sharing an
+    /// id and diverging permanently. But it also means every listing
+    /// published under a PREVIOUS generation carries an id the current
+    /// `AuthorizedListing::verify` refuses -- and `ListingsV1::apply_delta`
+    /// returns on the first refusal, so `fold_or_keep_primary` keeps the
+    /// newer generation and drops the predecessor **entirely**: the listings,
+    /// the orders, and the store's own info with them. A seller upgrading
+    /// loses their shop.
+    ///
+    /// Three things make it worse than the loss itself, and they are why this
+    /// is pinned rather than left to the prose:
+    ///
+    /// * it is reported by `probe_warn`, which is a browser console line and
+    ///   not something a user sees;
+    /// * the fold's own message says the migration then SEALS, so the
+    ///   generation is never looked at again;
+    /// * every other test in this repository builds its fixtures with the
+    ///   NEW derivation, so none of them can see it.
+    ///
+    /// **There is no clean repair and that is why this is a decision rather
+    /// than a bug to fix here.** The id is inside what the seller signed, so
+    /// the fold cannot re-stamp a record without invalidating its signature.
+    /// Accepting the old form in `verify` would work mechanically -- the
+    /// seller's fingerprint is derivable from the verifying key `verify`
+    /// already holds -- but it reopens exactly the hole the change closed,
+    /// since a seller could still mint two listings under one old-form id.
+    /// So the options are to accept the loss loudly, or not to make the
+    /// change; both are product decisions.
+    ///
+    /// This test asserts the CURRENT behaviour. It is not an endorsement of
+    /// it: it exists so that whoever resolves the decision finds a failing
+    /// test rather than a seller finding an empty shop.
+    #[test]
+    fn known_gap_a_predecessor_generations_store_is_discarded_in_full() {
+        let key = SigningKey::from_bytes(&[51u8; 32]);
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let old = signed(
+            Listing {
+                id: v1_listing_id("seller-fp", &created_at, "Ghost Pepper"),
+                title: "Ghost Pepper".into(),
+                description: "Hot".into(),
+                kind: ListingKind::Sale,
+                price: None,
+                created_at,
+            },
+            &key,
+        );
+        assert!(
+            old.verify(&key.verifying_key()).is_err(),
+            "the premise: a predecessor's listing no longer verifies"
+        );
+
+        let mut predecessor = StoreStateV1::default();
+        predecessor.listings.listings = vec![old];
+        predecessor.info.info.store_name = "Alice's Hot Sauce".to_string();
+        predecessor.info.info.version = 1;
+
+        let outcome = merge_store_reporting_discard(
+            StoreStateV1::default(),
+            &predecessor,
+            &StoreParameters::new(key.verifying_key()),
+            DiscardedSide::Predecessor,
+        );
+
+        assert!(
+            outcome.discarded,
+            "the fold refuses the predecessor in full"
+        );
+        assert!(
+            outcome.state.listings.listings.is_empty(),
+            "and carries none of its listings"
+        );
+        assert_eq!(
+            outcome.state.info.info.store_name, "",
+            "not even the store's own name, which had nothing wrong with it"
+        );
+    }
+
+    /// **A predecessor whose records DO carry their terms' ids is folded
+    /// normally.**
+    ///
+    /// The other half, so the test above is read as "this input is refused"
+    /// rather than "the fold is broken". It also pins that the refusal is
+    /// about the id and not about anything else the branch changed.
+    #[test]
+    fn a_predecessor_whose_ids_are_their_terms_is_carried_forward() {
+        let key = SigningKey::from_bytes(&[51u8; 32]);
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let good = signed(
+            Listing {
+                id: ListingId([0u8; 32]),
+                title: "Ghost Pepper".into(),
+                description: "Hot".into(),
+                kind: ListingKind::Sale,
+                price: None,
+                created_at,
+            }
+            .with_derived_id(),
+            &key,
+        );
+
+        let mut predecessor = StoreStateV1::default();
+        predecessor.listings.listings = vec![good];
+
+        let outcome = merge_store_reporting_discard(
+            StoreStateV1::default(),
+            &predecessor,
+            &StoreParameters::new(key.verifying_key()),
+            DiscardedSide::Predecessor,
+        );
+
+        assert!(!outcome.discarded);
+        assert_eq!(outcome.state.listings.listings.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod uncarried_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use freenet_stdlib::prelude::ContractInstanceId;
+    use harvest_common::listing::{AuthorizedListing, Listing, ListingId, ListingKind};
+
+    /// A listing carrying an id derived the way a PREDECESSOR generation
+    /// derived it, rather than the way this one does.
+    ///
+    /// The whole finding this module exists for is that every fixture in this
+    /// repository builds records with the CURRENT derivation, so not one of
+    /// them could see a change to it break the migration. This is the fixture
+    /// that can: it constructs the record the old way and asserts what the
+    /// fold does with it. See `predecessor_generation_tests` for the same
+    /// shape applied to the fold's outcome.
+    fn listing_with_a_foreign_id(key: &SigningKey, title: &str) -> AuthorizedListing {
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let listing = Listing {
+            // Not `with_derived_id`. Any id that is not the one these terms
+            // give stands in for "derived by a generation that is not this
+            // one" -- which is what a predecessor's records are.
+            id: ListingId([0xAB; 32]),
+            title: title.to_string(),
+            description: String::new(),
+            kind: ListingKind::Sale,
+            price: None,
+            created_at,
+        };
+        let message = harvest_common::to_cbor(&listing).expect("serialize");
+        let scoped = ghostkey_common::ScopedPayload {
+            requestor: ghostkey_common::SignatureRequestor::WebApp(
+                harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                    .parse::<ContractInstanceId>()
+                    .expect("canonical webapp id"),
+            ),
+            payload: message,
+        };
+        let scoped_payload = harvest_common::to_cbor(&scoped).expect("serialize scoped");
+        AuthorizedListing {
+            signature: key.sign(&scoped_payload).to_bytes().to_vec(),
+            listing,
+            scoped_payload,
+            certificate_pem: String::new(),
+        }
+    }
+
+    /// **A record whose id this generation did not derive is refused, is
+    /// reported, and takes its whole generation with it -- for EVERY id in
+    /// the store's state.**
+    ///
+    /// # The structural fix, and why it is worth more than the finding
+    ///
+    /// A change to how a `ListingId` is derived broke the migration in a way
+    /// that destroyed a seller's shop, passed all four gates and survived a
+    /// review round. It was invisible for one reason: **every fixture in this
+    /// repository builds its records with the CURRENT derivation**, so no
+    /// test in it could hold a record the previous generation would have
+    /// produced.
+    ///
+    /// This is the test that can. It builds each record with an id that is
+    /// simply NOT the one its terms give -- which is what every record of a
+    /// predecessor generation becomes the moment a derivation changes -- and
+    /// asserts the three things a future author needs to know before changing
+    /// one again:
+    ///
+    /// 1. the fold refuses it,
+    /// 2. it takes the entire predecessor with it, the store's own details
+    ///    included, and
+    /// 3. the seller is told, by name, in something other than a log line.
+    ///
+    /// It is written over a LIST of the ids, so adding a fourth id-bearing
+    /// record to `StoreStateV1` and forgetting this file means adding a case
+    /// here, not discovering the omission from a seller.
+    ///
+    /// **What it does not do is prevent the loss.** It cannot: the id is
+    /// inside what the seller signed, so no fold can re-stamp a record
+    /// without invalidating it. What it prevents is the loss being a
+    /// surprise -- which, given the migration seals and there is no second
+    /// attempt, is the whole of the available protection.
+    #[test]
+    fn a_derivation_change_fails_here_before_it_reaches_a_seller() {
+        let key = SigningKey::from_bytes(&[53u8; 32]);
+        let params = StoreParameters::new(key.verifying_key());
+
+        // One case per id-bearing record a store's state can hold. A new one
+        // belongs in this list.
+        let cases: Vec<(&str, StoreStateV1)> = vec![
+            ("listing", {
+                let mut state = StoreStateV1::default();
+                state.info.info.store_name = "Alice's Hot Sauce".to_string();
+                state.info.info.version = 1;
+                state.listings.listings = vec![listing_with_a_foreign_id(&key, "Ghost Pepper")];
+                state
+            }),
+            ("order", {
+                let mut state = StoreStateV1::default();
+                state.info.info.store_name = "Alice's Hot Sauce".to_string();
+                state.info.info.version = 1;
+                let order = order_with_a_foreign_id(&key);
+                state.orders.orders.insert(order.order.id.clone(), order);
+                state
+            }),
+        ];
+
+        for (what, predecessor) in cases {
+            take_uncarried();
+            let outcome = merge_store_reporting_discard(
+                StoreStateV1::default(),
+                &predecessor,
+                &params,
+                DiscardedSide::Predecessor,
+            );
+
+            assert!(
+                outcome.discarded,
+                "a {what} whose id this generation did not derive must be refused"
+            );
+            assert_eq!(
+                outcome.state.info.info.store_name, "",
+                "and it takes the store's own details with it, which is the part that hurts \
+                 ({what})"
+            );
+            let lost = take_uncarried();
+            assert_eq!(lost.len(), 1, "the seller is told, once ({what})");
+            assert!(
+                lost[0].contains("Alice's Hot Sauce"),
+                "by name ({what}): {}",
+                lost[0]
+            );
+        }
+    }
+
+    /// An order carrying an id this generation did not derive, otherwise
+    /// entirely valid and correctly signed.
+    fn order_with_a_foreign_id(key: &SigningKey) -> harvest_common::payment::AuthorizedOrder {
+        use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderStatus};
+
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let order = Order {
+            // Not `with_derived_id`, for the same reason as the listing above.
+            id: OrderId([0xCD; 32]),
+            listing_id: ListingId([1u8; 32]),
+            buyer_fingerprint: String::new(),
+            seller_fingerprint: "seller-fp".to_string(),
+            amount_sats: 50_000,
+            network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+            payment_script_pubkey: vec![0x00, 0x14, 0xaa],
+            payment_address: "tb1qexample".to_string(),
+            required_confirmations: 1,
+            payment_hash: None,
+            trusted_bridges: Vec::new(),
+            bitcoin_address_code_hash: None,
+            anchor: None,
+            order_binding: None,
+            created_at,
+        };
+        let message = harvest_common::to_cbor(&order).expect("serialize");
+        let scoped = ghostkey_common::ScopedPayload {
+            requestor: ghostkey_common::SignatureRequestor::WebApp(
+                harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                    .parse::<ContractInstanceId>()
+                    .expect("canonical webapp id"),
+            ),
+            payload: message,
+        };
+        let scoped_payload = harvest_common::to_cbor(&scoped).expect("serialize scoped");
+        AuthorizedOrder {
+            signature: key.sign(&scoped_payload).to_bytes().to_vec(),
+            order,
+            scoped_payload,
+            status: OrderStatus::AwaitingPayment,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        }
+    }
+
+    /// **A discarded predecessor names what was lost, in the seller's terms.**
+    ///
+    /// Ian's decision on 2026-09-06 was that no published store holds data
+    /// worth preserving and sellers republish. That makes the loss a decision
+    /// rather than an accident -- and a decision the person affected is not
+    /// told about is indistinguishable from a bug.
+    ///
+    /// "Migration incomplete" would not do. The seller has to know their
+    /// store's name and description are gone, how many listings went with
+    /// them, and that republishing is what fixes it.
+    #[test]
+    fn a_discarded_predecessor_says_what_was_lost() {
+        take_uncarried();
+        let key = SigningKey::from_bytes(&[52u8; 32]);
+
+        let mut predecessor = StoreStateV1::default();
+        predecessor.info.info.store_name = "Alice's Hot Sauce".to_string();
+        predecessor.info.info.version = 1;
+        predecessor.listings.listings = vec![
+            listing_with_a_foreign_id(&key, "Ghost Pepper"),
+            listing_with_a_foreign_id(&key, "Scotch Bonnet"),
+        ];
+
+        let outcome = merge_store_reporting_discard(
+            StoreStateV1::default(),
+            &predecessor,
+            &StoreParameters::new(key.verifying_key()),
+            DiscardedSide::Predecessor,
+        );
+        assert!(outcome.discarded, "the premise");
+
+        let lost = take_uncarried();
+        assert_eq!(lost.len(), 1, "one report for one discarded generation");
+        let said = &lost[0];
+        assert!(
+            said.contains("Alice's Hot Sauce"),
+            "the seller should recognise their own store: {said}"
+        );
+        assert!(
+            said.contains('2'),
+            "and be told how many listings went with it: {said}"
+        );
+        assert!(
+            said.to_lowercase().contains("publish"),
+            "and what to do about it: {said}"
+        );
+        assert!(
+            said.to_lowercase().contains("expected"),
+            "and that this was a consequence of the upgrade rather than a fault -- without \
+             it the seller goes looking for a bug instead of republishing: {said}"
+        );
+    }
+
+    /// **A refused LOCAL snapshot is not described as an upgrade loss.**
+    ///
+    /// Found in review. `merge_store_reporting_discard` has two callers and
+    /// `other` means a different thing in each: the predecessor for
+    /// `merge_generations`, and this node's own current-generation snapshot
+    /// for `merge_with_local`. The message was unconditional, so on the
+    /// second path a seller would be told the store already at the new
+    /// address "was not carried over when Harvest upgraded" and that they
+    /// should republish it -- false, and it would send them re-publishing
+    /// data that is fine.
+    ///
+    /// Low reachability: a local snapshot's listings are current-derivation
+    /// by construction. That is not a reason to leave it, because this
+    /// message is seen once and then the data is gone.
+    #[test]
+    fn a_refused_local_snapshot_is_described_as_a_failed_merge() {
+        take_uncarried();
+        let key = SigningKey::from_bytes(&[52u8; 32]);
+        let mut local = StoreStateV1::default();
+        local.info.info.store_name = "Alice's Hot Sauce".to_string();
+        local.info.info.version = 1;
+        local.listings.listings = vec![listing_with_a_foreign_id(&key, "Ghost Pepper")];
+
+        let outcome = merge_store_reporting_discard(
+            StoreStateV1::default(),
+            &local,
+            &StoreParameters::new(key.verifying_key()),
+            DiscardedSide::LocalSnapshot,
+        );
+        assert!(outcome.discarded, "the premise");
+
+        let said = take_uncarried().pop().expect("the seller is told");
+        assert!(
+            said.contains("Alice's Hot Sauce"),
+            "it still names the store: {said}"
+        );
+        assert!(
+            !said.contains("was not carried over when Harvest upgraded"),
+            "but not as an upgrade loss -- this store is at the new address: {said}"
+        );
+        assert!(said.contains("intact"), "and it says so: {said}");
+        assert!(
+            !said.to_lowercase().contains("publish your store details"),
+            "and does not send the seller re-publishing data that is fine: {said}"
+        );
+    }
+
+    /// **A fold that carries everything reports nothing.**
+    ///
+    /// The counterpart, so the report cannot be a constant. A notification
+    /// that appears on every successful migration is one a seller learns to
+    /// dismiss, which costs exactly the case it exists for.
+    #[test]
+    fn a_successful_fold_reports_nothing_lost() {
+        take_uncarried();
+        let key = SigningKey::from_bytes(&[52u8; 32]);
+
+        let mut predecessor = StoreStateV1::default();
+        predecessor.listings.listings = vec![listing_with_a_foreign_id(&key, "Ghost Pepper")];
+        // The same listing, stamped the way this generation stamps one.
+        predecessor.listings.listings[0].listing = predecessor.listings.listings[0]
+            .listing
+            .clone()
+            .with_derived_id();
+        let re_signed = {
+            let listing = predecessor.listings.listings[0].listing.clone();
+            let message = harvest_common::to_cbor(&listing).expect("serialize");
+            let scoped = ghostkey_common::ScopedPayload {
+                requestor: ghostkey_common::SignatureRequestor::WebApp(
+                    harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                        .parse::<ContractInstanceId>()
+                        .expect("canonical webapp id"),
+                ),
+                payload: message,
+            };
+            let scoped_payload = harvest_common::to_cbor(&scoped).expect("serialize scoped");
+            AuthorizedListing {
+                signature: key.sign(&scoped_payload).to_bytes().to_vec(),
+                listing,
+                scoped_payload,
+                certificate_pem: String::new(),
+            }
+        };
+        predecessor.listings.listings = vec![re_signed];
+
+        let outcome = merge_store_reporting_discard(
+            StoreStateV1::default(),
+            &predecessor,
+            &StoreParameters::new(key.verifying_key()),
+            DiscardedSide::Predecessor,
+        );
+
+        assert!(!outcome.discarded);
+        assert!(
+            take_uncarried().is_empty(),
+            "a migration that lost nothing must say nothing"
+        );
+    }
+
+    /// **Taking the reports clears them.**
+    ///
+    /// The drain is what stops one migration's loss being announced again on
+    /// the next notification, which would teach a seller the message means
+    /// nothing.
+    #[test]
+    fn taking_the_reports_clears_them() {
+        take_uncarried();
+        record_uncarried("something".to_string());
+        assert_eq!(take_uncarried().len(), 1);
+        assert!(take_uncarried().is_empty());
+    }
+}

@@ -2,15 +2,24 @@ use chrono::Utc;
 use dioxus::prelude::*;
 use harvest_common::listing::{Listing, ListingId, ListingKind, PriceInfo};
 
+/// The form a seller fills in to publish a listing.
+///
+/// # It no longer takes the seller's fingerprint, and that is not a loss
+///
+/// It used to, solely to feed `ListingId::new`. The id now comes from the
+/// listing's own terms, and a `Listing` carries no seller field -- so two
+/// sellers publishing an identical listing share an id. That is harmless:
+/// listings live in a store contract whose parameters bind the seller's key,
+/// so the two are in different contracts, and `AuthorizedListing::verify`
+/// checks each against its own store's key. A listing's authorship was never
+/// carried by its id; it is the ghostkey signature over the terms.
 #[component]
-pub fn ListingForm(seller_fingerprint: String, on_submit: EventHandler<Listing>) -> Element {
+pub fn ListingForm(on_submit: EventHandler<Listing>) -> Element {
     let mut title = use_signal(String::new);
     let mut description = use_signal(String::new);
     let mut kind = use_signal(|| ListingKind::Sale);
     let mut price_amount = use_signal(String::new);
     let mut price_currency = use_signal(|| "BTC".to_string());
-
-    let fp = seller_fingerprint.clone();
 
     rsx! {
         div { class: "card",
@@ -83,13 +92,16 @@ pub fn ListingForm(seller_fingerprint: String, on_submit: EventHandler<Listing>)
             button {
                 class: "btn btn-primary",
                 disabled: title().trim().is_empty(),
-                onclick: {
-                    let fp = fp.clone();
-                    move |_| {
+                onclick: move |_| {
                         let now = Utc::now();
                         let listing_title = title().trim().to_string();
                         let listing = Listing {
-                            id: ListingId::new(&fp, &now, &listing_title),
+                            // Stamped by `with_derived_id` below, out of the
+                            // finished terms: a listing whose id is not the
+                            // one its terms give is refused by every peer
+                            // (see `ListingId::from_terms`), so a literal
+                            // here would be a second place deciding identity.
+                            id: ListingId([0u8; 32]),
                             title: listing_title,
                             description: description().trim().to_string(),
                             kind: kind(),
@@ -104,14 +116,14 @@ pub fn ListingForm(seller_fingerprint: String, on_submit: EventHandler<Listing>)
                                 None
                             },
                             created_at: now,
-                        };
+                        }
+                        .with_derived_id();
 
                         title.set(String::new());
                         description.set(String::new());
                         price_amount.set(String::new());
 
                         on_submit.call(listing);
-                    }
                 },
                 "Create Listing"
             }

@@ -712,9 +712,9 @@ mod order_tests {
     fn make_order(buyer_fp: &str, created_at_secs: i64, script: &[u8]) -> Order {
         let seller_fp = "seller-fingerprint";
         let ts = timestamp(created_at_secs);
-        let listing_id = ListingId::new(seller_fp, &ts, "Widget");
+        let listing_id = ListingId::from_label("Widget");
         Order {
-            id: OrderId::new(seller_fp, &listing_id, &ts, buyer_fp),
+            id: OrderId([0u8; 32]),
             listing_id,
             buyer_fingerprint: buyer_fp.into(),
             seller_fingerprint: seller_fp.into(),
@@ -728,8 +728,11 @@ mod order_tests {
             // seller's signature, rather than in the store's address.
             trusted_bridges: bridges(&bridge_key()),
             bitcoin_address_code_hash: None,
+            anchor: None,
+            order_binding: None,
             created_at: ts,
         }
+        .with_derived_id()
     }
 
     /// 32-byte contract id that order-term / status signatures must carry
@@ -925,12 +928,16 @@ mod order_tests {
 
         let mut first = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
         first.trusted_bridges = bridges(&bridge_key());
+        // Re-stamped after changing a term: the id is derived from the terms
+        // (see `OrderId`), so an order edited in place carries a stale one.
+        let first = first.with_derived_id();
         let first_proof = make_payment_proof(&first, &bridge_key(), 1);
 
         // A second invoice, issued later, naming a different bridge -- the
         // rotation the old shape made impossible.
         let mut second = make_order("buyer-2", 1_700_000_100, &[0x00, 0x14, 0xcc, 0xdd]);
         second.trusted_bridges = bridges(&other_bridge_key());
+        let second = second.with_derived_id();
         let second_proof = make_payment_proof(&second, &other_bridge_key(), 2);
 
         let state = orders_of([
@@ -977,6 +984,10 @@ mod order_tests {
         let mut order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
         let proof = make_payment_proof(&order, &bridge_key(), 1);
         order.trusted_bridges = Vec::new();
+        // Re-stamped, because the id is derived from the terms: without this
+        // the order would be refused for its id and the bridge rule below
+        // would never be reached. See `OrderId`.
+        let order = order.with_derived_id();
         let record = make_authorized_order(&seller, order.clone(), OrderStatus::Paid, Some(proof));
 
         let state = orders_of([(order.id.clone(), record)]);
@@ -1955,10 +1966,9 @@ mod order_tests {
         status: OrderStatus,
     ) -> (OrderId, AuthorizedOrder) {
         let ts = timestamp(created_at_secs);
-        let listing_id = ListingId::new("seller", &ts, "Widget");
-        let id = OrderId::new("seller", &listing_id, &ts, &format!("buyer-{seed}"));
+        let listing_id = ListingId::from_label("Widget");
         let order = Order {
-            id: id.clone(),
+            id: OrderId([0u8; 32]),
             listing_id,
             buyer_fingerprint: format!("buyer-{seed}"),
             seller_fingerprint: "seller".into(),
@@ -1970,10 +1980,13 @@ mod order_tests {
             required_confirmations: 1,
             trusted_bridges: Vec::new(),
             bitcoin_address_code_hash: None,
+            anchor: None,
+            order_binding: None,
             created_at: ts,
-        };
+        }
+        .with_derived_id();
         (
-            id,
+            order.id.clone(),
             AuthorizedOrder {
                 order,
                 scoped_payload: vec![],
@@ -2302,13 +2315,14 @@ mod order_tests {
     fn make_listing(signer: &SigningKey, title: &str) -> AuthorizedListing {
         let ts = timestamp(1_700_000_000);
         let listing = crate::listing::Listing {
-            id: ListingId::new("seller-fingerprint", &ts, title),
+            id: ListingId([0u8; 32]),
             title: title.into(),
             description: String::new(),
             kind: crate::listing::ListingKind::Sale,
             price: None,
             created_at: ts,
-        };
+        }
+        .with_derived_id();
         let (scoped_payload, signature) = sign_scoped(signer, &listing);
         AuthorizedListing {
             listing,

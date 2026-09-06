@@ -72,34 +72,105 @@
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
 use freenet_bitcoin_common::{
-    fold_outpoint_status, BitcoinAddressParameters, BitcoinNetwork, BridgeId, Claim,
+    fold_outpoint_status, BitcoinAddressParameters, BitcoinNetwork, BlockAnchor, BridgeId, Claim,
     OutpointStatus, SignedClaim, SignedTipEntry,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::listing::ListingId;
 
-/// Unique order identifier: first 16 bytes of
-/// `BLAKE3(seller_fingerprint || listing_id || created_at_ms || buyer_fingerprint)`.
+/// Unique order identifier: a hash of the order's own TERMS.
+///
+/// # Why the identity is the content
+///
+/// It used to be `BLAKE3(seller_fingerprint || listing_id || created_at_ms ||
+/// buyer_fingerprint)` -- and **nothing else**. Not the amount, not the
+/// script, not the payment address. So one seller could sign two
+/// differently-termed, individually valid orders that shared an id, and they
+/// collided on one key of [`crate::store::OrdersV1`]'s map.
+///
+/// The collision was not a draw. `merge_order` resolves an equal-rank tie by
+/// keeping the lexicographically SMALLER CBOR encoding, which is
+/// deterministic -- and directional. A seller could publish the larger
+/// encoding, let it propagate and be read, then publish the smaller one,
+/// which wins on every replica and permanently. Applied to the buy flow that
+/// reads: show the buyer an order at address A, wait for them to pay it, then
+/// replace the terms with address B. The public record ends up describing a
+/// destination that never received anything, so the payment is unprovable and
+/// the declared debt the buyer relied on describes a different transaction.
+///
+/// The smaller-CBOR rule is not the defect and must not be changed to fix
+/// this -- it exists so that a third party cannot win a tie by PADDING a
+/// payment proof, and it is correct for that. The defect is that two
+/// different things were allowed to be one thing. Deriving the id from the
+/// terms makes them two orders, so there is no tie to resolve, and it is the
+/// same remedy the mailbox needed when message identity moved to
+/// `entry_digest`: **identity is the content, or something will eventually
+/// change under it.**
+///
+/// # What it covers, and why there is no list
+///
+/// The whole encoded struct, with the id blanked. Written that way rather
+/// than as a chosen list of fields because a list is a thing somebody adds a
+/// field beside -- which is exactly how the old preimage came to omit the
+/// amount and the address. A field added to [`Order`] tomorrow is inside the
+/// preimage without anybody remembering to put it there.
+///
+/// **With one exception, which is the way to break this.** `#[serde(skip)]`
+/// omits a field from `to_cbor` entirely, so it would be outside both this
+/// preimage AND the signature comparison in
+/// [`AuthorizedOrder::verify_terms`] -- a field free to vary under a fixed id
+/// and a valid signature, which is the swap attack again. `serde(default)`
+/// and `skip_serializing_if` are both fine: they still encode when set, so
+/// they are inside the digest. Do not put `#[serde(skip)]` on a field of
+/// [`Order`]. The compiler will not stop you; the guard one level up
+/// (`verify_unused_fields_absent`, which destructures without `..`) covers
+/// `AuthorizedOrder` and not this struct.
+///
+/// # Why 32 bytes and not 16
+///
+/// It was 16, and the residual was recorded rather than fixed. That was the
+/// wrong call and it is corrected here, because of what the attack actually
+/// needs. Finding a SECOND PREIMAGE for an id a buyer already holds is 2^128
+/// and out of reach -- but the swap above needs only a COLLISION between two
+/// orders the SELLER chooses, and at 16 bytes that is ~2^64. Expensive, not
+/// impossible for a motivated party over months, against a payoff of a
+/// stolen payment sitting behind a public record that says unpaid. The
+/// buyer-side binding does not help: a seller can put the buyer's
+/// [`Order::order_binding`] on both halves of a collision.
+///
+/// At 32 bytes the collision cost is 2^128 and the question closes.
+///
+/// **The width was changed here because this is the one moment it is free.**
+/// The branch re-keys every contract, so every published order is already
+/// crossing a migration boundary; afterwards the same change would cost a
+/// re-key plus a migration of its own. What it costs at this boundary is
+/// recorded honestly in `docs/untested-invariants.md`: an order published at
+/// the old width does not decode into this type at all, so it does not
+/// survive the re-key. Orders are short-lived by construction -- they expire
+/// after [`MAX_ANCHOR_AGE_BLOCKS`] -- which is what makes that acceptable
+/// for orders and NOT what makes it acceptable for listings; see
+/// [`ListingId`].
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
-pub struct OrderId(pub [u8; 16]);
+pub struct OrderId(pub [u8; 32]);
 
 impl OrderId {
-    pub fn new(
-        seller_fingerprint: &str,
-        listing_id: &ListingId,
-        created_at: &DateTime<Utc>,
-        buyer_fingerprint: &str,
-    ) -> Self {
+    /// The id these terms give.
+    ///
+    /// Idempotent: the id field is blanked before hashing, so computing this
+    /// on an order that already carries the answer gives the same answer --
+    /// which is what lets [`AuthorizedOrder::verify`] demand that they match.
+    pub fn from_terms(order: &Order) -> Self {
+        let mut probe = order.clone();
+        probe.id = Self([0u8; 32]);
+        // Infallible for the same reason as `order_content_digest`: `Order`
+        // derives `Serialize` over plain data with no custom fallible
+        // encoding.
+        let terms = crate::to_cbor(&probe).expect("Order always serializes to CBOR");
         let mut h = blake3::Hasher::new();
-        h.update(b"harvest/order-id/v1");
-        h.update(seller_fingerprint.as_bytes());
-        h.update(&listing_id.0);
-        h.update(&created_at.timestamp_millis().to_le_bytes());
-        h.update(buyer_fingerprint.as_bytes());
-        let mut id = [0u8; 16];
-        id.copy_from_slice(&h.finalize().as_bytes()[..16]);
-        Self(id)
+        h.update(b"harvest/order-id/v2");
+        h.update(&terms);
+        Self(*h.finalize().as_bytes())
     }
 
     /// Short, human-quotable form for the UI ("Order 3xK9…").
@@ -167,6 +238,71 @@ impl OrderStatus {
         }
     }
 }
+
+/// How far behind the tip an order's [`Order::anchor`] may be and still be
+/// treated as fresh by a buyer about to pay.
+///
+/// # Why a buyer checks this at all
+///
+/// A block hash proves the commitment was signed *no earlier than* that
+/// block. It is a lower bound and nothing more, and every past block hash is
+/// public -- so a seller can anchor a fresh commitment to an old block and
+/// have readers count it as already closed, reading as zero outstanding
+/// exposure while taking money. `docs/design/incentive-mechanism.md` argues
+/// this cannot happen; it is wrong, and GitHub issue 8 records the
+/// correction. The rule that neutralises it is this one, applied by the buyer
+/// before they pay.
+///
+/// # Why the reader applies it and not the contract
+///
+/// "Is this recent?" is a question about now, and a contract has no clock. A
+/// merge that consulted one would not be a function of its inputs and
+/// replicas would diverge. The network stores the anchor; the reader forms
+/// the verdict.
+///
+/// # It is also the order's LIFETIME, which is what sets the number
+///
+/// This was 6, by analogy with Bitcoin's customary confirmation depth. Review
+/// pointed out that the analogy is the wrong one, because the anchor is
+/// stamped when the seller signs and is immutable under their signature -- so
+/// the rule is not only a backdating guard, it is how long an accepted order
+/// stays payable. At 6 blocks an honest buyer who came back after lunch found
+/// their order refused, with no way for either party to see why and no way to
+/// reissue.
+///
+/// So the number is set by the SHORTER of two requirements:
+///
+/// * **Long enough to buy something.** A person is offered a Bitcoin address
+///   and has to reach a wallet. An hour is not that; a working day is.
+/// * **Short enough that backdating buys nothing.** A seller who anchors an
+///   old block gets readers to stop counting the order that much earlier.
+///   What that is measured against is the complaint window, which Phase 2
+///   sets and which is certainly days rather than hours -- so a few hours of
+///   slack is noise, while an hour of buyer patience is not.
+///
+/// 48 blocks is about eight hours and satisfies both. Nothing here depends on
+/// the exact number, and everything that reads it derives from it rather than
+/// repeating it -- see `harvest_ui::state::RECENT_BLOCKS_KEPT`.
+///
+/// **It cannot exceed the tip contract's retention.** A reader checks the
+/// anchor is on their chain by looking the height up in the block summaries
+/// the tip contract keeps, and that is `TIP_RETAIN` deep. A tolerance wider
+/// than the retention would accept anchors nobody can check, which is the
+/// unverified-reads-as-verified direction. Held by the assertion below rather
+/// than by this paragraph.
+pub const MAX_ANCHOR_AGE_BLOCKS: u32 = 48;
+
+/// A fresh anchor must be one a reader can still check against their own
+/// chain.
+///
+/// A build failure rather than a test, because the two constants live in
+/// different crates and the failure it prevents is silent: an anchor inside
+/// the tolerance but outside the retained window reads as unverifiable, which
+/// refuses payment for a reason no user or seller could act on.
+const _: () = assert!(
+    (MAX_ANCHOR_AGE_BLOCKS as usize) < freenet_bitcoin_common::TIP_RETAIN,
+    "the freshness tolerance must fit inside the tip contract's retained window"
+);
 
 /// The immutable terms of an order, as agreed and published by the seller.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -254,10 +390,141 @@ pub struct Order {
     /// Bitcoin contract could never be reflected.
     #[serde(default)]
     pub bitcoin_address_code_hash: Option<[u8; 32]>,
+    /// A recent Bitcoin block this commitment is anchored to.
+    ///
+    /// # What it is for
+    ///
+    /// The order commitment is the anti-exit-scam mechanism
+    /// (`docs/design/incentive-mechanism.md` Part 5, step 2): it makes a
+    /// seller's outstanding exposure countable by strangers, so a buyer can
+    /// see that more is staked than they are about to risk. Counting requires
+    /// deciding which commitments are still open, and that is a question
+    /// about time.
+    ///
+    /// **A contract cannot read a clock**, and a timestamp the writer chooses
+    /// is not a clock either -- it is an assertion by the one party with a
+    /// motive to lie about it. `created_at` is exactly that, which is why it
+    /// is not used for this. A block hash is the substitute: it proves the
+    /// commitment was signed *no earlier than* that block, and the reader's
+    /// own clock supplies the rest.
+    ///
+    /// # What it does NOT prove, and the direction it fails in
+    ///
+    /// It is a lower bound only. Every past block hash is public, so a seller
+    /// can anchor a fresh commitment to an old block and have readers close
+    /// it immediately -- reading as zero exposure while taking orders. The
+    /// design document is wrong where it argues otherwise, and issue 8
+    /// records the correction.
+    ///
+    /// The rule that neutralises it lives in the READER, because only a
+    /// reader has a clock: a buyer pays only if the anchor is canonical on
+    /// the chain they see and is within [`MAX_ANCHOR_AGE_BLOCKS`] of the tip.
+    /// See `harvest_ui::state::AppState::payment_blockers`. This field
+    /// carries the fact; the verdict is not a contract's to form.
+    ///
+    /// # Why `Option`, and why it skips when absent
+    ///
+    /// `None` for every order signed before this field existed.
+    /// [`AuthorizedOrder::verify_terms`] re-serializes this struct and
+    /// compares the result against the payload inside the signed
+    /// `ScopedPayload`, so a field that serialized when absent would change
+    /// the preimage of every earlier signature and the store contract would
+    /// reject the seller's own published invoices. Pinned by
+    /// `order_wire_compat_tests::an_order_that_predates_the_anchor_re_encodes_unchanged`,
+    /// which was observed red against the naive `#[serde(default)]`-only
+    /// form.
+    ///
+    /// A buyer refuses to pay an order with no anchor, so absence is the safe
+    /// direction rather than a silent downgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<BlockAnchor>,
+    /// What makes this commitment ONE buyer's rather than anyone's.
+    ///
+    /// # The hole this closes
+    ///
+    /// Nothing else here names a particular buyer -- `buyer_fingerprint` is
+    /// empty for every order the buy flow produces, because a buyer has no
+    /// identity. So without this a seller could accept one order, publish one
+    /// commitment, and send its id down any number of conversations: every
+    /// buyer's software found it published, signed, fresh and for a listing
+    /// they had asked about, and showed them all the same payment address.
+    /// One declared debt collecting unbounded money inverts the mechanism the
+    /// commitment exists for, since a count that does not bound the money is
+    /// not a count.
+    ///
+    /// This is `H(n)` from `docs/design/incentive-mechanism.md` and issue 8:
+    /// the buyer sends it with the request, the seller copies it here, and
+    /// the buyer refuses to pay a commitment that does not carry the value
+    /// their own node derives. See
+    /// [`crate::mailbox::order_binding_from_secret`] for where `n` comes
+    /// from, why the seller cannot compute it, and why publishing `H(n)`
+    /// reveals nothing.
+    ///
+    /// # Why `Option`, and why it skips when absent
+    ///
+    /// Exactly as for [`Self::anchor`], and for the same signature reason:
+    /// [`AuthorizedOrder::verify_terms`] re-serializes this struct, so a
+    /// field that encoded when absent would break every signature taken
+    /// before it existed.
+    ///
+    /// A buyer refuses an unbound commitment, so `None` fails closed rather
+    /// than matching everyone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_binding: Option<[u8; 32]>,
     pub created_at: DateTime<Utc>,
 }
 
 impl Order {
+    /// Stamp this order with the id its own terms give.
+    ///
+    /// Every producer of an `Order` must go through this, because
+    /// [`AuthorizedOrder::verify_terms`] refuses a record whose id is not the
+    /// one its terms give -- so an order built any other way is one no peer
+    /// will accept. Taking `self` and returning it makes the stamping part of
+    /// construction rather than a step a caller can forget after filling the
+    /// struct in.
+    #[must_use]
+    pub fn with_derived_id(mut self) -> Self {
+        self.id = OrderId::from_terms(&self);
+        self
+    }
+
+    /// The instance id of the `BitcoinAddressContract` that observes this
+    /// order's payment destination, or `None` when the order names no
+    /// contract build.
+    ///
+    /// # Why this is HERE and not at either call site
+    ///
+    /// Two things need it and they are in different crates: the store
+    /// contract, to cross-check an order against the address contract's own
+    /// state, and the UI, so a buyer can see what has already arrived at the
+    /// address they are about to pay. A hand-maintained second copy of a
+    /// contract-address derivation is the defect this repository ranks first
+    /// in `docs/untested-invariants.md` -- `create_store_contracts` held one
+    /// for the store's own parameters, and when the copies drifted every
+    /// derived id named a contract that was never published, reported as a
+    /// clean "nothing to migrate" over a seller's entire store.
+    ///
+    /// `BLAKE3(code_hash || cbor(parameters))` is not a convention this crate
+    /// may choose: it is how Freenet forms a contract's address. A drift
+    /// leaves the UI subscribed to an address that does not exist, reporting
+    /// "no payment seen" forever.
+    ///
+    /// `None` rather than a guess when `bitcoin_address_code_hash` is absent.
+    /// A default hash would name some other contract, and a buyer would be
+    /// shown its balance under their own order.
+    pub fn bitcoin_address_instance_id(&self) -> Option<[u8; 32]> {
+        let code_hash = self.bitcoin_address_code_hash?;
+        // Infallible: `BitcoinAddressParameters` is plain data with a derived
+        // `Serialize`.
+        let params = crate::to_cbor(&self.bitcoin_params())
+            .expect("BitcoinAddressParameters always serializes to CBOR");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&code_hash);
+        hasher.update(&params);
+        Some(*hasher.finalize().as_bytes())
+    }
+
     /// Parameters of the `BitcoinAddressContract` that observes this order's
     /// payment destination.
     pub fn bitcoin_params(&self) -> BitcoinAddressParameters {
@@ -527,6 +794,84 @@ impl std::fmt::Display for ProofError {
 /// of its arguments: no clock, no network, no ambient state. Everything it
 /// needs is either in the order or in the proof — including which bridges to
 /// believe, which the seller fixed when they signed the order.
+/// Build the on-chain proof that settles `order`, out of the claims a node
+/// holds for its payment address and the chain tip it can see.
+///
+/// # Why this exists at all
+///
+/// The verifier, the bridge-signed claims and the fold were all here; nothing
+/// CONSTRUCTED the thing they verify. So an order stayed `AwaitingPayment`
+/// forever however much had been paid, and the public record permanently
+/// misstated what happened -- which matters beyond the buyer's screen,
+/// because every later mechanism reads that record and Phase 2's whole
+/// argument is arithmetic over an order's status.
+///
+/// # It verifies before it returns, and that is the contract
+///
+/// An order published as `Paid` carrying a proof that does not verify is a
+/// state every peer refuses. On the buyer's screen that looks like the
+/// payment simply not registering, with nothing anywhere saying why. So this
+/// returns the verifier's own complaint instead, and a caller that gets `Ok`
+/// has something the network will accept.
+///
+/// # What it selects, and what it refuses
+///
+/// Claims about THIS order's script, and no others: a foreign claim makes
+/// `verify_on_chain_proof` refuse the whole proof, so including one would
+/// turn a provable payment into an unprovable one.
+///
+/// Beyond [`MAX_PROOF_CLAIMS`] it refuses rather than truncating. Dropping
+/// the excess would be curating which of a bridge's claims the network sees
+/// -- the omission [`OnChainPaymentProof`] documents as undetectable
+/// downstream -- and doing it on the buyer's behalf, in the buyer's favour.
+/// Refusing says so.
+///
+/// # What it does NOT establish
+///
+/// That the claims it was handed are the complete history. They are whatever
+/// the node's subscription to the address contract has delivered, and a
+/// retraction that has not arrived is invisible here exactly as it is to the
+/// verifier. See [`OnChainPaymentProof`]'s doc comment; this function inherits
+/// that gap whole and does not widen it.
+pub fn assemble_on_chain_proof(
+    order: &Order,
+    claims: &[SignedClaim],
+    tip: &SignedTipEntry,
+) -> Result<OrderPaymentProof, String> {
+    let expected_script = order.bitcoin_params().script_id();
+    // Filtered on the SIGNED body rather than on anything a caller says about
+    // the claim, so a claim that does not verify is dropped here rather than
+    // poisoning the proof.
+    let addr_params = order.bitcoin_params();
+    let mine: Vec<SignedClaim> = claims
+        .iter()
+        .filter(|claim| {
+            claim
+                .verify(&addr_params)
+                .is_ok_and(|body| body.script_id == expected_script)
+        })
+        .cloned()
+        .collect();
+
+    if mine.is_empty() {
+        return Err(
+            "no bridge has published anything about this order's payment address yet".to_string(),
+        );
+    }
+    let distinct = distinct_claims(&mine).len();
+    if distinct > MAX_PROOF_CLAIMS {
+        return Err(format!(
+            "this address has {distinct} distinct claims and a payment proof may carry \
+             {MAX_PROOF_CLAIMS}; a proof cannot be assembled without leaving some out, which \
+             would be choosing what the network gets to see"
+        ));
+    }
+
+    let proof = OrderPaymentProof::on_chain(mine, tip.clone());
+    verify_payment_proof(order, &proof).map_err(|e| e.to_string())?;
+    Ok(proof)
+}
+
 pub fn verify_payment_proof(order: &Order, proof: &OrderPaymentProof) -> Result<u64, ProofError> {
     match proof {
         OrderPaymentProof::OnChain(p) => verify_on_chain_proof(order, p),
@@ -877,7 +1222,27 @@ impl AuthorizedOrder {
             &self.signature,
             seller_key,
             &self.order,
-        )
+        )?;
+        // The id has to be the one these terms give, or two differently-termed
+        // orders could share a key and the later one would displace the
+        // earlier under `merge_order`'s tie-break -- see [`OrderId`] for the
+        // attack that made this necessary.
+        //
+        // AFTER the signature, and that ordering is about the message rather
+        // than about security -- both are refusals. A record with terms
+        // altered since signing fails both checks, and "the seller did not
+        // sign this" is the more useful of the two things to be told; the id
+        // check is what catches a record that is genuinely self-consistent
+        // and self-signed but filed under somebody else's id, which is the
+        // case only this check can see.
+        let expected = OrderId::from_terms(&self.order);
+        if self.order.id != expected {
+            return Err(format!(
+                "order id {} is not the id these terms give ({expected})",
+                self.order.id
+            ));
+        }
+        Ok(())
     }
 
     /// Which of the optional fields each status actually consults.
@@ -1208,9 +1573,9 @@ mod lightning_tests {
 
     fn lightning_order(payment_hash: Option<[u8; 32]>) -> Order {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let listing_id = ListingId::new("seller", &ts, "Widget");
+        let listing_id = ListingId::from_label("Widget");
         Order {
-            id: OrderId::new("seller", &listing_id, &ts, "buyer"),
+            id: OrderId([0u8; 32]),
             listing_id,
             buyer_fingerprint: "buyer".into(),
             seller_fingerprint: "seller".into(),
@@ -1226,8 +1591,11 @@ mod lightning_tests {
             // with no bridge in the picture.
             trusted_bridges: Vec::new(),
             bitcoin_address_code_hash: None,
+            anchor: None,
+            order_binding: None,
             created_at: ts,
         }
+        .with_derived_id()
     }
 
     #[test]
@@ -1314,9 +1682,9 @@ mod lightning_tests {
             created_at: chrono::DateTime<chrono::Utc>,
         }
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let listing_id = ListingId::new("seller", &ts, "Widget");
+        let listing_id = ListingId::from_label("Widget");
         let old = OldOrder {
-            id: OrderId::new("seller", &listing_id, &ts, "buyer"),
+            id: OrderId([3u8; 32]),
             listing_id,
             buyer_fingerprint: "buyer".into(),
             seller_fingerprint: "seller".into(),
@@ -1330,5 +1698,696 @@ mod lightning_tests {
         let bytes = crate::to_cbor(&old).unwrap();
         let decoded: Order = crate::from_cbor(&bytes).expect("old orders must still decode");
         assert_eq!(decoded.payment_hash, None);
+    }
+}
+
+#[cfg(test)]
+mod order_wire_compat_tests {
+    use super::*;
+
+    /// A real `Order` from before `OrderId` was widened to 32 bytes, as CBOR.
+    ///
+    /// `id` and `listing_id` are 16-element arrays (`0x90`); today's types
+    /// want 32 (`0x98 0x20`). Kept as a literal so the boundary this branch
+    /// crosses is pinned by a test rather than described in prose -- see
+    /// [`an_order_from_before_the_id_was_widened_does_not_decode`], which is
+    /// the honest statement of what the re-key costs.
+    const NARROW_ID_ORDER_CBOR: &[u8] = &[
+        0xad, 0x62, 0x69, 0x64, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6a, 0x6c, 0x69, 0x73, 0x74, 0x69, 0x6e, 0x67, 0x5f,
+        0x69, 0x64, 0x90, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x71, 0x62, 0x75, 0x79, 0x65, 0x72, 0x5f, 0x66, 0x69, 0x6e, 0x67,
+        0x65, 0x72, 0x70, 0x72, 0x69, 0x6e, 0x74, 0x60, 0x72, 0x73, 0x65, 0x6c, 0x6c, 0x65, 0x72,
+        0x5f, 0x66, 0x69, 0x6e, 0x67, 0x65, 0x72, 0x70, 0x72, 0x69, 0x6e, 0x74, 0x69, 0x73, 0x65,
+        0x6c, 0x6c, 0x65, 0x72, 0x2d, 0x66, 0x70, 0x6b, 0x61, 0x6d, 0x6f, 0x75, 0x6e, 0x74, 0x5f,
+        0x73, 0x61, 0x74, 0x73, 0x19, 0xc3, 0x50, 0x67, 0x6e, 0x65, 0x74, 0x77, 0x6f, 0x72, 0x6b,
+        0x66, 0x53, 0x69, 0x67, 0x6e, 0x65, 0x74, 0x75, 0x70, 0x61, 0x79, 0x6d, 0x65, 0x6e, 0x74,
+        0x5f, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x5f, 0x70, 0x75, 0x62, 0x6b, 0x65, 0x79, 0x82,
+        0x18, 0x51, 0x18, 0x20, 0x6f, 0x70, 0x61, 0x79, 0x6d, 0x65, 0x6e, 0x74, 0x5f, 0x61, 0x64,
+        0x64, 0x72, 0x65, 0x73, 0x73, 0x6b, 0x74, 0x62, 0x31, 0x71, 0x65, 0x78, 0x61, 0x6d, 0x70,
+        0x6c, 0x65, 0x76, 0x72, 0x65, 0x71, 0x75, 0x69, 0x72, 0x65, 0x64, 0x5f, 0x63, 0x6f, 0x6e,
+        0x66, 0x69, 0x72, 0x6d, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x73, 0x01, 0x6c, 0x70, 0x61, 0x79,
+        0x6d, 0x65, 0x6e, 0x74, 0x5f, 0x68, 0x61, 0x73, 0x68, 0xf6, 0x6f, 0x74, 0x72, 0x75, 0x73,
+        0x74, 0x65, 0x64, 0x5f, 0x62, 0x72, 0x69, 0x64, 0x67, 0x65, 0x73, 0x80, 0x78, 0x19, 0x62,
+        0x69, 0x74, 0x63, 0x6f, 0x69, 0x6e, 0x5f, 0x61, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73, 0x5f,
+        0x63, 0x6f, 0x64, 0x65, 0x5f, 0x68, 0x61, 0x73, 0x68, 0xf6, 0x6a, 0x63, 0x72, 0x65, 0x61,
+        0x74, 0x65, 0x64, 0x5f, 0x61, 0x74, 0x74, 0x32, 0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d,
+        0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32, 0x30, 0x5a,
+    ];
+
+    /// **An order published before the id was widened does not decode, and
+    /// that is what the re-key costs.**
+    ///
+    /// This test exists to be READ, not merely to pass. The migration folds a
+    /// predecessor generation by decoding its state and verifying every
+    /// record; an order at the old width fails at the first step, so the
+    /// generation is treated as absent. There is no compatibility path and
+    /// none is attempted: a type that accepted both widths would have to
+    /// decide which one an id is, which is the ambiguity the width exists to
+    /// remove.
+    ///
+    /// Orders are what makes this acceptable. One expires after
+    /// [`MAX_ANCHOR_AGE_BLOCKS`] -- about eight hours -- so an order old
+    /// enough to be in a predecessor generation is an order nobody can pay
+    /// anyway. The same is NOT true of a listing, and
+    /// `docs/untested-invariants.md` says so where it records what this
+    /// boundary costs in full.
+    #[test]
+    fn an_order_from_before_the_id_was_widened_does_not_decode() {
+        let refused = crate::from_cbor::<Order>(NARROW_ID_ORDER_CBOR)
+            .expect_err("a 16-byte id must not decode into a 32-byte one");
+        assert!(
+            refused.contains("invalid length 16"),
+            "the refusal should name the width: {refused}"
+        );
+    }
+
+    /// The same order at today's width, as CBOR, written out byte by byte.
+    ///
+    /// Thirteen fields; `payment_hash` and `bitcoin_address_code_hash`
+    /// present and null; `anchor` and `order_binding` ABSENT, which is the
+    /// property this pins.
+    ///
+    /// ```text
+    /// ad                                  map(13)
+    ///   62 "id"                    98 20 ..  32-element array (serde encodes
+    ///                                        [u8; 32] as a tuple, i.e. an
+    ///                                        array of numbers, NOT a byte
+    ///                                        string) -- the id these terms
+    ///                                        give
+    ///   6a "listing_id"            98 20 ..  32-element array, all 0x01
+    ///   71 "buyer_fingerprint"     60        empty -- an anonymous buyer,
+    ///                                        which is what the buy flow makes
+    ///   ... amount, network, script, address, confirmations ...
+    ///   6c "payment_hash"          f6        null
+    ///   6f "trusted_bridges"       80        empty seq
+    ///   78 19 "bitcoin_address_code_hash" f6 null
+    ///   6a "created_at"            74 ..     "2023-11-14T22:13:20Z"
+    /// ```
+    const ORDER_WITHOUT_OPTIONAL_FIELDS_CBOR: &[u8] = &[
+        0xad, 0x62, 0x69, 0x64, 0x98, 0x20, 0x18, 0x78, 0x18, 0x7f, 0x18, 0x79, 0x18, 0x3e, 0x18,
+        0x51, 0x18, 0xed, 0x18, 0xb7, 0x18, 0xed, 0x18, 0x2a, 0x13, 0x18, 0x38, 0x18, 0x95, 0x18,
+        0x23, 0x18, 0x70, 0x18, 0xd2, 0x18, 0xcd, 0x18, 0x8f, 0x18, 0xec, 0x18, 0xa7, 0x18, 0x98,
+        0x18, 0x61, 0x18, 0x8a, 0x18, 0x25, 0x18, 0x36, 0x18, 0x8c, 0x18, 0x73, 0x18, 0xbc, 0x18,
+        0x50, 0x18, 0xb6, 0x18, 0x3c, 0x18, 0xc8, 0x18, 0x28, 0x6a, 0x6c, 0x69, 0x73, 0x74, 0x69,
+        0x6e, 0x67, 0x5f, 0x69, 0x64, 0x98, 0x20, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x71, 0x62, 0x75, 0x79, 0x65, 0x72,
+        0x5f, 0x66, 0x69, 0x6e, 0x67, 0x65, 0x72, 0x70, 0x72, 0x69, 0x6e, 0x74, 0x60, 0x72, 0x73,
+        0x65, 0x6c, 0x6c, 0x65, 0x72, 0x5f, 0x66, 0x69, 0x6e, 0x67, 0x65, 0x72, 0x70, 0x72, 0x69,
+        0x6e, 0x74, 0x69, 0x73, 0x65, 0x6c, 0x6c, 0x65, 0x72, 0x2d, 0x66, 0x70, 0x6b, 0x61, 0x6d,
+        0x6f, 0x75, 0x6e, 0x74, 0x5f, 0x73, 0x61, 0x74, 0x73, 0x19, 0xc3, 0x50, 0x67, 0x6e, 0x65,
+        0x74, 0x77, 0x6f, 0x72, 0x6b, 0x66, 0x53, 0x69, 0x67, 0x6e, 0x65, 0x74, 0x75, 0x70, 0x61,
+        0x79, 0x6d, 0x65, 0x6e, 0x74, 0x5f, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x5f, 0x70, 0x75,
+        0x62, 0x6b, 0x65, 0x79, 0x82, 0x18, 0x51, 0x18, 0x20, 0x6f, 0x70, 0x61, 0x79, 0x6d, 0x65,
+        0x6e, 0x74, 0x5f, 0x61, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73, 0x6b, 0x74, 0x62, 0x31, 0x71,
+        0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x76, 0x72, 0x65, 0x71, 0x75, 0x69, 0x72, 0x65,
+        0x64, 0x5f, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x72, 0x6d, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x73,
+        0x01, 0x6c, 0x70, 0x61, 0x79, 0x6d, 0x65, 0x6e, 0x74, 0x5f, 0x68, 0x61, 0x73, 0x68, 0xf6,
+        0x6f, 0x74, 0x72, 0x75, 0x73, 0x74, 0x65, 0x64, 0x5f, 0x62, 0x72, 0x69, 0x64, 0x67, 0x65,
+        0x73, 0x80, 0x78, 0x19, 0x62, 0x69, 0x74, 0x63, 0x6f, 0x69, 0x6e, 0x5f, 0x61, 0x64, 0x64,
+        0x72, 0x65, 0x73, 0x73, 0x5f, 0x63, 0x6f, 0x64, 0x65, 0x5f, 0x68, 0x61, 0x73, 0x68, 0xf6,
+        0x6a, 0x63, 0x72, 0x65, 0x61, 0x74, 0x65, 0x64, 0x5f, 0x61, 0x74, 0x74, 0x32, 0x30, 0x32,
+        0x33, 0x2d, 0x31, 0x31, 0x2d, 0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32,
+        0x30, 0x5a,
+    ];
+
+    /// **An order carrying neither optional field re-encodes to the bytes its
+    /// signature was taken over.**
+    ///
+    /// [`AuthorizedOrder::verify_terms`] does not compare stored bytes: it
+    /// re-serializes this struct and checks the result against the payload
+    /// inside the signed `ScopedPayload`. A field that serializes when absent
+    /// therefore changes the preimage of every signature taken before it
+    /// existed, and the store contract rejects the seller's own published
+    /// invoices with "order signature invalid".
+    ///
+    /// That is why `anchor` and `order_binding` carry `skip_serializing_if`
+    /// rather than `serde(default)` alone -- observed red against the naive
+    /// form, as `0xae` map(14) with `"anchor": null` against the `0xad`
+    /// map(13) the signature covered. The literal is what keeps the next
+    /// optional field honest.
+    ///
+    /// The fixture is at the CURRENT id width. The one that predates the
+    /// widening is above, and it does not decode at all.
+    #[test]
+    fn an_order_without_the_optional_fields_re_encodes_unchanged() {
+        let order: Order = crate::from_cbor(ORDER_WITHOUT_OPTIONAL_FIELDS_CBOR).expect("decodes");
+        assert_eq!(order.anchor, None);
+        assert_eq!(order.order_binding, None);
+        assert_eq!(order.amount_sats, 50_000);
+        // And the id is the one these terms give, so the fixture is a record
+        // the contract would actually accept rather than a plausible fiction.
+        assert_eq!(order.id, OrderId::from_terms(&order));
+
+        assert_eq!(
+            crate::to_cbor(&order).expect("re-encodes"),
+            ORDER_WITHOUT_OPTIONAL_FIELDS_CBOR,
+            "an order with no optional fields must re-encode to the bytes its signature was \
+             taken over"
+        );
+    }
+}
+
+#[cfg(test)]
+mod order_identity_tests {
+    use super::*;
+
+    fn terms(address: &str, amount_sats: u64) -> Order {
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        Order {
+            id: OrderId([0u8; 32]),
+            listing_id: ListingId([1u8; 32]),
+            buyer_fingerprint: String::new(),
+            seller_fingerprint: "seller-fp".to_string(),
+            amount_sats,
+            network: BitcoinNetwork::Signet,
+            payment_script_pubkey: address.as_bytes().to_vec(),
+            payment_address: address.to_string(),
+            required_confirmations: 1,
+            payment_hash: None,
+            trusted_bridges: Vec::new(),
+            bitcoin_address_code_hash: None,
+            anchor: None,
+            order_binding: None,
+            created_at,
+        }
+    }
+
+    /// A commitment whose id is the one its own terms give.
+    fn commitment(order: Order, signing_key: &ed25519_dalek::SigningKey) -> AuthorizedOrder {
+        use ed25519_dalek::Signer;
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let mut order = order;
+        order.id = OrderId::from_terms(&order);
+        let message = crate::to_cbor(&order).expect("serialize");
+        let scoped = ghostkey_common::ScopedPayload {
+            requestor: ghostkey_common::SignatureRequestor::WebApp(
+                crate::HARVEST_WEBAPP_CONTRACT_ID
+                    .parse::<ContractInstanceId>()
+                    .expect("canonical webapp id"),
+            ),
+            payload: message,
+        };
+        let scoped_payload = crate::to_cbor(&scoped).expect("serialize scoped");
+        let signature = signing_key.sign(&scoped_payload).to_bytes().to_vec();
+        AuthorizedOrder {
+            order,
+            scoped_payload,
+            signature,
+            status: OrderStatus::AwaitingPayment,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        }
+    }
+
+    /// **A seller cannot swap the payment address under one order id.**
+    ///
+    /// The hole this closes, found in review. `OrderId` used to hash
+    /// `(seller, listing, created_at_ms, buyer)` and nothing else -- not the
+    /// amount, not the script, not the address -- so one seller could sign
+    /// two differently-termed, individually valid orders sharing one id.
+    /// `merge_order` resolves an equal-rank collision by smaller-CBOR-wins,
+    /// which is deterministic and DIRECTIONAL: publish the larger encoding,
+    /// let the buyer read and pay it, then publish the smaller, which wins
+    /// everywhere and permanently. The public record then shows an order
+    /// whose payment destination never received anything.
+    ///
+    /// Deriving the id from the terms makes the two orders two DIFFERENT
+    /// orders, so there is no collision to resolve and nothing to displace.
+    #[test]
+    fn two_differently_termed_orders_cannot_share_an_id() {
+        let shown = terms("tb1q_shown_to_the_buyer", 50_000);
+        let swapped = terms("tb1q_swapped_afterwards", 50_000);
+        assert_ne!(
+            OrderId::from_terms(&shown),
+            OrderId::from_terms(&swapped),
+            "two payment destinations must be two orders"
+        );
+
+        let dearer = terms("tb1q_shown_to_the_buyer", 500_000);
+        assert_ne!(
+            OrderId::from_terms(&shown),
+            OrderId::from_terms(&dearer),
+            "two amounts must be two orders"
+        );
+    }
+
+    /// **The id covers every field of the terms, by construction.**
+    ///
+    /// Written as a serialization of the whole struct with the id blanked,
+    /// rather than as a list of fields to hash: a list is a thing somebody
+    /// adds a field beside. So this test does not enumerate fields either --
+    /// it asserts the property that makes enumeration unnecessary, that two
+    /// orders with identical ids have identical encodings.
+    #[test]
+    fn an_id_determines_the_terms_it_was_derived_from() {
+        let one = terms("tb1q", 1);
+        let mut two = one.clone();
+        two.id = OrderId::from_terms(&one);
+        let mut three = two.clone();
+        three.anchor = Some(freenet_bitcoin_common::BlockAnchor {
+            height: 1,
+            hash: freenet_bitcoin_common::BlockHash([2u8; 32]),
+        });
+        assert_ne!(
+            OrderId::from_terms(&two),
+            OrderId::from_terms(&three),
+            "a field added since this test was written must still change the id"
+        );
+    }
+
+    /// **The id does not depend on what it currently holds.**
+    ///
+    /// The derivation blanks the id before hashing, so computing it twice --
+    /// once on a fresh order and once on the order carrying the result --
+    /// gives the same answer. Without that it would not be a fixed point and
+    /// `verify` could never be satisfied.
+    #[test]
+    fn deriving_an_id_is_idempotent() {
+        let mut order = terms("tb1q", 1);
+        let first = OrderId::from_terms(&order);
+        order.id = first.clone();
+        assert_eq!(OrderId::from_terms(&order), first);
+    }
+
+    /// **The order id derivation is pinned.**
+    ///
+    /// Same instrument and same reason as
+    /// `listing::listing_identity_tests::the_listing_id_derivation_is_pinned`,
+    /// which carries the full argument: a change here makes every order a
+    /// previous generation published fail `verify`, and the migration's fold
+    /// discards that generation whole rather than the offending record.
+    ///
+    /// Milder for orders than for listings, because an order expires after
+    /// [`MAX_ANCHOR_AGE_BLOCKS`] and one old enough to be in a predecessor
+    /// generation is one nobody could pay. It is still the same class of
+    /// change, and it still takes the store's listings with it, because the
+    /// fold refuses the generation rather than the record.
+    ///
+    /// **`docs/design/migratability.md` is the requirement and the procedure.**
+    /// The first question it asks is whether the new version can accept old
+    /// state after all, because that is the only option costing nobody
+    /// anything -- and it is what keeps ANY UI able to migrate a contract.
+    /// Owner-assisted re-issue buys the data back and spends that property.
+    /// Accepting the old format in `verify` is not available; the document
+    /// says why, twice over.
+    #[test]
+    fn the_order_id_derivation_is_pinned() {
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let order = Order {
+            id: OrderId([0u8; 32]),
+            listing_id: ListingId([1u8; 32]),
+            buyer_fingerprint: String::new(),
+            seller_fingerprint: "seller-fp".to_string(),
+            amount_sats: 50_000,
+            network: BitcoinNetwork::Signet,
+            payment_script_pubkey: vec![0x00, 0x14, 0xaa],
+            payment_address: "tb1qexample".to_string(),
+            required_confirmations: 1,
+            payment_hash: None,
+            trusted_bridges: Vec::new(),
+            bitcoin_address_code_hash: None,
+            anchor: None,
+            order_binding: None,
+            created_at,
+        };
+        assert_eq!(
+            hex::encode(OrderId::from_terms(&order).0),
+            "a9fca6b22ee60ee36880d5b1ae447b0ab13a9d5a4b5d5f11e62a0987e334f1c8",
+        );
+    }
+
+    /// **The id is the WHOLE digest, not a prefix of one.**
+    ///
+    /// The width is the point of the change that widened it: at 16 bytes a
+    /// collision between two orders the seller chooses costs ~2^64, and at 32
+    /// it costs 2^128. A derivation that kept the old truncation while the
+    /// type grew would leave 16 bytes of zeroes and the old cost, and nothing
+    /// else here would notice -- the ids would still be distinct, still
+    /// deterministic, still refuse a mismatched record.
+    ///
+    /// Asserted against the components rather than against a copy of the
+    /// function, so a change to the truncation fails while a change to the
+    /// domain separator or the preimage fails somewhere more specific.
+    #[test]
+    fn the_id_is_the_whole_digest() {
+        let order = terms("tb1q", 1);
+        let mut probe = order.clone();
+        probe.id = OrderId([0u8; 32]);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"harvest/order-id/v2");
+        hasher.update(&crate::to_cbor(&probe).expect("serialize"));
+
+        assert_eq!(OrderId::from_terms(&order).0, *hasher.finalize().as_bytes());
+    }
+
+    /// **A record whose id is not its terms' id is rejected.**
+    ///
+    /// This is what makes the property hold on the network rather than only
+    /// in the issuer: the store contract runs `verify` on every order in
+    /// every state it validates, so a hand-built record filed under somebody
+    /// else's id never becomes state anywhere.
+    #[test]
+    fn a_record_whose_id_is_not_its_terms_is_rejected() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[31u8; 32]);
+        let honest = commitment(terms("tb1q", 1), &signing_key);
+        honest
+            .verify(&signing_key.verifying_key())
+            .expect("an order carrying its own terms' id verifies");
+
+        // Re-sign a record whose id names a different order's terms, so the
+        // signature is genuine and the ID is the only thing wrong.
+        let mut forged = terms("tb1q", 1);
+        forged.id = OrderId::from_terms(&terms("tb1q_elsewhere", 1));
+        let forged = {
+            use ed25519_dalek::Signer;
+            use freenet_stdlib::prelude::ContractInstanceId;
+            let message = crate::to_cbor(&forged).expect("serialize");
+            let scoped = ghostkey_common::ScopedPayload {
+                requestor: ghostkey_common::SignatureRequestor::WebApp(
+                    crate::HARVEST_WEBAPP_CONTRACT_ID
+                        .parse::<ContractInstanceId>()
+                        .expect("canonical webapp id"),
+                ),
+                payload: message,
+            };
+            let scoped_payload = crate::to_cbor(&scoped).expect("serialize scoped");
+            AuthorizedOrder {
+                signature: signing_key.sign(&scoped_payload).to_bytes().to_vec(),
+                order: forged,
+                scoped_payload,
+                status: OrderStatus::AwaitingPayment,
+                payment_proof: None,
+                status_scoped_payload: None,
+                status_signature: None,
+            }
+        };
+        let refused = forged
+            .verify(&signing_key.verifying_key())
+            .expect_err("an order whose id is not its terms' id must be refused");
+        assert!(
+            refused.contains("id"),
+            "the refusal should say what is wrong: {refused}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod address_instance_tests {
+    use super::*;
+
+    fn terms(code_hash: Option<[u8; 32]>) -> Order {
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        Order {
+            id: OrderId([0u8; 32]),
+            listing_id: ListingId([1u8; 32]),
+            buyer_fingerprint: String::new(),
+            seller_fingerprint: "seller-fp".to_string(),
+            amount_sats: 50_000,
+            network: BitcoinNetwork::Signet,
+            payment_script_pubkey: vec![0x00, 0x14, 0xaa],
+            payment_address: "tb1q".to_string(),
+            required_confirmations: 1,
+            payment_hash: None,
+            trusted_bridges: Vec::new(),
+            bitcoin_address_code_hash: code_hash,
+            anchor: None,
+            order_binding: None,
+            created_at,
+        }
+        .with_derived_id()
+    }
+
+    /// **An order with no code hash names no address contract.**
+    ///
+    /// `bitcoin_address_code_hash` is optional, and the honest answer for an
+    /// order that omits it is "I cannot say", not a guess. A caller that got
+    /// an id anyway would subscribe to, and read a balance from, whatever
+    /// contract a default hash happened to name.
+    #[test]
+    fn an_order_with_no_code_hash_names_no_address_contract() {
+        assert_eq!(terms(None).bitcoin_address_instance_id(), None);
+    }
+
+    /// **The id is a function of the code hash and the order's own payment
+    /// terms.**
+    ///
+    /// Both halves asserted, because either one alone would be satisfied by
+    /// a derivation that ignored the other -- and a derivation that ignored
+    /// the script would show a buyer the balance of a different address under
+    /// their own order.
+    #[test]
+    fn the_address_contract_id_covers_the_code_hash_and_the_script() {
+        let one = terms(Some([7u8; 32]));
+        let mut other_script = one.clone();
+        other_script.payment_script_pubkey = vec![0x00, 0x14, 0xbb];
+        let other_script = other_script.with_derived_id();
+
+        assert_ne!(
+            one.bitcoin_address_instance_id(),
+            terms(Some([8u8; 32])).bitcoin_address_instance_id(),
+            "a different contract build is a different instance"
+        );
+        assert_ne!(
+            one.bitcoin_address_instance_id(),
+            other_script.bitcoin_address_instance_id(),
+            "a different destination is a different instance"
+        );
+    }
+
+    /// **It is the derivation Freenet itself performs.**
+    ///
+    /// `BLAKE3(code_hash || cbor(parameters))` is not a convention this crate
+    /// is free to choose -- it is how a contract's address is formed, and a
+    /// second derivation that drifted would have the UI subscribing to an
+    /// address that does not exist and reporting "no payment seen" forever.
+    /// Asserted against the components rather than against a copy of the
+    /// code.
+    #[test]
+    fn the_derivation_is_blake3_over_the_code_hash_and_the_parameters() {
+        let order = terms(Some([7u8; 32]));
+        let params = crate::to_cbor(&order.bitcoin_params()).expect("parameters always serialize");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&[7u8; 32]);
+        hasher.update(&params);
+
+        assert_eq!(
+            order.bitcoin_address_instance_id(),
+            Some(*hasher.finalize().as_bytes())
+        );
+    }
+}
+
+#[cfg(test)]
+mod proof_assembly_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use freenet_bitcoin_common::spv::testing::payment_proof;
+    use freenet_bitcoin_common::{BlockHash, ClaimBody, SignedTipEntry, TipEntryBody};
+
+    fn bridge() -> SigningKey {
+        SigningKey::from_bytes(&[61u8; 32])
+    }
+
+    fn order_for(amount_sats: u64, required_confirmations: u32) -> Order {
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        Order {
+            id: OrderId([0u8; 32]),
+            listing_id: ListingId([1u8; 32]),
+            buyer_fingerprint: String::new(),
+            seller_fingerprint: "seller-fp".to_string(),
+            amount_sats,
+            network: BitcoinNetwork::Signet,
+            payment_script_pubkey: vec![0x00, 0x14, 0xaa, 0xbb],
+            payment_address: "tb1qexample".to_string(),
+            required_confirmations,
+            payment_hash: None,
+            trusted_bridges: vec![BridgeId(bridge().verifying_key().to_bytes())],
+            bitcoin_address_code_hash: Some([4u8; 32]),
+            anchor: None,
+            order_binding: None,
+            created_at,
+        }
+        .with_derived_id()
+    }
+
+    /// One bridge-signed confirmation of `value_sats` to this order's script,
+    /// included at `confirmed_at` and attested by a bridge that has scanned
+    /// as far as `scanned_to`.
+    ///
+    /// # The two heights are not the same thing, and it took a red test to
+    /// see it
+    ///
+    /// The depth a claim attests is capped by the BRIDGE's own watermark
+    /// (`as_of`), not by the chain tip: a bridge that has only scanned to the
+    /// block a payment landed in is attesting one confirmation, however high
+    /// the tip has since climbed. That is deliberate upstream -- otherwise a
+    /// submitter could pair a pre-reorg confirmation with a fresh tip and
+    /// claim any depth they liked.
+    ///
+    /// A fixture that moved only the tip therefore reported "1 confirmation"
+    /// forever, which is what the first version of the depth test did.
+    fn confirmation(
+        order: &Order,
+        value_sats: u64,
+        confirmed_at: u32,
+        scanned_to: u32,
+    ) -> SignedClaim {
+        let (spv, txid, block_hash) =
+            payment_proof(&order.payment_script_pubkey, value_sats, 1, [7u8; 32]);
+        SignedClaim::sign(
+            &bridge(),
+            &ClaimBody {
+                script_id: order.bitcoin_params().script_id(),
+                network: order.network,
+                as_of: BlockAnchor {
+                    height: scanned_to,
+                    hash: BlockHash([5u8; 32]),
+                },
+                claim: Claim::ConfirmedOutput {
+                    outpoint: freenet_bitcoin_common::OutPoint { txid, vout: 0 },
+                    value_sats,
+                    anchor: BlockAnchor {
+                        height: confirmed_at,
+                        hash: block_hash,
+                    },
+                    spv,
+                },
+            },
+        )
+        .expect("sign")
+    }
+
+    fn tip_at(order: &Order, height: u32) -> SignedTipEntry {
+        SignedTipEntry::sign(
+            &bridge(),
+            &TipEntryBody {
+                network: order.network,
+                anchor: BlockAnchor {
+                    height,
+                    hash: BlockHash([9u8; 32]),
+                },
+                prev_hash: BlockHash([8u8; 32]),
+                block_time: 1_700_000_000,
+                tx_count: 1,
+                median_time: 1_700_000_000,
+            },
+        )
+        .expect("sign")
+    }
+
+    /// **A confirmed payment assembles into a proof that verifies.**
+    ///
+    /// The whole point: `verify_payment_proof` and the bridge claims existed
+    /// already, and nothing constructed the thing they verify -- so a
+    /// published order sat `AwaitingPayment` forever however much had been
+    /// paid, and the public record permanently misstated what happened.
+    #[test]
+    fn a_confirmed_payment_assembles_into_a_proof_that_verifies() {
+        let order = order_for(50_000, 1);
+        let claims = vec![confirmation(&order, 50_000, 100, 100)];
+
+        let proof = assemble_on_chain_proof(&order, &claims, &tip_at(&order, 100))
+            .expect("a confirmed payment of the full amount must assemble");
+
+        assert_eq!(
+            verify_payment_proof(&order, &proof).expect("and must verify"),
+            50_000
+        );
+    }
+
+    /// **The assembler verifies before it returns, so a caller cannot publish
+    /// a proof that will be refused.**
+    ///
+    /// Asserted through the cases a caller would otherwise have to know to
+    /// check for itself. Each is the assembler declining rather than handing
+    /// back something the contract rejects -- an order published as `Paid`
+    /// with a proof that does not verify is a state every peer refuses, which
+    /// on the buyer's screen looks like the payment simply not registering.
+    #[test]
+    fn the_assembler_declines_what_would_not_verify() {
+        let order = order_for(50_000, 6);
+
+        // Nothing seen at all.
+        assert!(assemble_on_chain_proof(&order, &[], &tip_at(&order, 100)).is_err());
+
+        // Seen, but the bridge has not scanned deep enough to attest the six
+        // confirmations this order asks for.
+        let shallow = vec![confirmation(&order, 50_000, 100, 102)];
+        assert!(
+            assemble_on_chain_proof(&order, &shallow, &tip_at(&order, 102)).is_err(),
+            "three confirmations is not the six this order asks for"
+        );
+        // The same payment, once the bridge has scanned on.
+        let deep = vec![confirmation(&order, 50_000, 100, 105)];
+        assert!(assemble_on_chain_proof(&order, &deep, &tip_at(&order, 105)).is_ok());
+
+        // Deep enough, but short of the amount.
+        let short = vec![confirmation(&order, 49_999, 100, 105)];
+        assert!(
+            assemble_on_chain_proof(&order, &short, &tip_at(&order, 105)).is_err(),
+            "an underpayment is not a payment"
+        );
+    }
+
+    /// **A claim about somebody else's address is not carried into the
+    /// proof.**
+    ///
+    /// The claims a node holds come from whatever address contracts it has
+    /// subscribed to, and there is no reason a caller cannot hand over the
+    /// wrong set. `verify_on_chain_proof` refuses a foreign claim outright --
+    /// so including one would turn a perfectly provable payment into an
+    /// unprovable one, which is the failure a buyer could not diagnose.
+    #[test]
+    fn a_claim_about_another_address_is_left_out() {
+        let order = order_for(50_000, 1);
+        let mut elsewhere = order_for(50_000, 1);
+        elsewhere.payment_script_pubkey = vec![0x00, 0x14, 0xcc, 0xdd];
+        let elsewhere = elsewhere.with_derived_id();
+
+        let claims = vec![
+            confirmation(&elsewhere, 50_000, 100, 100),
+            confirmation(&order, 50_000, 100, 100),
+        ];
+
+        let proof = assemble_on_chain_proof(&order, &claims, &tip_at(&order, 100))
+            .expect("the order's own claim is enough");
+        match &proof {
+            OrderPaymentProof::OnChain(on_chain) => assert_eq!(
+                on_chain.claims.len(),
+                1,
+                "only the claim about this order's script belongs in its proof"
+            ),
+            other => panic!("expected an on-chain proof, got {other:?}"),
+        }
+    }
+
+    /// **More claims than a proof may carry is refused, not truncated.**
+    ///
+    /// [`MAX_PROOF_CLAIMS`] is what the verifier will accept. Silently
+    /// dropping the excess would be choosing which of a bridge's claims the
+    /// network gets to see -- the curation the `OnChainPaymentProof` doc
+    /// comment says nothing downstream can detect -- and choosing it on a
+    /// buyer's behalf, in their own favour. Refusing says so instead.
+    ///
+    /// The fixture is sized from the constant, so raising the cap moves the
+    /// test with it.
+    #[test]
+    fn more_claims_than_a_proof_may_carry_is_refused() {
+        let order = order_for(50_000, 1);
+        let claims: Vec<SignedClaim> = (0..=MAX_PROOF_CLAIMS)
+            .map(|i| confirmation(&order, 50_000 + i as u64, 100, 100))
+            .collect();
+        assert!(claims.len() > MAX_PROOF_CLAIMS);
+
+        let refused = assemble_on_chain_proof(&order, &claims, &tip_at(&order, 100))
+            .expect_err("more claims than the verifier accepts must be refused");
+        assert!(
+            refused.contains("claims"),
+            "the refusal should name what is wrong: {refused}"
+        );
     }
 }

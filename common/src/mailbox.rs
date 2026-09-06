@@ -336,6 +336,79 @@ pub fn conversation_key_from_dh(shared_secret: &[u8; 32], direction: MessageDire
     blake3::derive_key(direction.context(), shared_secret)
 }
 
+/// The value a buyer's order commitment must carry so that no OTHER buyer can
+/// read it as theirs.
+///
+/// # The hole this closes
+///
+/// A published commitment named nothing that only one buyer could satisfy. So
+/// a seller could accept one order, publish one commitment, and send the same
+/// order id down any number of conversations: every buyer's software found the
+/// commitment published, signed, fresh and for a listing they had asked about,
+/// cleared every check, and showed them the same payment address. One declared
+/// debt collected unbounded money.
+///
+/// That does not merely weaken the anti-exit-scam mechanism, it inverts it.
+/// The commitment exists to make a seller's outstanding liability countable by
+/// a stranger; a commitment that can absorb N payments makes the count
+/// meaningless.
+///
+/// `docs/design/incentive-mechanism.md` and GitHub issue 8 already give the
+/// answer: the buyer chooses a secret `n`, sends `H(n)` with the order, and
+/// the seller publishes `H(n)` inside the commitment. The buyer's check
+/// becomes "the published commitment carries MY `H(n)`", which no other buyer
+/// can satisfy.
+///
+/// # Where `n` comes from, and why it is derived rather than drawn
+///
+/// `n` has to outlive the tab, or a returning buyer cannot check their own
+/// order -- and there is no browser storage at all here
+/// (`docs/buyer-conversation-persistence.md`). The one durable, buyer-only
+/// secret this application already has is the ephemeral conversation secret
+/// in the harvest delegate, which never leaves it and which the backup string
+/// already carries across machines. So `n` is derived from that secret rather
+/// than stored beside it: no new field on the record, no change to the backup
+/// format, and a restored conversation restores its binding for free.
+///
+/// **The seller cannot compute it.** They hold the Diffie-Hellman *shared*
+/// secret, not the buyer's private scalar, so `n` is buyer-only in the sense
+/// issue 8 needs for Phase 2 filing.
+///
+/// **It reveals nothing.** `H(n)` is a hash of a value nobody else holds, so a
+/// commitment carrying it is opaque to an observer. This is why the binding is
+/// not the buyer's ephemeral PUBLIC key, which would have been the obvious
+/// choice and is the mailbox routing tag -- publishing that would tie the
+/// public commitment to the conversation for anyone watching.
+///
+/// **If the conversation secret leaks, `n` leaks.** That is not extra
+/// exposure: an attacker holding the secret can already derive both direction
+/// keys and read the whole conversation, and from Phase 2 the confession lives
+/// in the same record.
+///
+/// # What it does NOT separate
+///
+/// One binding per CONVERSATION, not per order. Two orders a buyer places in
+/// one thread carry the same binding, so this does not distinguish them from
+/// each other -- their distinct order ids and the buyer's own request list do
+/// that. What it distinguishes is BUYERS, which is the hole above. Per-order
+/// nonces would need a durable per-order counter, which is a delegate change
+/// Phase 2 can make if filing turns out to need it.
+///
+/// # Why this is in `harvest-common`
+///
+/// The same reason as [`conversation_key_from_dh`], and with the same failure
+/// mode. The buyer's browser computes this from a secret it just generated;
+/// the harvest delegate computes it from the stored secret on recall, because
+/// that secret must not leave the delegate. If the two derivations ever
+/// disagree, nothing errors -- the buyer simply finds their own commitment
+/// unrecognisable after a reload and can never pay. Pinned by a known-answer
+/// test whose expected value came from `b3sum` rather than from this
+/// function, and by a cross-crate test that the delegate's recall answers what
+/// the buyer's own conversation computes.
+pub fn order_binding_from_secret(conversation_secret: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("harvest/order-binding/v1", conversation_secret)
+}
+
 /// Opaque conversation identifier chosen by the buyer.
 ///
 /// Privacy: this is a random 32-byte value, NOT derived from party identities.
@@ -954,6 +1027,50 @@ mod tests {
         assert_eq!(
             conversation_key_from_dh(&[7u8; 32], MessageDirection::SellerToBuyer),
             hex_literal("6565da998392cff761fc670a61bb365826b464e99449827bd1f4631033ab96a2"),
+        );
+    }
+
+    /// **The order binding derivation is pinned.**
+    ///
+    /// Expected value from `b3sum --derive-key "harvest/order-binding/v1"`
+    /// over 32 bytes of `0x07`, not from this function. The two ends of this
+    /// derivation are in different crates, and a silent disagreement leaves a
+    /// buyer unable to recognise their own commitment after a reload.
+    #[test]
+    fn the_order_binding_derivation_is_pinned() {
+        assert_eq!(
+            order_binding_from_secret(&[7u8; 32]),
+            hex_literal("481d7cec78bd2c8dd0f83bef532c333c639066576ff34e25fd564e2c38a7e260"),
+        );
+    }
+
+    /// **The binding is not one of the conversation keys.**
+    ///
+    /// Stated as a property rather than left to the constants: the binding is
+    /// PUBLISHED, and a derivation that collided with a direction key would
+    /// put an AES key for the conversation into the store's public state.
+    #[test]
+    fn the_binding_is_not_a_conversation_key() {
+        let secret = [7u8; 32];
+        assert_ne!(
+            order_binding_from_secret(&secret),
+            conversation_key_from_dh(&secret, MessageDirection::BuyerToSeller),
+        );
+        assert_ne!(
+            order_binding_from_secret(&secret),
+            conversation_key_from_dh(&secret, MessageDirection::SellerToBuyer),
+        );
+    }
+
+    /// **Two buyers do not share a binding.**
+    ///
+    /// The whole point: a commitment carrying one buyer's binding must not
+    /// read as another buyer's.
+    #[test]
+    fn two_conversations_do_not_share_a_binding() {
+        assert_ne!(
+            order_binding_from_secret(&[7u8; 32]),
+            order_binding_from_secret(&[8u8; 32]),
         );
     }
 

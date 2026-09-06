@@ -181,13 +181,30 @@ pub struct AppState {
     pub pending_conversation_recalls: std::collections::BTreeMap<u64, Vec<u8>>,
 
     /// `StoreBuyerConversation` requests in flight, as request id -> the
-    /// store the conversation is with.
+    /// store the conversation is with and its routing tag.
     ///
     /// Kept so a refusal can be reported against the store it belongs to. A
     /// refusal matters: the buyer has already been told their message was
     /// sent, and a conversation the delegate did not keep becomes unreadable
     /// the moment the tab closes.
-    pub pending_conversation_persists: std::collections::BTreeMap<u64, Vec<u8>>,
+    ///
+    /// # Why the TAG is here too
+    ///
+    /// The answer -- [`HarvestDelegateResponse::BuyerConversationStored`] --
+    /// carries a request id and nothing else, so without the tag recorded at
+    /// ASK time there is no way to say which of a store's conversations was
+    /// kept. Marking the store's newest conversation instead would be the
+    /// familiar mistake of trusting position: a second conversation opened
+    /// while the first was in flight would take the credit for the first's
+    /// write, and the buy flow would then let a buyer pay against a key the
+    /// delegate never stored.
+    pub pending_conversation_persists: std::collections::BTreeMap<u64, (Vec<u8>, [u8; 32])>,
+
+    /// Orders this tab has already published a `Paid` transition for.
+    ///
+    /// In-flight only. See [`AppState::publish_settled_orders`] for why it is
+    /// deliberately not durable.
+    pub settlements_submitted: HashSet<harvest_common::payment::OrderId>,
 
     /// `ForgetBuyerConversation` requests in flight, as request id -> the
     /// store and routing tag asked about.
@@ -490,7 +507,7 @@ fn spawn_order_signature(pending: PendingOrder) {
     wasm_bindgen_futures::spawn_local(async move {
         use dioxus::prelude::{ReadableExt, WritableExt};
 
-        let queued = PendingSignature::Order(pending.clone());
+        let queued = PendingSignature::Order(Box::new(pending.clone()));
         let withdraw = |reason: String| {
             dioxus::logger::tracing::error!("{reason}");
             let mut state = crate::gateway::APP_STATE.write();
@@ -709,7 +726,11 @@ impl PendingStoreEdit {
 pub enum PendingSignature {
     Listing(PendingListing),
     StoreInfo(PendingStoreInfo),
-    Order(PendingOrder),
+    /// Boxed because it is much the largest of the three -- an `Order`
+    /// carries two 32-byte ids, a script, an address, a bridge list and two
+    /// optional 32-byte fields -- and every entry of the queue would
+    /// otherwise be sized for it.
+    Order(Box<PendingOrder>),
 }
 
 impl PendingSignature {
@@ -748,6 +769,33 @@ pub struct PendingInvoice {
     pub buyer_fingerprint: String,
     pub amount_sats: u64,
     pub required_confirmations: u32,
+    /// The conversation this invoice ANSWERS, when it was issued against a
+    /// buyer's request.
+    ///
+    /// `None` for an invoice the seller wrote unprompted, which is still a
+    /// perfectly good invoice -- anyone holding the link may pay it.
+    ///
+    /// When it is `Some`, the buyer is waiting to be told which of the
+    /// store's published commitments is theirs, and cannot work it out for
+    /// themselves: `OrderId::new` hashes a `created_at` the seller stamps.
+    /// So this travels with the invoice all the way to the signature, and the
+    /// acceptance is sent from the same place the commitment is published --
+    /// not left to a second action the seller has to remember.
+    pub reply_to: Option<[u8; 32]>,
+    /// The value the buyer's request asked to have published, so that no
+    /// other buyer reads the commitment as theirs.
+    ///
+    /// `None` for an invoice written unprompted, which no buyer will pay
+    /// through the buy flow -- see
+    /// [`PaymentBlocker::CommitmentNotForThisBuyer`] -- but which is still a
+    /// perfectly good invoice for somebody paying a link by hand.
+    ///
+    /// Taken from the request in the seller's own mailbox, and that is not a
+    /// weakness: the value belongs to the buyer, a seller who altered it
+    /// would publish a commitment matching nobody, and the party who checks
+    /// it checks against what their OWN node derives rather than against
+    /// anything in a message.
+    pub order_binding: Option<[u8; 32]>,
 }
 
 /// A fully-formed invoice awaiting the seller's signature.
@@ -756,6 +804,9 @@ pub struct PendingOrder {
     pub fingerprint: String,
     pub order: harvest_common::payment::Order,
     pub store_contract_id: Vec<u8>,
+    /// Carried through from [`PendingInvoice::reply_to`]: the conversation
+    /// whose request this order answers, if any.
+    pub reply_to: Option<[u8; 32]>,
 }
 
 /// Build the invoice an address has just completed.
@@ -776,18 +827,27 @@ pub struct PendingOrder {
 pub fn order_for_invoice(
     pending: &PendingInvoice,
     derived: &harvest_common::DerivedAddress,
+    anchor: Option<freenet_bitcoin_common::BlockAnchor>,
     created_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<harvest_common::payment::Order, String> {
-    use harvest_common::payment::{Order, OrderId};
+    use harvest_common::payment::Order;
 
     let trusted_bridges = crate::gateway::bitcoin_config::default_trusted_bridges(derived.network)?;
+    // Refused rather than published without, and refused HERE rather than at
+    // the call site, for the same reason the bridge set is: this is the one
+    // place that decides whether an invoice can ever be acted on, and an
+    // invoice with no anchor is one no buyer will pay
+    // (`AppState::payment_blockers`). Publishing it would leave the seller
+    // showing a bill to somebody whose software silently refuses it.
+    let anchor = anchor.ok_or(
+        "this invoice has no recent Bitcoin block to anchor to yet, so a buyer could not \
+         tell how recently you took the order and would refuse to pay it. Wait for the chain \
+         data to load and issue it again.",
+    )?;
     Ok(Order {
-        id: OrderId::new(
-            &pending.seller_fingerprint,
-            &pending.listing_id,
-            &created_at,
-            &pending.buyer_fingerprint,
-        ),
+        // Stamped by `with_derived_id` below, out of the finished terms. A
+        // literal here would be a second place deciding an order's identity.
+        id: harvest_common::payment::OrderId([0u8; 32]),
         listing_id: pending.listing_id.clone(),
         buyer_fingerprint: pending.buyer_fingerprint.clone(),
         seller_fingerprint: pending.seller_fingerprint.clone(),
@@ -801,8 +861,13 @@ pub fn order_for_invoice(
         payment_hash: None,
         trusted_bridges,
         bitcoin_address_code_hash: crate::gateway::bitcoin_config::address_contract_code_hash(),
+        anchor: Some(anchor),
+        // Copied from the request verbatim. An invoice written unprompted has
+        // none, and no buyer will pay one through the buy flow.
+        order_binding: pending.order_binding,
         created_at,
-    })
+    }
+    .with_derived_id())
 }
 
 /// The message a `SignResult`'s scoped payload was built around, i.e. the
@@ -842,6 +907,272 @@ pub struct PendingListing {
     pub listing: harvest_common::listing::Listing,
     /// Store contract ID to submit the signed listing to.
     pub store_contract_id: Option<Vec<u8>>,
+}
+
+/// Why a buyer's software will not let them pay an order yet.
+///
+/// # Why an enum and not a message
+///
+/// Three reasons, and the third is the one this type exists for.
+///
+/// Each of these has a different remedy -- wait, come back later, walk away --
+/// so a screen that collapsed them into "cannot pay" would leave a buyer with
+/// no idea which. They are also the checks
+/// `docs/design/incentive-mechanism.md` Part 5 step 3 requires, and a test can
+/// name one and observe it rather than matching on prose.
+///
+/// And it is the seam Phase 2 needs. `docs/buyer-conversation-persistence.md`
+/// settles that the buyer persists the seller's pre-signed confession,
+/// confirms the delegate wrote it, and only THEN pays -- and warns that "a Buy
+/// flow that pays first and stores after passes every test in this repository
+/// and defeats the entire mechanism". Adding `ConfessionNotPersisted` here is
+/// one variant and one check; every screen that renders a blocker matches
+/// exhaustively, so nothing can quietly ignore it. [`Self::ConversationNotKept`]
+/// is the same shape one level down and is enforced today.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaymentBlocker {
+    /// The seller has published no commitment under this id.
+    ///
+    /// The reason the whole flow is shaped this way: an undeclared order
+    /// collects no money, so a seller cannot take payment without first
+    /// admitting publicly that they owe goods. See Part 5, step 2.
+    CommitmentNotPublished,
+    /// This store's identity key is unknown -- its ghostkey certificate did
+    /// not verify, or has not arrived -- so nothing can be checked against it.
+    SellerIdentityUnknown,
+    /// A commitment exists under this id, but it is not this seller's.
+    ///
+    /// Carries the verifier's own words, because the difference between "the
+    /// signature is not the seller's" and "the terms do not match what was
+    /// signed" is worth showing.
+    CommitmentNotTheSellers(String),
+    /// The commitment does not carry the value that makes it THIS buyer's.
+    ///
+    /// # Why this is the check the whole flow rests on
+    ///
+    /// Nothing else in a commitment names a particular buyer:
+    /// `buyer_fingerprint` is empty for every order the buy flow produces,
+    /// because a buyer has no identity. Without this, a seller could accept
+    /// one order, publish one commitment, and send its id down any number of
+    /// conversations -- every buyer would find it published, signed, fresh
+    /// and for a listing they had asked about, and all would pay the same
+    /// address. One declared debt would collect unbounded money, which
+    /// inverts the mechanism the commitment exists for: a count that does not
+    /// bound the money is not a count.
+    ///
+    /// The comparison is against
+    /// [`crate::messaging::BuyerConversation::order_binding`] -- what this
+    /// node derives from its own conversation secret -- and never against the
+    /// binding in the request sitting in the mailbox. Direction is not
+    /// authorship, so a seller can seal a request into the buyer's own
+    /// thread; comparing against that copy would let the seller supply the
+    /// value it is checked against and the check would pass for everyone at
+    /// once. Pinned by
+    /// `a_forged_request_cannot_supply_the_binding_the_check_uses`.
+    ///
+    /// Covers four cases with one sentence, deliberately: bound to somebody
+    /// else, bound to nothing at all, bound to all-zeros, and -- the one a
+    /// review found missing -- this CONVERSATION having no usable binding,
+    /// which a delegate answer predating the field produces. That last case
+    /// used to pass the check, because the seller chooses the value they sign
+    /// and could simply sign all-zeros back. See
+    /// `crate::messaging::BuyerConversation::usable_order_binding`.
+    ///
+    /// All four mean the same thing to the buyer, and none is safe.
+    CommitmentNotForThisBuyer,
+    /// The commitment names no Bitcoin bridge, so no payment to it could ever
+    /// be proven.
+    ///
+    /// `verify_payment_proof` answers `NoTrustedBridges` for such an order
+    /// permanently, and `trusted_bridges` is per-order and seller-chosen. It
+    /// was a footnote on the card, in smaller text UNDER the sentence saying
+    /// the order checked out and under the payment address; a condition that
+    /// decides whether money can ever be recovered belongs in the same list
+    /// as everything else that decides whether to pay.
+    NoTrustedBridge,
+    /// The commitment names a bridge this build does not know, so its "Paid"
+    /// verdict would rest on a stranger's signature.
+    ///
+    /// Carries the ids, because "check with the seller about bridge 7Kf2..."
+    /// is actionable and "an unknown bridge" is not.
+    BridgeNotRecognised(String),
+    /// The address the commitment DISPLAYS is not the script that would
+    /// settle it.
+    ///
+    /// The seller's signature covers both forms, so it proves the seller
+    /// wrote them, not that they agree. Verification uses the script; the
+    /// human pays the address.
+    DestinationDisagrees,
+    /// The address cannot be read for this network at all, so nothing can be
+    /// said about it -- which is itself a reason not to pay it.
+    DestinationUnreadable,
+    /// The commitment names a listing this conversation never asked about.
+    ///
+    /// "Confirm your own order is present" is not satisfied by an order being
+    /// present. Without this, a seller could answer a request for a cheap
+    /// listing with a commitment against an expensive one and every other
+    /// check here would pass -- the commitment being genuinely published,
+    /// genuinely signed and genuinely fresh.
+    ///
+    /// Empty when the buyer has asked for nothing in this conversation, which
+    /// is the case for a conversation that began as an ordinary question; the
+    /// check then has nothing to compare against and does not fire. That is
+    /// the honest answer rather than a refusal, since a seller may perfectly
+    /// well invoice against a conversation that never used the buy form.
+    CommitmentNotRequested,
+    /// The order has already moved past awaiting payment.
+    NotAwaitingPayment(harvest_common::payment::OrderStatus),
+    /// The commitment carries no block anchor, so nothing in it can be dated.
+    AnchorMissing,
+    /// This reader cannot see the chain, so cannot judge the anchor.
+    ///
+    /// Deliberately distinct from every verdict below: the remedy is to wait,
+    /// not to walk away.
+    ChainUnknown,
+    /// The anchor names a height this reader's chain has a different block at.
+    AnchorOffChain,
+    /// The anchor names a height this reader cannot check.
+    ///
+    /// Should not happen for an anchor that passed the freshness rule, since
+    /// [`RECENT_BLOCKS_KEPT`] covers that whole window -- but "should not
+    /// happen" is not a reason to treat unknown as verified.
+    AnchorUnverifiable,
+    /// The anchor is ahead of the tip this reader can see.
+    AnchorAheadOfTip { anchor_height: u32, tip_height: u32 },
+    /// The anchor is further behind the tip than
+    /// [`harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS`].
+    ///
+    /// # This is expiry, and the wording must not say otherwise
+    ///
+    /// Two different things land here and the code cannot tell them apart: a
+    /// commitment BACKDATED at signing, which is the attack the rule exists
+    /// for, and one that simply AGED since it was signed, which is what
+    /// happens to every honest order nobody paid in time. The anchor is
+    /// stamped when the seller signs and is immutable under their signature,
+    /// so the second is by far the common case.
+    ///
+    /// An earlier version of the sentence shown for this said "an order
+    /// backdated like this reads to everyone else as already finished, so do
+    /// not pay it" -- an accusation, delivered to a buyer whose seller had
+    /// done nothing wrong, with `is_temporary` classifying it as walk-away
+    /// and no way for either side to recover. Both are fixed: the sentence
+    /// says the order expired and to ask for another, and the remedy is
+    /// [`Remedy::AskTheSeller`].
+    ///
+    /// Refusing is still right in both cases. An expired order is one readers
+    /// are about to stop counting as open exposure, so paying it buys the
+    /// buyer a declaration that is going quiet either way.
+    AnchorStale { anchor_height: u32, tip_height: u32 },
+    /// This node has not confirmed it is keeping the key that reads this
+    /// conversation.
+    ///
+    /// Paying now buys goods and throws away the ability to read anything the
+    /// seller says afterwards -- and, from Phase 2, the confession that is the
+    /// buyer's only capability to complain. See
+    /// `docs/buyer-conversation-persistence.md`.
+    ConversationNotKept,
+}
+
+impl PaymentBlocker {
+    /// What to tell the buyer, in their terms rather than the protocol's.
+    pub fn describe(&self) -> String {
+        match self {
+            PaymentBlocker::CommitmentNotPublished => "The seller has not yet published this \
+                 order publicly. Until they do, there is no public record that they owe you \
+                 anything, so do not pay."
+                .to_string(),
+            PaymentBlocker::SellerIdentityUnknown => "This store's identity does not check out, \
+                 so nothing here can be tied to the seller. Do not pay."
+                .to_string(),
+            PaymentBlocker::CommitmentNotTheSellers(why) => format!(
+                "The published order is not signed by this store's seller ({why}). Do not pay."
+            ),
+            PaymentBlocker::CommitmentNotForThisBuyer => "The published order was not issued \
+                 to you. Anyone can read it, but paying it would be paying somebody else's \
+                 bill -- and the seller would still owe only the one order they published. \
+                 Do not pay it."
+                .to_string(),
+            PaymentBlocker::NoTrustedBridge => "The published order names no Bitcoin bridge, \
+                 so no payment to it could ever be proven -- not by you, not by anyone. Ask \
+                 the seller to reissue it."
+                .to_string(),
+            PaymentBlocker::BridgeNotRecognised(ids) => format!(
+                "The published order would be settled by a bridge this app does not recognise \
+                 ({ids}). Whether it counts as paid would rest on a signature you have no \
+                 reason to trust. Check with the seller before paying."
+            ),
+            PaymentBlocker::DestinationDisagrees => "The address shown on the published order \
+                 is not the destination that would settle it. Do not pay it -- ask the seller \
+                 to reissue it."
+                .to_string(),
+            PaymentBlocker::DestinationUnreadable => "The published order's payment address \
+                 cannot be read for its network, so nothing can be checked about it. Ask the \
+                 seller to reissue it."
+                .to_string(),
+            PaymentBlocker::CommitmentNotRequested => "The published order is for a different \
+                 listing than the one you asked about. Do not pay it -- ask the seller what it \
+                 is for."
+                .to_string(),
+            PaymentBlocker::NotAwaitingPayment(status) => format!(
+                "This order is no longer awaiting payment ({status:?}), so there is nothing \
+                 to pay."
+            ),
+            PaymentBlocker::AnchorMissing => "The published order names no recent Bitcoin \
+                 block, so there is no way to tell how long the seller has been holding it. \
+                 Do not pay."
+                .to_string(),
+            PaymentBlocker::ChainUnknown => "Your node has not loaded Bitcoin chain data yet, \
+                 so this order cannot be checked. Wait a moment and look again."
+                .to_string(),
+            PaymentBlocker::AnchorOffChain => "The published order is anchored to a block that \
+                 is not on the chain your node sees. Do not pay."
+                .to_string(),
+            PaymentBlocker::AnchorUnverifiable => "Your node cannot check the block this order \
+                 is anchored to. Wait for it to catch up rather than paying."
+                .to_string(),
+            PaymentBlocker::AnchorAheadOfTip {
+                anchor_height,
+                tip_height,
+            } => format!(
+                "The published order names block {anchor_height}, which is ahead of the \
+                 {tip_height} your node has seen. Either your node is behind or the order is \
+                 not genuine; wait before paying."
+            ),
+            PaymentBlocker::AnchorStale {
+                anchor_height,
+                tip_height,
+            } => format!(
+                "This order has expired. It was declared against Bitcoin block \
+                 {anchor_height}, which is {} blocks behind the {tip_height} your node sees, \
+                 and an order that old stops counting as something the seller openly owes. \
+                 Ask the seller to issue it again.",
+                tip_height.saturating_sub(*anchor_height)
+            ),
+            PaymentBlocker::ConversationNotKept => "Your node has not confirmed it is keeping \
+                 the key that reads this conversation. Pay now and you may not be able to read \
+                 what the seller sends afterwards. Send the seller a message to try again."
+                .to_string(),
+        }
+    }
+}
+
+/// One purchase this buyer is party to, as their own node can see it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BuyerPurchase {
+    pub order_id: harvest_common::payment::OrderId,
+    /// The routing tag of the conversation the acceptance arrived in, so the
+    /// purchase can be shown against the thread it belongs to.
+    pub conversation: [u8; 32],
+    /// The published commitment, or `None` when the store's state carries
+    /// none under this id.
+    ///
+    /// The buyer is shown the AMOUNT out of this rather than out of the
+    /// acceptance message: an amount named in a message is one the seller can
+    /// say without publishing, and the published commitment is the only
+    /// version a stranger can also count.
+    pub commitment: Option<harvest_common::payment::AuthorizedOrder>,
+    /// Empty when there is nothing standing between the buyer and paying.
+    pub blockers: Vec<PaymentBlocker>,
 }
 
 /// State for a store we're browsing.
@@ -1363,6 +1694,16 @@ impl AppState {
             ) {
                 Ok(addr_state) => {
                     self.apply_address_state(contract_id, network, &addr_state);
+                    // A payment confirming is exactly the moment an order
+                    // becomes provable, and this is the only notification
+                    // that says so -- the store's own state does not change
+                    // when coins arrive. Every store, because the claims that
+                    // just landed do not say which order they settle.
+                    for store_contract_id in
+                        self.browsing_stores.keys().cloned().collect::<Vec<_>>()
+                    {
+                        self.publish_settled_orders(&store_contract_id);
+                    }
                     return;
                 }
                 Err(e) => warn!(
@@ -1451,6 +1792,21 @@ impl AppState {
                     // buyer never fetches is the same to them as one that
                     // was never sent.
                     self.recall_buyer_conversations(&contract_id);
+
+                    // And subscribe to the address contract of every order
+                    // this node is party to, so a payment to one becomes
+                    // visible. Here rather than on the payments tab, because
+                    // the subscription is what fills the view a purchase card
+                    // reads, and a buyer who never opens that tab still needs
+                    // to see whether the address they are about to pay has
+                    // already been paid. Idempotent per tab.
+                    self.watch_purchase_addresses(&contract_id);
+
+                    // And publish any order whose payment this node can now
+                    // prove. Here as well as on the address path below,
+                    // because the two arrive independently: the claims may be
+                    // in hand before the order is, or the other way round.
+                    self.publish_settled_orders(&contract_id);
                     return;
                 }
             };
@@ -1694,6 +2050,77 @@ impl AppState {
         self.send_to_harvest_delegate("read this store's messages", &request);
     }
 
+    /// Seal a buyer's request to buy a listing, opening a conversation if
+    /// this node has none with the store.
+    ///
+    /// Step 1 of `docs/design/incentive-mechanism.md` Part 5. The buyer has
+    /// no identity and nothing is committed by sending this: it is an ask,
+    /// and the seller decides whether to publish a commitment against it.
+    ///
+    /// Like [`Self::compose_to_seller`], this asks the delegate to keep the
+    /// conversation on the path that opens it rather than leaving that to a
+    /// caller -- and here it matters more, because the answer to a request is
+    /// the acceptance the buyer needs in order to pay at all.
+    ///
+    /// Returns the sealed message for the caller to dispatch; the dispatch
+    /// needs a browser and this does not.
+    pub fn request_order(
+        &mut self,
+        store_contract_id: &[u8],
+        seller_encryption_key: &[u8; 32],
+        listing_id: &harvest_common::listing::ListingId,
+        quantity: u32,
+        shipping: String,
+        note: String,
+    ) -> Result<harvest_common::mailbox::EncryptedMessage, String> {
+        // Refused before anything is opened or sealed, so a rejected request
+        // leaves no conversation behind for the delegate to keep and no
+        // half-formed thread on screen.
+        if quantity == 0 {
+            return Err("say how many you want -- a quantity of zero is not an order".to_string());
+        }
+        if shipping.trim().is_empty() {
+            return Err(
+                "say where this should be sent. The seller cannot fulfil an order with no \
+                 destination, and this only ever reaches them -- it is encrypted before it \
+                 leaves your browser and is not part of what they publish."
+                    .to_string(),
+            );
+        }
+        let sealed = self
+            .conversation_with(store_contract_id, seller_encryption_key)?
+            .request_order(listing_id, quantity, shipping, note)?;
+        self.keep_this_conversation(store_contract_id, seller_encryption_key);
+        Ok(sealed)
+    }
+
+    /// The conversation a new message to this store continues, opening one if
+    /// there is none.
+    ///
+    /// The LAST rather than the first: a returning buyer resumes the thread
+    /// the delegate handed back instead of forking a second one beside it.
+    fn conversation_with(
+        &mut self,
+        store_contract_id: &[u8],
+        seller_encryption_key: &[u8; 32],
+    ) -> Result<&crate::messaging::BuyerConversation, String> {
+        let store = self
+            .browsing_stores
+            .entry(store_contract_id.to_vec())
+            .or_default();
+        if store.conversations.is_empty() {
+            store
+                .conversations
+                .push(crate::messaging::BuyerConversation::open(
+                    seller_encryption_key,
+                )?);
+        }
+        Ok(store
+            .conversations
+            .last()
+            .expect("just pushed if it was empty"))
+    }
+
     /// Seal a buyer's message to a store, opening a conversation if this
     /// node has none with it.
     ///
@@ -1714,21 +2141,8 @@ impl AppState {
         seller_encryption_key: &[u8; 32],
         text: String,
     ) -> Result<harvest_common::mailbox::EncryptedMessage, String> {
-        let store = self
-            .browsing_stores
-            .entry(store_contract_id.to_vec())
-            .or_default();
-        if store.conversations.is_empty() {
-            store
-                .conversations
-                .push(crate::messaging::BuyerConversation::open(
-                    seller_encryption_key,
-                )?);
-        }
-        let sealed = store
-            .conversations
-            .last()
-            .expect("just pushed if it was empty")
+        let sealed = self
+            .conversation_with(store_contract_id, seller_encryption_key)?
             .seal(text)?;
 
         // Ask the delegate to keep it, before the caller dispatches anything.
@@ -1759,14 +2173,16 @@ impl AppState {
         // which is the silent failure this whole mechanism exists to
         // prevent.
         let request_id = self.next_messaging_request_id();
-        let request = self
+        let conversation = self
             .browsing_stores
             .get(store_contract_id)?
             .conversations
-            .last()?
-            .to_persist(store_contract_id, seller_encryption_key, request_id)?;
+            .last()?;
+        let tag = conversation.buyer_public_key;
+        let request =
+            conversation.to_persist(store_contract_id, seller_encryption_key, request_id)?;
         self.pending_conversation_persists
-            .insert(request_id, store_contract_id.to_vec());
+            .insert(request_id, (store_contract_id.to_vec(), tag));
         Some(request)
     }
 
@@ -2245,6 +2661,490 @@ impl AppState {
     ///
     /// Empty for a store this browser has never written to -- there is no
     /// conversation, so there is nothing in the mailbox that could be theirs.
+    /// Every purchase this node is party to at `store_contract_id`, judged.
+    ///
+    /// One per acceptance the buyer can read in their own conversations,
+    /// judged individually: a buyer can buy twice from one store, and
+    /// collapsing to the newest would hide an order they still owe money on.
+    ///
+    /// # Why the acceptance message decides WHICH order, and nothing else
+    ///
+    /// The order id cannot be derived by the buyer -- `OrderId::new` hashes a
+    /// `created_at` the seller stamps -- so the seller has to name it. But
+    /// both parties hold both conversation direction keys, so the message
+    /// carrying that name proves nothing about who wrote it. Everything that
+    /// matters is therefore re-derived from the PUBLISHED commitment and this
+    /// node's own view of the chain; the message is a pointer and is treated
+    /// as one.
+    pub fn buyer_purchases(&self, store_contract_id: &[u8]) -> Vec<BuyerPurchase> {
+        use crate::messaging::{Addressing, MessageContent};
+
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return Vec::new();
+        };
+        let mut purchases: Vec<BuyerPurchase> = Vec::new();
+        for conversation in &store.conversations {
+            for message in conversation.read(&store.mailbox_messages) {
+                let MessageContent::OrderAccepted { order_id } = message.content else {
+                    continue;
+                };
+                // Addressed to the buyer, or it is something the buyer could
+                // have composed themselves -- see this method's doc comment
+                // and `Addressing`.
+                if message.addressing != Addressing::ToBuyer {
+                    continue;
+                }
+                if purchases
+                    .iter()
+                    .any(|purchase| purchase.order_id == order_id)
+                {
+                    // The seller may repeat an acceptance; it is still one
+                    // purchase, and showing it twice would read as two debts.
+                    continue;
+                }
+                let commitment = store
+                    .orders
+                    .iter()
+                    .find(|order| order.order.id == order_id)
+                    .cloned();
+                purchases.push(BuyerPurchase {
+                    blockers: self.payment_blockers(store, conversation, commitment.as_ref()),
+                    order_id,
+                    conversation: conversation.buyer_public_key,
+                    commitment,
+                });
+            }
+        }
+        purchases
+    }
+
+    /// Every listing this conversation has asked about.
+    ///
+    /// A set rather than the latest, because a buyer may ask about two things
+    /// in one thread and the acceptance names only an order id -- so "which
+    /// request does this answer" has no unambiguous answer, while "was this
+    /// one of the things I asked about" does.
+    fn requested_listings(
+        store: &BrowsingStore,
+        conversation: &crate::messaging::BuyerConversation,
+    ) -> Vec<harvest_common::listing::ListingId> {
+        use crate::messaging::{Addressing, MessageContent};
+
+        conversation
+            .read(&store.mailbox_messages)
+            .into_iter()
+            .filter(|message| message.addressing == Addressing::ToSeller)
+            .filter_map(|message| match message.content {
+                MessageContent::OrderRequest { listing_id, .. } => Some(listing_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every order at this store that this node can now prove was paid, as
+    /// the `Paid` record it would publish.
+    ///
+    /// # Why anything has to do this
+    ///
+    /// `verify_payment_proof`, the bridge-signed claims and the address
+    /// subscription all existed and nothing CONSTRUCTED the proof they
+    /// verify, so an order stayed `AwaitingPayment` however much had been
+    /// paid. That is not only a wrong line on a screen: the published record
+    /// is what every later mechanism reads, and Phase 2's reversal argument
+    /// is arithmetic over an order's status.
+    ///
+    /// # Why the buyer, and why anyone may
+    ///
+    /// `Paid` is authorized by EVIDENCE, not by a signature over the status
+    /// (see `AuthorizedOrder::verify`), so any reader holding the claims can
+    /// publish the transition -- there is nothing here only the seller could
+    /// sign. The buyer is simply the party who cares soonest, and the same
+    /// call serves a seller looking at their own invoices.
+    ///
+    /// # What it will not publish
+    ///
+    /// An order whose status has already moved, and an order whose evidence
+    /// does not carry the transition. The second is the one that matters:
+    /// `assemble_on_chain_proof` verifies before it returns, so a record this
+    /// produces is one the network accepts. Publishing `Paid` on evidence
+    /// that fails verification is a state every peer refuses, and on the
+    /// buyer's screen that looks like the payment never registering.
+    ///
+    /// Returns the records rather than dispatching them, so what would be
+    /// published is decidable without a browser.
+    pub fn settled_orders(
+        &self,
+        store_contract_id: &[u8],
+    ) -> Vec<harvest_common::payment::AuthorizedOrder> {
+        use harvest_common::payment::{assemble_on_chain_proof, OrderStatus};
+
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return Vec::new();
+        };
+        // Not scoped to orders this node is party to, and it does not need to
+        // be: `Paid` is evidence-backed, so publishing a stranger's settled
+        // order would be correct if it happened. It cannot, because
+        // `bitcoin.addresses` only ever holds the addresses
+        // `address_contracts_to_watch` subscribed to, which ARE this node's
+        // own. The scoping is the subscription's, and saying so here is
+        // cheaper than a second copy of the rule that could disagree with it.
+        let mut settled = Vec::new();
+        for order in &store.orders {
+            if order.status != OrderStatus::AwaitingPayment {
+                continue;
+            }
+            let Some(view) = order
+                .order
+                .bitcoin_address_instance_id()
+                .and_then(|id| self.bitcoin.addresses.get(id.as_slice()))
+            else {
+                continue;
+            };
+            let Some(tip) = self
+                .bitcoin
+                .tips
+                .get(&order.order.network)
+                .and_then(|tip| tip.signed_tip.as_ref())
+            else {
+                continue;
+            };
+            // Declines for every ordinary reason -- nothing seen yet, not
+            // deep enough, short of the amount -- which is the common case
+            // and not worth a line anywhere.
+            let Ok(proof) = assemble_on_chain_proof(&order.order, &view.claims, tip) else {
+                continue;
+            };
+            let mut paid = order.clone();
+            paid.status = OrderStatus::Paid;
+            paid.payment_proof = Some(proof);
+            settled.push(paid);
+        }
+        settled
+    }
+
+    /// [`Self::settled_orders`], published.
+    ///
+    /// Each order once per tab. Between dispatching the update and the
+    /// store's state coming back with it applied, every further notification
+    /// would otherwise re-derive the same settlement and send it again -- one
+    /// update per notification per paid order.
+    ///
+    /// The guard is in-flight only and deliberately not durable: after a
+    /// reload the order is either `Paid` in the state that arrives, in which
+    /// case `settled_orders` skips it, or it is not, in which case the
+    /// earlier update did not land and re-sending is exactly right.
+    ///
+    /// Returns what it actually dispatched. Not decoration: the dispatch is
+    /// wasm-gated, so without this a test of the guard can only look at the
+    /// in-flight SET -- and a set is idempotent, so it holds one entry
+    /// whether the guard skipped the second send or not. That test passed
+    /// under a mutation that deleted the guard, which is the
+    /// reports-success-while-measuring-nothing shape this repository is
+    /// built around avoiding.
+    pub fn publish_settled_orders(
+        &mut self,
+        store_contract_id: &[u8],
+    ) -> Vec<harvest_common::payment::AuthorizedOrder> {
+        let mut published = Vec::new();
+        for settled in self.settled_orders(store_contract_id) {
+            if !self.settlements_submitted.insert(settled.order.id.clone()) {
+                continue;
+            }
+            published.push(settled.clone());
+            info!(
+                "Publishing the settled order {} -- the payment verifies",
+                settled.order.id.short()
+            );
+            #[cfg(target_arch = "wasm32")]
+            {
+                let store_id = store_contract_id.to_vec();
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(e) =
+                        crate::gateway::store_ops::submit_order_by_id(&store_id, settled).await
+                    {
+                        dioxus::logger::tracing::error!("Failed to publish a settled order: {e}");
+                        crate::gateway::APP_STATE
+                            .write()
+                            .notifications
+                            .push(format!(
+                                "Your payment was seen on chain, but the order could not be \
+                             updated to say so: {e}"
+                            ));
+                    }
+                });
+            }
+        }
+        published
+    }
+
+    /// The Bitcoin address contracts this node should be watching for one
+    /// store, so a payment to an order it is party to becomes visible.
+    ///
+    /// # Why a buyer needs this at all
+    ///
+    /// `live_address_for_order` reads `bitcoin.addresses`, which is filled
+    /// only by a subscription. Nothing subscribed on a buyer's behalf, so a
+    /// purchase card read "Awaiting payment" however much had already arrived
+    /// at the address. A rule that stops the wrong payment is worth having;
+    /// the display that would have shown the buyer the money was already
+    /// there is what lets a person check the rule.
+    ///
+    /// # Why it is scoped, and not just "every order in the store"
+    ///
+    /// A store contract carries every order it ever issued. Subscribing to
+    /// all of them would advertise this node's interest in every one of a
+    /// busy seller's payment addresses, for orders it has nothing to do with
+    /// -- the shape `harvest_common::bitcoin_delegate` refuses to build when
+    /// it declines to publish a user's watch list. So: orders this node was
+    /// accepted for, and orders one of its own identities issued.
+    ///
+    /// Returns the ids rather than subscribing, so what is asked for is
+    /// decidable without a browser. [`Self::watch_purchase_addresses`] is the
+    /// half that needs one.
+    pub fn address_contracts_to_watch(&self, store_contract_id: &[u8]) -> Vec<[u8; 32]> {
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return Vec::new();
+        };
+        let mine: std::collections::HashSet<&str> = self
+            .my_stores
+            .iter()
+            .filter(|(_, stores)| {
+                stores
+                    .iter()
+                    .any(|s| s.store_contract_id == store_contract_id)
+            })
+            .map(|(fingerprint, _)| fingerprint.as_str())
+            .collect();
+        let bought: std::collections::HashSet<harvest_common::payment::OrderId> = self
+            .buyer_purchases(store_contract_id)
+            .into_iter()
+            .map(|purchase| purchase.order_id)
+            .collect();
+
+        let mut ids = Vec::new();
+        for order in &store.orders {
+            let ours = bought.contains(&order.order.id)
+                || mine.contains(order.order.seller_fingerprint.as_str());
+            if !ours {
+                continue;
+            }
+            // `None` for an order naming no contract build: there is nothing
+            // to subscribe to, and guessing would subscribe to some other
+            // contract.
+            let Some(id) = order.order.bitcoin_address_instance_id() else {
+                continue;
+            };
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// [`Self::address_contracts_to_watch`], subscribed.
+    ///
+    /// Each id once per tab: store state re-arrives on every update
+    /// notification, and re-subscribing on each would be one GET per
+    /// notification per order.
+    pub fn watch_purchase_addresses(&mut self, store_contract_id: &[u8]) {
+        for id in self.address_contracts_to_watch(store_contract_id) {
+            let bytes = id.to_vec();
+            self.bitcoin
+                .address_contract_network
+                .entry(bytes.clone())
+                .or_insert_with(|| {
+                    // Recorded so an incoming state routes to the right view
+                    // without guessing from the bytes -- the same reason
+                    // `register_watch_contract` records it.
+                    crate::gateway::bitcoin_config::default_network()
+                });
+            if !self.bitcoin.subscribed.insert(bytes.clone()) {
+                continue;
+            }
+            #[cfg(target_arch = "wasm32")]
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(e) = crate::gateway::bitcoin_ops::subscribe_contract(&bytes).await {
+                    dioxus::logger::tracing::error!(
+                        "Failed to subscribe an order's address contract: {e}"
+                    );
+                }
+            });
+        }
+    }
+
+    /// Whether one of the SELLER's own orders has stopped being payable and
+    /// should be issued again.
+    ///
+    /// The other side of `PaymentBlocker::AnchorStale`. An order's anchor is
+    /// stamped when the seller signs and cannot be changed afterwards, so
+    /// every honest order eventually ages past
+    /// [`harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS`] and stops being one
+    /// any buyer will pay. Without this the expiry is invisible on the only
+    /// side that can fix it: the buyer is sent back to a seller who has no
+    /// idea anything happened.
+    ///
+    /// Answers `false` when this node cannot see the chain. The judgement
+    /// needs the reader's own clock, and answering `true` without one would
+    /// have a seller reissuing every order every time their node was slow --
+    /// the unknown-treated-as-a-verdict mistake, in the direction that
+    /// creates work rather than the one that loses money.
+    ///
+    /// Deliberately NOT the whole of `payment_blockers`: most of those are
+    /// about a particular buyer, and a seller looking at their own invoice
+    /// list has no buyer in hand.
+    pub fn needs_reissue(&self, order: &harvest_common::payment::AuthorizedOrder) -> bool {
+        use harvest_common::payment::{OrderStatus, MAX_ANCHOR_AGE_BLOCKS};
+
+        if order.status != OrderStatus::AwaitingPayment {
+            return false;
+        }
+        let Some(tip_height) = self
+            .bitcoin
+            .tips
+            .get(&order.order.network)
+            .and_then(|tip| tip.tip_height)
+        else {
+            return false;
+        };
+        match order.order.anchor {
+            // Nothing to date it by, so no buyer will pay it -- the same
+            // verdict `order_for_invoice` refuses to create today, reached
+            // here for orders issued before it did.
+            None => true,
+            Some(anchor) => tip_height.saturating_sub(anchor.height) > MAX_ANCHOR_AGE_BLOCKS,
+        }
+    }
+
+    /// What stands between this buyer and paying one commitment.
+    ///
+    /// Ordered so the first blocker is the one worth showing first: what is
+    /// missing, then whether it is genuine, then whether it is current, then
+    /// whether this node is ready to hold what the buyer will need afterwards.
+    ///
+    /// It stops at the first failure of each dependent step rather than
+    /// collecting everything, because the later checks are not meaningful
+    /// against a commitment that failed an earlier one -- an unverified
+    /// commitment's anchor is not evidence of anything.
+    fn payment_blockers(
+        &self,
+        store: &BrowsingStore,
+        conversation: &crate::messaging::BuyerConversation,
+        commitment: Option<&harvest_common::payment::AuthorizedOrder>,
+    ) -> Vec<PaymentBlocker> {
+        use harvest_common::payment::{OrderStatus, MAX_ANCHOR_AGE_BLOCKS};
+
+        let Some(commitment) = commitment else {
+            return vec![PaymentBlocker::CommitmentNotPublished];
+        };
+        let Some(seller_key) = store.seller_verifying_key else {
+            return vec![PaymentBlocker::SellerIdentityUnknown];
+        };
+        let Ok(seller_key) = ed25519_dalek::VerifyingKey::from_bytes(&seller_key) else {
+            return vec![PaymentBlocker::SellerIdentityUnknown];
+        };
+        // `verify`, not `verify_terms`: the terms signature is what binds the
+        // seller, and the rest is what stops a record whose STATUS was
+        // asserted without the evidence that status requires.
+        if let Err(why) = commitment.verify(&seller_key) {
+            return vec![PaymentBlocker::CommitmentNotTheSellers(why)];
+        }
+        if commitment.status != OrderStatus::AwaitingPayment {
+            return vec![PaymentBlocker::NotAwaitingPayment(commitment.status)];
+        }
+        // Bound to THIS buyer, and checked before anything else about the
+        // terms: an order issued to somebody else is not this buyer's
+        // business, whatever its listing or anchor says. Compared against
+        // what this node derives, never against a value carried in a message
+        // -- see `PaymentBlocker::CommitmentNotForThisBuyer`.
+        // `usable_order_binding` rather than the raw value: an all-zeros
+        // binding identifies nobody, and comparing it would let a seller who
+        // signs all-zeros match every conversation in that state. A missing
+        // input must not read as a satisfied check -- see
+        // `no_missing_input_reads_as_approval`, which enumerates every other
+        // input to this function against the same question.
+        let Some(expected) = conversation.usable_order_binding() else {
+            return vec![PaymentBlocker::CommitmentNotForThisBuyer];
+        };
+        if commitment.order.order_binding != Some(expected) {
+            return vec![PaymentBlocker::CommitmentNotForThisBuyer];
+        }
+        // What this conversation actually asked about. Empty for a
+        // conversation that never used the buy form, and the check then has
+        // nothing to compare against -- see
+        // `PaymentBlocker::CommitmentNotRequested`.
+        let requested = Self::requested_listings(store, conversation);
+        if !requested.is_empty() && !requested.contains(&commitment.order.listing_id) {
+            return vec![PaymentBlocker::CommitmentNotRequested];
+        }
+
+        let mut blockers = Vec::new();
+        match commitment.order.anchor {
+            None => blockers.push(PaymentBlocker::AnchorMissing),
+            Some(anchor) => match self.bitcoin.tips.get(&commitment.order.network) {
+                None => blockers.push(PaymentBlocker::ChainUnknown),
+                Some(tip) => match tip.tip_height {
+                    None => blockers.push(PaymentBlocker::ChainUnknown),
+                    Some(tip_height) if anchor.height > tip_height => {
+                        blockers.push(PaymentBlocker::AnchorAheadOfTip {
+                            anchor_height: anchor.height,
+                            tip_height,
+                        })
+                    }
+                    Some(tip_height) if tip_height - anchor.height > MAX_ANCHOR_AGE_BLOCKS => {
+                        blockers.push(PaymentBlocker::AnchorStale {
+                            anchor_height: anchor.height,
+                            tip_height,
+                        })
+                    }
+                    Some(_) => match tip.anchor_is_canonical(&anchor) {
+                        Some(true) => {}
+                        Some(false) => blockers.push(PaymentBlocker::AnchorOffChain),
+                        None => blockers.push(PaymentBlocker::AnchorUnverifiable),
+                    },
+                },
+            },
+        }
+
+        // Whether a payment to this order could ever be PROVEN, and whether
+        // the address the buyer would type is the destination that settles
+        // it. Both are decided by fields the seller chose and the seller
+        // signed, and both were card footnotes until review pointed out that
+        // a condition deciding whether money is recoverable belongs with
+        // everything else that decides whether to pay.
+        if commitment.order.trusted_bridges.is_empty() {
+            blockers.push(PaymentBlocker::NoTrustedBridge);
+        } else {
+            let strangers =
+                crate::components::bitcoin_view::unrecognised_bridges(&commitment.order);
+            if !strangers.is_empty() {
+                blockers.push(PaymentBlocker::BridgeNotRecognised(
+                    strangers
+                        .iter()
+                        .map(|id| crate::components::bitcoin_view::short_bridge(id))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ));
+            }
+        }
+        match crate::components::bitcoin_view::DestinationNote::of(&commitment.order) {
+            crate::components::bitcoin_view::DestinationNote::Agrees => {}
+            crate::components::bitcoin_view::DestinationNote::Contradicts => {
+                blockers.push(PaymentBlocker::DestinationDisagrees)
+            }
+            crate::components::bitcoin_view::DestinationNote::Unreadable => {
+                blockers.push(PaymentBlocker::DestinationUnreadable)
+            }
+        }
+
+        // Last, and separate from everything above: the others are about the
+        // seller's side of the bargain, this one is about whether this node is
+        // ready. See `PaymentBlocker::ConversationNotKept`.
+        if !conversation.is_kept() {
+            blockers.push(PaymentBlocker::ConversationNotKept);
+        }
+        blockers
+    }
+
     pub fn conversation_thread(
         &self,
         store_contract_id: &[u8],
@@ -2353,6 +3253,129 @@ impl AppState {
             )?;
 
         crate::messaging::seal_reply(keys, conversation_tag, &conversation_id, text)
+    }
+
+    /// Seal the seller's acceptance of a request: the id of the commitment
+    /// they have just published, addressed back down the buyer's own thread.
+    ///
+    /// Split from the dispatch, and from the response handler that calls it,
+    /// for the usual reason: what gets sealed is decidable without a browser
+    /// and is the half a test can hold.
+    ///
+    /// # Why this errors rather than answering `None`
+    ///
+    /// The failure it reports -- no key for that conversation -- means a
+    /// commitment has been published that the buyer will never be able to
+    /// recognise as theirs. The seller believes they accepted; the buyer sees
+    /// a public order book entry that means nothing to them. That is worth a
+    /// notification, so it must not look like "there was nothing to do".
+    pub fn acceptance_for(
+        &self,
+        store_contract_id: &[u8],
+        conversation_tag: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Result<harvest_common::mailbox::EncryptedMessage, String> {
+        if self.store_owner_fingerprint(store_contract_id).is_none() {
+            return Err(
+                "this store is not one of yours -- only the seller can answer a request on it"
+                    .to_string(),
+            );
+        }
+        let keys = self
+            .conversation_keys
+            .get(conversation_tag)
+            .ok_or("your delegate has not produced this conversation\'s key yet")?;
+        // The newest message this seller could read in this conversation.
+        // `mailbox_entries` is newest-first, so the first match is it. Same
+        // derivation as `compose_reply`, and for the same reason: the
+        // conversation id is inside the ciphertext, so the only honest source
+        // for it is a message that has actually been decrypted.
+        let conversation_id = self
+            .mailbox_entries(store_contract_id)
+            .into_iter()
+            .find_map(|entry| match entry {
+                crate::messaging::MailboxEntry::Readable {
+                    conversation,
+                    conversation_id,
+                    ..
+                } if conversation == conversation_tag => Some(conversation_id),
+                _ => None,
+            })
+            .ok_or(
+                "no message in this conversation has been read yet, so there is nothing to \
+                 answer",
+            )?;
+
+        crate::messaging::seal_order_accepted(keys, conversation_tag, &conversation_id, order_id)
+    }
+
+    /// [`Self::acceptance_for`], recorded and dispatched.
+    ///
+    /// A failure is reported to the seller rather than logged: they have just
+    /// been told their invoice went out, and the difference between "the
+    /// buyer knows which order is theirs" and "the buyer is looking at an
+    /// order book entry they cannot place" is one they can act on -- by
+    /// sending the order number themselves.
+    fn announce_acceptance(
+        &mut self,
+        store_contract_id: &[u8],
+        reply_to: Option<[u8; 32]>,
+        order_id: &harvest_common::payment::OrderId,
+    ) {
+        let Some(tag) = reply_to else {
+            return;
+        };
+        let sealed = match self.acceptance_for(store_contract_id, &tag, order_id) {
+            Ok(sealed) => sealed,
+            Err(why) => {
+                warn!("Could not tell the buyer about order {order_id}: {why}");
+                self.notifications.push(format!(
+                    "Invoice {} was issued, but the buyer could not be told which order is \
+                     theirs: {why}. Send them the order number yourself.",
+                    order_id.short()
+                ));
+                return;
+            }
+        };
+        let mailbox = self
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|store| store.mailbox_contract_id.clone());
+        // Recorded before the dispatch and regardless of it, for the same
+        // reason a reply is: this is the only authorship this browser can
+        // establish, and a message the seller sent that they cannot recognise
+        // afterwards reads as a stranger writing into their own mailbox.
+        self.record_sent_message(
+            store_contract_id,
+            format!("Accepted -- invoice {} is published.", order_id.short()),
+            &sealed,
+        );
+        match mailbox {
+            Some(_mailbox) => {
+                #[cfg(target_arch = "wasm32")]
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(e) =
+                        crate::gateway::mailbox_ops::reply_to_mailbox(&_mailbox, sealed).await
+                    {
+                        dioxus::logger::tracing::error!("Failed to send the acceptance: {e}");
+                        crate::gateway::APP_STATE
+                            .write()
+                            .notifications
+                            .push(format!(
+                                "The invoice was published, but the buyer could not be told: {e}"
+                            ));
+                    }
+                });
+            }
+            None => {
+                warn!("No mailbox known for this store, so the acceptance was not sent");
+                self.notifications.push(format!(
+                    "Invoice {} was issued, but this store\'s mailbox is not known, so the \
+                     buyer could not be told which order is theirs.",
+                    order_id.short()
+                ));
+            }
+        }
     }
 
     /// Whether THIS browser wrote the message with this digest.
@@ -2732,8 +3755,26 @@ impl AppState {
             return;
         };
 
-        let created_at = self.unused_invoice_timestamp(&invoice, chrono::Utc::now());
-        let order = match order_for_invoice(&invoice, &derived, created_at) {
+        // Plain `now`. There used to be a collision dance here, because
+        // `OrderId` hashed only `(seller, listing, created_at_ms, buyer)` and
+        // two invoices for one listing in a single millisecond were the same
+        // order as far as the contract was concerned -- one silently
+        // displacing the other under `merge_order`'s tie-break, taking a
+        // derivation index and an address already shown to somebody. The id
+        // is now derived from the whole terms, and every invoice carries a
+        // distinct payment address from the delegate's own index, so two
+        // invoices in one millisecond are simply two orders. That old comment
+        // named this as the structural answer and deferred it; this is it.
+        let created_at = chrono::Utc::now();
+        // The seller's own view of the chain, which is the only anchor they
+        // have. A seller whose tip contract has not answered cannot issue an
+        // invoice at all -- `order_for_invoice` says so, and says why.
+        let anchor = self
+            .bitcoin
+            .tips
+            .get(&derived.network)
+            .and_then(|tip| tip.current_anchor());
+        let order = match order_for_invoice(&invoice, &derived, anchor, created_at) {
             Ok(order) => order,
             Err(e) => {
                 self.notifications
@@ -2753,84 +3794,13 @@ impl AppState {
             fingerprint: invoice.seller_fingerprint,
             order,
             store_contract_id: invoice.store_contract_id,
+            reply_to: invoice.reply_to,
         };
         self.pending_signatures
-            .push_back(PendingSignature::Order(pending.clone()));
+            .push_back(PendingSignature::Order(Box::new(pending.clone())));
 
         #[cfg(target_arch = "wasm32")]
         spawn_order_signature(pending);
-    }
-
-    /// A creation time whose resulting `OrderId` is not one we already hold.
-    ///
-    /// # Why this is needed at all
-    ///
-    /// `OrderId::new` hashes `(seller, listing, created_at_ms, buyer)` -- and
-    /// nothing else. Not the amount, not the script, not the derivation index.
-    /// So two invoices for the same listing, with the same buyer field, whose
-    /// timestamps land in the same MILLISECOND are the same order as far as
-    /// the contract is concerned, and `merge_order` keeps whichever has the
-    /// greater CBOR bytes at equal rank. The loser disappears with no error
-    /// anywhere, taking a derivation index and a payment address that has
-    /// already been shown to somebody.
-    ///
-    /// It is not far-fetched. The buyer field is explicitly optional -- the
-    /// form offers leaving it blank as the normal way to write an invoice
-    /// anyone may pay -- and the timestamp is stamped when the delegate's
-    /// answer is HANDLED, so two invoices issued minutes apart collide if
-    /// their two `OrderAddress` responses arrive in one batch.
-    ///
-    /// Advancing by a millisecond is the cheap fix, and it is a fix rather
-    /// than a mitigation because the id then genuinely differs. The structural
-    /// answer is to fold the derivation index into `OrderId::new`, which the
-    /// delegate guarantees unique -- but that is in `harvest-common`, so it
-    /// re-keys all four artifacts and belongs in a generation of its own.
-    ///
-    /// It only sees invoices THIS client knows about: ones it has queued for
-    /// signing, and ones already in the store state it has loaded. A collision
-    /// with an order issued by another client of the same store is not
-    /// reachable here -- only the same seller can issue on a store, so it
-    /// would take one seller running two clients within a millisecond.
-    fn unused_invoice_timestamp(
-        &self,
-        invoice: &PendingInvoice,
-        from: chrono::DateTime<chrono::Utc>,
-    ) -> chrono::DateTime<chrono::Utc> {
-        use harvest_common::payment::OrderId;
-
-        let known: std::collections::HashSet<OrderId> = self
-            .pending_signatures
-            .iter()
-            .filter_map(|pending| match pending {
-                PendingSignature::Order(order) => Some(order.order.id.clone()),
-                _ => None,
-            })
-            .chain(
-                self.browsing_stores
-                    .get(&invoice.store_contract_id)
-                    .into_iter()
-                    .flat_map(|store| store.orders.iter().map(|o| o.order.id.clone())),
-            )
-            .collect();
-
-        let mut at = from;
-        // Bounded rather than `loop`: a full second of consecutive collisions
-        // is not a state this can reach, and spinning forever in a response
-        // handler would be a worse failure than the one being prevented.
-        for _ in 0..1_000 {
-            let id = OrderId::new(
-                &invoice.seller_fingerprint,
-                &invoice.listing_id,
-                &at,
-                &invoice.buyer_fingerprint,
-            );
-            if !known.contains(&id) {
-                return at;
-            }
-            at += chrono::Duration::milliseconds(1);
-        }
-        warn!("Could not find a free invoice timestamp within a second of {from}");
-        at
     }
 
     /// Publish a new store's contracts, once every input creation needs has
@@ -2972,10 +3942,34 @@ impl AppState {
                 result,
                 evicted,
             } => {
-                let store_contract_id = self.pending_conversation_persists.remove(&request_id);
+                let asked = self.pending_conversation_persists.remove(&request_id);
                 // Said before the write's own outcome: what was discarded is
                 // gone either way, and it is the sharper of the two.
                 self.report_evicted_conversations(evicted);
+                // The delegate SAYING it kept the record is the only thing
+                // that marks it kept, and it is what the buy flow waits on
+                // before letting a buyer pay -- see
+                // `PaymentBlocker::ConversationNotKept`. Marking on dispatch
+                // instead would make a refused write indistinguishable from a
+                // successful one, which is the failure this whole mechanism
+                // exists to prevent.
+                if result.is_ok() {
+                    if let Some((store_contract_id, tag)) = asked.as_ref() {
+                        if let Some(conversation) = self
+                            .browsing_stores
+                            .get_mut(store_contract_id)
+                            .and_then(|store| {
+                                store
+                                    .conversations
+                                    .iter_mut()
+                                    .find(|conversation| conversation.buyer_public_key == *tag)
+                            })
+                        {
+                            conversation.mark_kept();
+                        }
+                    }
+                }
+                let store_contract_id = asked.map(|(store_contract_id, _)| store_contract_id);
                 if let Err(why) = result {
                     let store = store_contract_id
                         .as_deref()
@@ -3330,6 +4324,26 @@ impl AppState {
                             authorized.order.amount_sats
                         );
 
+                        // Tell the buyer which commitment is theirs, if this
+                        // invoice answers a request. Done here rather than
+                        // left as a second thing for the seller to do: a
+                        // published commitment nobody was told about is one
+                        // the buyer cannot recognise, so accepting has to
+                        // produce both halves or neither.
+                        //
+                        // The two are dispatched independently and may land
+                        // in either order. That is safe rather than merely
+                        // tolerable: a buyer holding an acceptance for a
+                        // commitment that has not arrived reads
+                        // `CommitmentNotPublished` and does not pay, which is
+                        // the same answer they would get from a seller who
+                        // never published at all.
+                        self.announce_acceptance(
+                            &pending.store_contract_id,
+                            pending.reply_to,
+                            &authorized.order.id,
+                        );
+
                         #[cfg(target_arch = "wasm32")]
                         {
                             let store_id = pending.store_contract_id;
@@ -3666,20 +4680,27 @@ impl AppState {
         network: BitcoinNetwork,
         state: &freenet_bitcoin_common::BitcoinTipStateV1,
     ) {
-        let recent = state.blocks.recent(8);
+        let recent = state.blocks.recent(RECENT_BLOCKS_KEPT);
         let last_block_time = recent.first().map(|b| b.block_time);
         let view = self.bitcoin.tips.entry(network).or_insert_with(|| TipView {
             network,
             tip_height: None,
+            signed_tip: None,
             last_block_time: None,
             recent_blocks: Vec::new(),
         });
         view.tip_height = state.tip_height();
+        // The signed original, kept alongside the projection: a payment proof
+        // carries one and `tip_height` cannot stand in for it.
+        view.signed_tip = state
+            .tip_height()
+            .and_then(|height| state.blocks.blocks.get(&height).cloned());
         view.last_block_time = last_block_time;
         view.recent_blocks = recent
             .into_iter()
             .map(|b| BlockRow {
                 height: b.anchor.height,
+                hash: b.anchor.hash,
                 tx_count: b.tx_count,
                 block_time: b.block_time,
             })
@@ -3766,12 +4787,26 @@ impl AppState {
             .entry(contract_id)
             .or_insert_with(|| AddressView {
                 network,
+                claims: Vec::new(),
                 scanned_to: None,
                 confirmed_sats: 0,
                 pending_sats: 0,
                 txs: Vec::new(),
             });
         view.network = network;
+        // The signed claims themselves, capped at what a proof may carry.
+        // `scanned` watermarks come first: a `ScannedTo` is what lets a
+        // confirmation attest any depth at all, so dropping those to keep
+        // payment claims would leave a proof that cannot reach the order's
+        // `required_confirmations`.
+        view.claims = state
+            .claims
+            .scanned
+            .values()
+            .chain(state.claims.claims.values())
+            .take(harvest_common::payment::MAX_PROOF_CLAIMS)
+            .cloned()
+            .collect();
         view.scanned_to = state.scanned_to();
         view.confirmed_sats = confirmed_sats;
         view.pending_sats = pending_sats;
@@ -3863,6 +4898,7 @@ impl AppState {
         self.bitcoin.tips.entry(network).or_insert_with(|| TipView {
             network,
             tip_height: None,
+            signed_tip: None,
             last_block_time: None,
             recent_blocks: Vec::new(),
         });
@@ -4042,6 +5078,12 @@ impl BitcoinState {
 pub struct TipView {
     pub network: BitcoinNetwork,
     pub tip_height: Option<u32>,
+    /// The tip entry as the bridge signed it.
+    ///
+    /// A payment proof carries one, and it is what the verifier measures
+    /// confirmation depth against. The projected `tip_height` beside it is
+    /// for display and cannot be put in a proof.
+    pub signed_tip: Option<freenet_bitcoin_common::SignedTipEntry>,
     /// Header timestamp (Bitcoin's clock) of the most recent block. Display
     /// only -- e.g. "X minutes ago" computed against the browser's own
     /// clock, never trusted as authoritative.
@@ -4053,8 +5095,71 @@ pub struct TipView {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlockRow {
     pub height: u32,
+    /// The block's own hash.
+    ///
+    /// Kept because an order's anchor names a height AND a hash, and a check
+    /// that compared only heights would accept an anchor from a chain this
+    /// reader is not on -- which is precisely the case the hash is in the
+    /// anchor for.
+    pub hash: freenet_bitcoin_common::BlockHash,
     pub tx_count: u32,
     pub block_time: u32,
+}
+
+/// How many recent blocks [`TipView`] keeps.
+///
+/// Two consumers, and the larger wins. The Bitcoin panel renders a handful
+/// for display; [`TipView::anchor_is_canonical`] has to be able to answer
+/// about every height a FRESH anchor may name, which is the tip and the
+/// [`harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS`] beneath it. A window that kept fewer would
+/// report a perfectly good anchor as unknown, and unknown reads as "do not
+/// pay" -- so the buy flow would break for no reason a user could see.
+///
+/// Derived from the constant rather than written as a number, so raising the
+/// tolerance cannot silently outgrow the window.
+pub const RECENT_BLOCKS_KEPT: usize = {
+    const DISPLAYED: usize = 8;
+    const FRESH: usize = harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS as usize + 1;
+    if DISPLAYED > FRESH {
+        DISPLAYED
+    } else {
+        FRESH
+    }
+};
+
+impl TipView {
+    /// The anchor a commitment written now should carry.
+    ///
+    /// `None` before this network's tip contract has answered. A seller with
+    /// no tip cannot write a commitment a buyer will pay, which is why
+    /// [`order_for_invoice`] refuses rather than publishing one without.
+    pub fn current_anchor(&self) -> Option<freenet_bitcoin_common::BlockAnchor> {
+        let newest = self.recent_blocks.first()?;
+        Some(freenet_bitcoin_common::BlockAnchor {
+            height: newest.height,
+            hash: newest.hash,
+        })
+    }
+
+    /// Whether `anchor` is on the chain THIS reader sees.
+    ///
+    /// `None` means unknown -- the height is outside the window kept here --
+    /// which is deliberately not the same answer as "not on this chain". A
+    /// caller must treat unknown as a reason to withhold payment rather than
+    /// as evidence of a reorg; the two differ in what the user should be
+    /// told. Same contract as
+    /// `freenet_bitcoin_common::BlockSummariesV1::anchor_is_canonical`, which
+    /// is the authority this mirrors.
+    pub fn anchor_is_canonical(
+        &self,
+        anchor: &freenet_bitcoin_common::BlockAnchor,
+    ) -> Option<bool> {
+        let row = self
+            .recent_blocks
+            .iter()
+            .find(|block| block.height == anchor.height)?;
+        Some(row.hash == anchor.hash)
+    }
 }
 
 /// Live view of one watched address, mirrored from its
@@ -4062,6 +5167,20 @@ pub struct BlockRow {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AddressView {
     pub network: BitcoinNetwork,
+    /// The bridge-signed claims themselves, not just the balances folded out
+    /// of them.
+    ///
+    /// The projection below is what a screen renders; a payment PROOF needs
+    /// the signed originals, and until this field existed nothing in the app
+    /// held them -- so `verify_payment_proof` and the whole bridge-claim
+    /// machinery had nothing to verify, and an order stayed `AwaitingPayment`
+    /// however much had been paid.
+    ///
+    /// Bounded by [`harvest_common::payment::MAX_PROOF_CLAIMS`], because that
+    /// is the most a proof may carry: keeping more would be keeping what
+    /// cannot be used. An address that exceeds it is left un-provable rather
+    /// than curated, which `assemble_on_chain_proof` reports.
+    pub claims: Vec<freenet_bitcoin_common::SignedClaim>,
     /// The highest height any trusted bridge has scanned this script to.
     /// `None` means "not synchronized yet", distinct from "no activity".
     pub scanned_to: Option<u32>,
@@ -4336,7 +5455,7 @@ mod tests {
         PendingSignature::Listing(PendingListing {
             fingerprint: FINGERPRINT.to_string(),
             listing: harvest_common::listing::Listing {
-                id: harvest_common::listing::ListingId([1u8; 16]),
+                id: harvest_common::listing::ListingId([1u8; 32]),
                 title: "Beans".to_string(),
                 description: String::new(),
                 kind: harvest_common::listing::ListingKind::Sale,
@@ -4844,7 +5963,7 @@ mod tests {
     fn listing_with(id: u8, certificate_pem: &str) -> AuthorizedListing {
         AuthorizedListing {
             listing: harvest_common::listing::Listing {
-                id: harvest_common::listing::ListingId([id; 16]),
+                id: harvest_common::listing::ListingId([id; 32]),
                 title: "Beans".to_string(),
                 description: String::new(),
                 kind: harvest_common::listing::ListingKind::Sale,
@@ -4948,11 +6067,11 @@ mod tests {
         );
 
         assert!(
-            !marked.contains(&harvest_common::listing::ListingId([1u8; 16])),
+            !marked.contains(&harvest_common::listing::ListingId([1u8; 32])),
             "a listing carrying the store's own verified certificate is verified"
         );
         assert!(
-            marked.contains(&harvest_common::listing::ListingId([2u8; 16])),
+            marked.contains(&harvest_common::listing::ListingId([2u8; 32])),
             "a listing carrying somebody else's certificate is not"
         );
     }
@@ -4971,7 +6090,7 @@ mod tests {
             &crate::ghostkey_cert::CertificateStatus::Invalid("nope".to_string()),
         );
 
-        assert!(marked.contains(&harvest_common::listing::ListingId([1u8; 16])));
+        assert!(marked.contains(&harvest_common::listing::ListingId([1u8; 32])));
     }
 
     /// State arriving after the deadline fired wins. Treating a store that
@@ -5596,7 +6715,7 @@ mod invoice_tests {
     const STORE_ID: [u8; 32] = [9u8; 32];
 
     fn listing_id() -> ListingId {
-        ListingId::new(SELLER, &chrono::Utc::now(), "Widget")
+        ListingId::from_label("Widget")
     }
 
     fn invoice() -> PendingInvoice {
@@ -5606,6 +6725,8 @@ mod invoice_tests {
             listing_id: listing_id(),
             listing_title: "Widget".to_string(),
             buyer_fingerprint: "buyer-fp".to_string(),
+            reply_to: None,
+            order_binding: None,
             amount_sats: 50_000,
             required_confirmations: 1,
         }
@@ -5617,6 +6738,17 @@ mod invoice_tests {
             network: BitcoinNetwork::Signet,
             script_pubkey: vec![0x00, 0x14, index as u8],
             address: format!("tb1qexample{index}"),
+        }
+    }
+
+    /// A block anchor at `height`, whose hash is a function of the height so
+    /// two different heights never accidentally share one.
+    pub(super) fn anchor(height: u32) -> freenet_bitcoin_common::BlockAnchor {
+        let mut hash = [0u8; 32];
+        hash[..4].copy_from_slice(&height.to_le_bytes());
+        freenet_bitcoin_common::BlockAnchor {
+            height,
+            hash: freenet_bitcoin_common::BlockHash(hash),
         }
     }
 
@@ -5638,7 +6770,46 @@ mod invoice_tests {
             next_index: 0,
         });
         state.bitcoin.payment_xpub_loaded = true;
+        // A seller who cannot see the chain cannot anchor a commitment, and
+        // `order_for_invoice` refuses to publish one without. That is
+        // deliberate, and pinned by
+        // `a_seller_who_cannot_see_the_chain_cannot_issue_an_invoice`; here
+        // it is set up so the other tests exercise the ordinary path.
         state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
+        state
+    }
+
+    /// The height every test in this module treats as the current tip.
+    pub(super) const TIP_HEIGHT: u32 = 800_000;
+
+    /// A tip view holding the window this build actually keeps, newest first.
+    ///
+    /// Sized from [`RECENT_BLOCKS_KEPT`] rather than from a number, so a
+    /// change to the freshness tolerance cannot leave these fixtures too
+    /// small to observe what they attest -- the case where an anchor inside
+    /// the tolerance would fall outside the fixture's window and read as
+    /// unknown.
+    pub(super) fn tip_at(height: u32) -> TipView {
+        TipView {
+            network: BitcoinNetwork::Signet,
+            tip_height: Some(height),
+            signed_tip: None,
+            last_block_time: None,
+            recent_blocks: (0..RECENT_BLOCKS_KEPT as u32)
+                .map(|back| {
+                    let at = anchor(height - back);
+                    BlockRow {
+                        height: at.height,
+                        hash: at.hash,
+                        tx_count: 1,
+                        block_time: 0,
+                    }
+                })
+                .collect(),
+        }
     }
 
     fn address_answer(request_id: u64, index: u32) -> BitcoinDelegateResponse {
@@ -5681,8 +6852,13 @@ mod invoice_tests {
     /// store parameter.
     #[test]
     fn an_issued_invoice_names_the_bridges_that_can_settle_it() {
-        let order = order_for_invoice(&invoice(), &derived(0), chrono::Utc::now())
-            .expect("the build's constants must be usable");
+        let order = order_for_invoice(
+            &invoice(),
+            &derived(0),
+            Some(anchor(800_000)),
+            chrono::Utc::now(),
+        )
+        .expect("the build's constants must be usable");
 
         assert!(
             !order.trusted_bridges.is_empty(),
@@ -5702,13 +6878,85 @@ mod invoice_tests {
         );
     }
 
+    /// **An invoice carries the seller's own view of the chain tip.**
+    ///
+    /// The anchor is what lets a buyer tell how recently the seller took the
+    /// order on. `created_at` cannot do that job: the seller stamps it, and a
+    /// seller-chosen timestamp as a freshness source is the mistake this
+    /// repository has made and corrected three times.
+    #[test]
+    fn an_issued_invoice_carries_a_block_anchor() {
+        let mut state = seller_with_a_store();
+        state.issue_invoice(invoice()).expect("accepted");
+        let request_id = *state.pending_invoices.keys().next().expect("one entry");
+        state.on_bitcoin_delegate_response(address_answer(request_id, 0));
+
+        let queued = state
+            .pending_signatures
+            .iter()
+            .find_map(|pending| match pending {
+                PendingSignature::Order(order) => Some(order.order.clone()),
+                _ => None,
+            })
+            .expect("an invoice should be queued for signing");
+
+        assert_eq!(
+            queued.anchor,
+            Some(anchor(TIP_HEIGHT)),
+            "the invoice must be anchored to the newest block the seller can see"
+        );
+    }
+
+    /// **A seller who cannot see the chain issues nothing at all.**
+    ///
+    /// The alternative is worse than it looks: an unanchored invoice is one
+    /// every buyer's software refuses (`payment_blockers` answers
+    /// `AnchorMissing`), so the seller would be showing somebody a bill that
+    /// silently cannot be paid -- the same shape as the bridge-less invoices
+    /// that made every early store permanently unable to take money.
+    ///
+    /// Observed red by making `order_for_invoice` fall back to
+    /// `anchor: None` instead of refusing:
+    ///
+    /// ```text
+    /// panicked at ui/src/state.rs:5883:9:
+    /// an invoice with no anchor must not reach the signing queue
+    /// ```
+    #[test]
+    fn a_seller_who_cannot_see_the_chain_cannot_issue_an_invoice() {
+        let mut state = seller_with_a_store();
+        state.bitcoin.tips.clear();
+        state.issue_invoice(invoice()).expect("accepted");
+        let request_id = *state.pending_invoices.keys().next().expect("one entry");
+        state.on_bitcoin_delegate_response(address_answer(request_id, 0));
+
+        assert!(
+            state.pending_signatures.is_empty(),
+            "an invoice with no anchor must not reach the signing queue"
+        );
+        let notice = state
+            .notifications
+            .last()
+            .expect("the seller must be told why nothing was issued");
+        assert!(
+            notice.contains("Bitcoin block"),
+            "the notice must name what is missing: {notice}"
+        );
+    }
+
     /// The address the delegate derived has to be the one the invoice
     /// actually asks the buyer to pay, in BOTH forms -- verification uses the
     /// script and the buyer reads the address.
     #[test]
     fn an_issued_invoice_carries_the_derived_destination() {
         let derived = derived(3);
-        let order = order_for_invoice(&invoice(), &derived, chrono::Utc::now()).expect("build");
+        let order = order_for_invoice(
+            &invoice(),
+            &derived,
+            Some(anchor(800_000)),
+            chrono::Utc::now(),
+        )
+        .expect("build");
 
         assert_eq!(order.payment_script_pubkey, derived.script_pubkey);
         assert_eq!(order.payment_address, derived.address);
@@ -5999,61 +7247,54 @@ mod invoice_tests {
         );
     }
 
-    /// The same guard has to see orders already published to the store, not
-    /// just ones queued locally -- a page that has loaded the store's state
-    /// knows about invoices from earlier sessions, and re-issuing one of their
-    /// ids would replace a live invoice rather than adding one.
+    /// **Two invoices for one listing are two orders, because their
+    /// destinations differ.**
+    ///
+    /// This replaces three tests of `unused_invoice_timestamp`, a
+    /// collision-avoidance dance that is now deleted. It existed because
+    /// `OrderId` hashed only `(seller, listing, created_at_ms, buyer)`, so two
+    /// invoices for one listing in one millisecond WERE one order and one of
+    /// them silently vanished on merge -- taking a derivation index and an
+    /// address already shown to somebody. The id now covers the whole terms,
+    /// and the delegate hands out a distinct payment address per invoice, so
+    /// the collision it guarded is not reachable and the guard's own
+    /// timestamp-advancing behaviour is no longer a thing to test.
+    ///
+    /// Asserted at the same instant, which is the case the old guard existed
+    /// for.
     #[test]
-    fn an_id_already_on_the_store_is_avoided() {
-        let mut state = seller_with_a_store();
+    fn two_invoices_at_one_instant_are_two_orders() {
         let mut anonymous = invoice();
         anonymous.buyer_fingerprint = String::new();
-
-        // An order already on the store, carrying exactly the id a new
-        // invoice stamped at `now` would take.
         let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
-        let published = order_for_invoice(&anonymous, &derived(0), now).expect("build");
-        let collides = published.id.clone();
-        state
-            .browsing_stores
-            .entry(anonymous.store_contract_id.clone())
-            .or_default()
-            .orders
-            .push(authorize_new_order(published, Vec::new(), Vec::new()));
 
-        let at = state.unused_invoice_timestamp(&anonymous, now);
+        let one =
+            order_for_invoice(&anonymous, &derived(0), Some(anchor(800_000)), now).expect("build");
+        let other =
+            order_for_invoice(&anonymous, &derived(1), Some(anchor(800_000)), now).expect("build");
 
-        assert_ne!(at, now, "the guard must move off a timestamp already taken");
+        assert_ne!(one.payment_address, other.payment_address);
         assert_ne!(
-            harvest_common::payment::OrderId::new(
-                &anonymous.seller_fingerprint,
-                &anonymous.listing_id,
-                &at,
-                &anonymous.buyer_fingerprint,
-            ),
-            collides
+            one.id, other.id,
+            "two invoices sharing an id means one of them silently vanishes on merge"
         );
     }
 
-    /// A store we have never loaded, or an unrelated one, must not constrain
-    /// the timestamp -- otherwise the guard would be scanning the wrong set
-    /// and would look like it worked while checking nothing.
+    /// **An issued invoice carries the id its own terms give.**
+    ///
+    /// The seller's half of the rule the contract enforces: an order stamped
+    /// any other way is one `AuthorizedOrder::verify` refuses, so it would be
+    /// signed, published and then rejected by every peer with nothing on the
+    /// seller's screen saying why.
     #[test]
-    fn an_unrelated_stores_orders_do_not_move_the_timestamp() {
-        let mut state = seller_with_a_store();
-        let mut anonymous = invoice();
-        anonymous.buyer_fingerprint = String::new();
-
+    fn an_issued_invoice_carries_the_id_its_terms_give() {
         let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
-        let published = order_for_invoice(&anonymous, &derived(0), now).expect("build");
-        state
-            .browsing_stores
-            .entry(vec![77u8; 32])
-            .or_default()
-            .orders
-            .push(authorize_new_order(published, Vec::new(), Vec::new()));
-
-        assert_eq!(state.unused_invoice_timestamp(&anonymous, now), now);
+        let order =
+            order_for_invoice(&invoice(), &derived(0), Some(anchor(800_000)), now).expect("build");
+        assert_eq!(
+            order.id,
+            harvest_common::payment::OrderId::from_terms(&order)
+        );
     }
 
     /// A rejected key is reported verbatim: every rejection the delegate can
@@ -6086,9 +7327,9 @@ mod authorized_order_tests {
 
     fn order() -> Order {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
-        let listing_id = ListingId::new("seller", &created_at, "Widget");
+        let listing_id = ListingId::from_label("Widget");
         Order {
-            id: OrderId::new("seller", &listing_id, &created_at, "buyer"),
+            id: OrderId([0u8; 32]),
             listing_id,
             buyer_fingerprint: "buyer".to_string(),
             seller_fingerprint: "seller".to_string(),
@@ -6100,8 +7341,11 @@ mod authorized_order_tests {
             payment_hash: None,
             trusted_bridges: vec![freenet_bitcoin_common::BridgeId([3u8; 32])],
             bitcoin_address_code_hash: None,
+            anchor: None,
+            order_binding: None,
             created_at,
         }
+        .with_derived_id()
     }
 
     /// A seller may say what is owed and where; they may NOT say it was paid.
@@ -7228,6 +8472,7 @@ mod buyer_persistence_tests {
             conversation_id,
             buyer_to_seller: conversation_key_from_dh(&shared, MessageDirection::BuyerToSeller),
             seller_to_buyer: conversation_key_from_dh(&shared, MessageDirection::SellerToBuyer),
+            order_binding: harvest_common::mailbox::order_binding_from_secret(&secret.to_bytes()),
             created_at,
             // A conversation just handed to the delegate has not been saved
             // anywhere by the buyer, and was opened here rather than
@@ -7307,7 +8552,11 @@ mod buyer_persistence_tests {
         state
             .compose_to_seller(STORE, &seller_public(), "hello".into())
             .expect("compose");
-        let asked: Vec<&Vec<u8>> = state.pending_conversation_persists.values().collect();
+        let asked: Vec<&Vec<u8>> = state
+            .pending_conversation_persists
+            .values()
+            .map(|(store_contract_id, _)| store_contract_id)
+            .collect();
         assert_eq!(
             asked,
             vec![&STORE.to_vec()],
@@ -7853,6 +9102,7 @@ mod buyer_backup_tests {
             conversation_id: [seed; 32],
             buyer_to_seller: [seed; 32],
             seller_to_buyer: [seed; 32],
+            order_binding: harvest_common::mailbox::order_binding_from_secret(&[seed; 32]),
             created_at: 1_700_000_000 + seed as i64,
             imported: false,
             backed_up,
@@ -8573,5 +9823,2235 @@ mod nonce_collision_tests {
             "the seller's own reply was removed from their own mailbox"
         );
         assert!(seller.unconfirmed_sent(STORE).is_empty());
+    }
+}
+
+/// The buy flow, from the buyer's side: what has to be true before their
+/// software will let them part with money.
+///
+/// `docs/design/incentive-mechanism.md` Part 5 steps 3 and 5, and the
+/// ordering constraint recorded in `docs/buyer-conversation-persistence.md`:
+/// the buyer persists what protects them, confirms the persistence, and only
+/// then pays.
+#[cfg(test)]
+mod buy_flow_tests {
+    use super::invoice_tests::{anchor, tip_at, TIP_HEIGHT};
+    use super::*;
+    use crate::messaging::{BuyerConversation, ConversationKeys};
+    use ed25519_dalek::{Signer, SigningKey};
+    use freenet_bitcoin_common::BitcoinNetwork;
+    use harvest_common::listing::ListingId;
+    use harvest_common::mailbox::EncryptedMessage;
+    use harvest_common::payment::{
+        AuthorizedOrder, Order, OrderId, OrderStatus, MAX_ANCHOR_AGE_BLOCKS,
+    };
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    const STORE: &[u8] = &[7u8; 32];
+
+    /// A real signet address, the BIP-173 test vector this repository already
+    /// uses in `components::bitcoin_view`.
+    ///
+    /// The fixture's `payment_script_pubkey` is DERIVED from it rather than
+    /// written out, so the two cannot drift into the disagreement that
+    /// `PaymentBlocker::DestinationDisagrees` exists to refuse -- which would
+    /// otherwise make every fixture here unpayable for a reason unrelated to
+    /// what the test is about.
+    const PAYMENT_ADDRESS: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+
+    /// A different, equally valid signet address (the BIP-173 P2WSH vector),
+    /// for the case where the two disagree.
+    const ANOTHER_ADDRESS: &str = "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7";
+
+    fn script_of(address: &str) -> Vec<u8> {
+        crate::gateway::bitcoin_address::address_to_script_pubkey(address, BitcoinNetwork::Signet)
+            .expect("a known-good signet address")
+    }
+
+    /// Re-stamp and re-sign a commitment whose terms a test has edited.
+    ///
+    /// Both halves are needed and forgetting either is a test that passes for
+    /// the wrong reason: the id is derived from the terms, and the signature
+    /// is over them.
+    fn resigned(mut order: AuthorizedOrder, signing_key: &SigningKey) -> AuthorizedOrder {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        order.order = order.order.with_derived_id();
+        let message = harvest_common::to_cbor(&order.order).expect("serialize order");
+        let scoped = ghostkey_common::ScopedPayload {
+            requestor: ghostkey_common::SignatureRequestor::WebApp(
+                harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                    .parse::<ContractInstanceId>()
+                    .expect("canonical webapp id"),
+            ),
+            payload: message,
+        };
+        order.scoped_payload = harvest_common::to_cbor(&scoped).expect("serialize scoped");
+        order.signature = signing_key.sign(&order.scoped_payload).to_bytes().to_vec();
+        order
+    }
+
+    fn seller_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[21u8; 32])
+    }
+
+    fn seller_encryption_secret() -> StaticSecret {
+        StaticSecret::from([22u8; 32])
+    }
+
+    fn seller_encryption_key() -> [u8; 32] {
+        *PublicKey::from(&seller_encryption_secret()).as_bytes()
+    }
+
+    /// The keys the seller's delegate would answer for one conversation tag.
+    /// Built from the raw X25519 secret rather than from `BuyerConversation`,
+    /// so a test cannot pass because the two halves drifted together.
+    fn seller_keys_for(tag: &[u8; 32]) -> ConversationKeys {
+        let shared = seller_encryption_secret()
+            .diffie_hellman(&PublicKey::from(*tag))
+            .to_bytes();
+        ConversationKeys::from_shared_secret(&shared)
+    }
+
+    /// A published commitment, signed the way the invoice flow signs one.
+    ///
+    /// `what` varies the listing, and therefore the order id, so a test can
+    /// hold two distinct commitments from one seller.
+    fn commitment_for(
+        what: &str,
+        signing_key: &SigningKey,
+        anchor_at: Option<freenet_bitcoin_common::BlockAnchor>,
+        status: OrderStatus,
+        order_binding: Option<[u8; 32]>,
+    ) -> AuthorizedOrder {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let listing_id = ListingId::from_label(what);
+        let order = Order {
+            id: OrderId([0u8; 32]),
+            listing_id,
+            // Empty, and that is the point: a buyer has no identity to name.
+            buyer_fingerprint: String::new(),
+            seller_fingerprint: "seller-fp".to_string(),
+            amount_sats: 50_000,
+            network: BitcoinNetwork::Signet,
+            payment_script_pubkey: script_of(PAYMENT_ADDRESS),
+            payment_address: PAYMENT_ADDRESS.to_string(),
+            required_confirmations: 1,
+            payment_hash: None,
+            // The bridge this build actually trusts, derived rather than
+            // invented: an invoice naming any other is refused
+            // (`PaymentBlocker::BridgeNotRecognised`), so a made-up id here
+            // would make every fixture unpayable.
+            trusted_bridges: crate::gateway::bitcoin_config::default_trusted_bridges(
+                BitcoinNetwork::Signet,
+            )
+            .expect("the build's own bridge constant must parse"),
+            bitcoin_address_code_hash: Some([4u8; 32]),
+            anchor: anchor_at,
+            order_binding,
+            created_at,
+        }
+        .with_derived_id();
+        let message = harvest_common::to_cbor(&order).expect("serialize order");
+        let scoped = ghostkey_common::ScopedPayload {
+            requestor: ghostkey_common::SignatureRequestor::WebApp(
+                harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                    .parse::<ContractInstanceId>()
+                    .expect("canonical webapp id"),
+            ),
+            payload: message,
+        };
+        let scoped_payload = harvest_common::to_cbor(&scoped).expect("serialize scoped");
+        let signature = signing_key.sign(&scoped_payload).to_bytes().to_vec();
+        AuthorizedOrder {
+            order,
+            scoped_payload,
+            signature,
+            status,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        }
+    }
+
+    /// [`commitment_for`] with a binding of the caller's choosing.
+    fn commitment_bound_to(
+        signing_key: &SigningKey,
+        anchor_at: Option<freenet_bitcoin_common::BlockAnchor>,
+        status: OrderStatus,
+        order_binding: Option<[u8; 32]>,
+    ) -> AuthorizedOrder {
+        commitment_for("Widget", signing_key, anchor_at, status, order_binding)
+    }
+
+    /// The conversation every single-buyer test uses.
+    ///
+    /// Fixed rather than random so a commitment fixture can be bound to it
+    /// without threading the conversation through every call.
+    fn the_buyers_conversation() -> BuyerConversation {
+        BuyerConversation::opened_from_secret_for_test(&[41u8; 32], &seller_encryption_key())
+            .expect("open")
+    }
+
+    /// [`commitment_for`] with the listing every single-order test uses,
+    /// bound to [`the_buyers_conversation`].
+    fn commitment(
+        signing_key: &SigningKey,
+        anchor_at: Option<freenet_bitcoin_common::BlockAnchor>,
+        status: OrderStatus,
+    ) -> AuthorizedOrder {
+        commitment_for(
+            "Widget",
+            signing_key,
+            anchor_at,
+            status,
+            Some(the_buyers_conversation().order_binding()),
+        )
+    }
+
+    /// An `AppState` browsing `STORE`, and a conversation with a fresh
+    /// ephemeral secret. The state does not yet hold the conversation --
+    /// [`buyer_holding`] is what puts them together.
+    fn buyer_conversation() -> (AppState, BuyerConversation) {
+        let mut state = AppState::default();
+        state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
+        state.begin_browsing(STORE.to_vec());
+        (
+            state,
+            BuyerConversation::open(&seller_encryption_key()).expect("open"),
+        )
+    }
+
+    /// Move a commitment to `Cancelled`, signed the way the contract demands
+    /// -- over `(order id, status)`, not over the order terms.
+    fn cancel(order: &mut AuthorizedOrder, signing_key: &SigningKey) {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        order.status = OrderStatus::Cancelled;
+        let message = harvest_common::to_cbor(&(order.order.id.clone(), order.status))
+            .expect("serialize the status");
+        let scoped = ghostkey_common::ScopedPayload {
+            requestor: ghostkey_common::SignatureRequestor::WebApp(
+                harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                    .parse::<ContractInstanceId>()
+                    .expect("canonical webapp id"),
+            ),
+            payload: message,
+        };
+        let scoped_payload = harvest_common::to_cbor(&scoped).expect("serialize scoped");
+        order.status_signature = Some(signing_key.sign(&scoped_payload).to_bytes().to_vec());
+        order.status_scoped_payload = Some(scoped_payload);
+    }
+
+    /// Put a buyer, their conversation and one published commitment together,
+    /// with the seller's acceptance already in the mailbox.
+    ///
+    /// `kept` is whether this node's delegate has confirmed it is keeping the
+    /// conversation. It is a parameter rather than something a test pokes
+    /// afterwards, so `mark_kept` stays reachable only from the delegate's
+    /// own answer.
+    fn buyer_holding_with(
+        mut state: AppState,
+        mut conversation: BuyerConversation,
+        published: &AuthorizedOrder,
+        kept: bool,
+    ) -> AppState {
+        let tag = conversation.buyer_public_key;
+        if kept {
+            conversation.mark_kept();
+        }
+        let acceptance = crate::messaging::seal_order_accepted(
+            &seller_keys_for(&tag),
+            &tag,
+            &conversation.conversation_id,
+            &published.order.id,
+        )
+        .expect("the seller seals their acceptance");
+
+        let store = state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("begin_browsing creates it");
+        store.seller_verifying_key = Some(seller_signing_key().verifying_key().to_bytes());
+        store.orders = vec![published.clone()];
+        store.conversations = vec![conversation];
+        store.mailbox_messages = vec![acceptance];
+        state
+    }
+
+    /// [`buyer_holding_with`] for the ordinary case: the node has confirmed
+    /// it is keeping the conversation.
+    fn buyer_holding(
+        state: AppState,
+        conversation: BuyerConversation,
+        published: &AuthorizedOrder,
+    ) -> AppState {
+        buyer_holding_with(state, conversation, published, true)
+    }
+
+    /// A buyer who has asked to buy, been accepted, and whose node has
+    /// confirmed it is keeping the conversation. Everything each test below
+    /// does is to take one of those away.
+    fn buyer_after_acceptance(commitment: &AuthorizedOrder) -> (AppState, [u8; 32]) {
+        buyer_after_acceptance_with(commitment, true)
+    }
+
+    fn buyer_after_acceptance_with(
+        commitment: &AuthorizedOrder,
+        kept: bool,
+    ) -> (AppState, [u8; 32]) {
+        let (state, _) = buyer_conversation();
+        let conversation = the_buyers_conversation();
+        let tag = conversation.buyer_public_key;
+        (
+            buyer_holding_with(state, conversation, commitment, kept),
+            tag,
+        )
+    }
+
+    fn purchases(state: &AppState) -> Vec<BuyerPurchase> {
+        state.buyer_purchases(STORE)
+    }
+
+    /// The seller's half: a store they own, a buyer's request already in
+    /// their mailbox, and the conversation key their delegate answered.
+    fn seller_holding_a_request() -> (AppState, [u8; 32], EncryptedMessage) {
+        use crate::messaging::BuyerConversation;
+
+        let mut state = AppState::default();
+        state.my_stores.insert(
+            "seller-fp".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+            }],
+        );
+        state.bitcoin.payment_xpub = Some(harvest_common::PaymentXpubStatus {
+            xpub: "vpub-placeholder".to_string(),
+            network: BitcoinNetwork::Signet,
+            next_index: 0,
+        });
+        state.bitcoin.payment_xpub_loaded = true;
+        state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
+
+        let buyer = BuyerConversation::open(&seller_encryption_key()).expect("open");
+        let tag = buyer.buyer_public_key;
+        let request = buyer
+            .request_order(
+                &ListingId([3u8; 32]),
+                2,
+                "12 Example St".into(),
+                String::new(),
+            )
+            .expect("seal the request");
+
+        state.begin_browsing(STORE.to_vec());
+        let store = state.browsing_stores.get_mut(STORE).expect("the store");
+        store.mailbox_contract_id = Some(vec![11u8; 32]);
+        store.mailbox_messages = vec![request.clone()];
+        state
+            .conversation_keys
+            .insert(tag.to_vec(), seller_keys_for(&tag));
+        (state, tag, request)
+    }
+
+    fn invoice_answering(tag: [u8; 32]) -> PendingInvoice {
+        PendingInvoice {
+            store_contract_id: STORE.to_vec(),
+            seller_fingerprint: "seller-fp".to_string(),
+            listing_id: ListingId([3u8; 32]),
+            listing_title: "Widget".to_string(),
+            buyer_fingerprint: String::new(),
+            amount_sats: 50_000,
+            required_confirmations: 1,
+            reply_to: Some(tag),
+            order_binding: Some(the_buyers_conversation().order_binding()),
+        }
+    }
+
+    /// **Accepting a request tells the buyer which commitment is theirs.**
+    ///
+    /// The buyer cannot derive the order id -- it hashes a `created_at` the
+    /// seller stamps -- so an acceptance that did not name it would leave the
+    /// buyer looking at a public order book with no way to tell which entry
+    /// they are supposed to pay.
+    ///
+    /// Read back through the BUYER's own conversation rather than by
+    /// inspecting what the seller composed, because the buyer's side is the
+    /// one that has to work.
+    #[test]
+    fn accepting_a_request_tells_the_buyer_which_commitment_is_theirs() {
+        let (state, tag, _) = seller_holding_a_request();
+        let buyer_keys = seller_keys_for(&tag);
+
+        let published = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let sealed = state
+            .acceptance_for(STORE, &tag, &published.order.id)
+            .expect("the seller can answer a request they hold the key for");
+
+        // The buyer, holding only their own conversation, reads it.
+        let thread = decrypt_as_buyer(&buyer_keys, &tag, &sealed);
+        assert_eq!(
+            thread,
+            Some(published.order.id.clone()),
+            "the acceptance must name the published commitment"
+        );
+    }
+
+    /// **A request whose key the seller no longer holds is refused, not
+    /// silently skipped.**
+    ///
+    /// The alternative is a published commitment nobody was ever told about:
+    /// the seller believes they accepted, and the buyer sees an order book
+    /// entry they cannot recognise as their own.
+    #[test]
+    fn an_acceptance_with_no_conversation_key_is_an_error() {
+        let (state, _, _) = seller_holding_a_request();
+        let published = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+
+        let refused = state.acceptance_for(STORE, &[0xcd; 32], &published.order.id);
+        assert!(
+            refused.is_err(),
+            "a tag with no key must not produce a message"
+        );
+    }
+
+    /// **The published invoice, and the acceptance, both come out of one
+    /// click.**
+    ///
+    /// The whole seller path: request in hand, accept, and the acceptance is
+    /// recorded as the seller's own outgoing message. Publishing the
+    /// commitment itself needs a browser and is not exercised here; what this
+    /// pins is that accepting produces the message that makes the commitment
+    /// findable, rather than leaving that to a second manual step nobody
+    /// takes.
+    #[test]
+    fn accepting_records_the_acceptance_as_the_sellers_own_message() {
+        let (mut state, tag, _) = seller_holding_a_request();
+        state
+            .issue_invoice(invoice_answering(tag))
+            .expect("the seller owns this store");
+        let request_id = *state.pending_invoices.keys().next().expect("one entry");
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::OrderAddress {
+            request_id,
+            result: Ok(harvest_common::DerivedAddress {
+                index: 0,
+                network: BitcoinNetwork::Signet,
+                script_pubkey: vec![0x00, 0x14, 0x01],
+                address: "tb1qexample".to_string(),
+            }),
+        });
+        let queued = match state.pending_signatures.front() {
+            Some(PendingSignature::Order(order)) => order.clone(),
+            other => panic!("expected an order awaiting signature, got {other:?}"),
+        };
+        assert_eq!(
+            queued.reply_to,
+            Some(tag),
+            "the invoice must remember which request it answers"
+        );
+
+        state.on_ghostkey_response(order_sign_result(&queued));
+
+        let sent = &state.browsing_stores[STORE].sent_messages;
+        assert_eq!(sent.len(), 1, "accepting writes one message to the buyer");
+        assert!(
+            sent[0].text.contains(&queued.order.id.short()),
+            "the seller's own record should name the order: {}",
+            sent[0].text
+        );
+    }
+
+    /// A `SignResult` shaped the way the ghostkey delegate answers.
+    fn order_sign_result(pending: &PendingOrder) -> ghostkey_common::GhostkeyResponse {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let message = harvest_common::to_cbor(&pending.order).expect("serialize");
+        let scoped = ghostkey_common::ScopedPayload {
+            requestor: ghostkey_common::SignatureRequestor::WebApp(
+                harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                    .parse::<ContractInstanceId>()
+                    .expect("canonical webapp id"),
+            ),
+            payload: message,
+        };
+        let scoped_payload = harvest_common::to_cbor(&scoped).expect("serialize scoped");
+        let signature = seller_signing_key()
+            .sign(&scoped_payload)
+            .to_bytes()
+            .to_vec();
+        ghostkey_common::GhostkeyResponse::SignResult {
+            scoped_payload,
+            signature,
+            certificate_pem: String::new(),
+        }
+    }
+
+    /// What the buyer makes of one sealed message: the order id it names, or
+    /// `None` if they cannot read it or it is not an acceptance.
+    fn decrypt_as_buyer(
+        keys: &ConversationKeys,
+        tag: &[u8; 32],
+        sealed: &EncryptedMessage,
+    ) -> Option<OrderId> {
+        let plaintext = crate::messaging::decrypt_message(sealed, &keys.from_seller).ok()?;
+        let _ = tag;
+        match plaintext.content {
+            crate::messaging::MessageContent::OrderAccepted { order_id } => Some(order_id),
+            _ => None,
+        }
+    }
+
+    /// **Asking to buy opens a conversation and asks the node to keep it.**
+    ///
+    /// The request is the buyer's first message, so it is also the moment the
+    /// key that reads the seller's answer comes into existence. Leaving the
+    /// keep to a later message would mean the acceptance -- and, in Phase 2,
+    /// the confession -- arriving against a key nothing durable holds.
+    #[test]
+    fn asking_to_buy_opens_a_conversation_and_asks_the_node_to_keep_it() {
+        let mut state = AppState::default();
+        state.begin_browsing(STORE.to_vec());
+        state.harvest_delegate_key = Some(freenet_stdlib::prelude::DelegateKey::new(
+            [0xA1; 32],
+            freenet_stdlib::prelude::CodeHash::new([0xA1; 32]),
+        ));
+
+        let listing = ListingId([3u8; 32]);
+        let sealed = state
+            .request_order(
+                STORE,
+                &seller_encryption_key(),
+                &listing,
+                2,
+                "12 Example St".to_string(),
+                String::new(),
+            )
+            .expect("a request should be sealable");
+
+        assert_eq!(
+            state.browsing_stores[STORE].conversations.len(),
+            1,
+            "the request opens the conversation it will be answered in"
+        );
+        let tag = state.browsing_stores[STORE].conversations[0].buyer_public_key;
+        assert_eq!(
+            state
+                .pending_conversation_persists
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![(STORE.to_vec(), tag)],
+            "the node must be asked to keep the key that reads the answer"
+        );
+
+        // And what was sealed is a request the seller can actually read.
+        let seller_keys = seller_keys_for(&tag);
+        let mut keys = std::collections::HashMap::new();
+        keys.insert(tag.to_vec(), seller_keys);
+        let inbox = crate::messaging::read_mailbox(&[sealed], &keys);
+        match &inbox[0] {
+            crate::messaging::MailboxEntry::Readable {
+                content:
+                    crate::messaging::MessageContent::OrderRequest {
+                        listing_id,
+                        quantity,
+                        shipping,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(listing_id, &listing);
+                assert_eq!(*quantity, 2);
+                assert_eq!(shipping, "12 Example St");
+            }
+            other => panic!("expected an order request, got {other:?}"),
+        }
+    }
+
+    /// **A request continues the thread rather than forking a new one.**
+    ///
+    /// Same reasoning as an ordinary message: a seller who cannot connect the
+    /// request to the question that preceded it is looking at two strangers.
+    #[test]
+    fn a_request_continues_the_conversation_already_open() {
+        let mut state = AppState::default();
+        state.begin_browsing(STORE.to_vec());
+        state.harvest_delegate_key = Some(freenet_stdlib::prelude::DelegateKey::new(
+            [0xA1; 32],
+            freenet_stdlib::prelude::CodeHash::new([0xA1; 32]),
+        ));
+        state
+            .compose_to_seller(STORE, &seller_encryption_key(), "is this in stock?".into())
+            .expect("first message");
+        let tag = state.browsing_stores[STORE].conversations[0].buyer_public_key;
+
+        state
+            .request_order(
+                STORE,
+                &seller_encryption_key(),
+                &ListingId([3u8; 32]),
+                1,
+                "12 Example St".to_string(),
+                String::new(),
+            )
+            .expect("request");
+
+        assert_eq!(state.browsing_stores[STORE].conversations.len(), 1);
+        assert_eq!(
+            state.browsing_stores[STORE].conversations[0].buyer_public_key,
+            tag
+        );
+    }
+
+    /// **A request for nothing, or to nowhere, is refused before it is sent.**
+    ///
+    /// A zero quantity would have the seller invoicing for an amount the
+    /// buyer never agreed to, and a request with no destination cannot be
+    /// fulfilled at all -- both are better refused beside the box than
+    /// discovered by a seller who has already published a commitment.
+    #[test]
+    fn an_empty_request_is_refused() {
+        let mut state = AppState::default();
+        state.begin_browsing(STORE.to_vec());
+
+        let none = state.request_order(
+            STORE,
+            &seller_encryption_key(),
+            &ListingId([3u8; 32]),
+            0,
+            "12 Example St".to_string(),
+            String::new(),
+        );
+        assert!(none.is_err(), "a quantity of zero is not an order");
+
+        let nowhere = state.request_order(
+            STORE,
+            &seller_encryption_key(),
+            &ListingId([3u8; 32]),
+            1,
+            "   ".to_string(),
+            String::new(),
+        );
+        assert!(nowhere.is_err(), "an order has to go somewhere");
+
+        assert!(
+            state.browsing_stores[STORE].conversations.is_empty(),
+            "a refused request must not leave a conversation behind"
+        );
+    }
+
+    /// **One published commitment is payable by exactly one buyer.**
+    ///
+    /// The hole this closes, found in review: nothing in the commitment named
+    /// anything only one buyer could satisfy, so a seller could accept one
+    /// order, publish one commitment, and send the same `OrderAccepted` down
+    /// any number of conversations. Every buyer's software cleared every
+    /// check and showed them the same payment address. One declared debt
+    /// collected unbounded money -- which inverts the mechanism the
+    /// commitment exists for, since a count that does not bound the money is
+    /// not a count of anything.
+    ///
+    /// Alice and Bob are separate `AppState`s with separate conversations and
+    /// separate ephemeral secrets, both pointed at the one commitment. The
+    /// commitment is bound to Alice.
+    #[test]
+    fn one_commitment_is_payable_by_exactly_one_buyer() {
+        let (alice, alice_conversation) = buyer_conversation();
+        let published = commitment_bound_to(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+            Some(alice_conversation.order_binding()),
+        );
+
+        let alice = buyer_holding(alice, alice_conversation, &published);
+        let (bob, bob_conversation) = buyer_conversation();
+        let bob = buyer_holding(bob, bob_conversation, &published);
+
+        assert_eq!(
+            purchases(&alice)[0].blockers,
+            Vec::new(),
+            "the buyer it was issued to can pay it"
+        );
+        assert_eq!(
+            purchases(&bob)[0].blockers,
+            vec![PaymentBlocker::CommitmentNotForThisBuyer],
+            "and nobody else can"
+        );
+    }
+
+    /// **A commitment carrying no binding at all is refused.**
+    ///
+    /// Absence must not read as "matches". `Order::order_binding` is
+    /// `Option` for the same wire-compatibility reason the anchor is, so the
+    /// unbound case is reachable and has to fail closed.
+    #[test]
+    fn a_commitment_with_no_binding_is_refused() {
+        let (state, conversation) = buyer_conversation();
+        let published = commitment_bound_to(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+            None,
+        );
+        let state = buyer_holding(state, conversation, &published);
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::CommitmentNotForThisBuyer]
+        );
+    }
+
+    /// **The binding the buyer checks against is their own, not the one in
+    /// the mailbox.**
+    ///
+    /// Direction is not authorship, so a seller can seal a request into the
+    /// buyer's own thread -- the weakness `CommitmentNotRequested` already
+    /// documents. If the check compared the commitment against the binding in
+    /// that request, the seller would simply forge a request carrying the
+    /// binding they published, and the check would pass for every buyer at
+    /// once. It has to compare against the value this node derives from its
+    /// own conversation secret, which no message can influence.
+    #[test]
+    fn a_forged_request_cannot_supply_the_binding_the_check_uses() {
+        let (alice, alice_conversation) = buyer_conversation();
+        let (_, other_conversation) = buyer_conversation();
+        let published = commitment_bound_to(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+            // Bound to somebody else entirely.
+            Some(other_conversation.order_binding()),
+        );
+        let tag = alice_conversation.buyer_public_key;
+        let conversation_id = alice_conversation.conversation_id.clone();
+        let mut alice = buyer_holding(alice, alice_conversation, &published);
+
+        // The seller seals a request into Alice's thread, in the
+        // buyer-to-seller direction, carrying the binding they published.
+        let forged = crate::messaging::seal_for_test(
+            &seller_keys_for(&tag).to_seller,
+            &tag,
+            &conversation_id,
+            crate::messaging::MessageContent::OrderRequest {
+                listing_id: published.order.listing_id.clone(),
+                quantity: 1,
+                shipping: "anywhere".into(),
+                note: String::new(),
+                order_binding: other_conversation.order_binding(),
+            },
+        )
+        .expect("seal");
+        alice
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .mailbox_messages
+            .push(forged);
+
+        assert_eq!(
+            purchases(&alice)[0].blockers,
+            vec![PaymentBlocker::CommitmentNotForThisBuyer],
+            "a request the seller wrote must not decide what the buyer compares against"
+        );
+    }
+
+    /// **The binding this browser computes is the shared derivation, applied
+    /// to the secret it just generated.**
+    ///
+    /// The other half of the cross-crate seam lives in the delegate
+    /// (`recall_answers_the_binding_the_shared_derivation_gives`). Neither
+    /// side tests the other -- they cannot, they are different crates on
+    /// different machines -- so each is pinned to
+    /// `harvest_common::mailbox::order_binding_from_secret`, which has a
+    /// known-answer test against `b3sum`. A drift on either side turns one of
+    /// the three red.
+    ///
+    /// This matters because the failure is silent: the buyer computes the
+    /// binding here from a secret it has just generated, and after a reload
+    /// the delegate computes it from the copy it kept. If those disagree,
+    /// nothing errors -- the buyer simply finds their own commitment
+    /// unrecognisable and can never pay it.
+    #[test]
+    fn the_browsers_binding_is_the_shared_derivation() {
+        let (_, conversation) = buyer_conversation();
+        assert_eq!(
+            conversation.order_binding(),
+            harvest_common::mailbox::order_binding_from_secret(&conversation.secret_for_test()),
+        );
+    }
+
+    /// **A conversation the delegate hands back keeps the binding it was
+    /// given.**
+    ///
+    /// The UI's half of the recall path: whatever the delegate computed has
+    /// to survive into the conversation the buyer's checks read.
+    #[test]
+    fn a_recalled_conversation_keeps_its_binding() {
+        let recalled =
+            crate::messaging::BuyerConversation::recalled(&harvest_common::RecalledConversation {
+                buyer_public_key: [5u8; 32],
+                conversation_id: [6u8; 32],
+                buyer_to_seller: [7u8; 32],
+                seller_to_buyer: [8u8; 32],
+                order_binding: [9u8; 32],
+                created_at: 1,
+                imported: false,
+                backed_up: false,
+            });
+        assert_eq!(recalled.order_binding(), [9u8; 32]);
+    }
+
+    /// **An invoice naming no Bitcoin bridge is refused, not footnoted.**
+    ///
+    /// Found in review. `verify_payment_proof` returns `NoTrustedBridges` for
+    /// such an order permanently, so no payment to it can EVER be proven --
+    /// and `trusted_bridges` is per-order and seller-chosen, so a malicious
+    /// seller picks it. The card said so in smaller text underneath the
+    /// sentence saying the order checked out, with the payment address shown
+    /// above it. A condition that decides whether money can ever be recovered
+    /// belongs in the same list as everything else that decides whether to
+    /// pay.
+    #[test]
+    fn an_invoice_naming_no_bridge_is_refused() {
+        let mut order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        order.order.trusted_bridges = Vec::new();
+        let order = resigned(order, &seller_signing_key());
+        let (state, _) = buyer_after_acceptance(&order);
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::NoTrustedBridge]
+        );
+    }
+
+    /// **An invoice settled by a bridge this build does not know is refused.**
+    ///
+    /// Its "Paid" verdict would rest on a signature the buyer has no reason
+    /// to trust, and the seller chose it.
+    #[test]
+    fn an_invoice_naming_an_unknown_bridge_is_refused() {
+        let mut order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        order.order.trusted_bridges = vec![freenet_bitcoin_common::BridgeId([0x77; 32])];
+        let order = resigned(order, &seller_signing_key());
+        let (state, _) = buyer_after_acceptance(&order);
+
+        assert!(
+            matches!(
+                purchases(&state)[0].blockers.as_slice(),
+                [PaymentBlocker::BridgeNotRecognised(_)]
+            ),
+            "got {:?}",
+            purchases(&state)[0].blockers
+        );
+    }
+
+    /// **An invoice whose displayed address is not the script that settles it
+    /// is refused.**
+    ///
+    /// An `Order` carries both forms and the seller's signature covers both,
+    /// so a signature proves the seller wrote them, not that they agree.
+    /// Every verification path uses the script; the human pays the address.
+    ///
+    /// `OrderCard` already withheld the address for this, which is why it is
+    /// the one case review found handled correctly -- but as a card-level
+    /// special case rather than a blocker, so the top-line sentence still
+    /// said the order checked out. Moving it here makes the pattern one
+    /// pattern.
+    #[test]
+    fn an_invoice_whose_address_is_not_its_script_is_refused() {
+        let mut order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        // A well-formed signet address that is not the order's script.
+        order.order.payment_address = ANOTHER_ADDRESS.to_string();
+        let order = resigned(order, &seller_signing_key());
+        let (state, _) = buyer_after_acceptance(&order);
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::DestinationDisagrees]
+        );
+    }
+
+    /// **An address that cannot be read at all is refused too.**
+    ///
+    /// Nothing can be said about it, which is itself a reason not to pay it.
+    #[test]
+    fn an_invoice_with_an_unreadable_address_is_refused() {
+        let mut order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        order.order.payment_address = "not an address".to_string();
+        let order = resigned(order, &seller_signing_key());
+        let (state, _) = buyer_after_acceptance(&order);
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::DestinationUnreadable]
+        );
+    }
+
+    /// **An expired order is not the seller's fault, and is not the end of
+    /// the purchase.**
+    ///
+    /// The anchor is stamped when the seller signs and cannot be changed
+    /// afterwards, so every honest order eventually ages past the tolerance.
+    /// The buyer's screen used to accuse the seller of backdating and
+    /// classify it as walk-away, which abandons a purchase one message would
+    /// have rescued.
+    #[test]
+    fn an_expired_order_sends_the_buyer_back_to_the_seller() {
+        use crate::components::buy_view::{remedy, Remedy};
+
+        let expired = PaymentBlocker::AnchorStale {
+            anchor_height: TIP_HEIGHT - MAX_ANCHOR_AGE_BLOCKS - 1,
+            tip_height: TIP_HEIGHT,
+        };
+        assert_eq!(remedy(&expired), Remedy::AskTheSeller);
+
+        let said = expired.describe();
+        assert!(
+            said.contains("expired"),
+            "the buyer should be told what happened: {said}"
+        );
+        assert!(
+            !said.contains("backdated"),
+            "and not told the seller did something: {said}"
+        );
+    }
+
+    /// **A seller is told when one of their own orders has aged out.**
+    ///
+    /// Without this the expiry is invisible on the side that can fix it: the
+    /// buyer is asked to go back to a seller who has no idea anything
+    /// happened, and nothing anywhere says the order stopped being payable.
+    #[test]
+    fn a_seller_is_told_which_of_their_orders_need_reissuing() {
+        let fresh = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let expired = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - MAX_ANCHOR_AGE_BLOCKS - 1)),
+            OrderStatus::AwaitingPayment,
+        );
+        let unanchored = commitment(&seller_signing_key(), None, OrderStatus::AwaitingPayment);
+        let mut settled = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - MAX_ANCHOR_AGE_BLOCKS - 1)),
+            OrderStatus::AwaitingPayment,
+        );
+        cancel(&mut settled, &seller_signing_key());
+
+        let mut state = AppState::default();
+        state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
+
+        assert!(!state.needs_reissue(&fresh), "a fresh order is fine");
+        assert!(state.needs_reissue(&expired), "an aged-out order is not");
+        assert!(
+            state.needs_reissue(&unanchored),
+            "and neither is one that never had an anchor"
+        );
+        assert!(
+            !state.needs_reissue(&settled),
+            "an order nobody is waiting to pay needs nothing"
+        );
+    }
+
+    /// **A seller who cannot see the chain is not told to reissue
+    /// everything.**
+    ///
+    /// The judgement needs the reader's own clock. Without a tip there is no
+    /// clock, and answering "yes" would have every seller reissuing every
+    /// order every time their node was slow to load -- the same
+    /// unknown-read-as-a-verdict mistake the buyer's side refuses to make in
+    /// the other direction.
+    #[test]
+    fn a_seller_with_no_chain_view_is_told_to_reissue_nothing() {
+        let expired = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - MAX_ANCHOR_AGE_BLOCKS - 1)),
+            OrderStatus::AwaitingPayment,
+        );
+        let state = AppState::default();
+        assert!(!state.needs_reissue(&expired));
+    }
+
+    /// **A buyer's own purchase gets its payment address watched.**
+    ///
+    /// Without this, `bitcoin.addresses` never holds an entry for the order
+    /// and the card reads "Awaiting payment" whatever has arrived. The
+    /// blockers stop the wrong payment; this is the evidence a person can
+    /// check them against -- and, in the one-commitment-many-buyers case the
+    /// binding now refuses, it is what would have shown a buyer the money was
+    /// already there.
+    #[test]
+    fn a_buyers_purchase_names_the_address_contract_to_watch() {
+        let published = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (state, _) = buyer_after_acceptance(&published);
+
+        assert_eq!(
+            state.address_contracts_to_watch(STORE),
+            vec![published
+                .order
+                .bitcoin_address_instance_id()
+                .expect("the fixture names a build")],
+        );
+    }
+
+    /// **A seller's own issued invoice is watched too.**
+    ///
+    /// The same blindness on the other side: a seller who never added a
+    /// manual watch could not see their own invoice being paid.
+    #[test]
+    fn a_sellers_own_invoice_names_the_address_contract_to_watch() {
+        let published = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let mut state = AppState::default();
+        state.begin_browsing(STORE.to_vec());
+        state.my_stores.insert(
+            "seller-fp".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+            }],
+        );
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .orders = vec![published.clone()];
+
+        assert_eq!(
+            state.address_contracts_to_watch(STORE),
+            vec![published
+                .order
+                .bitcoin_address_instance_id()
+                .expect("the fixture names a build")],
+        );
+    }
+
+    /// **A stranger's order in a store this node is only browsing is not
+    /// watched.**
+    ///
+    /// A store contract carries every order it has ever issued. Subscribing
+    /// to all of them would advertise an interest in every one of a busy
+    /// seller's payment addresses to the network, for orders this node has
+    /// nothing to do with -- which is the private-watch-list-as-public-record
+    /// shape `harvest_common::bitcoin_delegate` refuses to build.
+    #[test]
+    fn somebody_elses_order_is_not_watched() {
+        let published = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let mut state = AppState::default();
+        state.begin_browsing(STORE.to_vec());
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .orders = vec![published];
+
+        assert!(
+            state.address_contracts_to_watch(STORE).is_empty(),
+            "an order this node is neither buyer nor seller of is not ours to watch"
+        );
+    }
+
+    /// **An order naming no contract build names nothing to watch.**
+    #[test]
+    fn an_order_with_no_build_names_no_contract_to_watch() {
+        let mut published = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        published.order.bitcoin_address_code_hash = None;
+        let published = resigned(published, &seller_signing_key());
+        let (state, _) = buyer_after_acceptance(&published);
+
+        assert!(state.address_contracts_to_watch(STORE).is_empty());
+    }
+
+    /// The bridge these settlement fixtures sign with.
+    ///
+    /// The order has to NAME it, because `verify_on_chain_proof` refuses a
+    /// claim from a bridge the order does not trust -- so `a_paid_order`
+    /// re-signs the commitment with this bridge in `trusted_bridges` rather
+    /// than the build's own constant, whose private key nobody here has.
+    fn settling_bridge() -> SigningKey {
+        SigningKey::from_bytes(&[61u8; 32])
+    }
+
+    /// An order naming [`settling_bridge`], the claims that settle it, and a
+    /// tip deep enough for its `required_confirmations`.
+    fn a_paid_order() -> (
+        AuthorizedOrder,
+        Vec<freenet_bitcoin_common::SignedClaim>,
+        freenet_bitcoin_common::SignedTipEntry,
+    ) {
+        use freenet_bitcoin_common::spv::testing::payment_proof;
+        use freenet_bitcoin_common::{
+            BlockHash, ClaimBody, SignedClaim, SignedTipEntry, TipEntryBody,
+        };
+
+        let mut order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        order.order.trusted_bridges = vec![freenet_bitcoin_common::BridgeId(
+            settling_bridge().verifying_key().to_bytes(),
+        )];
+        let order = resigned(order, &seller_signing_key());
+
+        let confirmed_at = TIP_HEIGHT - 1;
+        let (spv, txid, block_hash) = payment_proof(
+            &order.order.payment_script_pubkey,
+            order.order.amount_sats,
+            1,
+            [7u8; 32],
+        );
+        let claim = SignedClaim::sign(
+            &settling_bridge(),
+            &ClaimBody {
+                script_id: order.order.bitcoin_params().script_id(),
+                network: order.order.network,
+                // The bridge has scanned as far as the tip, which is what
+                // lets the confirmation attest any depth at all -- see
+                // `payment::proof_assembly_tests::confirmation`.
+                as_of: freenet_bitcoin_common::BlockAnchor {
+                    height: TIP_HEIGHT,
+                    hash: BlockHash([5u8; 32]),
+                },
+                claim: freenet_bitcoin_common::Claim::ConfirmedOutput {
+                    outpoint: freenet_bitcoin_common::OutPoint { txid, vout: 0 },
+                    value_sats: order.order.amount_sats,
+                    anchor: freenet_bitcoin_common::BlockAnchor {
+                        height: confirmed_at,
+                        hash: block_hash,
+                    },
+                    spv,
+                },
+            },
+        )
+        .expect("sign the claim");
+
+        let tip = SignedTipEntry::sign(
+            &settling_bridge(),
+            &TipEntryBody {
+                network: order.order.network,
+                anchor: anchor(TIP_HEIGHT),
+                prev_hash: BlockHash([8u8; 32]),
+                block_time: 1_700_000_000,
+                tx_count: 1,
+                median_time: 1_700_000_000,
+            },
+        )
+        .expect("sign the tip");
+
+        (order, vec![claim], tip)
+    }
+
+    /// The same claim shape as [`a_paid_order`], one satoshi short.
+    ///
+    /// A genuine, verifying, bridge-signed claim about this order's own
+    /// script -- so it reaches the assembler's verify rather than being
+    /// filtered out before it.
+    fn an_underpayment(order: &AuthorizedOrder) -> Vec<freenet_bitcoin_common::SignedClaim> {
+        use freenet_bitcoin_common::spv::testing::payment_proof;
+        use freenet_bitcoin_common::{BlockHash, ClaimBody, SignedClaim};
+
+        let short = order.order.amount_sats - 1;
+        let (spv, txid, block_hash) =
+            payment_proof(&order.order.payment_script_pubkey, short, 1, [7u8; 32]);
+        vec![SignedClaim::sign(
+            &settling_bridge(),
+            &ClaimBody {
+                script_id: order.order.bitcoin_params().script_id(),
+                network: order.order.network,
+                as_of: freenet_bitcoin_common::BlockAnchor {
+                    height: TIP_HEIGHT,
+                    hash: BlockHash([5u8; 32]),
+                },
+                claim: freenet_bitcoin_common::Claim::ConfirmedOutput {
+                    outpoint: freenet_bitcoin_common::OutPoint { txid, vout: 0 },
+                    value_sats: short,
+                    anchor: freenet_bitcoin_common::BlockAnchor {
+                        height: TIP_HEIGHT - 1,
+                        hash: block_hash,
+                    },
+                    spv,
+                },
+            },
+        )
+        .expect("sign")]
+    }
+
+    /// Put the chain material where a subscription would have put it.
+    fn give_the_node_the_chain(
+        state: &mut AppState,
+        order: &AuthorizedOrder,
+        claims: Vec<freenet_bitcoin_common::SignedClaim>,
+        tip: freenet_bitcoin_common::SignedTipEntry,
+    ) {
+        let mut view = tip_at(TIP_HEIGHT);
+        view.signed_tip = Some(tip);
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, view);
+        state.bitcoin.addresses.insert(
+            order
+                .order
+                .bitcoin_address_instance_id()
+                .expect("the fixture names a build")
+                .to_vec(),
+            AddressView {
+                network: BitcoinNetwork::Signet,
+                claims,
+                scanned_to: Some(TIP_HEIGHT),
+                confirmed_sats: order.order.amount_sats,
+                pending_sats: 0,
+                txs: Vec::new(),
+            },
+        );
+    }
+
+    /// **A buyer whose payment has confirmed publishes the settled order.**
+    ///
+    /// The gap this closes: `verify_payment_proof`, the bridge claims and the
+    /// address subscription all existed, and nothing constructed the proof --
+    /// so an order sat `AwaitingPayment` forever however much had been paid,
+    /// and the public record permanently misstated what happened. Every later
+    /// mechanism reads that record; Phase 2's reversal argument is arithmetic
+    /// over it.
+    #[test]
+    fn a_confirmed_payment_produces_a_paid_order_to_publish() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+
+        let settled = state
+            .settled_orders(STORE)
+            .pop()
+            .expect("a confirmed payment settles the order");
+
+        assert_eq!(settled.order.id, order.order.id);
+        assert_eq!(settled.status, OrderStatus::Paid);
+        assert!(settled.payment_proof.is_some());
+        // And it is a record the network will actually accept.
+        settled
+            .verify(&seller_signing_key().verifying_key())
+            .expect("a settled order must verify as Paid");
+    }
+
+    /// **An order whose payment has not confirmed is not settled.**
+    ///
+    /// Two cases, and the second is the one that would otherwise go
+    /// untested here. Nothing seen at all takes the assembler's early
+    /// refusal; a claim that exists but does not carry the transition takes
+    /// the verify. An earlier version of this test covered only the first,
+    /// so deleting the assembler's `verify_payment_proof` call left it green
+    /// -- the guard is pinned in
+    /// `harvest_common::payment::proof_assembly_tests`, and this is the same
+    /// question asked through the state that actually publishes.
+    ///
+    /// Publishing `Paid` on evidence that does not carry it is a state every
+    /// peer refuses, which on the buyer's screen looks like the payment
+    /// never registering.
+    #[test]
+    fn an_unpaid_order_is_not_settled() {
+        let (order, claims, tip) = a_paid_order();
+
+        // Nothing seen at all.
+        let (mut nothing_seen, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut nothing_seen, &order, Vec::new(), tip.clone());
+        assert!(nothing_seen.settled_orders(STORE).is_empty());
+
+        // Seen, and short of the amount: the claims verify, and what they
+        // attest is not this order being paid.
+        let underpaid = an_underpayment(&order);
+        assert_eq!(claims.len(), underpaid.len(), "the same shape of evidence");
+        let (mut short, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut short, &order, underpaid, tip);
+        assert!(
+            short.settled_orders(STORE).is_empty(),
+            "an underpayment is not a payment"
+        );
+    }
+
+    /// **An order already past `AwaitingPayment` is not settled again.**
+    ///
+    /// Status is a monotonic maximum under merge, so re-publishing is inert
+    /// rather than harmful -- but it is an update per state arrival for an
+    /// order that has already moved, which is exactly the churn the
+    /// subscription path exists to avoid.
+    #[test]
+    fn an_order_that_has_already_moved_is_not_settled_again() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+
+        // Publish the settled form back into the store's state, as the
+        // network would once the update lands.
+        let settled = state.settled_orders(STORE).pop().expect("settles once");
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .orders = vec![settled];
+
+        assert!(
+            state.settled_orders(STORE).is_empty(),
+            "an order that is already Paid has nothing left to settle"
+        );
+    }
+
+    /// **Settling an order does not stop the node keeping the conversation.**
+    ///
+    /// The ordering constraint from `docs/buyer-conversation-persistence.md`,
+    /// checked at the moment it would be easiest to break: "paid" is exactly
+    /// when a buyer's software might conclude the transaction is over and the
+    /// conversation record no longer matters. In Phase 2 the confession lives
+    /// in that record and has to be persisted BEFORE payment, so treating
+    /// payment as a reason to stop caring about it inverts the whole
+    /// argument.
+    #[test]
+    fn settling_leaves_the_conversation_record_alone() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, tag) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+
+        let settled = state.settled_orders(STORE).pop().expect("settles");
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .orders = vec![settled];
+
+        let store = &state.browsing_stores[STORE];
+        assert_eq!(
+            store.conversations.len(),
+            1,
+            "the conversation is still kept after payment"
+        );
+        assert_eq!(store.conversations[0].buyer_public_key, tag);
+        assert!(
+            store.conversations[0].is_kept(),
+            "and the node has not forgotten it is keeping it"
+        );
+        // The purchase is still shown, now as one there is nothing to pay.
+        assert_eq!(
+            state.buyer_purchases(STORE)[0].blockers,
+            vec![PaymentBlocker::NotAwaitingPayment(OrderStatus::Paid)]
+        );
+    }
+
+    /// **A settlement is published once, not once per notification.**
+    ///
+    /// Between dispatching the update and the store's state coming back with
+    /// it applied, `settled_orders` keeps answering the same order -- the
+    /// state it reads has not changed yet. Without the guard that is one
+    /// update per notification per paid order, against a contract, forever.
+    #[test]
+    fn a_settlement_is_published_once_per_tab() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+
+        assert_eq!(
+            state.settled_orders(STORE).len(),
+            1,
+            "the order is settleable"
+        );
+        assert_eq!(
+            state.publish_settled_orders(STORE).len(),
+            1,
+            "and was published once"
+        );
+
+        // The store's state has not come back yet, so it is still settleable
+        // -- and must not be published again.
+        assert_eq!(state.settled_orders(STORE).len(), 1);
+        assert!(
+            state.publish_settled_orders(STORE).is_empty(),
+            "a second notification must not send a second update"
+        );
+    }
+
+    /// **A conversation with no usable binding cannot pay anything.**
+    ///
+    /// Found in review. `RecalledConversation::order_binding` carries
+    /// `#[serde(default)]` so a delegate answer produced before the field
+    /// existed still decodes -- and it decodes to all-zeros, which
+    /// `BuyerConversation::recalled` carried through verbatim. The commitment
+    /// side of the comparison is a field the SELLER chooses and signs, so a
+    /// seller signing `Some([0u8; 32])` matched every buyer in that state at
+    /// once: H1 again, narrowed to a population rather than closed.
+    ///
+    /// Three comments asserted this could not happen, all reasoning about an
+    /// *honest* commitment. The threat model here is a malicious seller, who
+    /// is free to carry whatever value they like.
+    ///
+    /// Unreachable in a shipped build today -- the delegate WASM is
+    /// `include_bytes!`d into the UI, so a new UI cannot reach an old
+    /// delegate. That is the weakest kind of safe, and it is exactly why this
+    /// is worth closing rather than deleting: the `serde(default)` exists FOR
+    /// the skew case and got the skew case wrong.
+    #[test]
+    fn a_conversation_with_no_usable_binding_cannot_pay() {
+        let (state, live) = buyer_conversation();
+        let tag = live.buyer_public_key;
+        let keys = seller_keys_for(&tag);
+        // Exactly what `RecalledConversation` decodes to from a delegate
+        // built before `order_binding` existed.
+        let legacy =
+            crate::messaging::BuyerConversation::recalled(&harvest_common::RecalledConversation {
+                buyer_public_key: tag,
+                conversation_id: live.conversation_id.0,
+                buyer_to_seller: keys.to_seller,
+                seller_to_buyer: keys.from_seller,
+                order_binding: [0u8; 32],
+                created_at: 0,
+                imported: false,
+                backed_up: false,
+            });
+        assert_eq!(legacy.order_binding(), [0u8; 32], "the premise");
+
+        // The seller signs the matching value, which they are free to do.
+        let published = commitment_bound_to(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+            Some([0u8; 32]),
+        );
+        let state = buyer_holding(state, legacy, &published);
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::CommitmentNotForThisBuyer],
+            "a binding that identifies nobody must not identify everybody"
+        );
+    }
+
+    /// **Every input `payment_blockers` reads either yields a verdict or a
+    /// blocker -- absence never reads as approval.**
+    ///
+    /// The generalisable half of the finding above. That function's entire
+    /// contract is "empty means safe to pay", so a missing input that reads
+    /// as a satisfied check is the one defect shape it cannot tolerate. The
+    /// review found one; this enumerates the rest so the next one is a
+    /// failing test rather than another review round.
+    ///
+    /// Each case removes exactly one input from an otherwise payable
+    /// purchase and asserts SOME blocker comes back. It deliberately does not
+    /// assert WHICH -- the individual blockers have their own tests, and
+    /// pinning the identity here would make this test fail for reasons that
+    /// are not the property it is about.
+    ///
+    /// The one deliberate exception is documented rather than tested as a
+    /// blocker: an empty `requested_listings` does NOT block, because a
+    /// conversation that never used the buy form is a real case (a seller
+    /// invoicing against a plain question). It is safe only because the
+    /// binding check above it already requires the seller to hold a value
+    /// they can only have learned from a request -- so "no request" and "a
+    /// matching binding" cannot both be true. If the binding check is ever
+    /// weakened, that exception stops being safe.
+    #[test]
+    fn no_missing_input_reads_as_approval() {
+        let order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+
+        // The baseline: everything present, nothing standing in the way.
+        let (state, _) = buyer_after_acceptance(&order);
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            Vec::new(),
+            "the baseline must be payable, or the cases below prove nothing"
+        );
+
+        /// One input, and how to take it away.
+        type MissingInput = (&'static str, Box<dyn Fn(&mut AppState)>);
+
+        // Each case names an input and takes it away.
+        let cases: Vec<MissingInput> = vec![
+            (
+                "the published commitment",
+                Box::new(|s: &mut AppState| {
+                    s.browsing_stores
+                        .get_mut(STORE)
+                        .expect("store")
+                        .orders
+                        .clear();
+                }),
+            ),
+            (
+                "the store's identity key",
+                Box::new(|s: &mut AppState| {
+                    s.browsing_stores
+                        .get_mut(STORE)
+                        .expect("store")
+                        .seller_verifying_key = None;
+                }),
+            ),
+            (
+                "this node's view of the chain",
+                Box::new(|s: &mut AppState| s.bitcoin.tips.clear()),
+            ),
+            (
+                "the tip's height",
+                Box::new(|s: &mut AppState| {
+                    for tip in s.bitcoin.tips.values_mut() {
+                        tip.tip_height = None;
+                    }
+                }),
+            ),
+            (
+                "the blocks the anchor is checked against",
+                Box::new(|s: &mut AppState| {
+                    for tip in s.bitcoin.tips.values_mut() {
+                        tip.recent_blocks.clear();
+                    }
+                }),
+            ),
+        ];
+
+        // Safe means EITHER a blocker or no purchase shown at all -- a buyer
+        // shown nothing is a buyer shown no payment address, which is the
+        // property. Asserting a blocker specifically would fail for the cases
+        // where the purchase becomes unreadable, which are safe by a
+        // different route.
+        let refuses = |state: &AppState| {
+            let found = purchases(state);
+            found.is_empty() || found.iter().all(|p| !p.blockers.is_empty())
+        };
+
+        for (what, remove) in cases {
+            let (mut state, _) = buyer_after_acceptance(&order);
+            remove(&mut state);
+            assert!(
+                refuses(&state),
+                "without {what}, the buyer is told it is safe to pay"
+            );
+        }
+
+        // The delegate's confirmation that it is keeping the conversation.
+        // Built through the fixture rather than by swapping the conversation
+        // out, because a fresh one carries a fresh `conversation_id` and the
+        // acceptance then cannot be read at all -- safe, but for the wrong
+        // reason, which would make this case prove nothing.
+        let (not_kept, _) = buyer_after_acceptance_with(&order, false);
+        assert!(
+            refuses(&not_kept),
+            "without the delegate's confirmation, the buyer is told it is safe to pay"
+        );
+
+        // The commitment's own optional fields, taken away one at a time.
+        // These need re-signing, so they do not fit the closure shape above.
+        for (what, mutate) in [
+            (
+                "the block anchor",
+                Box::new(|o: &mut AuthorizedOrder| o.order.anchor = None)
+                    as Box<dyn Fn(&mut AuthorizedOrder)>,
+            ),
+            (
+                "the buyer binding",
+                Box::new(|o: &mut AuthorizedOrder| o.order.order_binding = None),
+            ),
+            (
+                "the trusted bridges",
+                Box::new(|o: &mut AuthorizedOrder| o.order.trusted_bridges.clear()),
+            ),
+        ] {
+            let mut stripped = order.clone();
+            mutate(&mut stripped);
+            let stripped = resigned(stripped, &seller_signing_key());
+            let (state, _) = buyer_after_acceptance(&stripped);
+            assert!(
+                refuses(&state),
+                "without {what}, the buyer is told it is safe to pay"
+            );
+        }
+    }
+
+    /// **A commitment for something this conversation never asked about is
+    /// refused.**
+    ///
+    /// "Confirm your own order is present" is not satisfied by an order being
+    /// present. A seller who accepted a request for a $5 listing by
+    /// publishing a commitment against a $500 one would have a buyer paying
+    /// the amount on a commitment for goods they never asked for -- and every
+    /// other check in this list would pass, because the commitment is
+    /// genuinely published, genuinely signed and genuinely fresh.
+    ///
+    /// What this rests on: the request is in the buyer's own thread, which
+    /// only the two parties can write to. Direction is not authorship (see
+    /// `messaging::Addressing`), so a seller CAN insert a request the buyer
+    /// never sent -- but it then appears in the buyer's own thread as a
+    /// request they do not recognise, which is a thing a person can see. The
+    /// check is worth having for the case it does close and is not claimed to
+    /// close more.
+    #[test]
+    fn a_commitment_for_a_listing_never_requested_is_refused() {
+        let asked_for = ListingId([3u8; 32]);
+        let published = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        assert_ne!(
+            published.order.listing_id, asked_for,
+            "the fixture must name a different listing, or this asserts nothing"
+        );
+
+        let (mut state, _) = buyer_after_acceptance(&published);
+        // Put the buyer's own request into the thread, for a different
+        // listing than the one the seller committed to.
+        let conversation = state.browsing_stores[STORE].conversations[0].clone();
+        let request = conversation
+            .request_order(&asked_for, 1, "12 Example St".into(), String::new())
+            .expect("seal the request");
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .mailbox_messages
+            .push(request);
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::CommitmentNotRequested]
+        );
+    }
+
+    /// **And the commitment for the listing that WAS asked about is fine.**
+    ///
+    /// The other half, so the rule above cannot pass by refusing everything.
+    #[test]
+    fn a_commitment_for_the_listing_that_was_requested_is_payable() {
+        let published = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut state, _) = buyer_after_acceptance(&published);
+        let conversation = state.browsing_stores[STORE].conversations[0].clone();
+        let request = conversation
+            .request_order(
+                &published.order.listing_id,
+                1,
+                "12 Example St".into(),
+                String::new(),
+            )
+            .expect("seal the request");
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .mailbox_messages
+            .push(request);
+
+        assert_eq!(purchases(&state)[0].blockers, Vec::new());
+    }
+
+    /// **A buyer who has been accepted has a purchase they can pay.**
+    ///
+    /// The whole flow, end to end, with nothing taken away. Every test below
+    /// removes exactly one thing from this setup, so a failure here means the
+    /// others are asserting about a state that never worked.
+    #[test]
+    fn an_accepted_request_becomes_a_payable_purchase() {
+        let order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (state, tag) = buyer_after_acceptance(&order);
+
+        let found = purchases(&state);
+        assert_eq!(found.len(), 1, "the acceptance names one purchase");
+        assert_eq!(found[0].order_id, order.order.id);
+        assert_eq!(found[0].conversation, tag);
+        assert_eq!(
+            found[0].blockers,
+            Vec::new(),
+            "nothing should stand between this buyer and paying"
+        );
+        assert_eq!(
+            found[0].commitment.as_ref().map(|c| c.order.amount_sats),
+            Some(50_000),
+            "the buyer must see the amount they are about to pay"
+        );
+    }
+
+    /// **The buyer will not pay until their own commitment is published.**
+    ///
+    /// This is the anti-exit-scam mechanism and the reason it works: an
+    /// undeclared order collects no money, so a seller cannot take payment
+    /// without first admitting publicly that they owe goods. The buyer is not
+    /// policing anything -- they are refusing to be the order that was never
+    /// declared.
+    #[test]
+    fn a_buyer_does_not_pay_a_commitment_that_was_never_published() {
+        let order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut state, _) = buyer_after_acceptance(&order);
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .orders
+            .clear();
+
+        let found = purchases(&state);
+        assert_eq!(found.len(), 1, "the acceptance is still in the thread");
+        assert!(
+            found[0].commitment.is_none(),
+            "there is no commitment to show"
+        );
+        assert_eq!(
+            found[0].blockers,
+            vec![PaymentBlocker::CommitmentNotPublished]
+        );
+    }
+
+    /// **A commitment somebody else signed is not the seller's.**
+    ///
+    /// The acceptance message carries no authority -- both parties hold both
+    /// direction keys, so the buyer could have written it themselves. What
+    /// makes a commitment binding is the ghostkey signature over its terms,
+    /// checked against the identity whose store this is.
+    #[test]
+    fn a_commitment_signed_by_another_identity_is_refused() {
+        let impostor = SigningKey::from_bytes(&[99u8; 32]);
+        let order = commitment(
+            &impostor,
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (state, _) = buyer_after_acceptance(&order);
+
+        let found = purchases(&state);
+        assert!(
+            matches!(
+                found[0].blockers.as_slice(),
+                [PaymentBlocker::CommitmentNotTheSellers(_)]
+            ),
+            "expected a signature refusal, got {:?}",
+            found[0].blockers
+        );
+    }
+
+    /// **A commitment with no block anchor is refused.**
+    ///
+    /// Without one there is nothing in the record a reader can date, and
+    /// `created_at` is not a substitute: the seller stamps it, and the seller
+    /// is the party with a motive to lie about when they took the order on.
+    #[test]
+    fn a_commitment_with_no_anchor_is_refused() {
+        let order = commitment(&seller_signing_key(), None, OrderStatus::AwaitingPayment);
+        let (state, _) = buyer_after_acceptance(&order);
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::AnchorMissing]
+        );
+    }
+
+    /// **A backdated commitment is refused, and the boundary is where the
+    /// constant says it is.**
+    ///
+    /// Every past block hash is public, so a seller can anchor a fresh
+    /// commitment to an old block and have readers count it as already
+    /// closed -- reading as no outstanding exposure while taking money. The
+    /// design document argues this is impossible; issue 8 records that it is
+    /// wrong. This is the rule that neutralises it, and it lives in the
+    /// reader because only a reader has a clock.
+    ///
+    /// Both sides of the boundary are asserted from the constant, so raising
+    /// the tolerance moves the test with it rather than leaving it pinned to
+    /// a number that no longer means anything.
+    #[test]
+    fn a_backdated_commitment_is_refused_and_a_fresh_one_is_not() {
+        let oldest_allowed = TIP_HEIGHT - MAX_ANCHOR_AGE_BLOCKS;
+        let order = commitment(
+            &seller_signing_key(),
+            Some(anchor(oldest_allowed)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (state, _) = buyer_after_acceptance(&order);
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            Vec::new(),
+            "an anchor exactly at the tolerance is still fresh"
+        );
+
+        let order = commitment(
+            &seller_signing_key(),
+            Some(anchor(oldest_allowed - 1)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (state, _) = buyer_after_acceptance(&order);
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::AnchorStale {
+                anchor_height: oldest_allowed - 1,
+                tip_height: TIP_HEIGHT,
+            }],
+            "one block past the tolerance is stale"
+        );
+    }
+
+    /// **An anchor naming a block this reader does not have at that height is
+    /// refused.**
+    ///
+    /// A height alone would accept an anchor from a chain the buyer is not
+    /// on, which is exactly what the hash is in the anchor for.
+    #[test]
+    fn an_anchor_from_another_chain_is_refused() {
+        let mut forged = anchor(TIP_HEIGHT);
+        forged.hash = freenet_bitcoin_common::BlockHash([0xff; 32]);
+        let order = commitment(
+            &seller_signing_key(),
+            Some(forged),
+            OrderStatus::AwaitingPayment,
+        );
+        let (state, _) = buyer_after_acceptance(&order);
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::AnchorOffChain]
+        );
+    }
+
+    /// **A buyer who cannot see the chain does not judge the anchor -- and
+    /// does not pay either.**
+    ///
+    /// Unknown is not the same answer as fresh, and the safe direction is to
+    /// withhold. Saying which of the two it is matters because the fix is
+    /// different: waiting versus walking away.
+    #[test]
+    fn a_buyer_who_cannot_see_the_chain_does_not_pay() {
+        let order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut state, _) = buyer_after_acceptance(&order);
+        state.bitcoin.tips.clear();
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::ChainUnknown]
+        );
+    }
+
+    /// **The buyer does not pay until their node has confirmed it is keeping
+    /// the key that reads this conversation.**
+    ///
+    /// This is the ordering constraint from
+    /// `docs/buyer-conversation-persistence.md`, applied to the thing that
+    /// exists today. In Phase 2 the seller's reply carries a pre-signed
+    /// confession, which is the buyer's only capability to file against the
+    /// seller's bond, and it lands in the same delegate record as these keys.
+    /// The doc's warning is aimed exactly here: "a Buy flow that pays first
+    /// and stores after passes every test in this repository and defeats the
+    /// entire mechanism".
+    ///
+    /// A conversation whose write the delegate refused, or has not answered,
+    /// is one the buyer cannot read after a reload -- so paying against it
+    /// buys goods and throws away the means of complaining about them.
+    #[test]
+    fn a_buyer_does_not_pay_before_the_node_confirms_it_kept_the_conversation() {
+        let order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (state, _) = buyer_after_acceptance_with(&order, false);
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::ConversationNotKept]
+        );
+    }
+
+    /// **The delegate's own answer is what clears that blocker.**
+    ///
+    /// Not the request having been sent, and not the UI's guess about what
+    /// probably happened: the delegate is the only thing that knows whether a
+    /// record was written, and a refused write must leave the buyer where
+    /// they were.
+    #[test]
+    fn only_the_delegates_answer_marks_a_conversation_kept() {
+        let mut state = AppState::default();
+        state.begin_browsing(STORE.to_vec());
+        let conversation =
+            BuyerConversation::open(&seller_encryption_key()).expect("open a conversation");
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .conversations = vec![conversation];
+
+        let request = state
+            .conversation_to_keep(STORE, &seller_encryption_key())
+            .expect("a freshly opened conversation is one to keep");
+        let request_id = match request {
+            harvest_common::HarvestDelegateRequest::StoreBuyerConversation {
+                request_id, ..
+            } => request_id,
+            other => panic!("expected a store request, got {other:?}"),
+        };
+        assert!(
+            !state.browsing_stores[STORE].conversations[0].is_kept(),
+            "sending the request is not the delegate answering it"
+        );
+
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationStored {
+            request_id,
+            result: Err("the node refused the write".to_string()),
+            evicted: Vec::new(),
+        });
+        assert!(
+            !state.browsing_stores[STORE].conversations[0].is_kept(),
+            "a refused write must not count as kept"
+        );
+
+        let request = state
+            .conversation_to_keep(STORE, &seller_encryption_key())
+            .expect("asking again");
+        let request_id = match request {
+            harvest_common::HarvestDelegateRequest::StoreBuyerConversation {
+                request_id, ..
+            } => request_id,
+            other => panic!("expected a store request, got {other:?}"),
+        };
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationStored {
+            request_id,
+            result: Ok(()),
+            evicted: Vec::new(),
+        });
+        assert!(
+            state.browsing_stores[STORE].conversations[0].is_kept(),
+            "the delegate said it kept it"
+        );
+    }
+
+    /// **A conversation the delegate handed back is already kept.**
+    ///
+    /// It came out of the delegate's own store, so there is nothing to
+    /// confirm -- and a returning buyer who had to send a message before they
+    /// could pay would be a buyer told to do something pointless.
+    #[test]
+    fn a_recalled_conversation_is_already_kept() {
+        let recalled = BuyerConversation::recalled(&harvest_common::RecalledConversation {
+            buyer_public_key: [5u8; 32],
+            conversation_id: [6u8; 32],
+            buyer_to_seller: [7u8; 32],
+            seller_to_buyer: [8u8; 32],
+            order_binding: [9u8; 32],
+            created_at: 1,
+            imported: false,
+            backed_up: false,
+        });
+        assert!(recalled.is_kept());
+    }
+
+    /// **An order the seller has cancelled is not offered for payment.**
+    ///
+    /// The cancellation is signed the way the contract requires, so this
+    /// tests the status rule rather than tripping over an unsigned record --
+    /// the first version of this test used a `Paid` status with no payment
+    /// evidence and was refused by the signature check before it ever reached
+    /// the status check, which would have made it a test of the wrong thing.
+    #[test]
+    fn an_order_that_is_not_awaiting_payment_is_not_payable() {
+        let mut order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        cancel(&mut order, &seller_signing_key());
+        let (state, _) = buyer_after_acceptance(&order);
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::NotAwaitingPayment(OrderStatus::Cancelled)]
+        );
+    }
+
+    /// **An acceptance the buyer composed themselves is not an acceptance.**
+    ///
+    /// Both parties hold both direction keys, so a buyer's own message can be
+    /// sealed in either direction. Reading one addressed to the seller as an
+    /// acceptance would let anything the buyer typed point their own software
+    /// at an order.
+    #[test]
+    fn an_acceptance_addressed_to_the_seller_is_not_one() {
+        let order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut state, tag) = buyer_after_acceptance(&order);
+
+        // The same content, sealed the other way: buyer-to-seller.
+        let keys = seller_keys_for(&tag);
+        let conversation_id = state.browsing_stores[STORE].conversations[0]
+            .conversation_id
+            .clone();
+        let wrong_way = crate::messaging::seal_for_test(
+            &keys.to_seller,
+            &tag,
+            &conversation_id,
+            crate::messaging::MessageContent::OrderAccepted {
+                order_id: order.order.id.clone(),
+            },
+        )
+        .expect("seal");
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .mailbox_messages = vec![wrong_way];
+
+        assert!(
+            purchases(&state).is_empty(),
+            "a message the buyer could have written is not the seller accepting"
+        );
+    }
+
+    /// **Every acceptance in the thread is a purchase, and each is judged on
+    /// its own.**
+    ///
+    /// A buyer can buy twice from one store. Collapsing to the newest would
+    /// hide an earlier order the buyer still owes money on, and judging them
+    /// together would let one fresh anchor carry a stale one.
+    #[test]
+    fn two_acceptances_are_two_purchases_judged_separately() {
+        let fresh = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        // Signed with the stale anchor rather than edited afterwards: an
+        // edited order fails its signature check first, and the test would
+        // then pass without ever reaching the freshness rule it is about.
+        let stale = commitment_for(
+            "Second widget",
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - MAX_ANCHOR_AGE_BLOCKS - 1)),
+            OrderStatus::AwaitingPayment,
+            Some(the_buyers_conversation().order_binding()),
+        );
+        assert_ne!(fresh.order.id, stale.order.id, "two distinct orders");
+
+        let (mut state, tag) = buyer_after_acceptance(&fresh);
+        let conversation_id = state.browsing_stores[STORE].conversations[0]
+            .conversation_id
+            .clone();
+        let acceptance = crate::messaging::seal_order_accepted(
+            &seller_keys_for(&tag),
+            &tag,
+            &conversation_id,
+            &stale.order.id,
+        )
+        .expect("seal");
+        {
+            let store = state.browsing_stores.get_mut(STORE).expect("the store");
+            store.mailbox_messages.push(acceptance);
+            store.orders.push(stale.clone());
+        }
+
+        let found = purchases(&state);
+        assert_eq!(found.len(), 2, "two acceptances, two purchases");
+        let payable = found
+            .iter()
+            .find(|purchase| purchase.order_id == fresh.order.id)
+            .expect("the fresh purchase");
+        assert_eq!(payable.blockers, Vec::new());
+        let refused = found
+            .iter()
+            .find(|purchase| purchase.order_id == stale.order.id)
+            .expect("the stale purchase");
+        assert_eq!(
+            refused.blockers,
+            vec![PaymentBlocker::AnchorStale {
+                anchor_height: TIP_HEIGHT - MAX_ANCHOR_AGE_BLOCKS - 1,
+                tip_height: TIP_HEIGHT,
+            }]
+        );
+    }
+}
+
+#[cfg(test)]
+mod payment_blocker_wording_tests {
+    use super::*;
+    use harvest_common::payment::OrderStatus;
+
+    /// Every variant, once each.
+    ///
+    /// # Why the match is over the LIST rather than beside it
+    ///
+    /// The first version of this built a `vec!` and put an exhaustive `match`
+    /// next to it, and its comment claimed that made a missing variant a
+    /// compile error. It did not: the match forced itself to be updated and
+    /// the list was independent, so a variant could be added to one and left
+    /// out of the other and this test would silently stop covering it. Review
+    /// found it.
+    ///
+    /// Matching on each element of the list is what actually ties them: a new
+    /// variant does not compile until it is in the match, and the only way to
+    /// reach the match is to be in the list. The `seen` count then fails if
+    /// the list holds fewer distinct variants than the match has arms.
+    fn every_blocker() -> Vec<PaymentBlocker> {
+        let all = vec![
+            PaymentBlocker::CommitmentNotPublished,
+            PaymentBlocker::SellerIdentityUnknown,
+            PaymentBlocker::CommitmentNotTheSellers("the signature is not theirs".to_string()),
+            PaymentBlocker::CommitmentNotForThisBuyer,
+            PaymentBlocker::NoTrustedBridge,
+            PaymentBlocker::BridgeNotRecognised("7Kf2abcd".to_string()),
+            PaymentBlocker::DestinationDisagrees,
+            PaymentBlocker::DestinationUnreadable,
+            PaymentBlocker::CommitmentNotRequested,
+            PaymentBlocker::NotAwaitingPayment(OrderStatus::Cancelled),
+            PaymentBlocker::AnchorMissing,
+            PaymentBlocker::ChainUnknown,
+            PaymentBlocker::AnchorOffChain,
+            PaymentBlocker::AnchorUnverifiable,
+            PaymentBlocker::AnchorAheadOfTip {
+                anchor_height: 801_000,
+                tip_height: 800_000,
+            },
+            PaymentBlocker::AnchorStale {
+                anchor_height: 799_000,
+                tip_height: 800_000,
+            },
+            PaymentBlocker::ConversationNotKept,
+        ];
+
+        // Exhaustive and wildcard-free, over the list itself. Each arm is
+        // reached exactly once by a well-formed list; `discriminant` counts
+        // distinct variants rather than entries, so duplicating one to pad
+        // the list does not hide an omission.
+        let mut seen = std::collections::HashSet::new();
+        for blocker in &all {
+            match blocker {
+                PaymentBlocker::CommitmentNotPublished
+                | PaymentBlocker::SellerIdentityUnknown
+                | PaymentBlocker::CommitmentNotTheSellers(_)
+                | PaymentBlocker::CommitmentNotForThisBuyer
+                | PaymentBlocker::NoTrustedBridge
+                | PaymentBlocker::BridgeNotRecognised(_)
+                | PaymentBlocker::DestinationDisagrees
+                | PaymentBlocker::DestinationUnreadable
+                | PaymentBlocker::CommitmentNotRequested
+                | PaymentBlocker::NotAwaitingPayment(_)
+                | PaymentBlocker::AnchorMissing
+                | PaymentBlocker::ChainUnknown
+                | PaymentBlocker::AnchorOffChain
+                | PaymentBlocker::AnchorUnverifiable
+                | PaymentBlocker::AnchorAheadOfTip { .. }
+                | PaymentBlocker::AnchorStale { .. }
+                | PaymentBlocker::ConversationNotKept => {}
+            }
+            seen.insert(std::mem::discriminant(blocker));
+        }
+        assert_eq!(
+            seen.len(),
+            EVERY_BLOCKER,
+            "the list must hold every variant exactly once; add the new one here as well as \
+             to the match"
+        );
+        all
+    }
+
+    /// How many variants `PaymentBlocker` has.
+    ///
+    /// The one number a future edit has to change by hand, and the assertion
+    /// above is what makes forgetting it fail rather than silently narrow the
+    /// coverage.
+    const EVERY_BLOCKER: usize = 17;
+
+    /// **Every blocker says something, and says it as prose.**
+    ///
+    /// These sentences are the only thing a buyer has to decide on, and they
+    /// are assembled from `\`-continued string literals -- a form where
+    /// dropping the backslash leaves a run of spaces in the middle of the
+    /// sentence and nothing complains. That happened once while this change
+    /// was being written, in `components::buy_view`, and was caught by
+    /// reading the file rather than by anything automatic. This is the
+    /// automatic part.
+    #[test]
+    fn every_blocker_reads_as_a_sentence() {
+        for blocker in every_blocker() {
+            let said = blocker.describe();
+            assert!(
+                !said.trim().is_empty(),
+                "{blocker:?} tells the buyer nothing"
+            );
+            assert!(
+                !said.contains("  "),
+                "{blocker:?} has a broken line continuation: {said}"
+            );
+            assert!(
+                said.ends_with('.'),
+                "{blocker:?} is not a finished sentence: {said}"
+            );
+        }
     }
 }

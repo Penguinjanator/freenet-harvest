@@ -86,6 +86,11 @@ freenet-migrate = { workspace = true, features = ["ui"] }
 freenet-scaffold = { workspace = true }
 
 [dev-dependencies]
+# Enables `freenet_bitcoin_common::spv::testing`, so the settlement tests
+# build GENUINE bridge-signed claims and SPV proofs rather than stubbing out
+# the verification the whole mechanism rests on. Same reason `harvest-common`
+# takes it.
+freenet-bitcoin-common = { workspace = true, features = ["test-support"] }
 # Naming the notary's RSA signing key, so the certificate tests can mint a
 # chain of their own rather than needing one Freenet issued. Pinned to what
 # `ghostkey_lib` itself depends on -- a second version would be a second,

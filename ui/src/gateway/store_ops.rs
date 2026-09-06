@@ -656,9 +656,9 @@ mod tests {
 
         let signing_key = SigningKey::from_bytes(&[11u8; 32]);
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
-        let listing_id = ListingId::new("seller-fp", &created_at, "Widget");
+        let listing_id = ListingId::from_label("Widget");
         let order = Order {
-            id: OrderId::new("seller-fp", &listing_id, &created_at, "buyer-fp"),
+            id: OrderId([0u8; 32]),
             listing_id,
             buyer_fingerprint: "buyer-fp".to_string(),
             seller_fingerprint: "seller-fp".to_string(),
@@ -670,8 +670,11 @@ mod tests {
             payment_hash: None,
             trusted_bridges: vec![freenet_bitcoin_common::BridgeId([3u8; 32])],
             bitcoin_address_code_hash: Some([4u8; 32]),
+            anchor: None,
+            order_binding: None,
             created_at,
-        };
+        }
+        .with_derived_id();
 
         // Exactly the bytes the invoice flow hands `SignMessage`, wrapped the
         // way the ghostkey delegate wraps them.

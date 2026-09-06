@@ -425,6 +425,329 @@ node contacted (removable, and the removal is a real deletion). See
 
 ---
 
+### The buy flow (added on `feat/buy-flow`, 2026-09-05)
+
+Recorded while the code was written, for the same reason the section above
+was. Two of these are design gaps rather than test gaps, and they are here
+because a reader of the code would otherwise take the comments around them as
+covering more than they do.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `ui/src/state.rs::AppState::payment_blockers` | A buyer will not pay a commitment that is unpublished, not the seller's, not theirs, for a listing they never asked about, not awaiting payment, unanchored, off-chain, stale, unbridgeable, or paying an address that is not its own script. | **Yes** -- `buy_flow_tests`, one test per blocker, each mutated red by deleting the guard it names. **This list was shorter, and the missing entries were the two HIGH findings below plus the bridge and destination checks that were card footnotes rather than blockers.** The mutations were run and the failures recorded: dropping the kept-conversation check, the staleness check, the canonicality check, the direction filter, the signature check and the listing check each turned exactly the intended test red. |
+| same, `ConversationNotKept` | The buyer does not part with money before their node has confirmed it is keeping the key that reads the conversation. | **Yes** -- `a_buyer_does_not_pay_before_the_node_confirms_it_kept_the_conversation`, and the other half, `only_the_delegates_answer_marks_a_conversation_kept`, which drives a refusal and then a success through `on_delegate_response`. This is the Phase 2 ordering constraint from `buyer-conversation-persistence.md` applied to the thing that exists today; the confession does not exist, so nothing here holds a confession. |
+| `ui/src/state.rs::PaymentBlocker` | Adding the Phase 2 blocker is one variant and one check, and no screen can quietly ignore it. | **Yes, structurally.** `components::buy_view::is_temporary` matches the enum without a wildcard, so a new variant does not compile until somebody has said whether it means "wait" or "walk away" -- which is the sentence the buyer is shown. This fired for real while the change was being written: adding `CommitmentNotRequested` failed the build until that question was answered. |
+| `harvest_common::payment::Order::anchor` | `skip_serializing_if` keeps every pre-existing order signature verifying. | **Yes** -- `order_wire_compat_tests::an_order_that_predates_the_anchor_re_encodes_unchanged`, observed red against the naive `#[serde(default)]`-only form: `0xae` map(14) with `"anchor": null` against the `0xad` map(13) the signature was taken over. Same trap, and the same fix, as `StoreInfoV1::encryption_public_key`. |
+| `ui/src/state.rs::order_for_invoice` | A seller who cannot see the chain publishes no commitment at all. | **Yes** -- `a_seller_who_cannot_see_the_chain_cannot_issue_an_invoice`, mutated red by falling back to `anchor: None`. Without it the seller would show a bill that every buyer's software silently refuses, which is the shape of the bridge-less invoices that made every early store permanently unable to take money. |
+| `ui/src/state.rs::AppState::acceptance_for` | The buyer can read the acceptance and it names the published commitment. | **Yes** -- `accepting_a_request_tells_the_buyer_which_commitment_is_theirs`, read back through the BUYER's conversation keys rather than by inspecting what the seller composed. |
+| `ui/src/state.rs::AppState::announce_acceptance` | The acceptance actually reaches the seller's mailbox. | **No.** The dispatch is a wasm-gated `spawn_local`, the same blind spot as every other send in this repository. What is tested is everything either side: that the message is composed and recorded as the seller's own (`accepting_records_the_acceptance_as_the_sellers_own_message`), and that a buyer who receives one reads it correctly. |
+| same | The commitment is published before the buyer is told about it. | **No, and deliberately not attempted.** The two are independent fire-and-forget dispatches and may land in either order. The buy flow does not depend on the order: a buyer holding an acceptance for a commitment that has not arrived reads `CommitmentNotPublished` and does not pay, which is the same answer a seller who never published would produce. |
+| `ui/src/state.rs::PaymentBlocker::CommitmentNotRequested` | The commitment is for something this conversation asked about. | **Yes for the case it closes** -- `a_commitment_for_a_listing_never_requested_is_refused` and its converse. **The claim is narrower than it looks**, and the doc comment says so rather than overstating it: the request it compares against sits in the buyer's own thread, and direction is not authorship (`messaging::Addressing`), so a seller can insert a request the buyer never sent. What the check closes is the seller answering a cheap listing's request with a commitment against an expensive one; what it does not close is a forged request, which shows up instead as a line in the buyer's own thread they do not recognise. |
+| `ui/src/components/buy_view.rs` | Everything the buy form, the purchases panel and the accept control say on screen. | **No.** There are no component tests in this repository at all -- the same row as `message_view` above, and worth repeating here because this is the screen that tells a buyer an order is safe to pay. The *decisions* behind the words are all in `AppState` and tested; the words are not. |
+
+#### What the review round changed, and what it left open
+
+Two HIGH findings, both single-seller attacks reachable through the ordinary
+UI, both defeating properties this section previously claimed. They are
+recorded here rather than only in the commit log because the first one falsifies
+a sentence this document used to carry.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `harvest_common::mailbox::order_binding_from_secret` | Two buyers never share a binding, and the seller cannot compute one. | **Yes** -- a known-answer test against `b3sum --derive-key`, plus `two_conversations_do_not_share_a_binding` and the delegate's `recall_answers_the_binding_the_shared_derivation_gives`, which also asserts the binding is NOT the one the shared secret would give. That second assertion is the load-bearing one: deriving from the DH shared secret would look identical and would hand the seller the ability to compute any buyer's binding. |
+| `ui/src/state.rs::AppState::payment_blockers` (`CommitmentNotForThisBuyer`) | One published commitment is payable by exactly one buyer. | **Yes** -- `one_commitment_is_payable_by_exactly_one_buyer` drives two independent `AppState`s with separate ephemeral secrets at one commitment. Mutation-verified twice: deleting the check, and -- the one that matters -- changing it to compare against the binding in the mailbox request instead of the locally-derived one, which is the wrong version a reasonable person would write. |
+| same | The binding this browser computes is the same value the delegate answers on recall. | **Yes, in two halves, and it cannot be one test.** They are different crates on different machines, so each side is pinned to the shared derivation (`the_browsers_binding_is_the_shared_derivation` in the UI, `recall_answers_the_binding_the_shared_derivation_gives` in the delegate) and the derivation itself has the known-answer test. A drift on either side turns one of the three red. The failure it prevents is silent: a returning buyer would simply find their own commitment unrecognisable and could never pay it. |
+| `harvest_common::payment::OrderId::from_terms` | Two differently-termed orders cannot share an id, so a seller cannot swap the payment address under one after the buyer has seen it. | **Yes** -- `two_differently_termed_orders_cannot_share_an_id` and `an_id_determines_the_terms_it_was_derived_from`, both mutated red by restoring the old four-field preimage. `a_record_whose_id_is_not_its_terms_is_rejected` covers the enforcement half and is mutated red by dropping the check from `verify_terms`. |
+| `harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS` | The freshness tolerance fits inside the tip contract's retained window. | **Yes, as a BUILD failure** -- a `const _: () = assert!(...)` against `freenet_bitcoin_common::TIP_RETAIN`, verified by raising the constant to 96 and watching the build fail. A test would have been the wrong instrument: the two constants live in different crates and the failure is silent, since an anchor inside the tolerance but outside the retained window reads as unverifiable and refuses payment for a reason nobody can act on. |
+| `ui/src/state.rs::AppState::needs_reissue` | A seller learns when one of their own orders has aged out. | **Yes** -- `a_seller_is_told_which_of_their_orders_need_reissuing` covers fresh, expired, never-anchored and settled, and `a_seller_with_no_chain_view_is_told_to_reissue_nothing` covers the no-clock case. The screen that renders it is not tested; see the component row above. |
+| `ui/src/components/buy_view.rs::remedy` | Every blocker is classified as wait, ask-the-seller, or walk-away. | **Yes, structurally** -- wildcard-free match, so a new blocker does not compile until classified. The specific case review found is pinned by `an_expired_order_sends_the_buyer_back_to_the_seller`, which asserts both the classification and that the sentence no longer accuses the seller of backdating. |
+| `ui/src/state.rs::payment_blocker_wording_tests::every_blocker` | Every variant has a sentence. | **Yes, since the review round.** It was NOT before, and the way it failed is worth keeping: the test held a hand-written `vec!` with an exhaustive `match` NEXT TO it, and its own comment claimed that made a missing variant a compile error. The match forced only itself; a variant could be added to it and omitted from the list, and the test would silently stop covering it. It now matches over each element of the list, so the list is the only way to reach the match, plus a count assertion. Verified by removing one variant from the list. |
+
+**And one the sweep for the same shape found elsewhere.**
+
+The review asked whether any other id in this flow had the order id's shape.
+One did. `ListingId` hashed `(seller_fingerprint, created_at_ms, title)` --
+not the price, the description or the kind -- so a seller could sign two
+listings with one id at different prices.
+
+The symptom is different and arguably worse than the order case.
+`ListingsV1::apply_delta` is first-writer-wins: a listing whose id is already
+held is SKIPPED. So nothing is displaced; instead a peer that saw the cheap
+copy first keeps it and thereafter excludes that id from every delta it sends
+and every delta it asks for, a peer that saw the dear copy keeps that, and
+**neither can ever tell the other**, because each one's summary already names
+the id. Two readers see two prices for one listing, permanently. Fixed the
+same way and pinned by `listing::listing_identity_tests`, including a merge in
+both orders through the real `apply_delta`.
+
+Fixing it exposed a second thing, in a test rather than in the code:
+`migrate::tests::store_with` assigned an arbitrary `Vec` to
+`ListingsV1::listings`, building a state no peer could hold, since the only
+order a merged state is ever in is sorted by id. It passed while the fixture's
+hand-chosen ids happened to ascend with its own argument order, and the
+commutativity check went red the moment derived ids reordered them. The
+fixture now sorts. **The underlying gap is still open**: `ListingsV1::verify`
+does not require sortedness, so a peer that deserialized an unsorted state
+from the network would merge to different bytes than one that reached the same
+set through deltas. Pre-existing, not touched by this branch, recorded here
+because this is where it was found.
+
+**And the tell the buy flow had none of.**
+
+Review named it beside H1 and it is the half that makes the rule checkable by
+a person: nothing registered a payment watch for a purchase, so a card read
+"Awaiting payment" however much had already arrived at the address. So it was
+not only that N buyers could pay one commitment -- none of them could see that
+anyone else had.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `harvest_common::payment::Order::bitcoin_address_instance_id` | The address contract an order names is derived from the code hash and the payment parameters the seller signed. | **Yes** -- `payment::address_instance_tests`, including that the id changes with the build AND with the script, and that it is `BLAKE3(code_hash \|\| cbor(parameters))` asserted against the components rather than against a copy of the code. It replaces a hand-written second copy in the store contract: a duplicated contract-address derivation is the shape ranked first in this document, where the copies drifted and every derived id named a contract that had never been published. |
+| `ui/src/components/bitcoin_view::live_address_for_order` | A buyer sees the state of the address they are about to pay, holding no watch. | **Yes** -- `live_address_tests`, mutated red by removing the derived-id lookup. The same change also fixed an identity mismatch: the old lookup matched a watch on `(network, script_pubkey)` and then trusted the `contract_id` STRING the watch carried, so where the two disagreed a buyer was shown some other address's balance under this order. Pinned by `a_watch_pointing_elsewhere_does_not_override_the_orders_own_terms`, and the watch fallback is pinned as still working for an order that names no build. |
+| `ui/src/state.rs::AppState::address_contracts_to_watch` | Only orders this node is party to are subscribed. | **Yes** -- `somebody_elses_order_is_not_watched`, mutated red by watching every order in the store. A store contract carries every order it ever issued, so subscribing to all of them would advertise this node's interest in every one of a busy seller's payment addresses -- the private-watch-list-as-public-record shape `harvest_common::bitcoin_delegate` refuses to build. |
+| same, dispatch | The subscription actually happens. | **No.** `watch_purchase_addresses` ends in a wasm-gated `spawn_local`, like every other send here. What is tested is which ids it asks for. |
+
+This narrows, but does not close, the "nothing takes over after payment" gap
+recorded below: the buyer can now SEE a payment arrive at the order's address,
+because the address contract is subscribed and the card reads its state.
+Nothing still constructs an `OrderPaymentProof`, so the published order never
+advances to `Paid`.
+
+#### The id widening, and what it costs at the migration boundary
+
+`OrderId` and `ListingId` are 32 bytes as of the third round, widened at the
+team lead's direction while the wire was open. The argument is that this branch
+re-keys every contract, so every published record is already crossing a
+migration boundary: the change is free exactly once and costs a re-key plus a
+migration of its own afterwards. The threat it closes is specific -- the swap
+attack needs a COLLISION between two orders the seller chooses rather than a
+second preimage, so 16 bytes cost ~2^64 rather than 2^128, which is expensive
+rather than impossible against a payoff of a stolen payment behind a public
+record that says unpaid.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `OrderId::from_terms` / `ListingId::from_terms` | The id is the whole digest, not a prefix. | **Yes** -- `the_id_is_the_whole_digest` in both modules, mutated red by restoring the 16-byte truncation zero-extended into the wider type. Worth having as its own test: under that mutation every OTHER identity test still passed, because the ids stayed distinct, deterministic and enforced -- only the collision cost changed, and nothing else could see it. |
+| `Order` wire shape | An order published at the old id width does not decode. | **Yes, deliberately** -- `an_order_from_before_the_id_was_widened_does_not_decode`, asserting on the `invalid length 16` the decoder gives. That is the honest statement of what the re-key costs, pinned rather than described. Orders expire after `MAX_ANCHOR_AGE_BLOCKS`, so one old enough to be in a predecessor generation is one nobody could pay anyway. |
+| same | An order carrying neither optional field re-encodes to the bytes its signature covered. | **Yes** -- `an_order_without_the_optional_fields_re_encodes_unchanged`, a hand-written literal at the current width. It replaces the pre-anchor fixture, which can no longer decode; the property it protects (a future optional field must not change an old signature's preimage) is unchanged. |
+
+#### KNOWN GAP, and it needs a decision rather than a fix
+
+**A predecessor generation's store is discarded in full, and the seller is
+told only in a console log.** Pinned by
+`migrate::predecessor_generation_tests::known_gap_a_predecessor_generations_store_is_discarded_in_full`.
+
+Making a listing's id a function of its terms is right, and it is what stops
+two differently-priced listings sharing an id and diverging permanently. It
+also means every listing published under a previous generation carries an id
+`AuthorizedListing::verify` now refuses. `ListingsV1::apply_delta` returns on
+the first refusal, so `fold_or_keep_primary` keeps the newer generation and
+drops the predecessor **entirely** -- the listings, the orders, and the
+store's own info with them. A seller upgrading loses their shop.
+
+Three things make it worse than the loss:
+
+* it is reported by `probe_warn`, a browser console line, not something a user
+  sees;
+* the fold's own message says the migration then **seals**, so the generation
+  is never looked at again;
+* every other test in this repository builds its fixtures with the NEW
+  derivation, so not one of them could see it. It passed all four gates.
+
+**The requirement this produced lives in
+[`docs/design/migratability.md`](design/migratability.md).** A new contract
+version must be migratable from every version that has ever held user data;
+that document carries the argument, the unbuilt re-issue path, and why
+accepting the old format in `verify` is wrong. What follows is what this
+branch actually did.
+
+**RESOLVED 2026-09-06, by decision rather than by repair.** Ian's answer: no
+published store holds data worth preserving, sellers republish. So the loss
+stands, and what changed is that it is now a decision the affected person is
+TOLD about:
+
+* `migrate::describe_lost_store` names the store, its details, and how many
+  listings and orders went with it, and says to publish them again --
+  "migration incomplete" is not something a seller can act on.
+* It reaches `AppState::notifications` rather than a console line, drained in
+  `migrate_ops::finish` **before** the nothing-was-recovered early return.
+  That ordering is the whole of it: draining after that return would mean the
+  one message that matters is the one never sent.
+* Pinned by `migrate::uncarried_tests`, including that a fold which carries
+  everything reports nothing -- a notification on every successful migration
+  is one a seller learns to dismiss, which costs exactly the case it exists
+  for.
+
+**And the structural half, which is worth more than the rest.** The reason
+neither the author nor the review saw this is that **every fixture in this
+repository builds its records with the CURRENT derivation**, so none of them
+could hold what a predecessor generation produced. The fix is a known-answer
+test on each derivation --
+`listing::listing_identity_tests::the_listing_id_derivation_is_pinned` and its
+order counterpart -- whose doc comments carry the consequence and say to read
+the migration tests before changing the constant.
+
+A first attempt at this pin did not work and the failure is worth recording:
+it built a record with a hard-coded foreign id, which is refused whatever the
+derivation is, so simulating a future derivation change (`v2` to `v3`) failed
+**zero** tests. What fires is a fixture that depends on the derivation's
+actual output. Verified by making that change and watching the KAT go red,
+and again by adding a field to the order id's preimage.
+
+**The original difficulty, for a reader who reaches this by a different
+route:**
+The id is inside what the seller signed, so the fold cannot re-stamp a record
+without invalidating its signature. Accepting the old form in `verify` works
+mechanically -- the seller's fingerprint is derivable from the verifying key
+`verify` already holds -- but reopens exactly the hole the change closed, since
+a seller could still mint two listings under one old-form id. So the options
+are to accept the loss loudly, or not to make the change, and both are
+decisions about whether any published store holds listings worth preserving.
+
+The asymmetry worth carrying into that decision: an ORDER expiring is fine,
+because orders expire anyway. A LISTING is a seller's shop and does not.
+
+**One thing the round did not close, and one it did.**
+
+**`OrderId` was 16 bytes, and that is CLOSED.** It is recorded here because
+this section is where a reader looks for open gaps and this one was left
+listed as open after it had been fixed -- which costs the same as overstating
+a gap, since a reader cannot tell which sentence is current.
+
+Deriving the id from the terms means an attacker needs two orders that hash to
+one id. Second-preimage against an id a buyer already holds is 2^128 and out
+of reach, but the swap attack needs only a COLLISION between two orders the
+SELLER chooses, which at 16 bytes was ~2^64. Both ids are now 32 bytes, so it
+is 2^128 either way. See "The id widening, and what it costs at the migration
+boundary" above, and `docs/design/migratability.md` for what the widening cost
+at the re-key.
+
+**One binding per conversation, not per order.** Two orders a buyer places in
+one thread carry the same binding, so the binding does not distinguish them
+from each other -- their distinct ids and the buyer's own request list do. It
+distinguishes BUYERS, which is the hole. A consequence on the seller's side:
+`unanswered_requests` treats a request as answered when a published commitment
+carries its binding AND its listing, so a buyer who asks twice for the same
+listing in one conversation sees the second ask read as already answered. Per
+order it would need a durable per-order counter in the delegate, which Phase 2
+can add if filing turns out to need it.
+
+#### Two design gaps this change does NOT close
+
+Neither is a missing test. Both are Phase 2 work recorded in issue 8, and both
+are named here because the surrounding comments would otherwise read as
+covering them.
+
+**The commitment is not private.** `docs/design/incentive-mechanism.md` Part 5
+step 2 says an order commitment reveals "a scrambled order number, the amount,
+and a recent Bitcoin block hash" and "nothing about who Bob is or what he
+bought". What is actually published is an `AuthorizedOrder`, which carries the
+`listing_id`, the payment address and its `scriptPubKey`. So **what** was
+bought is public, and the address links the order to a chain transaction.
+
+Who bought is not published -- `buyer_fingerprint` is empty for every order
+the buy flow produces, and the buyer has no identity to name -- and the
+shipping address never leaves the AEAD. The commitment now also carries
+`order_binding`, and that one genuinely reveals nothing: it is a hash of a
+value only the buyer holds (see
+`harvest_common::mailbox::order_binding_from_secret`), so it identifies the
+buyer to the buyer and to nobody else. But the design's claim about the whole
+commitment is stronger than the code, and the difference is real.
+
+Two further seller-chosen fields are published per order and are not on the
+design's list either: `required_confirmations` and `trusted_bridges`. They
+make the bridge set a per-order fingerprint of the seller's configuration.
+Minor, but the accept panel's enumeration is written to be exact and this is
+the honest full list.
+
+It is not fixable here: the payment address must be public, because a stranger
+being able to verify the payment is the entire point of the on-chain rail.
+Closing it means separating the countable commitment from the payable invoice,
+which is what issue 8's per-seller ledger contract does.
+
+**The commitment is per-store, not per-identity.** Issue 8, point 3: one
+ghostkey may create unlimited stores, so a buyer counting a seller's
+outstanding orders from one store's state sees a fraction of what the bond
+would back. The exposure cap that makes the whole mechanism work is therefore
+not yet countable, and nothing in this change counts it -- the buy flow checks
+that the buyer's OWN commitment is published, which is the half that forces
+the seller to publish at all, and stops there. There is no bond to count
+against yet, which is why this is Phase 2 rather than a defect.
+
+#### The payment proof: what now takes over after payment, and what still does not
+
+The gap this document recorded twice -- "nothing takes over after payment" --
+is closed for the transition itself. `harvest_common::payment::
+assemble_on_chain_proof` builds the proof out of the claims a node holds and
+the tip it can see, and `AppState::settled_orders` publishes the `Paid`
+record.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `assemble_on_chain_proof` | A confirmed payment assembles into a proof the verifier accepts. | **Yes** -- `proof_assembly_tests`, built on GENUINE bridge-signed claims and SPV proofs (`freenet_bitcoin_common::spv::testing`, added to `harvest-ui`'s dev-dependencies for the same reason `harvest-common` takes it). Not stubs: the thing being tested is whether real evidence verifies. |
+| same | It verifies before returning, so a caller cannot publish a proof the network refuses. | **Yes** -- `the_assembler_declines_what_would_not_verify`, mutated red by deleting the `verify_payment_proof` call. Also caught on the state side by `an_unpaid_order_is_not_settled`, but only after that test was fixed: see below. |
+| same | A claim about another address is left out, and more claims than a proof may carry is refused rather than truncated. | **Yes** -- two tests. The refusal matters more than it looks: silently dropping the excess would be curating which of a bridge's claims the network sees, which `OnChainPaymentProof` documents as undetectable downstream, and doing it in the buyer's favour. |
+| `AppState::settled_orders` | An order already past `AwaitingPayment` is not settled again. | **Yes** -- mutated red by deleting the status guard. |
+| `AppState::publish_settled_orders` | A settlement is dispatched once per tab, not once per notification. | **Yes, after a correction.** See below. |
+| same, dispatch | The update reaches the contract. | **No.** Wasm-gated `spawn_local`, like every send here. What is tested is which records it would publish. |
+| the ordering constraint from `buyer-conversation-persistence.md` | Settling does not stop the node keeping the conversation. | **Yes** -- `settling_leaves_the_conversation_record_alone`, which checks the conversation is still held and still marked kept after the order goes `Paid`. Payment is exactly the moment a buyer's software might conclude the transaction is over; in Phase 2 the confession lives in that record and must be persisted BEFORE payment, so treating payment as a reason to stop caring about it inverts the argument. |
+
+**Two of these tests initially reported success while measuring nothing, and
+both were found by mutation rather than by reading.** Recorded because the
+second is the exact shape this document exists for.
+
+* `an_unpaid_order_is_not_settled` passed a claim set that was EMPTY, so it
+  took the assembler's early "nothing seen" refusal and never reached the
+  verify. Deleting `verify_payment_proof` from the assembler left it green. It
+  now also drives a genuine, verifying, correctly-scripted claim that is one
+  satoshi short -- evidence that exists and does not carry the transition.
+* `a_settlement_is_published_once_per_tab` asserted on the length of the
+  in-flight `settlements_submitted` SET. A set insert is idempotent, so the
+  length was one whether the guard skipped the second send or not; deleting
+  the guard left it green. `publish_settled_orders` now returns what it
+  actually dispatched, and the test counts that. **The dispatch being
+  wasm-gated is what made the wrong thing the only observable thing** -- which
+  is the general trap, not a detail of this test.
+
+**What still does not happen.** Nothing constructs a `PaymentReversed`
+transition, so a reorg that undoes a settled payment leaves the order reading
+`Paid`. The evidence rule for it is stricter than for `Paid` -- a reversal has
+to show confirmations that were themselves retracted -- and the claims to do
+it arrive by the same subscription, so the shape is available; it is simply
+not built. `Paid` is the transition the buy flow needs and the one that was
+missing.
+
+#### And one thing the buy flow does not do at all
+
+**It does not send money.** Step 5 of the design is a person opening a wallet.
+Harvest shows the address and the amount once the checks pass, watches the
+address, and publishes the settled order once the payment verifies -- but the
+paying itself is a person and a wallet, and nothing here moves coin.
+
+An earlier version of this paragraph said "nothing takes over once it is
+sent", which was true when written and is no longer. What was missing then,
+and is recorded above now:
+
+An earlier version of this paragraph said "the existing on-chain verification
+path takes over from there", which review showed was false in both halves, in
+a document whose whole purpose is not claiming more than the code does:
+
+* **No watch is registered.** *(Closed.)* `live_address_for_order` resolved only through
+  `bitcoin.watches`, and the only thing that creates one is the manual "Watch
+  address" form. So `live` was `None` for every purchase and the card read
+  "Awaiting payment" however much had arrived. **Closed** -- the lookup now
+  derives the address contract from the order's own signed terms and the buy
+  flow subscribes to it; see the round-2 section above.
+* **Nothing constructs an `OrderPaymentProof`.** *(Closed.)* Every
+  `payment_proof` site in `ui/` was `None`, so a published order never
+  advanced to `Paid` and `NotAwaitingPayment` never fired for a real
+  settlement. `assemble_on_chain_proof` and `settled_orders` are what changed
+  it; `PaymentReversed` is still unbuilt.
+
+The verification machinery exists and is tested (`verify_payment_proof`, the
+bridge claims, the fold); what does not exist is anything in the buy flow that
+drives it. That is the honest boundary of this change.
+
 ## The four that matter
 
 Ranked by what breaks if the claim turns out to be false, not by how easy the

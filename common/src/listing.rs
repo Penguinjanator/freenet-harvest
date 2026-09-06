@@ -19,20 +19,100 @@ pub struct PriceInfo {
     pub currency: String,
 }
 
-/// Unique listing identifier: first 16 bytes of BLAKE3(fingerprint || timestamp_ms || title).
+/// Unique listing identifier: a hash of the listing's own TERMS.
+///
+/// # Why 32 bytes, and why the reasoning is NOT the order's
+///
+/// Widened alongside [`crate::payment::OrderId`] while the wire was open, but
+/// the case for it is weaker and worth stating honestly rather than borrowing.
+/// A collision here buys a griefing attack -- two listings under one id, and
+/// readers permanently disagreeing about the price -- not a stolen payment.
+/// 2^64 of work for that is a poor trade, so 16 bytes was not obviously
+/// wrong.
+///
+/// It is 32 anyway for two reasons that are about the change rather than the
+/// threat. The cost is zero at this boundary and nonzero at every later one,
+/// which is the whole argument for doing the order's now. And a `ListingId`
+/// sits inside every `Order` and therefore inside the order id's own
+/// preimage, so leaving the two at different widths would invite exactly the
+/// "why is this one 16?" question at the next audit, with no answer better
+/// than "nobody widened it on the night the wire was open".
+///
+/// **What it costs is different from the order's, and it is the part to
+/// weigh.** An order published at the old width does not decode into this
+/// generation, and orders expire in hours, so losing them is survivable. A
+/// LISTING is a seller's shop and does not expire. See
+/// `docs/untested-invariants.md` for what the migration actually does with
+/// both, which is the same thing, and why only one of the two is comfortable.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
-pub struct ListingId(pub [u8; 16]);
+pub struct ListingId(pub [u8; 32]);
 
 impl ListingId {
-    pub fn new(seller_fingerprint: &str, created_at: &DateTime<Utc>, title: &str) -> Self {
+    /// The id these terms give.
+    ///
+    /// # Why the identity is the content
+    ///
+    /// It used to be `BLAKE3(seller_fingerprint || created_at_ms || title)`
+    /// -- not the price, not the description, not the kind. So one seller
+    /// could sign two listings, differing in price, that shared an id.
+    ///
+    /// Found by looking for the shape after `OrderId` had it, and the symptom
+    /// is different and arguably worse. `ListingsV1::apply_delta` is
+    /// first-writer-wins: a listing whose id is already held is SKIPPED. So
+    /// this is not the order case's displacement, it is a **permanent
+    /// divergence**. A peer that saw the cheap copy first keeps it and
+    /// thereafter excludes that id from every delta it sends and every delta
+    /// it asks for; a peer that saw the dear copy keeps that; and neither can
+    /// ever tell the other, because each one's summary already names the id.
+    /// Two readers see two prices for one listing, for good.
+    ///
+    /// Deriving from the whole encoded struct with the id blanked, rather
+    /// than from a chosen list of fields, for the same reason as
+    /// [`crate::payment::OrderId::from_terms`]: a list is what somebody adds
+    /// a field beside, which is exactly how this preimage came to omit the
+    /// price.
+    ///
+    /// The same `#[serde(skip)]` exception applies and is the way to break
+    /// it -- a skipped field is outside both this preimage and the signature
+    /// comparison in [`AuthorizedListing::verify`]. See that function's
+    /// counterpart on `OrderId` for the full statement.
+    ///
+    /// Derived the same way and at the same width as
+    /// [`crate::payment::OrderId::from_terms`], which carries the argument
+    /// for both.
+    pub fn from_terms(listing: &Listing) -> Self {
+        let mut probe = listing.clone();
+        probe.id = Self([0u8; 32]);
+        // Infallible: `Listing` derives `Serialize` over plain data with no
+        // custom fallible encoding.
+        let terms = crate::to_cbor(&probe).expect("Listing always serializes to CBOR");
         let mut hasher = blake3::Hasher::new();
-        hasher.update(seller_fingerprint.as_bytes());
-        hasher.update(&created_at.timestamp_millis().to_le_bytes());
-        hasher.update(title.as_bytes());
-        let hash = hasher.finalize();
-        let mut id = [0u8; 16];
-        id.copy_from_slice(&hash.as_bytes()[..16]);
-        Self(id)
+        hasher.update(b"harvest/listing-id/v2");
+        hasher.update(&terms);
+        Self(*hasher.finalize().as_bytes())
+    }
+
+    /// A distinct id per label, for naming a listing whose terms are not to
+    /// hand.
+    ///
+    /// **This is not a listing's identity.** A real listing's id comes from
+    /// its own terms ([`Self::from_terms`]), and
+    /// [`AuthorizedListing::verify`] refuses any listing carrying anything
+    /// else -- so a listing built with this is one no peer accepts, and
+    /// misuse fails closed rather than quietly.
+    ///
+    /// It exists for two honest uses: a fixture that needs *an* id without
+    /// building a whole listing, and a reference to a listing this code does
+    /// not hold. `crate::payment::Order::listing_id` is a reference of
+    /// exactly that kind.
+    ///
+    /// Domain-separated from [`Self::from_terms`], so a label can never
+    /// collide with a real listing's id.
+    pub fn from_label(label: &str) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"harvest/listing-id/label/v1");
+        hasher.update(label.as_bytes());
+        Self(*hasher.finalize().as_bytes())
     }
 }
 
@@ -65,6 +145,21 @@ pub struct Listing {
     pub created_at: DateTime<Utc>,
 }
 
+impl Listing {
+    /// Stamp this listing with the id its own terms give.
+    ///
+    /// Every producer must go through this, because
+    /// [`AuthorizedListing::verify`] refuses a record whose id is not the one
+    /// its terms give -- so a listing built any other way is one no peer will
+    /// accept. Taking `self` and returning it makes the stamping part of
+    /// construction rather than a step a caller can forget.
+    #[must_use]
+    pub fn with_derived_id(mut self) -> Self {
+        self.id = ListingId::from_terms(&self);
+        self
+    }
+}
+
 /// A listing signed by the seller's ghostkey via the ghostkey delegate.
 ///
 /// The ghostkey delegate wraps the listing bytes in a `ScopedPayload`
@@ -90,7 +185,23 @@ impl AuthorizedListing {
             &self.signature,
             verifying_key,
             &self.listing,
-        )
+        )?;
+        // The id has to be the one these terms give, or two differently-priced
+        // listings could share one and the merge would keep whichever arrived
+        // first on each peer -- permanently, and differently per peer. See
+        // [`ListingId::from_terms`].
+        //
+        // After the signature for the same reason as the order check: a
+        // record altered since signing fails both, and "the seller did not
+        // sign this" is the more useful thing to be told.
+        let expected = ListingId::from_terms(&self.listing);
+        if self.listing.id != expected {
+            return Err(format!(
+                "listing id {} is not the id these terms give ({expected})",
+                self.listing.id
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -293,7 +404,7 @@ mod tests {
     ) -> AuthorizedListing {
         let ts = DateTime::from_timestamp(1700000000, 0).unwrap();
         let listing = Listing {
-            id: ListingId::new("abc123", &ts, "Widget"),
+            id: ListingId([0u8; 32]),
             title: "Widget".into(),
             description: "A nice widget".into(),
             kind: ListingKind::Sale,
@@ -302,7 +413,8 @@ mod tests {
                 currency: "BTC".into(),
             }),
             created_at: ts,
-        };
+        }
+        .with_derived_id();
 
         #[derive(serde::Serialize)]
         struct TestScopedPayload {
@@ -347,18 +459,21 @@ mod tests {
 
     #[test]
     fn test_listing_id_deterministic() {
-        let ts = DateTime::from_timestamp(1700000000, 0).unwrap();
-        let id1 = ListingId::new("abc123", &ts, "Widget");
-        let id2 = ListingId::new("abc123", &ts, "Widget");
+        let id1 = ListingId::from_label("Widget");
+        let id2 = ListingId::from_label("Widget");
         assert_eq!(id1, id2);
     }
 
+    /// Two labels are two ids. Not a listing's identity -- see
+    /// `listing_identity_tests` for that -- but `from_label` still has to
+    /// distinguish what it is given, or a fixture naming two listings would
+    /// name one.
     #[test]
     fn test_listing_id_differs_by_input() {
-        let ts = DateTime::from_timestamp(1700000000, 0).unwrap();
-        let id1 = ListingId::new("abc123", &ts, "Widget");
-        let id2 = ListingId::new("abc123", &ts, "Gadget");
-        assert_ne!(id1, id2);
+        assert_ne!(
+            ListingId::from_label("Widget"),
+            ListingId::from_label("Gadget")
+        );
     }
 
     #[test]
@@ -433,7 +548,7 @@ mod tests {
         let verifying_key = signing_key.verifying_key();
         let ts = DateTime::from_timestamp(1700000000, 0).unwrap();
         let listing = Listing {
-            id: ListingId::new("abc123", &ts, "Widget"),
+            id: ListingId::from_label("Widget"),
             title: "Widget".into(),
             description: "n/a".into(),
             kind: ListingKind::Sale,
@@ -585,5 +700,220 @@ mod tests {
 
         use freenet_scaffold::ComposableState;
         assert!(authorized.verify(&parent, &params).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod listing_identity_tests {
+    use super::*;
+    use crate::store::ListingsV1;
+    use ed25519_dalek::SigningKey;
+    use freenet_scaffold::ComposableState;
+
+    fn seller() -> SigningKey {
+        SigningKey::from_bytes(&[41u8; 32])
+    }
+
+    fn listing_priced(price: &str) -> Listing {
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        Listing {
+            id: ListingId([0u8; 32]),
+            title: "Ghost Pepper".to_string(),
+            description: String::new(),
+            kind: ListingKind::Sale,
+            price: Some(PriceInfo {
+                amount: price.to_string(),
+                currency: "BTC".to_string(),
+            }),
+            created_at,
+        }
+        .with_derived_id()
+    }
+
+    fn authorize(listing: Listing, signing_key: &SigningKey) -> AuthorizedListing {
+        use ed25519_dalek::Signer;
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let message = crate::to_cbor(&listing).expect("serialize");
+        let scoped = ghostkey_common::ScopedPayload {
+            requestor: ghostkey_common::SignatureRequestor::WebApp(
+                crate::HARVEST_WEBAPP_CONTRACT_ID
+                    .parse::<ContractInstanceId>()
+                    .expect("canonical webapp id"),
+            ),
+            payload: message,
+        };
+        let scoped_payload = crate::to_cbor(&scoped).expect("serialize scoped");
+        AuthorizedListing {
+            signature: signing_key.sign(&scoped_payload).to_bytes().to_vec(),
+            listing,
+            scoped_payload,
+            certificate_pem: String::new(),
+        }
+    }
+
+    /// **Two differently-priced listings cannot share an id.**
+    ///
+    /// The same defect `OrderId` had, found by looking for it after the order
+    /// one was fixed, and with a different symptom that is arguably worse.
+    /// `ListingId` hashed `(seller, created_at_ms, title)` -- not the price,
+    /// the description or the kind -- so one seller could sign two listings
+    /// with one id and different prices.
+    ///
+    /// `ListingsV1::apply_delta` is first-writer-wins: a listing whose id is
+    /// already held is SKIPPED. So this is not a displacement like the order
+    /// case; it is a **permanent divergence**. A peer that saw the cheap copy
+    /// first keeps it and excludes the id from every later delta, a peer that
+    /// saw the dear one keeps that, and neither can ever tell the other --
+    /// each one's summary already names the id. Two readers see two prices
+    /// for one listing, for good.
+    #[test]
+    fn two_differently_priced_listings_cannot_share_an_id() {
+        assert_ne!(
+            listing_priced("0.001").id,
+            listing_priced("0.100").id,
+            "two prices must be two listings"
+        );
+    }
+
+    /// **The listing id derivation is pinned, and changing it costs a
+    /// seller their shop.**
+    ///
+    /// # Read this before changing the derivation
+    ///
+    /// This test exists to FAIL when somebody changes how a `ListingId` is
+    /// derived, because the consequence is not local to this function and is
+    /// not visible from it.
+    ///
+    /// Every listing published by a previous generation carries an id derived
+    /// the old way. `AuthorizedListing::verify` refuses any listing whose id
+    /// is not the one its terms give, and `ListingsV1::apply_delta` returns
+    /// on the first refusal -- so the migration's fold discards the ENTIRE
+    /// predecessor generation: the listings, the orders, and the store's own
+    /// name, description and certificate with them. The migration then
+    /// SEALS, so there is no second attempt.
+    ///
+    /// That happened on this branch. It passed every gate and survived a
+    /// review round, because every other fixture in this repository builds
+    /// its records with the CURRENT derivation and so none of them could see
+    /// it. See `harvest_ui::migrate::uncarried_tests` for what the fold does
+    /// and what the seller is told.
+    ///
+    /// So: if you are here because this test went red, the change may still
+    /// be right -- it was, on that branch -- but it is a decision about
+    /// published data and not a refactor. Updating the constant is the last
+    /// step, not the first.
+    ///
+    /// **`docs/design/migratability.md` is the requirement and the procedure.**
+    /// The first question it asks is whether the new version can accept old
+    /// state after all, because that is the only option costing nobody
+    /// anything -- and it is what keeps ANY UI able to migrate a contract.
+    /// Owner-assisted re-issue buys the data back and spends that property.
+    /// Accepting the old format in `verify` is not available; the document
+    /// says why, twice over.
+    ///
+    /// The expected value comes from this crate's own derivation rather than
+    /// an outside tool, which is weaker than the `b3sum` known answers in
+    /// `mailbox`: what it pins is CHANGE, not correctness.
+    #[test]
+    fn the_listing_id_derivation_is_pinned() {
+        let created_at = DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let listing = Listing {
+            id: ListingId([0u8; 32]),
+            title: "Ghost Pepper".into(),
+            description: "Hot".into(),
+            kind: ListingKind::Sale,
+            price: Some(PriceInfo {
+                amount: "0.001".into(),
+                currency: "BTC".into(),
+            }),
+            created_at,
+        };
+        assert_eq!(
+            hex::encode(ListingId::from_terms(&listing).0),
+            "abf0ddc0555aaabae4edfbc9d60ab5e7c33bf7966a9022a44efa018be2e9d5c5",
+        );
+    }
+
+    /// **The id is the WHOLE digest, not a prefix of one.**
+    ///
+    /// Same reasoning as `payment::order_identity_tests::the_id_is_the_whole_digest`:
+    /// a derivation that kept the old 16-byte truncation while the type grew
+    /// would leave half the id zero and the old collision cost, and every
+    /// other test here would still pass.
+    #[test]
+    fn the_id_is_the_whole_digest() {
+        let listing = listing_priced("0.001");
+        let mut probe = listing.clone();
+        probe.id = ListingId([0u8; 32]);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"harvest/listing-id/v2");
+        hasher.update(&crate::to_cbor(&probe).expect("serialize"));
+
+        assert_eq!(
+            ListingId::from_terms(&listing).0,
+            *hasher.finalize().as_bytes()
+        );
+    }
+
+    /// **A listing whose id is not its terms' id is refused.**
+    ///
+    /// The enforcement half: the store contract runs `verify` over every
+    /// listing in every state it validates, so a hand-built record filed
+    /// under another listing's id never becomes state anywhere -- which is
+    /// what makes the divergence above unreachable rather than merely
+    /// unlikely.
+    #[test]
+    fn a_listing_whose_id_is_not_its_terms_is_refused() {
+        let seller = seller();
+        authorize(listing_priced("0.001"), &seller)
+            .verify(&seller.verifying_key())
+            .expect("a listing carrying its own terms' id verifies");
+
+        let mut forged = listing_priced("0.001");
+        forged.id = listing_priced("0.100").id;
+        let refused = authorize(forged, &seller)
+            .verify(&seller.verifying_key())
+            .expect_err("a listing whose id is not its terms' id must be refused");
+        assert!(
+            refused.contains("id"),
+            "the refusal should say what is wrong: {refused}"
+        );
+    }
+
+    /// **Two listings that differ only in price both survive a merge, in
+    /// either order.**
+    ///
+    /// The property the id fix buys, asserted through the real `apply_delta`
+    /// rather than on the ids alone: `ListingsV1` is first-writer-wins by id,
+    /// so before the fix one of these was silently dropped and WHICH one
+    /// depended on arrival order. Now they are two listings and both land,
+    /// whichever way round they arrive.
+    #[test]
+    fn two_listings_differing_only_in_price_both_survive_either_order() {
+        let seller = seller();
+        let cheap = authorize(listing_priced("0.001"), &seller);
+        let dear = authorize(listing_priced("0.100"), &seller);
+        let params = crate::store::StoreParameters::new(seller.verifying_key());
+
+        let merged = |first: &AuthorizedListing, second: &AuthorizedListing| {
+            let mut state = ListingsV1::default();
+            let parent = crate::store::StoreStateV1::default();
+            state
+                .apply_delta(&parent, &params, &Some(vec![first.clone()]))
+                .expect("first");
+            state
+                .apply_delta(&parent, &params, &Some(vec![second.clone()]))
+                .expect("second");
+            state
+        };
+
+        let one = merged(&cheap, &dear);
+        let other = merged(&dear, &cheap);
+        assert_eq!(one.listings.len(), 2, "both listings must survive");
+        assert_eq!(
+            one.listings, other.listings,
+            "and the result must not depend on which arrived first"
+        );
     }
 }

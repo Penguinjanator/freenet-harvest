@@ -4,7 +4,7 @@ use ciborium::{de::from_reader, ser::into_writer};
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::*;
 
-use freenet_bitcoin_common::{BitcoinAddressParameters, BitcoinAddressStateV1};
+use freenet_bitcoin_common::BitcoinAddressStateV1;
 use harvest_common::payment::OrderStatus;
 use harvest_common::store::{
     StoreParameters, StoreStateV1, StoreStateV1Delta, StoreStateV1Summary,
@@ -49,16 +49,20 @@ const MAX_RELATED_CONTRACTS_PER_REQUEST: usize = 10;
 /// signs them, so the address contract this names is the one the seller meant
 /// for this payment. A mismatch costs the cross-check for that order and
 /// nothing more -- see `validate_state` on why it is additive-only.
+/// The address contract an order names, as a `ContractInstanceId`.
+///
+/// A thin wrapper over `Order::bitcoin_address_instance_id`, which is where
+/// the derivation lives. It used to be a second hand-written copy of
+/// `BLAKE3(code_hash || cbor(parameters))` here -- the shape ranked first in
+/// `docs/untested-invariants.md`, where a duplicated contract-address
+/// derivation drifted and made every derived id name a contract that had
+/// never been published, silently.
 fn bitcoin_address_instance_id(
-    code_hash: &[u8; 32],
-    params: &BitcoinAddressParameters,
-) -> Result<ContractInstanceId, ContractError> {
-    let mut param_bytes = Vec::new();
-    into_writer(params, &mut param_bytes).map_err(|e| ContractError::Deser(e.to_string()))?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(code_hash);
-    hasher.update(&param_bytes);
-    Ok(ContractInstanceId::new(*hasher.finalize().as_bytes()))
+    order: &harvest_common::payment::Order,
+) -> Option<ContractInstanceId> {
+    order
+        .bitcoin_address_instance_id()
+        .map(ContractInstanceId::new)
 }
 
 #[allow(dead_code)]
@@ -128,14 +132,13 @@ impl ContractInterface for Contract {
             ) {
                 continue;
             }
-            // No code hash on this order means nothing to compute a related
-            // instance id with -- skip that order's cross-check rather than
-            // guessing at one. See the field's doc comment on `Order`.
-            let Some(code_hash) = record.order.bitcoin_address_code_hash else {
+            // `None` means the order names no code hash, so there is nothing
+            // to compute a related instance id with -- skip that order's
+            // cross-check rather than guessing at one. See the field's doc
+            // comment on `Order`.
+            let Some(instance_id) = bitcoin_address_instance_id(&record.order) else {
                 continue;
             };
-            let addr_params = record.order.bitcoin_params();
-            let instance_id = bitcoin_address_instance_id(&code_hash, &addr_params)?;
             if !wanted_ids.contains(&instance_id) {
                 wanted_ids.push(instance_id);
             }
@@ -172,11 +175,7 @@ impl ContractInterface for Contract {
             ) {
                 continue;
             }
-            let Some(code_hash) = record.order.bitcoin_address_code_hash else {
-                continue;
-            };
-            let addr_params = record.order.bitcoin_params();
-            let Ok(instance_id) = bitcoin_address_instance_id(&code_hash, &addr_params) else {
+            let Some(instance_id) = bitcoin_address_instance_id(&record.order) else {
                 continue;
             };
             let Some((_, Some(related_bytes))) =
@@ -353,9 +352,9 @@ mod tests {
 
     fn make_order(script: &[u8], code_hash: Option<[u8; 32]>) -> Order {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let listing_id = ListingId::new("seller-fp", &ts, "Widget");
+        let listing_id = ListingId::from_label("Widget");
         Order {
-            id: OrderId::new("seller-fp", &listing_id, &ts, "buyer-fp"),
+            id: OrderId([0u8; 32]),
             listing_id,
             buyer_fingerprint: "buyer-fp".into(),
             seller_fingerprint: "seller-fp".into(),
@@ -369,8 +368,11 @@ mod tests {
                 bridge_key().verifying_key().to_bytes(),
             )],
             bitcoin_address_code_hash: code_hash,
+            anchor: None,
+            order_binding: None,
             created_at: ts,
         }
+        .with_derived_id()
     }
 
     fn make_paid_order(seller: &SigningKey, bridge: &SigningKey, order: Order) -> AuthorizedOrder {
@@ -480,8 +482,7 @@ mod tests {
         let bridge = bridge_key();
         let code_hash = [42u8; 32];
         let order = make_order(&[0x00, 0x14, 0xaa, 0xbb], Some(code_hash));
-        let addr_params = order.bitcoin_params();
-        let expected_id = bitcoin_address_instance_id(&code_hash, &addr_params).unwrap();
+        let expected_id = bitcoin_address_instance_id(&order).expect("the order names a build");
 
         let (state_bytes, _id) = paid_store_state_bytes(&seller, &bridge, order);
         let params = params_bytes(&seller);
@@ -506,8 +507,7 @@ mod tests {
         let bridge = bridge_key();
         let code_hash = [42u8; 32];
         let order = make_order(&[0x00, 0x14, 0xaa, 0xbb], Some(code_hash));
-        let addr_params = order.bitcoin_params();
-        let expected_id = bitcoin_address_instance_id(&code_hash, &addr_params).unwrap();
+        let expected_id = bitcoin_address_instance_id(&order).expect("the order names a build");
 
         let (state_bytes, _id) = paid_store_state_bytes(&seller, &bridge, order);
         let params = params_bytes(&seller);

@@ -78,12 +78,17 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
             .map(|entry| entry.digest())
             .filter(|digest| app_state.authored_here(&store_contract_id, digest))
             .collect();
+        let (listings, published) = store
+            .map(|store| (store.listings.clone(), store.orders.clone()))
+            .unwrap_or_default();
         drop(app_state);
         return rsx! {
             Inbox {
                 store_contract_id: store_contract_id.clone(),
                 entries: entries,
                 authored: authored,
+                listings: listings,
+                published: published,
             }
         };
     }
@@ -563,7 +568,26 @@ fn send(
         seller_encryption_key,
         text.clone(),
     )?;
+    deliver_to_seller(store_contract_id, seller, text, sealed)
+}
 
+/// Subscribe, dispatch, and record -- everything a buyer's outgoing message
+/// needs once it is sealed.
+///
+/// Shared with the buy form rather than copied, because the subscribe is the
+/// part that is easy to leave out of a second copy: without it the buyer
+/// never fetches the mailbox again, and the seller's acceptance -- the one
+/// thing that tells them which commitment is theirs -- sits there unread.
+///
+/// `record_as` is what the buyer's own record calls this message. It is not
+/// the message: a request carries structured fields, and the local record
+/// exists to say "you wrote this", not to reproduce it.
+pub(crate) fn deliver_to_seller(
+    store_contract_id: &[u8],
+    seller: ed25519_dalek::VerifyingKey,
+    record_as: String,
+    sealed: harvest_common::mailbox::EncryptedMessage,
+) -> Result<(), String> {
     // Subscribe to the seller's mailbox, once, on the first message. This is
     // what makes a reply reachable: without it the buyer never fetches the
     // contract again and the answer sits there unread.
@@ -581,7 +605,7 @@ fn send(
 
     APP_STATE
         .write()
-        .record_sent_message(store_contract_id, text, &sealed);
+        .record_sent_message(store_contract_id, record_as, &sealed);
     Ok(())
 }
 
@@ -632,6 +656,8 @@ fn Inbox(
     store_contract_id: Vec<u8>,
     entries: Vec<MailboxEntry>,
     authored: Vec<[u8; 32]>,
+    listings: Vec<harvest_common::listing::AuthorizedListing>,
+    published: Vec<harvest_common::payment::AuthorizedOrder>,
 ) -> Element {
     if entries.is_empty() {
         return rsx! {
@@ -682,6 +708,8 @@ fn Inbox(
                     tag: tag.clone(),
                     entries: group.clone(),
                     authored: authored.clone(),
+                    listings: listings.clone(),
+                    published: published.clone(),
                 }
             }
         }
@@ -695,6 +723,14 @@ fn Conversation(
     tag: Vec<u8>,
     entries: Vec<MailboxEntry>,
     authored: Vec<[u8; 32]>,
+    /// The store's own listings, so the accept control can NAME what it is
+    /// about to price. The buyer's message carries a listing id and nothing
+    /// readable; a seller typing a satoshi amount for an item the screen
+    /// never names is being asked to sign for something they cannot see.
+    listings: Vec<harvest_common::listing::AuthorizedListing>,
+    /// What this store has already published, which is how an already-
+    /// answered request is recognised after a reload.
+    published: Vec<harvest_common::payment::AuthorizedOrder>,
 ) -> Element {
     let mut draft = use_signal(String::new);
     let mut problem = use_signal(|| Option::<String>::None);
@@ -721,6 +757,22 @@ fn Conversation(
                 MessageCard {
                     entry: entry.clone(),
                     authored_here: authored.contains(&entry.digest()),
+                }
+            }
+
+            // A request to buy is the one message in a seller's inbox that
+            // has an action attached, so it gets the control rather than
+            // leaving the seller to copy a listing id into the invoice form
+            // by hand -- which is also how the reply-to tag would get lost.
+            for request in unanswered_requests(&entries, &listings, &published) {
+                super::buy_view::AcceptRequest {
+                    key: "{bs58::encode(request.digest).into_string()}",
+                    store_contract_id: store_contract_id.clone(),
+                    tag: tag.clone(),
+                    listing_id: request.listing_id.clone(),
+                    listing_title: request.listing_title.clone(),
+                    order_binding: request.order_binding,
+                    quantity: request.quantity,
                 }
             }
 
@@ -815,6 +867,117 @@ fn attribution(
         (Role::Seller, Addressing::ToSeller) => "Addressed to you",
         (Role::Seller, Addressing::ToBuyer) => "Addressed to this buyer",
     }
+}
+
+/// The request to buy this conversation is waiting on, if any.
+///
+/// Newest first, so a buyer who asked twice gets the second ask acted on
+/// rather than the first. `entries` is a seller's own inbox view, which
+/// `mailbox_entries` returns newest-first.
+///
+/// # Why direction is not checked here, and where it IS
+///
+/// This is the seller's side, and it deliberately does NOT mirror the buyer's
+/// rule (`state::AppState::buyer_purchases`, which ignores an acceptance not
+/// addressed to the buyer). `MailboxEntry::Readable` does carry
+/// `addressing`, so the check is available -- an earlier version of this
+/// comment said it was not, which was simply false and is corrected here
+/// rather than quietly dropped, because a reader auditing why the two sides
+/// differ was being given one true reason and one invented one.
+///
+/// The true reason stands on its own: a request the SELLER composed is one
+/// they wrote to themselves, and acting on it costs them their own
+/// derivation index and publishes a commitment nobody will pay. There is
+/// nothing for a third party to gain, because there is no third party -- only
+/// the two holders of the conversation key can produce a readable entry at
+/// all. What protects the BUYER is not this filter but the binding: accepting
+/// publishes a commitment carrying a value only the real buyer can match.
+fn unanswered_requests(
+    entries: &[MailboxEntry],
+    listings: &[harvest_common::listing::AuthorizedListing],
+    published: &[harvest_common::payment::AuthorizedOrder],
+) -> Vec<PendingRequest> {
+    let mut requests: Vec<PendingRequest> = Vec::new();
+    for entry in entries {
+        let MailboxEntry::Readable {
+            content:
+                MessageContent::OrderRequest {
+                    listing_id,
+                    quantity,
+                    order_binding,
+                    ..
+                },
+            digest,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        // Already answered, decided from the seller's OWN published state
+        // rather than from anything in the mailbox: a commitment carrying
+        // this request's binding and listing is the answer to it, and the
+        // buyer cannot forge or withdraw one.
+        let answered = published.iter().any(|order| {
+            order.order.order_binding == Some(*order_binding)
+                && order.order.listing_id == *listing_id
+        });
+        if answered {
+            continue;
+        }
+        // One control per distinct request. Two identical requests are one
+        // ask repeated, and offering the seller two controls for it would
+        // invite two published debts for one order.
+        if requests
+            .iter()
+            .any(|held| held.listing_id == *listing_id && held.quantity == *quantity)
+        {
+            continue;
+        }
+        requests.push(PendingRequest {
+            listing_id: listing_id.clone(),
+            listing_title: listings
+                .iter()
+                .find(|listing| listing.listing.id == *listing_id)
+                .map(|listing| listing.listing.title.clone())
+                .unwrap_or_default(),
+            quantity: *quantity,
+            order_binding: *order_binding,
+            digest: *digest,
+        });
+    }
+    // Ordered by the entry's own content digest, NOT by the timestamp
+    // `entries` arrives in. That timestamp is chosen by whoever wrote the
+    // message and signed by nobody -- `read_mailbox` says so where it sorts
+    // on it, and calls it a display order -- so letting it decide which
+    // request a seller answers first would put the choice of what gets priced
+    // in the buyer's clock. The digest is content-derived and total.
+    requests.sort_by_key(|request| request.digest);
+    requests
+}
+
+/// One request a seller has not yet answered, as the accept control needs it.
+///
+/// A struct rather than a tuple because the accept control publishes a
+/// commitment out of every one of these fields, and a positional call that
+/// swapped two of them would price the wrong listing or bind the commitment
+/// to the wrong buyer.
+#[derive(Clone, Debug, PartialEq)]
+struct PendingRequest {
+    listing_id: harvest_common::listing::ListingId,
+    /// The listing's title as the SELLER's own store publishes it, or empty
+    /// when this store's listings have not arrived.
+    ///
+    /// Deliberately not taken from the message: the buyer names a listing by
+    /// id, and a title carried in their message would be a name the buyer
+    /// chose for the thing the seller is about to price.
+    listing_title: String,
+    quantity: u32,
+    order_binding: [u8; 32],
+    /// `harvest_common::mailbox::entry_digest` of the message this came from.
+    ///
+    /// Used to order the controls deterministically without consulting a
+    /// timestamp the sender chose, and to key the rendered list.
+    digest: [u8; 32],
 }
 
 /// Enough of a conversation tag to tell two apart on screen, and no more --
@@ -917,5 +1080,279 @@ fn describe(content: &MessageContent) -> String {
             format!("{message}\n\n(This message also carries a blind signature, which this version of Harvest cannot act on.)")
         }
         MessageContent::Decline { reason } => format!("Declined: {reason}"),
+        MessageContent::OrderRequest {
+            quantity,
+            shipping,
+            note,
+            ..
+        } => {
+            let mut described = format!("Wants to buy {quantity}.\n\nShip to:\n{shipping}");
+            if !note.trim().is_empty() {
+                described.push_str(&format!("\n\n{note}"));
+            }
+            described
+        }
+        MessageContent::OrderAccepted { order_id } => {
+            format!("Accepted -- invoice {} is published.", order_id.short())
+        }
+    }
+}
+
+#[cfg(test)]
+mod inbox_tests {
+    use super::*;
+    use harvest_common::listing::{AuthorizedListing, Listing, ListingId, ListingKind};
+
+    const BINDING: [u8; 32] = [0x5a; 32];
+
+    fn listing(id: ListingId, title: &str) -> AuthorizedListing {
+        AuthorizedListing {
+            listing: Listing {
+                id,
+                title: title.to_string(),
+                description: String::new(),
+                kind: ListingKind::Sale,
+                price: None,
+                created_at: chrono::Utc::now(),
+            },
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            certificate_pem: String::new(),
+        }
+    }
+
+    fn readable(content: MessageContent, digest: [u8; 32]) -> MailboxEntry {
+        MailboxEntry::Readable {
+            conversation: vec![1u8; 32],
+            conversation_id: harvest_common::mailbox::ConversationId([2u8; 32]),
+            addressing: crate::messaging::Addressing::ToSeller,
+            timestamp: chrono::Utc::now(),
+            nonce: [0u8; 24],
+            digest,
+            content,
+        }
+    }
+
+    fn request(listing_id: ListingId, quantity: u32, digest: [u8; 32]) -> MailboxEntry {
+        readable(
+            MessageContent::OrderRequest {
+                listing_id,
+                quantity,
+                shipping: "12 Example St".into(),
+                note: String::new(),
+                order_binding: BINDING,
+            },
+            digest,
+        )
+    }
+
+    /// A published commitment answering `listing_id` under `binding`, built
+    /// by hand: only the two fields the answered-check reads matter here, and
+    /// signing one would test the signature path instead.
+    fn published(
+        listing_id: ListingId,
+        binding: Option<[u8; 32]>,
+    ) -> harvest_common::payment::AuthorizedOrder {
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        harvest_common::payment::AuthorizedOrder {
+            order: harvest_common::payment::Order {
+                id: harvest_common::payment::OrderId([0u8; 32]),
+                listing_id,
+                buyer_fingerprint: String::new(),
+                seller_fingerprint: "seller-fp".to_string(),
+                amount_sats: 1,
+                network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                payment_script_pubkey: Vec::new(),
+                payment_address: String::new(),
+                required_confirmations: 1,
+                payment_hash: None,
+                trusted_bridges: Vec::new(),
+                bitcoin_address_code_hash: None,
+                anchor: None,
+                order_binding: binding,
+                created_at,
+            },
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            status: harvest_common::payment::OrderStatus::AwaitingPayment,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        }
+    }
+
+    /// **The seller is offered an Accept only when there is a request.**
+    ///
+    /// An accept control on an ordinary question would publish a commitment
+    /// against an order nobody asked for.
+    #[test]
+    fn an_ordinary_message_offers_nothing_to_accept() {
+        let entries = vec![readable(
+            MessageContent::Text("is this in stock?".into()),
+            [1u8; 32],
+        )];
+        assert!(unanswered_requests(&entries, &[], &[]).is_empty());
+    }
+
+    /// **A request carries its listing, its title, its quantity and its
+    /// binding through to the accept control.**
+    ///
+    /// Not merely "there is a request": all four are what the commitment is
+    /// published out of. Dropping the listing id would price the wrong item;
+    /// dropping the binding would publish a commitment no buyer will pay;
+    /// dropping the TITLE leaves the seller typing a satoshi amount for an
+    /// item the screen never names, which is the state the accept control was
+    /// in when review found it.
+    #[test]
+    fn a_request_carries_everything_the_accept_control_publishes() {
+        let id = ListingId([9u8; 32]);
+        let entries = vec![
+            readable(MessageContent::Text("hello".into()), [1u8; 32]),
+            request(id.clone(), 4, [2u8; 32]),
+        ];
+        let found = unanswered_requests(&entries, &[listing(id.clone(), "Ghost Pepper")], &[]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].listing_id, id);
+        assert_eq!(found[0].listing_title, "Ghost Pepper");
+        assert_eq!(found[0].quantity, 4);
+        assert_eq!(found[0].order_binding, BINDING);
+    }
+
+    /// **A title the store has not published is empty, not invented.**
+    ///
+    /// The accept control refuses to price an unnamed listing rather than
+    /// showing a made-up label; a placeholder here would defeat that.
+    #[test]
+    fn a_listing_the_store_has_not_published_has_no_title() {
+        let id = ListingId([9u8; 32]);
+        let found = unanswered_requests(&[request(id, 1, [2u8; 32])], &[], &[]);
+        assert_eq!(found[0].listing_title, "");
+    }
+
+    /// **An unreadable entry is not a request.**
+    ///
+    /// The mailbox is open-write, so most of what arrives at a busy store is
+    /// junk; an accept control that appeared for it would invite the seller
+    /// to publish a commitment against nothing.
+    #[test]
+    fn an_unreadable_entry_is_not_a_request() {
+        let entries = vec![MailboxEntry::Unreadable {
+            conversation: vec![1u8; 32],
+            timestamp: chrono::Utc::now(),
+            nonce: [0u8; 24],
+            digest: [0u8; 32],
+            why: "not for us".to_string(),
+        }];
+        assert!(unanswered_requests(&entries, &[], &[]).is_empty());
+    }
+
+    /// **A request the seller has already answered is not offered again.**
+    ///
+    /// Found in review: the only thing preventing a second accept was a
+    /// component signal, which is gone after a reload -- so a seller coming
+    /// back to the tab was invited to publish a second commitment for one
+    /// order, burning a second derivation index and leaving the buyer with
+    /// two cards they could reasonably pay both of.
+    ///
+    /// "Answered" is decided from the seller's OWN published state, which the
+    /// buyer can neither forge nor withdraw.
+    #[test]
+    fn a_request_already_answered_is_not_offered_again() {
+        let id = ListingId([9u8; 32]);
+        let entries = vec![request(id.clone(), 1, [2u8; 32])];
+        let listings = vec![listing(id.clone(), "Ghost Pepper")];
+
+        assert_eq!(
+            unanswered_requests(&entries, &listings, &[]).len(),
+            1,
+            "unanswered while nothing is published"
+        );
+        assert!(
+            unanswered_requests(&entries, &listings, &[published(id.clone(), Some(BINDING))])
+                .is_empty(),
+            "a commitment carrying this request's binding and listing IS the answer to it"
+        );
+    }
+
+    /// **Somebody else's commitment does not answer this request.**
+    ///
+    /// The pair is what identifies the answer: a commitment for the same
+    /// listing bound to another buyer, or one bound to this buyer for a
+    /// different listing, leaves the request outstanding.
+    #[test]
+    fn another_buyers_commitment_does_not_answer_this_request() {
+        let id = ListingId([9u8; 32]);
+        let entries = vec![request(id.clone(), 1, [2u8; 32])];
+        let listings = vec![listing(id.clone(), "Ghost Pepper")];
+
+        assert_eq!(
+            unanswered_requests(
+                &entries,
+                &listings,
+                &[published(id.clone(), Some([0x11; 32]))]
+            )
+            .len(),
+            1,
+            "same listing, another buyer's binding"
+        );
+        assert_eq!(
+            unanswered_requests(
+                &entries,
+                &listings,
+                &[published(ListingId([8u8; 32]), Some(BINDING))]
+            )
+            .len(),
+            1,
+            "this buyer's binding, another listing"
+        );
+        assert_eq!(
+            unanswered_requests(&entries, &listings, &[published(id, None)]).len(),
+            1,
+            "an unbound commitment answers nobody"
+        );
+    }
+
+    /// **Which request is offered first is not decided by the sender's
+    /// clock.**
+    ///
+    /// `entries` arrives sorted by `MailboxEntry::timestamp`, which
+    /// `read_mailbox` documents in as many words as "chosen by whoever wrote
+    /// the message and signed by nobody ... a display order and NOT evidence
+    /// about when anything happened". Letting it choose which listing a
+    /// seller prices first would put that choice in the buyer's clock -- the
+    /// writer-chosen-ordering defect this repository has already paid for
+    /// three times. The order here is by the entry's own content digest.
+    ///
+    /// Both orderings of the same two entries must produce the same list.
+    #[test]
+    fn the_order_offered_does_not_depend_on_the_senders_clock() {
+        let cheap = ListingId([1u8; 32]);
+        let dear = ListingId([2u8; 32]);
+        let listings = vec![
+            listing(cheap.clone(), "Cheap"),
+            listing(dear.clone(), "Dear"),
+        ];
+        let first = request(cheap, 1, [0x01; 32]);
+        let second = request(dear, 1, [0x02; 32]);
+
+        let one = unanswered_requests(&[first.clone(), second.clone()], &listings, &[]);
+        let other = unanswered_requests(&[second, first], &listings, &[]);
+        assert_eq!(one, other, "the seller sees the same order either way");
+        assert_eq!(one[0].digest, [0x01; 32], "and it is the digest order");
+    }
+
+    /// **One ask repeated is one control.**
+    ///
+    /// A buyer whose send retried, or who pressed the button twice, has asked
+    /// once; two controls would invite two published debts for one order.
+    #[test]
+    fn the_same_request_twice_is_offered_once() {
+        let id = ListingId([9u8; 32]);
+        let entries = vec![
+            request(id.clone(), 2, [0x01; 32]),
+            request(id.clone(), 2, [0x02; 32]),
+        ];
+        let found = unanswered_requests(&entries, &[listing(id, "Ghost Pepper")], &[]);
+        assert_eq!(found.len(), 1);
     }
 }
