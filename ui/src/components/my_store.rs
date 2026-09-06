@@ -263,7 +263,7 @@ fn IdentityCard(
                         "{truncate_fingerprint(&identity.fingerprint)}"
                     }
                 }
-                span { class: "identity-tier", "({identity.notary_info})" }
+                span { class: "identity-tier", "{describe_notary_info(&identity.notary_info)}" }
             }
             div {
                 if has_store {
@@ -674,6 +674,153 @@ pub(crate) fn ensure_encryption_key(fingerprint: String) {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn ensure_encryption_key(_fingerprint: String) {}
 
+/// Render a ghostkey's notary attestation as something a person can read.
+///
+/// `GhostKeyInfo::notary_info` is the raw certificate field, and it was being
+/// printed verbatim -- so the UI showed
+/// `First Ghostkey({"action":"freenet-donation","amount":1,"delegate-key-created":"2024-08-13 15:45:36"})`.
+/// The surrounding CSS class is `identity-tier`, so a tier was always the
+/// intent; the payload was just never unpacked.
+///
+/// This is worth doing properly rather than merely hiding, because the value is
+/// real signal here: Harvest's own reputation model says a clean record with an
+/// old, high-tier ghostkey is the best reputation a seller can have, so the
+/// amount and the date are exactly what a buyer wants to weigh.
+///
+/// THREE shapes exist in the wild and all are handled, matching how the
+/// ghostkeys vault itself presents them (`ui/src/components/ghostkey_list.rs`)
+/// so the two apps do not disagree about the same key:
+///
+///   * JSON, current: `{"action":"freenet-donation","amount":1,
+///     "delegate-key-created":"2024-08-13 15:45:36"}`
+///   * legacy: `donation_amount:100`
+///   * a plain string such as `Freenet Notary`, written by the vault's own
+///     migration adapters
+///
+/// Anything unrecognised is passed through unchanged rather than replaced with
+/// a guess: showing the raw field is ugly, but inventing a tier for a
+/// certificate this build cannot read would misrepresent a seller's standing.
+fn describe_notary_info(info: &str) -> String {
+    let amount = extract_amount(info);
+    let date = extract_created_date(info);
+    match (amount, date) {
+        (Some(a), Some(d)) => format!("${a} donated, {d}"),
+        (Some(a), None) => format!("${a} donated"),
+        (None, Some(d)) => format!("donated {d}"),
+        // Not a shape we know. Keep whatever the certificate said.
+        (None, None) => info.to_string(),
+    }
+}
+
+/// The donation amount, from either the JSON or the legacy encoding.
+fn extract_amount(info: &str) -> Option<u32> {
+    if info.starts_with('{') {
+        extract_json_field(info, "amount")?.parse().ok()
+    } else {
+        info.strip_prefix("donation_amount:")?.trim().parse().ok()
+    }
+}
+
+/// The creation date, rendered as `13 August 2024`. JSON only; the legacy
+/// encoding carries no date.
+fn extract_created_date(info: &str) -> Option<String> {
+    if !info.starts_with('{') {
+        return None;
+    }
+    let raw = extract_json_field(info, "delegate-key-created")?;
+    let ymd = raw.split(' ').next().unwrap_or(raw);
+    let mut parts = ymd.split('-');
+    let year = parts.next()?;
+    let month: u32 = parts.next()?.parse().ok()?;
+    let day: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || year.len() != 4 {
+        return None;
+    }
+    let month_name = match month {
+        1 => "January",
+        2 => "February",
+        3 => "March",
+        4 => "April",
+        5 => "May",
+        6 => "June",
+        7 => "July",
+        8 => "August",
+        9 => "September",
+        10 => "October",
+        11 => "November",
+        12 => "December",
+        _ => return None,
+    };
+    if !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(format!("{day} {month_name} {year}"))
+}
+
+/// A deliberately small reader for the one flat object this field ever holds.
+///
+/// Not `serde_json`: the value is a certificate field written by another
+/// project, so the failure that matters is an unexpected shape, and every
+/// caller here already treats "could not read it" as a normal outcome rather
+/// than an error. A reader that returns `None` on anything surprising is the
+/// right shape for that, and it cannot panic on a malformed certificate.
+///
+/// Matches the key only at the TOP LEVEL of the object. An earlier version
+/// took the first textual match, so `{"nested":{"amount":42},"amount":7}`
+/// answered 42 -- the wrong donation, reported confidently. The field is flat
+/// in practice and notary-issued rather than seller-chosen, so that input is
+/// not expected; it is refused anyway, because a wrong answer here misstates a
+/// seller's standing while `None` merely declines to.
+fn extract_json_field<'a>(info: &'a str, key: &str) -> Option<&'a str> {
+    let bytes = info.as_bytes();
+    let pat = format!("\"{key}\"");
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth -= 1,
+            '"' => {
+                // A key sits at depth 1 and is followed by a colon.
+                if depth == 1 && info[i..].starts_with(&pat) {
+                    let after = info[i + pat.len()..].trim_start();
+                    if let Some(after) = after.strip_prefix(':') {
+                        let after = after.trim_start();
+                        return if let Some(rest) = after.strip_prefix('"') {
+                            rest.find('"').map(|end| &rest[..end])
+                        } else {
+                            let end = after.find(|c: char| !c.is_ascii_digit())?;
+                            if end == 0 {
+                                None
+                            } else {
+                                Some(&after[..end])
+                            }
+                        };
+                    }
+                }
+                in_string = true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 fn sign_and_submit_listing(_fingerprint: String, _listing: Listing) {
     #[cfg(target_arch = "wasm32")]
     {
@@ -761,5 +908,95 @@ fn truncate_fingerprint(fp: &str) -> String {
         format!("{}...", &fp[..12])
     } else {
         fp.to_string()
+    }
+}
+
+#[cfg(test)]
+mod notary_info_tests {
+    use super::describe_notary_info;
+
+    /// The exact string observed in the browser on 2026-09-06, which is what
+    /// prompted this. Pinning the real value rather than a synthetic one:
+    /// the whole bug was that nobody had looked at what the field contains.
+    #[test]
+    fn the_observed_certificate_reads_as_a_donation_and_a_date() {
+        let info = r#"{"action":"freenet-donation","amount":1,"delegate-key-created":"2024-08-13 15:45:36"}"#;
+        assert_eq!(describe_notary_info(info), "$1 donated, 13 August 2024");
+    }
+
+    #[test]
+    fn a_larger_donation_keeps_its_amount() {
+        let info = r#"{"action":"freenet-donation","amount":100,"delegate-key-created":"2023-01-01 00:00:00"}"#;
+        assert_eq!(describe_notary_info(info), "$100 donated, 1 January 2023");
+    }
+
+    /// The pre-JSON encoding, still present in the vault's own fixtures. It
+    /// carries no date, so only the amount is claimed.
+    #[test]
+    fn the_legacy_encoding_still_reads() {
+        assert_eq!(describe_notary_info("donation_amount:20"), "$20 donated");
+    }
+
+    /// Written by the vault's migration adapters. Not a shape we can unpack,
+    /// and inventing a tier for it would misstate a seller's standing -- so it
+    /// passes through untouched.
+    #[test]
+    fn an_unrecognised_certificate_is_shown_verbatim_rather_than_guessed_at() {
+        assert_eq!(describe_notary_info("Freenet Notary"), "Freenet Notary");
+        assert_eq!(describe_notary_info(""), "");
+    }
+
+    /// A malformed certificate must not panic and must not be dressed up as a
+    /// donation it does not attest.
+    #[test]
+    fn malformed_json_does_not_panic_or_invent_a_tier() {
+        for info in [
+            r#"{"amount":}"#,
+            r#"{"amount":"not-a-number"}"#,
+            r#"{"delegate-key-created":"not-a-date"}"#,
+            r#"{"delegate-key-created":"2024-13-99 00:00:00"}"#,
+            "{",
+            r#"{"amount"#,
+        ] {
+            let shown = describe_notary_info(info);
+            assert!(
+                !shown.contains('$'),
+                "{info:?} is not a readable donation but rendered as {shown:?}"
+            );
+        }
+    }
+
+    /// A nested object must not shadow the real field. An earlier version of
+    /// the reader took the first textual match and answered 42 here -- the
+    /// wrong donation, reported confidently, which is worse than declining.
+    #[test]
+    fn a_nested_amount_does_not_shadow_the_top_level_one() {
+        let info = r#"{"nested":{"amount":42},"amount":7}"#;
+        assert_eq!(describe_notary_info(info), "$7 donated");
+    }
+
+    /// A key that only appears nested has no top-level answer, so none is
+    /// given -- the certificate passes through as-is rather than being
+    /// described by a number lifted out of a sub-object.
+    #[test]
+    fn an_amount_that_exists_only_nested_is_not_claimed() {
+        let info = r#"{"nested":{"amount":42}}"#;
+        assert_eq!(describe_notary_info(info), info);
+    }
+
+    /// The key appearing inside a STRING value must not be mistaken for the
+    /// key itself.
+    #[test]
+    fn the_key_inside_a_string_value_is_not_matched() {
+        let info = r#"{"note":"beware \"amount\": 99","amount":3}"#;
+        assert_eq!(describe_notary_info(info), "$3 donated");
+    }
+
+    /// A date without an amount still tells a buyer how old the identity is,
+    /// which is half the reputation signal.
+    #[test]
+    fn a_date_alone_is_still_worth_showing() {
+        let info = r#"{"delegate-key-created":"2024-08-13 15:45:36"}"#;
+        assert_eq!(describe_notary_info(info), "donated 13 August 2024");
     }
 }
