@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use crate::feedback::{FeedbackCategory, FeedbackToken};
 
@@ -57,11 +57,42 @@ pub struct ReputationStateV1 {
     /// Append-only list of negative feedback entries.
     pub feedback: Vec<FeedbackEntry>,
     /// Used nonces for replay prevention (mirrors nonces from feedback entries).
-    pub used_nonces: HashSet<[u8; 32]>,
+    ///
+    /// **`BTreeSet`, not `HashSet`, and that is load-bearing.** This field is
+    /// part of the contract STATE, so its CBOR encoding is bytes peers compare,
+    /// and it has to be a function of the contents alone.
+    ///
+    /// The mechanism is a COUNTER, not randomness, and the distinction matters
+    /// because this contract runs on `wasm32-unknown-unknown`. `RandomState::
+    /// new` caches two keys per thread and does `keys.set((k0.wrapping_add(1),
+    /// k1))` on every construction, precisely so each `HashMap` gets a
+    /// different iteration order. That bump is target-independent. What IS
+    /// target-specific is the base: on wasm32 `std` routes to
+    /// `sys::random::unsupported`, whose `hashmap_random_keys` returns a stack
+    /// address and a heap address with the comment "this isn't particularly
+    /// secure, but there isn't really an alternative". So there is no entropy
+    /// on the target at all.
+    ///
+    /// Do not read that as "so it was deterministic anyway and this change was
+    /// unnecessary". Two peers differ in how many sets they have built, which
+    /// is their operation history, so they still encode differently. The
+    /// counter is the whole defect and it survives having no entropy.
+    ///
+    /// Note what is NOT true: two `to_cbor` calls on ONE `HashSet` value give
+    /// identical bytes. Only independently-built instances diverge, which is
+    /// the shape `used_nonces_encoding_is_deterministic` uses.
+    ///
+    /// `feedback` below is sorted for exactly this reason; a `HashSet` beside
+    /// it silently spent that sort.
+    pub used_nonces: BTreeSet<[u8; 32]>,
 }
 
 /// Summary for delta computation: the set of known nonces.
-pub type ReputationSummary = HashSet<[u8; 32]>;
+///
+/// `BTreeSet` for the same reason as [`ReputationStateV1::used_nonces`]: a
+/// summary is encoded and sent, so its bytes must be a function of its
+/// contents alone.
+pub type ReputationSummary = BTreeSet<[u8; 32]>;
 
 /// Delta: new feedback entries to add.
 pub type ReputationDelta = Vec<FeedbackEntry>;
@@ -408,6 +439,141 @@ mod tests {
             saw_genuine_first.feedback, saw_neutered_first.feedback,
             "these two peers converged, so this known gap is CLOSED -- delete this test and \
              correct the commutativity claim on `ReputationStateV1`"
+        );
+    }
+
+    /// **Two peers given the same feedback in different orders must hold
+    /// byte-identical state.**
+    ///
+    /// This is the property `mailbox::determinism_tests::
+    /// merging_is_order_independent` pins for the mailbox. Reputation had no
+    /// equivalent -- and reputation is the contract whose STATE actually held
+    /// a nondeterministically-encoded collection, so the guard existed on the
+    /// one of the two that did not need it.
+    ///
+    /// Red before `used_nonces` became a `BTreeSet`. `RandomState::new` bumps
+    /// a per-thread counter on EVERY construction, so two independently-built
+    /// `HashSet`s iterate differently and therefore CBOR-encode differently.
+    /// `apply_delta` already sorts `feedback` "deterministically by nonce for
+    /// CRDT convergence"; the set beside it silently spent that sort.
+    ///
+    /// 32 nonces, not a handful: with only a few members two `HashSet`s can
+    /// coincidentally agree on an order and the guard passes by luck. RSA
+    /// signing dominates the runtime either way.
+    #[test]
+    fn used_nonces_encoding_is_deterministic() {
+        let (private, params) = key_pair();
+        let entries: Vec<_> = (1u8..33).map(|n| signed_entry(&private, n)).collect();
+        let reversed: Vec<_> = entries.iter().rev().cloned().collect();
+
+        let mut forward = ReputationStateV1::default();
+        forward.apply_delta(&params, &Some(entries)).expect("apply");
+
+        let mut backward = ReputationStateV1::default();
+        backward
+            .apply_delta(&params, &Some(reversed))
+            .expect("apply");
+
+        assert_eq!(
+            forward.used_nonces, backward.used_nonces,
+            "the two states must hold the same nonces, or this test is \
+             measuring the wrong thing"
+        );
+        assert_eq!(
+            crate::to_cbor(&forward).expect("encode"),
+            crate::to_cbor(&backward).expect("encode"),
+            "the same feedback in a different order must produce identical bytes"
+        );
+    }
+
+    /// **State written by a predecessor generation still decodes, and
+    /// normalises on the way in.**
+    ///
+    /// `legacy/reputation_contract.toml`'s V10 row asserts this, and a
+    /// registry claim that is only reasoned about is how a migration seals
+    /// over data.
+    ///
+    /// **The decode target is the real type, and that is the whole test.** An
+    /// earlier version of this test decoded into a `BTreeSet` it named in its
+    /// own body, so no change to the production types could ever move it: it
+    /// tested `ciborium` and `std`. It was green under every revert, including
+    /// the full one. Review caught it. If you edit this test, keep
+    /// [`ReputationStateV1`] as the thing being decoded INTO.
+    ///
+    /// V9 wrote `used_nonces` as a `HashSet`, whose CBOR is a plain array
+    /// (major type 4) in whatever order that instance chose, so both orders
+    /// below are valid V9 bytes for the same state. It re-encodes rather than
+    /// only comparing the decoded values, because `PartialEq` on the struct
+    /// compares sets and passes under the defect; the bytes are the claim.
+    #[test]
+    fn predecessor_state_decodes_through_the_real_type_and_normalises() {
+        /// V9's on-the-wire shape: `used_nonces` as a bare CBOR array.
+        #[derive(serde::Serialize)]
+        struct V9State {
+            owner_certificate_pem: String,
+            feedback: Vec<FeedbackEntry>,
+            used_nonces: Vec<[u8; 32]>,
+        }
+
+        let ascending: Vec<[u8; 32]> = (1u8..33).map(|n| [n; 32]).collect();
+        let descending: Vec<[u8; 32]> = ascending.iter().rev().copied().collect();
+
+        let v9 = |used_nonces: Vec<[u8; 32]>| V9State {
+            owner_certificate_pem: String::new(),
+            feedback: Vec::new(),
+            used_nonces,
+        };
+
+        let a: ReputationStateV1 =
+            crate::from_cbor(&crate::to_cbor(&v9(ascending)).expect("encode")).expect("decode");
+        let b: ReputationStateV1 =
+            crate::from_cbor(&crate::to_cbor(&v9(descending)).expect("encode")).expect("decode");
+
+        assert_eq!(
+            a, b,
+            "the same members in a different order are the same state"
+        );
+        assert_eq!(
+            crate::to_cbor(&a).expect("encode"),
+            crate::to_cbor(&b).expect("encode"),
+            "predecessor bytes in any order must fold to one canonical encoding"
+        );
+    }
+
+    /// **Documentary, not a guard, and labelled so deliberately.**
+    ///
+    /// [`ReputationStateV1::summarize`] returns `used_nonces.clone()`, so the
+    /// field type and the summary alias must agree or the crate does not
+    /// compile. There is therefore NO revert under which
+    /// `used_nonces_encoding_is_deterministic` passes and this one fails, and
+    /// it should not be counted as separate coverage.
+    ///
+    /// It is kept for the trap it records. Cloning a `HashSet` copies its
+    /// hasher along with its contents, so summarising ONE state twice yields
+    /// identical bytes even under the defect: the obvious form of this test is
+    /// vacuous here. Measured, not assumed. The mailbox is not like this --
+    /// its `summarize` rebuilds with `collect()`, drawing a fresh key each
+    /// call -- so the same shape is a real guard there and a note here. Both
+    /// files use the two-independent-states form so the weaker one cannot be
+    /// copied from either.
+    #[test]
+    fn the_summary_encodes_the_same_for_two_independently_built_states() {
+        let (private, params) = key_pair();
+        let entries: Vec<_> = (1u8..33).map(|n| signed_entry(&private, n)).collect();
+        let reversed: Vec<_> = entries.iter().rev().cloned().collect();
+
+        let mut forward = ReputationStateV1::default();
+        forward.apply_delta(&params, &Some(entries)).expect("apply");
+
+        let mut backward = ReputationStateV1::default();
+        backward
+            .apply_delta(&params, &Some(reversed))
+            .expect("apply");
+
+        assert_eq!(
+            crate::to_cbor(&forward.summarize()).expect("encode"),
+            crate::to_cbor(&backward.summarize()).expect("encode"),
+            "two peers holding the same nonces must send the same summary bytes"
         );
     }
 }
