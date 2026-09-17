@@ -764,7 +764,12 @@ fn Conversation(
             // has an action attached, so it gets the control rather than
             // leaving the seller to copy a listing id into the invoice form
             // by hand -- which is also how the reply-to tag would get lost.
-            for request in unanswered_requests(&entries, &listings, &published) {
+            for request in unanswered_requests(
+                &entries,
+                &listings,
+                &published,
+                crate::gateway::APP_STATE.read().conversation_keys.get(&tag),
+            ) {
                 super::buy_view::AcceptRequest {
                     key: "{bs58::encode(request.digest).into_string()}",
                     store_contract_id: store_contract_id.clone(),
@@ -896,6 +901,7 @@ fn unanswered_requests(
     entries: &[MailboxEntry],
     listings: &[harvest_common::listing::AuthorizedListing],
     published: &[harvest_common::payment::AuthorizedOrder],
+    keys: Option<&crate::messaging::ConversationKeys>,
 ) -> Vec<PendingRequest> {
     let mut requests: Vec<PendingRequest> = Vec::new();
     for entry in entries {
@@ -914,12 +920,17 @@ fn unanswered_requests(
             continue;
         };
         // Already answered, decided from the seller's OWN published state
-        // rather than from anything in the mailbox: a commitment carrying
-        // this request's binding and listing is the answer to it, and the
-        // buyer cannot forge or withdraw one.
-        let answered = published.iter().any(|order| {
-            order.order.order_binding == Some(*order_binding)
-                && order.order.listing_id == *listing_id
+        // rather than from anything in the mailbox: an order carrying this
+        // request's binding and this listing's tag is the answer to it, and
+        // the buyer can neither forge nor withdraw one. The tag stands in for
+        // the listing id orders no longer publish (harvest#57); only this
+        // conversation's keys can compute it.
+        let answered = keys.is_some_and(|keys| {
+            let tag = keys.listing_tag(listing_id);
+            published.iter().any(|order| {
+                order.order.order_binding == Some(*order_binding)
+                    && order.order.listing_tag == Some(tag)
+            })
         });
         if answered {
             continue;
@@ -1133,6 +1144,10 @@ mod inbox_tests {
         }
     }
 
+    fn keys() -> crate::messaging::ConversationKeys {
+        crate::messaging::ConversationKeys::from_shared_secret(&[4u8; 32])
+    }
+
     fn request(listing_id: ListingId, quantity: u32, digest: [u8; 32]) -> MailboxEntry {
         readable(
             MessageContent::OrderRequest {
@@ -1146,18 +1161,18 @@ mod inbox_tests {
         )
     }
 
-    /// A published commitment answering `listing_id` under `binding`, built
+    /// A published commitment with order id `[n; 32]` under `binding`, built
     /// by hand: only the two fields the answered-check reads matter here, and
     /// signing one would test the signature path instead.
     fn published(
-        listing_id: ListingId,
+        n: u8,
         binding: Option<[u8; 32]>,
+        tag: Option<[u8; 32]>,
     ) -> harvest_common::payment::AuthorizedOrder {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         harvest_common::payment::AuthorizedOrder {
             order: harvest_common::payment::Order {
-                id: harvest_common::payment::OrderId([0u8; 32]),
-                listing_id,
+                id: harvest_common::payment::OrderId([n; 32]),
                 buyer_fingerprint: String::new(),
                 seller_fingerprint: "seller-fp".to_string(),
                 amount_sats: 1,
@@ -1170,6 +1185,7 @@ mod inbox_tests {
                 bitcoin_address_code_hash: None,
                 anchor: None,
                 order_binding: binding,
+                listing_tag: tag,
                 created_at,
             },
             scoped_payload: Vec::new(),
@@ -1191,7 +1207,7 @@ mod inbox_tests {
             MessageContent::Text("is this in stock?".into()),
             [1u8; 32],
         )];
-        assert!(unanswered_requests(&entries, &[], &[]).is_empty());
+        assert!(unanswered_requests(&entries, &[], &[], Some(&keys())).is_empty());
     }
 
     /// **A request carries its listing, its title, its quantity and its
@@ -1210,7 +1226,12 @@ mod inbox_tests {
             readable(MessageContent::Text("hello".into()), [1u8; 32]),
             request(id.clone(), 4, [2u8; 32]),
         ];
-        let found = unanswered_requests(&entries, &[listing(id.clone(), "Ghost Pepper")], &[]);
+        let found = unanswered_requests(
+            &entries,
+            &[listing(id.clone(), "Ghost Pepper")],
+            &[],
+            Some(&keys()),
+        );
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].listing_id, id);
         assert_eq!(found[0].listing_title, "Ghost Pepper");
@@ -1225,7 +1246,7 @@ mod inbox_tests {
     #[test]
     fn a_listing_the_store_has_not_published_has_no_title() {
         let id = ListingId([9u8; 32]);
-        let found = unanswered_requests(&[request(id, 1, [2u8; 32])], &[], &[]);
+        let found = unanswered_requests(&[request(id, 1, [2u8; 32])], &[], &[], Some(&keys()));
         assert_eq!(found[0].listing_title, "");
     }
 
@@ -1243,7 +1264,7 @@ mod inbox_tests {
             digest: [0u8; 32],
             why: "not for us".to_string(),
         }];
-        assert!(unanswered_requests(&entries, &[], &[]).is_empty());
+        assert!(unanswered_requests(&entries, &[], &[], Some(&keys())).is_empty());
     }
 
     /// **A request the seller has already answered is not offered again.**
@@ -1255,60 +1276,88 @@ mod inbox_tests {
     /// two cards they could reasonably pay both of.
     ///
     /// "Answered" is decided from the seller's OWN published state, which the
-    /// buyer can neither forge nor withdraw.
+    /// buyer can neither forge nor withdraw: an order carrying this request's
+    /// binding and this listing's tag. Not from the mailbox, where the seller's
+    /// acceptance can be lost or evicted.
     #[test]
     fn a_request_already_answered_is_not_offered_again() {
         let id = ListingId([9u8; 32]);
         let entries = vec![request(id.clone(), 1, [2u8; 32])];
         let listings = vec![listing(id.clone(), "Ghost Pepper")];
+        let tag = keys().listing_tag(&id);
 
         assert_eq!(
-            unanswered_requests(&entries, &listings, &[]).len(),
+            unanswered_requests(&entries, &listings, &[], Some(&keys())).len(),
             1,
             "unanswered while nothing is published"
         );
         assert!(
-            unanswered_requests(&entries, &listings, &[published(id.clone(), Some(BINDING))])
-                .is_empty(),
-            "a commitment carrying this request's binding and listing IS the answer to it"
+            unanswered_requests(
+                &entries,
+                &listings,
+                &[published(7, Some(BINDING), Some(tag))],
+                Some(&keys())
+            )
+            .is_empty(),
+            "an order carrying this request's binding and listing tag IS the answer to it"
         );
     }
 
-    /// **Somebody else's commitment does not answer this request.**
-    ///
-    /// The pair is what identifies the answer: a commitment for the same
-    /// listing bound to another buyer, or one bound to this buyer for a
-    /// different listing, leaves the request outstanding.
+    /// **Nothing short of that answers the request.**
     #[test]
-    fn another_buyers_commitment_does_not_answer_this_request() {
+    fn a_request_is_answered_only_by_an_order_with_its_binding_and_tag() {
         let id = ListingId([9u8; 32]);
         let entries = vec![request(id.clone(), 1, [2u8; 32])];
         let listings = vec![listing(id.clone(), "Ghost Pepper")];
+        let tag = keys().listing_tag(&id);
+        let other_conversation = crate::messaging::ConversationKeys::from_shared_secret(&[5u8; 32]);
+        let still_open = |orders: &[harvest_common::payment::AuthorizedOrder],
+                          keys: Option<&crate::messaging::ConversationKeys>,
+                          why: &str| {
+            assert_eq!(
+                unanswered_requests(&entries, &listings, orders, keys).len(),
+                1,
+                "{why}"
+            );
+        };
 
-        assert_eq!(
-            unanswered_requests(
-                &entries,
-                &listings,
-                &[published(id.clone(), Some([0x11; 32]))]
-            )
-            .len(),
-            1,
-            "same listing, another buyer's binding"
+        still_open(
+            &[published(7, Some([0x11; 32]), Some(tag))],
+            Some(&keys()),
+            "same listing, another buyer's binding",
         );
-        assert_eq!(
-            unanswered_requests(
-                &entries,
-                &listings,
-                &[published(ListingId([8u8; 32]), Some(BINDING))]
-            )
-            .len(),
-            1,
-            "this buyer's binding, another listing"
+        still_open(
+            &[published(
+                7,
+                Some(BINDING),
+                Some(keys().listing_tag(&ListingId([8u8; 32]))),
+            )],
+            Some(&keys()),
+            "this buyer's binding, another listing",
         );
-        assert_eq!(
-            unanswered_requests(&entries, &listings, &[published(id, None)]).len(),
-            1,
-            "an unbound commitment answers nobody"
+        still_open(
+            &[published(7, None, Some(tag))],
+            Some(&keys()),
+            "an unbound commitment answers nobody",
+        );
+        still_open(
+            &[published(7, Some(BINDING), None)],
+            Some(&keys()),
+            "an order naming no listing answers no request",
+        );
+        still_open(
+            &[published(
+                7,
+                Some(BINDING),
+                Some(other_conversation.listing_tag(&id)),
+            )],
+            Some(&keys()),
+            "a tag computed under another conversation's key",
+        );
+        still_open(
+            &[published(7, Some(BINDING), Some(tag))],
+            None,
+            "without this conversation's keys nothing can be matched",
         );
     }
 
@@ -1335,8 +1384,13 @@ mod inbox_tests {
         let first = request(cheap, 1, [0x01; 32]);
         let second = request(dear, 1, [0x02; 32]);
 
-        let one = unanswered_requests(&[first.clone(), second.clone()], &listings, &[]);
-        let other = unanswered_requests(&[second, first], &listings, &[]);
+        let one = unanswered_requests(
+            &[first.clone(), second.clone()],
+            &listings,
+            &[],
+            Some(&keys()),
+        );
+        let other = unanswered_requests(&[second, first], &listings, &[], Some(&keys()));
         assert_eq!(one, other, "the seller sees the same order either way");
         assert_eq!(one[0].digest, [0x01; 32], "and it is the digest order");
     }
@@ -1352,7 +1406,8 @@ mod inbox_tests {
             request(id.clone(), 2, [0x01; 32]),
             request(id.clone(), 2, [0x02; 32]),
         ];
-        let found = unanswered_requests(&entries, &[listing(id, "Ghost Pepper")], &[]);
+        let found =
+            unanswered_requests(&entries, &[listing(id, "Ghost Pepper")], &[], Some(&keys()));
         assert_eq!(found.len(), 1);
     }
 }

@@ -442,7 +442,7 @@ covering more than they do.
 | `ui/src/state.rs::AppState::acceptance_for` | The buyer can read the acceptance and it names the published commitment. | **Yes** -- `accepting_a_request_tells_the_buyer_which_commitment_is_theirs`, read back through the BUYER's conversation keys rather than by inspecting what the seller composed. |
 | `ui/src/state.rs::AppState::announce_acceptance` | The acceptance actually reaches the seller's mailbox. | **No.** The dispatch is a wasm-gated `spawn_local`, the same blind spot as every other send in this repository. What is tested is everything either side: that the message is composed and recorded as the seller's own (`accepting_records_the_acceptance_as_the_sellers_own_message`), and that a buyer who receives one reads it correctly. |
 | same | The commitment is published before the buyer is told about it. | **No, and deliberately not attempted.** The two are independent fire-and-forget dispatches and may land in either order. The buy flow does not depend on the order: a buyer holding an acceptance for a commitment that has not arrived reads `CommitmentNotPublished` and does not pay, which is the same answer a seller who never published would produce. |
-| `ui/src/state.rs::PaymentBlocker::CommitmentNotRequested` | The commitment is for something this conversation asked about. | **Yes for the case it closes** -- `a_commitment_for_a_listing_never_requested_is_refused` and its converse. **The claim is narrower than it looks**, and the doc comment says so rather than overstating it: the request it compares against sits in the buyer's own thread, and direction is not authorship (`messaging::Addressing`), so a seller can insert a request the buyer never sent. What the check closes is the seller answering a cheap listing's request with a commitment against an expensive one; what it does not close is a forged request, which shows up instead as a line in the buyer's own thread they do not recognise. |
+| `ui/src/state.rs::PaymentBlocker::CommitmentNotRequested` | The order is for something this conversation asked about. Since harvest#57 the published order carries a listing TAG keyed by the conversation (`harvest_common::mailbox::listing_tag`), which the buyer recomputes for each listing they asked for; an untagged order for a conversation that asked is refused. | **Yes for the case it closes** -- `a_commitment_for_a_listing_never_requested_is_refused` and its converse, `an_untagged_order_for_a_conversation_that_asked_is_refused`, and `a_listing_tag_from_another_conversation_is_refused`. **The claim is narrower than it looks**, and the doc comment says so rather than overstating it: the request it compares against sits in the buyer's own thread, and direction is not authorship (`messaging::Addressing`), so a seller can insert a request the buyer never sent. What the check closes is the seller answering a cheap listing's request with a commitment against an expensive one; what it does not close is a forged request, which shows up instead as a line in the buyer's own thread they do not recognise. |
 | `ui/src/components/buy_view.rs` | Everything the buy form, the purchases panel and the accept control say on screen. | **No.** There are no component tests in this repository at all -- the same row as `message_view` above, and worth repeating here because this is the screen that tells a buyer an order is safe to pay. The *decisions* behind the words are all in `AppState` and tested; the words are not. |
 
 #### What the review round changed, and what it left open
@@ -626,9 +626,11 @@ at the re-key.
 one thread carry the same binding, so the binding does not distinguish them
 from each other -- their distinct ids and the buyer's own request list do. It
 distinguishes BUYERS, which is the hole. A consequence on the seller's side:
-`unanswered_requests` treats a request as answered when a published commitment
-carries its binding AND its listing, so a buyer who asks twice for the same
-listing in one conversation sees the second ask read as already answered. Per
+`unanswered_requests` treats a request as answered when a published order
+carries its binding AND its listing tag (the tag replaces the listing id,
+harvest#57, and only this conversation's keys compute it), so a buyer who asks
+twice for the same listing in one conversation sees the second ask read as
+already answered. Per
 order it would need a durable per-order counter in the delegate, which Phase 2
 can add if filing turns out to need it.
 
@@ -641,17 +643,41 @@ covering them.
 **The commitment is not private.** `docs/design/incentive-mechanism.md` Part 5
 step 2 says an order commitment reveals "a scrambled order number, the amount,
 and a recent Bitcoin block hash" and "nothing about who Bob is or what he
-bought". What is actually published is an `AuthorizedOrder`, which carries the
-`listing_id`, the payment address and its `scriptPubKey`. So **what** was
-bought is public, and the address links the order to a chain transaction.
+bought". What is actually published is an `AuthorizedOrder`, which carries the payment
+address and its `scriptPubKey`, so the address links the order to a chain
+transaction. It no longer carries the `listing_id` (harvest#57). It carries a
+listing TAG keyed by the conversation, which only the buyer and seller can
+compute, so a reader of the store cannot test a listing against it. **What can
+still be inferred, or is lost:**
+
+- The amount is public, and amount is price times quantity, so an order whose
+  amount is a multiple of a uniquely priced listing (a BTC price exactly, a
+  fiat price approximately at the anchor's exchange rate) still reveals the
+  listing. Only bucketed amounts or the ledger contract below would close that.
+- Orders from one conversation share a binding, and two of them with equal
+  tags were for the same listing, so a repeat buyer's pattern (same item again
+  or something else) is visible, though not which item.
+- Which listing an order was for is now checkable by its two parties only. It
+  used to be a public, signed claim. Either party can still show it to a third
+  party by revealing the conversation's tag key
+  (`harvest_common::mailbox::listing_tag_key`), which decrypts nothing.
+- What to ship is read from the buyer's request, which lives in the mailbox. A
+  seller whose copy of that request is lost or evicted still sees the order is
+  answered, but has only the tag, testable against their listings with the
+  conversation keys, to recover which listing it was. An unprompted invoice
+  (no request) records no listing at all.
+- The buyer's `CommitmentNotRequested` check compares against the requests in
+  their own thread; if those have been evicted (a funded flood, see the mailbox
+  gaps) the check has nothing to compare and does not fire.
 
 Who bought is not published -- `buyer_fingerprint` is empty for every order
 the buy flow produces, and the buyer has no identity to name -- and the
 shipping address never leaves the AEAD. The commitment now also carries
-`order_binding`, and that one genuinely reveals nothing: it is a hash of a
-value only the buyer holds (see
-`harvest_common::mailbox::order_binding_from_secret`), so it identifies the
-buyer to the buyer and to nobody else. But the design's claim about the whole
+`order_binding`, which cannot be linked to a person: it is a hash of a value
+only the buyer holds (see `harvest_common::mailbox::order_binding_from_secret`).
+It does link orders to each other, though: every order from one conversation
+carries the same binding, so a reader can group one pseudonymous buyer's
+purchases from that conversation. But the design's claim about the whole
 commitment is stronger than the code, and the difference is real.
 
 Two further seller-chosen fields are published per order and are not on the

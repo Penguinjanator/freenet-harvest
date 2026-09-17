@@ -712,10 +712,8 @@ mod order_tests {
     fn make_order(buyer_fp: &str, created_at_secs: i64, script: &[u8]) -> Order {
         let seller_fp = "seller-fingerprint";
         let ts = timestamp(created_at_secs);
-        let listing_id = ListingId::from_label("Widget");
         Order {
             id: OrderId([0u8; 32]),
-            listing_id,
             buyer_fingerprint: buyer_fp.into(),
             seller_fingerprint: seller_fp.into(),
             amount_sats: 50_000,
@@ -730,6 +728,7 @@ mod order_tests {
             bitcoin_address_code_hash: None,
             anchor: None,
             order_binding: None,
+            listing_tag: None,
             created_at: ts,
         }
         .with_derived_id()
@@ -1966,10 +1965,8 @@ mod order_tests {
         status: OrderStatus,
     ) -> (OrderId, AuthorizedOrder) {
         let ts = timestamp(created_at_secs);
-        let listing_id = ListingId::from_label("Widget");
         let order = Order {
             id: OrderId([0u8; 32]),
-            listing_id,
             buyer_fingerprint: format!("buyer-{seed}"),
             seller_fingerprint: "seller".into(),
             amount_sats: 1,
@@ -1982,6 +1979,7 @@ mod order_tests {
             bitcoin_address_code_hash: None,
             anchor: None,
             order_binding: None,
+            listing_tag: None,
             created_at: ts,
         }
         .with_derived_id();

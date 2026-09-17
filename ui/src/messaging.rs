@@ -191,8 +191,9 @@ pub enum MessageContent {
     /// have written itself.
     ///
     /// The id has to be told rather than derived:
-    /// `harvest_common::payment::OrderId::new` hashes a
-    /// `created_at` the seller stamps, so a buyer cannot compute it.
+    /// `harvest_common::payment::OrderId::from_terms` hashes terms the seller
+    /// chooses, including a `created_at` they stamp, so a buyer cannot
+    /// compute it.
     OrderAccepted {
         order_id: harvest_common::payment::OrderId,
     },
@@ -219,6 +220,12 @@ impl ConversationKeys {
             to_seller: conversation_key_from_dh(shared_secret, MessageDirection::BuyerToSeller),
             from_seller: conversation_key_from_dh(shared_secret, MessageDirection::SellerToBuyer),
         }
+    }
+
+    /// The tag a published order carries for `listing` in this conversation.
+    /// See [`harvest_common::mailbox::listing_tag`].
+    pub fn listing_tag(&self, listing: &harvest_common::listing::ListingId) -> [u8; 32] {
+        harvest_common::mailbox::listing_tag(&self.from_seller, listing)
     }
 }
 
@@ -376,6 +383,11 @@ impl BuyerConversation {
     /// The value a commitment must carry to be this buyer's.
     pub fn order_binding(&self) -> [u8; 32] {
         self.order_binding
+    }
+
+    /// The tag an order this conversation asked for carries, for `listing`.
+    pub fn listing_tag(&self, listing: &harvest_common::listing::ListingId) -> [u8; 32] {
+        self.keys.listing_tag(listing)
     }
 
     /// The ephemeral secret, for this crate's tests only.
@@ -1879,8 +1891,8 @@ mod buy_flow_tests {
     /// **The buyer learns which published commitment is theirs, and from
     /// which direction.**
     ///
-    /// The order id is not something a buyer can derive: `OrderId::new`
-    /// hashes a `created_at` the seller stamps. So the acceptance has to name
+    /// The order id is not something a buyer can derive: `OrderId::from_terms`
+    /// hashes terms the seller chooses, including a `created_at` they stamp. So the acceptance has to name
     /// it, and it has to arrive addressed TO THE BUYER -- a buyer counting
     /// their own outbound messages as acceptances would let anything they
     /// composed point them at an order.

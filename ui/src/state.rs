@@ -847,7 +847,7 @@ pub struct PendingInvoice {
     ///
     /// When it is `Some`, the buyer is waiting to be told which of the
     /// store's published commitments is theirs, and cannot work it out for
-    /// themselves: `OrderId::new` hashes a `created_at` the seller stamps.
+    /// themselves: `OrderId::from_terms` hashes terms the seller chooses, including a `created_at` they stamp.
     /// So this travels with the invoice all the way to the signature, and the
     /// acceptance is sent from the same place the commitment is published --
     /// not left to a second action the seller has to remember.
@@ -900,8 +900,24 @@ pub fn order_for_invoice(
     anchor: Option<freenet_bitcoin_common::BlockAnchor>,
     created_at: chrono::DateTime<chrono::Utc>,
     address_generation: &crate::bitcoin_generation::Generation,
+    conversation_keys: Option<&crate::messaging::ConversationKeys>,
 ) -> Result<harvest_common::payment::Order, String> {
     use harvest_common::payment::Order;
+
+    // Which listing this answers, tagged so only the buyer and seller can
+    // tell (harvest#57). An invoice answering a request must carry it: the
+    // buyer refuses an untagged order for a conversation that asked for
+    // something, and the seller recognises an answered request by it.
+    let listing_tag =
+        match (pending.reply_to, conversation_keys) {
+            (None, _) => None,
+            (Some(_), Some(keys)) => Some(keys.listing_tag(&pending.listing_id)),
+            (Some(_), None) => return Err(
+                "this invoice answers a buyer's request, but your delegate has not produced that \
+                 conversation's key, so the order could not say which listing it is for"
+                    .to_string(),
+            ),
+        };
 
     // Which address contract this order's payment is watched and settled
     // through: `Order::bitcoin_address_instance_id` derives it from this hash,
@@ -934,7 +950,6 @@ pub fn order_for_invoice(
         // Stamped by `with_derived_id` below, out of the finished terms. A
         // literal here would be a second place deciding an order's identity.
         id: harvest_common::payment::OrderId([0u8; 32]),
-        listing_id: pending.listing_id.clone(),
         buyer_fingerprint: pending.buyer_fingerprint.clone(),
         seller_fingerprint: pending.seller_fingerprint.clone(),
         amount_sats: pending.amount_sats,
@@ -951,6 +966,7 @@ pub fn order_for_invoice(
         // Copied from the request verbatim. An invoice written unprompted has
         // none, and no buyer will pay one through the buy flow.
         order_binding: pending.order_binding,
+        listing_tag,
         created_at,
     }
     .with_derived_id())
@@ -1092,19 +1108,24 @@ pub enum PaymentBlocker {
     /// The address cannot be read for this network at all, so nothing can be
     /// said about it -- which is itself a reason not to pay it.
     DestinationUnreadable,
-    /// The commitment names a listing this conversation never asked about.
+    /// The order's listing tag matches nothing this conversation asked for,
+    /// or it carries none.
     ///
     /// "Confirm your own order is present" is not satisfied by an order being
     /// present. Without this, a seller could answer a request for a cheap
-    /// listing with a commitment against an expensive one and every other
-    /// check here would pass -- the commitment being genuinely published,
-    /// genuinely signed and genuinely fresh.
+    /// listing with an order for an expensive one and every other check here
+    /// would pass -- the commitment being genuinely published, genuinely
+    /// signed and genuinely fresh.
     ///
-    /// Empty when the buyer has asked for nothing in this conversation, which
-    /// is the case for a conversation that began as an ordinary question; the
-    /// check then has nothing to compare against and does not fire. That is
-    /// the honest answer rather than a refusal, since a seller may perfectly
-    /// well invoice against a conversation that never used the buy form.
+    /// The order publishes a tag rather than the listing id (harvest#57,
+    /// `harvest_common::mailbox::listing_tag`), which this conversation can
+    /// recompute for each listing it asked about. A missing tag is refused,
+    /// since a seller answering a request always writes one.
+    ///
+    /// Does not fire when the buyer has asked for nothing in this conversation
+    /// (one that began as an ordinary question): there is then nothing to
+    /// compare, and a seller may perfectly well invoice against a conversation
+    /// that never used the buy form.
     CommitmentNotRequested,
     /// The order has already moved past awaiting payment.
     NotAwaitingPayment(harvest_common::payment::OrderStatus),
@@ -1195,9 +1216,9 @@ impl PaymentBlocker {
                  cannot be read for its network, so nothing can be checked about it. Ask the \
                  seller to reissue it."
                 .to_string(),
-            PaymentBlocker::CommitmentNotRequested => "The published order is for a different \
-                 listing than the one you asked about. Do not pay it -- ask the seller what it \
-                 is for."
+            PaymentBlocker::CommitmentNotRequested => "The seller says this order is for a \
+                 different listing than the one you asked about. Do not pay it -- ask the seller \
+                 what it is for."
                 .to_string(),
             PaymentBlocker::NotAwaitingPayment(status) => format!(
                 "This order is no longer awaiting payment ({status:?}), so there is nothing \
@@ -2789,8 +2810,8 @@ impl AppState {
     ///
     /// # Why the acceptance message decides WHICH order, and nothing else
     ///
-    /// The order id cannot be derived by the buyer -- `OrderId::new` hashes a
-    /// `created_at` the seller stamps -- so the seller has to name it. But
+    /// The order id cannot be derived by the buyer -- `OrderId::from_terms` hashes
+    /// terms the seller chooses, including a `created_at` they stamp -- so the seller has to name it. But
     /// both parties hold both conversation direction keys, so the message
     /// carrying that name proves nothing about who wrote it. Everything that
     /// matters is therefore re-derived from the PUBLISHED commitment and this
@@ -3193,8 +3214,20 @@ impl AppState {
         // nothing to compare against -- see
         // `PaymentBlocker::CommitmentNotRequested`.
         let requested = Self::requested_listings(store, conversation);
-        if !requested.is_empty() && !requested.contains(&commitment.order.listing_id) {
-            return vec![PaymentBlocker::CommitmentNotRequested];
+        if !requested.is_empty() {
+            // The published order's tag says which listing it is, to this
+            // conversation only (`harvest_common::mailbox::listing_tag`). A
+            // missing tag on an order for a conversation that asked for
+            // something is refused, not skipped: an honest seller answering a
+            // request always writes one.
+            let for_a_request = commitment.order.listing_tag.is_some_and(|tag| {
+                requested
+                    .iter()
+                    .any(|listing| conversation.listing_tag(listing) == tag)
+            });
+            if !for_a_request {
+                return vec![PaymentBlocker::CommitmentNotRequested];
+            }
         }
 
         let mut blockers = Vec::new();
@@ -3844,6 +3877,18 @@ impl AppState {
                     .to_string(),
             );
         }
+        // An invoice answering a request must carry that conversation's listing
+        // tag, which needs its key. Refused here, before a derivation index is
+        // spent on an address, rather than when the order is built.
+        if let Some(tag) = invoice.reply_to {
+            if !self.conversation_keys.contains_key(tag.as_slice()) {
+                return Err(
+                    "your delegate has not produced this conversation's key yet, so the \
+                     invoice could not say which listing it is for; try again in a moment"
+                        .to_string(),
+                );
+            }
+        }
 
         // Register before sending, and un-register if the send fails: the
         // answer can arrive as soon as the send returns, and an `OrderAddress`
@@ -3894,12 +3939,16 @@ impl AppState {
             .tips
             .get(&derived.network)
             .and_then(|tip| tip.current_anchor());
+        let conversation_keys = invoice
+            .reply_to
+            .and_then(|tag| self.conversation_keys.get(tag.as_slice()));
         let order = match order_for_invoice(
             &invoice,
             &derived,
             anchor,
             created_at,
             &self.bitcoin.address_generation,
+            conversation_keys,
         ) {
             Ok(order) => order,
             Err(e) => {
@@ -7724,6 +7773,7 @@ mod invoice_tests {
             Some(anchor(800_000)),
             chrono::Utc::now(),
             &resolved_address_generation(),
+            None,
         )
         .expect("the build's constants must be usable");
 
@@ -7870,6 +7920,7 @@ mod invoice_tests {
             Some(anchor(800_000)),
             chrono::Utc::now(),
             &resolved_address_generation(),
+            None,
         )
         .expect("build");
 
@@ -7890,6 +7941,94 @@ mod invoice_tests {
         assert!(
             state.bitcoin.in_flight.contains(&request_id),
             "the request should show as in flight"
+        );
+    }
+
+    /// **An invoice answering a request tags its listing so only the two
+    /// parties can tell, and publishes no listing id.** (harvest#57)
+    #[test]
+    fn an_invoice_answering_a_request_tags_its_listing_privately() {
+        let keys = crate::messaging::ConversationKeys::from_shared_secret(&[6u8; 32]);
+        let mut answering = invoice();
+        answering.reply_to = Some([0xcd; 32]);
+
+        let order = order_for_invoice(
+            &answering,
+            &derived(0),
+            Some(anchor(800_000)),
+            chrono::Utc::now(),
+            &resolved_address_generation(),
+            Some(&keys),
+        )
+        .expect("builds");
+        assert_eq!(order.listing_tag, Some(keys.listing_tag(&listing_id())));
+        let published = harvest_common::to_cbor(&order).expect("encodes");
+        assert!(
+            !published
+                .windows(listing_id().0.len())
+                .any(|w| w == listing_id().0.as_slice()),
+            "the listing id itself appears nowhere in the published bytes"
+        );
+
+        assert!(
+            order_for_invoice(
+                &answering,
+                &derived(0),
+                Some(anchor(800_000)),
+                chrono::Utc::now(),
+                &resolved_address_generation(),
+                None,
+            )
+            .is_err(),
+            "an invoice for a request cannot be built without the conversation's key"
+        );
+
+        let unprompted = order_for_invoice(
+            &invoice(),
+            &derived(0),
+            Some(anchor(800_000)),
+            chrono::Utc::now(),
+            &resolved_address_generation(),
+            None,
+        )
+        .expect("builds");
+        assert_eq!(
+            unprompted.listing_tag, None,
+            "an unprompted invoice answers no request"
+        );
+    }
+
+    /// **Accepting a request, end to end, publishes the conversation's tag.**
+    /// Drives the real issue path, so the key is looked up where it is in the
+    /// app rather than handed in by the test.
+    #[test]
+    fn an_invoice_for_a_request_publishes_that_conversations_listing_tag() {
+        let mut state = seller_with_a_store();
+        let tag = [0xcd; 32];
+        let keys = crate::messaging::ConversationKeys::from_shared_secret(&[6u8; 32]);
+        let mut answering = invoice();
+        answering.reply_to = Some(tag);
+
+        assert!(
+            state.issue_invoice(answering.clone()).is_err(),
+            "refused before an address is requested while the key is missing"
+        );
+        assert!(
+            state.pending_invoices.is_empty(),
+            "and nothing is in flight"
+        );
+
+        state.conversation_keys.insert(
+            tag.to_vec(),
+            crate::messaging::ConversationKeys::from_shared_secret(&[6u8; 32]),
+        );
+        state.issue_invoice(answering).expect("accepted");
+        let request_id = *state.pending_invoices.keys().next().expect("one entry");
+        state.on_bitcoin_delegate_response(address_answer(request_id, 3));
+
+        assert_eq!(
+            queued_order(&state).listing_tag,
+            Some(keys.listing_tag(&listing_id()))
         );
     }
 
@@ -8189,6 +8328,7 @@ mod invoice_tests {
             Some(anchor(800_000)),
             now,
             &resolved_address_generation(),
+            None,
         )
         .expect("build");
         let other = order_for_invoice(
@@ -8197,6 +8337,7 @@ mod invoice_tests {
             Some(anchor(800_000)),
             now,
             &resolved_address_generation(),
+            None,
         )
         .expect("build");
 
@@ -8222,6 +8363,7 @@ mod invoice_tests {
             Some(anchor(800_000)),
             now,
             &resolved_address_generation(),
+            None,
         )
         .expect("build");
         assert_eq!(
@@ -8260,10 +8402,8 @@ mod authorized_order_tests {
 
     fn order() -> Order {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
-        let listing_id = ListingId::from_label("Widget");
         Order {
             id: OrderId([0u8; 32]),
-            listing_id,
             buyer_fingerprint: "buyer".to_string(),
             seller_fingerprint: "seller".to_string(),
             amount_sats: 50_000,
@@ -8276,6 +8416,7 @@ mod authorized_order_tests {
             bitcoin_address_code_hash: None,
             anchor: None,
             order_binding: None,
+            listing_tag: None,
             created_at,
         }
         .with_derived_id()
@@ -10846,10 +10987,15 @@ mod buy_flow_tests {
         ConversationKeys::from_shared_secret(&shared)
     }
 
+    /// The listing the fixtures' acceptances say an order is for.
+    fn widget() -> ListingId {
+        ListingId::from_label("Widget")
+    }
+
     /// A published commitment, signed the way the invoice flow signs one.
     ///
-    /// `what` varies the listing, and therefore the order id, so a test can
-    /// hold two distinct commitments from one seller.
+    /// `what` varies the terms, and therefore the order id, so a test can hold
+    /// two distinct commitments from one seller.
     fn commitment_for(
         what: &str,
         signing_key: &SigningKey,
@@ -10859,11 +11005,13 @@ mod buy_flow_tests {
     ) -> AuthorizedOrder {
         use freenet_stdlib::prelude::ContractInstanceId;
 
-        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
-        let listing_id = ListingId::from_label(what);
+        // `what` used to vary the listing; orders no longer carry one
+        // (harvest#57), so it varies the timestamp, which the id also covers.
+        let offset: i64 = what.bytes().map(i64::from).sum();
+        let created_at =
+            chrono::DateTime::from_timestamp(1_700_000_000 + offset, 0).expect("timestamp");
         let order = Order {
             id: OrderId([0u8; 32]),
-            listing_id,
             // Empty, and that is the point: a buyer has no identity to name.
             buyer_fingerprint: String::new(),
             seller_fingerprint: "seller-fp".to_string(),
@@ -10884,6 +11032,9 @@ mod buy_flow_tests {
             bitcoin_address_code_hash: Some([4u8; 32]),
             anchor: anchor_at,
             order_binding,
+            // The tag this conversation would expect for the fixtures'
+            // listing, when the order is bound to it.
+            listing_tag: order_binding.map(|_| the_buyers_conversation().listing_tag(&widget())),
             created_at,
         }
         .with_derived_id();
@@ -11489,7 +11640,7 @@ mod buy_flow_tests {
             &tag,
             &conversation_id,
             crate::messaging::MessageContent::OrderRequest {
-                listing_id: published.order.listing_id.clone(),
+                listing_id: widget(),
                 quantity: 1,
                 shipping: "anywhere".into(),
                 note: String::new(),
@@ -11555,6 +11706,31 @@ mod buy_flow_tests {
                 backed_up: false,
             });
         assert_eq!(recalled.order_binding(), [9u8; 32]);
+    }
+
+    /// **A conversation restored through the delegate tags listings exactly as
+    /// the seller does.** The seller's key comes from its own Diffie-Hellman;
+    /// a recalled buyer conversation takes the delegate's derived key. If the
+    /// two ever used different halves, every honest order would be refused.
+    #[test]
+    fn a_recalled_conversation_computes_the_sellers_listing_tag() {
+        let recalled =
+            crate::messaging::BuyerConversation::recalled(&harvest_common::RecalledConversation {
+                buyer_public_key: [5u8; 32],
+                conversation_id: [6u8; 32],
+                buyer_to_seller: [7u8; 32],
+                seller_to_buyer: [8u8; 32],
+                order_binding: [9u8; 32],
+                created_at: 1,
+                imported: false,
+                backed_up: false,
+            });
+        let seller = crate::messaging::ConversationKeys {
+            to_seller: [7u8; 32],
+            from_seller: [8u8; 32],
+        };
+        let listing = ListingId([3u8; 32]);
+        assert_eq!(recalled.listing_tag(&listing), seller.listing_tag(&listing));
     }
 
     /// **An invoice naming no Bitcoin bridge is refused, not footnoted.**
@@ -12385,8 +12561,9 @@ mod buy_flow_tests {
             OrderStatus::AwaitingPayment,
         );
         assert_ne!(
-            published.order.listing_id, asked_for,
-            "the fixture must name a different listing, or this asserts nothing"
+            widget(),
+            asked_for,
+            "the acceptance must name a different listing, or this asserts nothing"
         );
 
         let (mut state, _) = buyer_after_acceptance(&published);
@@ -12395,6 +12572,66 @@ mod buy_flow_tests {
         let conversation = state.browsing_stores[STORE].conversations[0].clone();
         let request = conversation
             .request_order(&asked_for, 1, "12 Example St".into(), String::new())
+            .expect("seal the request");
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .mailbox_messages
+            .push(request);
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::CommitmentNotRequested]
+        );
+    }
+
+    /// **An order with no listing tag, for a conversation that asked for
+    /// something, is refused.** An honest seller answering a request always
+    /// writes one, so a missing tag fails closed rather than skipping the
+    /// check.
+    #[test]
+    fn an_untagged_order_for_a_conversation_that_asked_is_refused() {
+        let mut published = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        published.order.listing_tag = None;
+        let published = resigned(published, &seller_signing_key());
+        let (mut state, _) = buyer_after_acceptance(&published);
+        let conversation = state.browsing_stores[STORE].conversations[0].clone();
+        let request = conversation
+            .request_order(&widget(), 1, "12 Example St".into(), String::new())
+            .expect("seal the request");
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .mailbox_messages
+            .push(request);
+
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::CommitmentNotRequested]
+        );
+    }
+
+    /// **A tag computed under another conversation's key does not match.**
+    #[test]
+    fn a_listing_tag_from_another_conversation_is_refused() {
+        let (_, stranger) = buyer_conversation();
+        let mut published = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        published.order.listing_tag = Some(stranger.listing_tag(&widget()));
+        let published = resigned(published, &seller_signing_key());
+        let (mut state, _) = buyer_after_acceptance(&published);
+        let conversation = state.browsing_stores[STORE].conversations[0].clone();
+        let request = conversation
+            .request_order(&widget(), 1, "12 Example St".into(), String::new())
             .expect("seal the request");
         state
             .browsing_stores
@@ -12422,12 +12659,7 @@ mod buy_flow_tests {
         let (mut state, _) = buyer_after_acceptance(&published);
         let conversation = state.browsing_stores[STORE].conversations[0].clone();
         let request = conversation
-            .request_order(
-                &published.order.listing_id,
-                1,
-                "12 Example St".into(),
-                String::new(),
-            )
+            .request_order(&widget(), 1, "12 Example St".into(), String::new())
             .expect("seal the request");
         state
             .browsing_stores

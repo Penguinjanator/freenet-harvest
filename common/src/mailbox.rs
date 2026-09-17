@@ -409,6 +409,42 @@ pub fn order_binding_from_secret(conversation_secret: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key("harvest/order-binding/v1", conversation_secret)
 }
 
+/// Which listing an order is for, as a published order carries it: a keyed
+/// digest only the order's two parties can compute or check (harvest#57).
+///
+/// An order once carried the listing id itself. Listings are public store
+/// state, so anyone reading the store could join orders to listings and read
+/// off a per-product sales record. This tag keeps what the id was for:
+/// - the seller's published, signed record still says which listing an order
+///   answers, so "is this request answered" rests on published state rather
+///   than on a mailbox message that can be lost or evicted;
+/// - the buyer can still check the order is for what they asked for.
+///
+/// It is keyed by a key derived from the conversation's seller-direction key
+/// ([`listing_tag_key`]), which only the buyer and seller can compute, so a
+/// reader of the store cannot test a listing against it, and the same listing
+/// in two conversations gives unrelated tags.
+///
+/// The tag key is derived rather than being the direction key itself so that
+/// either party can later show a third party which listing a signed order
+/// named, by revealing the tag key and the listing id, without revealing the
+/// key that decrypts the rest of the conversation.
+///
+/// Like [`order_binding_from_secret`], computed on both sides, so the two
+/// derivations must agree, and a known-answer test pins it.
+pub fn listing_tag(conversation_key: &[u8; 32], listing: &crate::listing::ListingId) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key("harvest/listing-tag/v1");
+    hasher.update(&listing_tag_key(conversation_key));
+    hasher.update(&listing.0);
+    *hasher.finalize().as_bytes()
+}
+
+/// The key a conversation's listing tags are computed under: see
+/// [`listing_tag`]. Disclosable on its own; it decrypts nothing.
+pub fn listing_tag_key(conversation_key: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("harvest/listing-tag-key/v1", conversation_key)
+}
+
 /// Opaque conversation identifier chosen by the buyer.
 ///
 /// Privacy: this is a random 32-byte value, NOT derived from party identities.
@@ -1051,6 +1087,40 @@ mod tests {
         assert_eq!(
             order_binding_from_secret(&[7u8; 32]),
             hex_literal("481d7cec78bd2c8dd0f83bef532c333c639066576ff34e25fd564e2c38a7e260"),
+        );
+    }
+
+    /// **The listing tag derivation is pinned.**
+    ///
+    /// Expected values from the `b3sum` CLI, not from this function: the tag
+    /// key is `b3sum --derive-key "harvest/listing-tag-key/v1"` over 32 bytes
+    /// of `0x07`, and the tag is `b3sum --derive-key "harvest/listing-tag/v1"`
+    /// over that key then 32 bytes of `0x09` (the listing id). The seller
+    /// computes it when publishing and the buyer when checking, and a silent
+    /// disagreement would refuse every honest order.
+    #[test]
+    fn the_listing_tag_derivation_is_pinned() {
+        assert_eq!(
+            listing_tag_key(&[7u8; 32]),
+            hex_literal("ccc2fa94688cb070caa9a07224e0bbdcdda126e0df54f6569781e051d7f64c17"),
+        );
+        assert_eq!(
+            listing_tag(&[7u8; 32], &crate::listing::ListingId([9u8; 32])),
+            hex_literal("7ae087be800864334c9fe1b079653523cb8ae5463d455661515cc9ba11cb5527"),
+        );
+    }
+
+    /// **A listing tag cannot be tested without the conversation key.**
+    #[test]
+    fn a_listing_tag_differs_by_conversation_and_by_listing() {
+        let listing = crate::listing::ListingId([9u8; 32]);
+        assert_ne!(
+            listing_tag(&[7u8; 32], &listing),
+            listing_tag(&[8u8; 32], &listing)
+        );
+        assert_ne!(
+            listing_tag(&[7u8; 32], &listing),
+            listing_tag(&[7u8; 32], &crate::listing::ListingId([10u8; 32]))
         );
     }
 
