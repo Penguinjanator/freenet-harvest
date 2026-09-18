@@ -292,6 +292,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // which makes verification stricter, so a predecessor
                 // holding such an order no longer verifies.
                 "3f47ab79e985659f7c03728d907f05e9321037aa23c1ff7c7e569512a445489a",
+                // V15, from `git show 1b0d3c3:ui/public/contracts/store_contract.wasm`.
+                // Superseded by harvest#26 (canonical listings in `verify`)
+                // and #55 (an empty summary or state is not a decode error).
+                "c4e212924bc4547525a63c3ab13f6170b552224b32e9ae990b4a438abe890a98",
             ],
         ),
         (
@@ -324,6 +328,11 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // `RandomState` construction. See the registry row for why
                 // that is a counter rather than randomness on wasm32.
                 "3c55af21e5658f03121bbeccfe347d4d530b57139251048767089596145e0594",
+                // V11, from `git show f46bbf0:ui/public/contracts/\
+                // reputation_contract.wasm`. Superseded by harvest#22: the
+                // token's entry key now signs every field of an entry, which
+                // changes what a record's signature covers.
+                "eef8685c7a829a36fd95733b94a00a1581f377e734bd64765f0a8ed239709054",
             ],
         ),
         (
@@ -355,6 +364,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // `MailboxSummaryV2`, which is a summary and not state, so
                 // nothing stored at V9 changes shape.
                 "29e874557b99730efb7a863d7d393ea8f5444d066144cf354582c23c60b11404",
+                // V11, from `git show f46bbf0:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by harvest#85: size-class caps instead of a
+                // byte budget, and a `verify` that requires canonical state.
+                "5c0145d2421ebcae41ae8ee5591907c7f015502400b939e46dcbd8f128051854",
             ],
         ),
     ];
@@ -425,6 +438,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // store's published orders (harvest#77): `SetPaymentXpub` and
             // `DeriveOrderAddress` gained `published_scripts`.
             "08eac64a49dd1ca2f97421db0f022843b631b8c3b45fcd7f296f231bf9d0bd7e".to_string(),
+            // V14, from `git show 1b0d3c3:ui/public/contracts/harvest_delegate.wasm`.
+            // Superseded by harvest#22: `FeedbackToken` gained `entry_key`, a
+            // wire type this delegate stores.
+            "a1118c09466362b8b7b9edba06087126b71b08ddbd048287d04064af0e56e413".to_string(),
         ],
     );
 }
@@ -796,6 +813,9 @@ const PUBLISHED_UNDER_LEGACY_PARAMS: &[(u32, bool)] = &[
     // `scripts/check-code-hashes.sh` after the rebuild, checked rather than
     // assumed.
     (14, false),
+    // V15: harvest#26 and #55. `StoreParameters` did not move: still 56 bytes
+    // per `cargo make code-hashes`, checked rather than assumed.
+    (15, false),
 ];
 
 /// V1 is derived under TODAY's parameter encoding, not the legacy one.
@@ -1553,11 +1573,12 @@ fn folding_is_commutative_across_the_message_size_bound() {
 /// **What the fold cannot carry, it drops from BOTH sides.**
 ///
 /// The direction matters and is the reason commutativity is restored by
-/// dropping rather than by keeping. `verify` tolerates an over-budget state,
-/// so a folded state carrying an oversized message would be accepted by
-/// `validate_state` and PUT successfully -- and then every peer that merged it
-/// would run `apply_delta` and drop the message, leaving this node holding an
-/// entry no other peer has, permanently. Dropping it here moves the node
+/// dropping rather than by keeping. Until harvest#85 `verify` tolerated an
+/// oversized message, so a folded state carrying one would have been accepted
+/// by `validate_state` and PUT successfully -- and then every peer that merged
+/// it would run `apply_delta` and drop the message, leaving this node holding
+/// an entry no other peer has, permanently. Since harvest#85 `verify` refuses
+/// it, so keeping it would fail the fold's own PUT instead. Dropping it here moves the node
 /// toward what the network holds; keeping it would be a silent permanent
 /// divergence dressed up as data preservation.
 #[test]
@@ -1702,11 +1723,13 @@ fn dummy_feedback() -> FeedbackEntry {
         token: harvest_common::feedback::FeedbackToken {
             target_reputation_contract: [5u8; 32],
             nonce: [4u8; 32],
+            entry_key: [4u8; 32],
         },
         signature: vec![0u8; 8],
         category: harvest_common::feedback::FeedbackCategory::NonDelivery,
         comment: String::new(),
         submitted_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+        entry_signature: vec![0u8; 64],
     }
 }
 
@@ -1760,16 +1783,14 @@ fn a_wholly_discarded_predecessor_generation_is_reported() {
     unverifiable.feedback.push(dummy_feedback());
     unverifiable.used_nonces.insert([4u8; 32]);
 
-    let rep = merge_reputation_reporting_exclusions(
+    let rep = merge_reputation_reporting_discard(
         ReputationStateV1::default(),
         &unverifiable,
         &rep_params,
     );
     assert!(
         rep.discarded,
-        "a reputation generation refused in full must be reported, not kept quiet -- \
-         `excluded_variants` is empty on this path, so it was the only signal and it \
-         said nothing"
+        "a reputation generation refused in full must be reported, not kept quiet"
     );
     assert!(
         rep.state.feedback.is_empty(),
@@ -1778,7 +1799,7 @@ fn a_wholly_discarded_predecessor_generation_is_reported() {
 
     // And a fold that succeeds does NOT claim a discard, so the flag is
     // evidence rather than noise.
-    let quiet = merge_reputation_reporting_exclusions(
+    let quiet = merge_reputation_reporting_discard(
         ReputationStateV1::default(),
         &ReputationStateV1::default(),
         &rep_params,
@@ -1809,6 +1830,52 @@ fn a_wholly_discarded_predecessor_generation_is_reported() {
     assert!(!ok.discarded, "a successful store fold claims no discard");
 }
 
+/// **A fold that prunes to the caps says how many it pruned** (PR #82 review,
+/// Should Fix 7). Two generations of top-size messages meet for the first time
+/// in the fold and together exceed the top size class's cap; the lowest-ranked
+/// go, and the report counts them once each, even where a message is on both
+/// sides.
+#[test]
+fn a_fold_that_prunes_to_the_caps_reports_it() {
+    let cap = harvest_common::mailbox::SIZE_CLASS_CAPS[3];
+    let top = harvest_common::mailbox::MAX_MESSAGE_BYTES;
+    let base = 1_700_000_000;
+    let newer: Vec<_> = (0..cap as u8)
+        .map(|i| sized_message(i, base + 100 + i as i64, top))
+        .collect();
+    // Older than every message above, so these are the ones pruned; one of
+    // them is on both sides.
+    let older: Vec<_> = (0..3u8)
+        .map(|i| sized_message(200 + i, base + i as i64, top))
+        .collect();
+    let successor = {
+        let mut s = MailboxStateV1::default();
+        s.apply_delta(&Some(newer)).expect("apply");
+        s.messages.push(older[0].clone());
+        s
+    };
+    let report = merge_mailbox_reporting_drops(successor, &mailbox_with(older.clone()));
+    assert_eq!(report.state.messages.len(), cap);
+    assert_eq!(
+        report.pruned_by_cap, 3,
+        "three distinct older messages were pruned"
+    );
+    let warning = report
+        .unfoldable_warning()
+        .expect("a prune must be reported");
+    assert!(
+        warning.contains("3 message(s) were pruned"),
+        "got: {warning}"
+    );
+
+    let clean = merge_mailbox_reporting_drops(mailbox_with(vec![]), &mailbox_with(older));
+    assert_eq!(clean.pruned_by_cap, 0);
+    assert!(
+        clean.unfoldable_warning().is_none(),
+        "nothing pruned, nothing said"
+    );
+}
+
 /// An oversized message present on BOTH sides is one message that could not be
 /// carried, not two.
 ///
@@ -1829,64 +1896,148 @@ fn an_oversized_message_on_both_sides_is_counted_once() {
     );
 }
 
-/// **A fold that excludes a genuine feedback entry says so.**
-///
-/// The second migration-time data-loss path, and the one that matters because
-/// it fires during a migration rather than during an attack somebody has to
-/// mount. The RSA signature covers `entry.token` alone (issue #22), so two
-/// entries can share a token with different words; whichever side the fold
-/// already holds wins, and the other is excluded permanently.
-///
-/// **Nothing here can preserve both.** `ReputationStateV1::verify` requires
-/// `feedback.len() == used_nonces.len()`, so a state carrying two entries
-/// under one token is invalid by construction -- the repair is the reputation
-/// contract's own re-key, which is #22 and not this branch. What the fold CAN
-/// stop doing is losing one in silence, which is the same standard the
-/// oversized-message path is now held to.
-///
-/// Signatures are not the property under test, so the fixture uses unsigned
-/// entries; the report is computed before `apply_delta` is reached.
+/// **A fold does not carry unsigned version-0 details forward** (PR #82
+/// round-3 review). Before the re-review the contract accepted any content at
+/// version 0, so a predecessor can hold an injected name and key at version 0
+/// beside real listings. The scaffold's merge never touches a version-0 base,
+/// so the fold carried the junk forward, the new contract refused the PUT,
+/// and the listings never moved. The fold resets it to the default instead.
 #[test]
-fn a_fold_that_excludes_a_feedback_variant_reports_it() {
-    let params = reputation_params(vec![1u8; 32], &seller_vk());
+fn a_fold_drops_unsigned_version_zero_details() {
+    use freenet_scaffold::ComposableState;
+    let mut junk = store_with(&[signed_listing("Alpha")]);
+    junk.info.info.store_name = "Totally Legit Farm".into();
+    junk.info.info.encryption_public_key = Some([0xAA; 32]);
+    let params = store_params(&seller_vk());
 
-    let genuine = dummy_feedback();
-    let neutered = FeedbackEntry {
-        category: harvest_common::feedback::FeedbackCategory::Other("no complaint".to_string()),
-        comment: "actually it was fine".to_string(),
-        ..genuine.clone()
+    let folded = merge_store_reporting_discard(
+        junk,
+        &StoreStateV1::default(),
+        &params,
+        DiscardedSide::Predecessor,
+    );
+    assert!(!folded.discarded);
+    assert_eq!(
+        folded.state.info,
+        harvest_common::store::AuthorizedStoreInfoV1::default()
+    );
+    assert_eq!(
+        folded.state.listings.listings.len(),
+        1,
+        "the listing is carried"
+    );
+    folded
+        .state
+        .verify(&folded.state, &params)
+        .expect("the folded state is one the new contract accepts");
+}
+
+/// Store details at `version`, signed by the test seller the way the ghostkey
+/// delegate would.
+fn signed_store_info(version: u32) -> harvest_common::store::AuthorizedStoreInfoV1 {
+    let info = harvest_common::store::StoreInfoV1 {
+        version,
+        certificate_pem: String::new(),
+        seller_fingerprint: "fp".into(),
+        reputation_contract_id: [7u8; 32],
+        store_name: format!("Shop v{version}"),
+        description: String::new(),
+        encryption_public_key: None,
     };
-    assert_eq!(
-        genuine.token.nonce, neutered.token.nonce,
-        "precondition: one token, two entries"
+    let scoped = ghostkey_common::ScopedPayload {
+        requestor: ghostkey_common::SignatureRequestor::WebApp(
+            harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                .parse::<ContractInstanceId>()
+                .expect("canonical webapp id"),
+        ),
+        payload: harvest_common::to_cbor(&info).expect("serialize info"),
+    };
+    let scoped_payload = harvest_common::to_cbor(&scoped).expect("serialize scoped payload");
+    let signature = seller().sign(&scoped_payload).to_bytes().to_vec();
+    harvest_common::store::AuthorizedStoreInfoV1 {
+        info,
+        scoped_payload,
+        signature,
+    }
+}
+
+/// **The four fold orders the round-3 review reproduced, through the real
+/// fold.** Each is a sequence of generations, newest first, folded the way
+/// `merge_generations` folds them and then merged with an empty local state.
+/// Every forward state must be one the new contract accepts, with the listing
+/// carried; where a signed predecessor exists its details win.
+#[test]
+fn every_fold_order_with_injected_version_zero_details_moves_the_listings() {
+    use freenet_scaffold::ComposableState;
+    let params = store_params(&seller_vk());
+    let mut junk = store_with(&[signed_listing("Alpha")]);
+    junk.info.info.store_name = "Totally Legit Farm".into();
+    junk.info.info.encryption_public_key = Some([0xAA; 32]);
+    let signed = StoreStateV1 {
+        info: signed_store_info(1),
+        ..Default::default()
+    };
+    let plain = store_with(&[signed_listing("Alpha")]);
+
+    let fold = |base: StoreStateV1, other: &StoreStateV1| {
+        merge_store_reporting_discard(base, other, &params, DiscardedSide::Predecessor).state
+    };
+    let cases: [(&str, Vec<&StoreStateV1>, u32); 4] = [
+        ("junk only", vec![&junk], 0),
+        ("junk newest, signed older", vec![&junk, &signed], 1),
+        ("signed newest, junk older", vec![&signed, &junk], 1),
+        ("plain newest, junk older", vec![&plain, &junk], 0),
+    ];
+    for (name, generations, version) in cases {
+        let mut acc = generations[0].clone();
+        for older in &generations[1..] {
+            acc = fold(acc, older);
+        }
+        let forward = fold(acc, &StoreStateV1::default());
+        forward
+            .verify(&forward, &params)
+            .unwrap_or_else(|e| panic!("{name}: the new contract refuses the forward state: {e}"));
+        assert_eq!(
+            forward.listings.listings.len(),
+            1,
+            "{name}: the listing moved"
+        );
+        assert_eq!(forward.info.info.version, version, "{name}: details");
+        assert!(
+            forward.info.info.encryption_public_key.is_none(),
+            "{name}: the injected key did not move"
+        );
+    }
+}
+
+/// **A fold whose base is not canonical writes canonical state (harvest#26).**
+///
+/// The current contract refuses unsorted listings or a listing held twice,
+/// and the old one accepted both, so a predecessor generation can hold either.
+/// When the other side of the fold brings nothing new the scaffold never calls
+/// `ListingsV1::apply_delta`, so only the fold's own normalise stands between
+/// that base and a PUT the new contract would refuse.
+#[test]
+fn a_fold_normalises_a_non_canonical_base() {
+    let mut listings = vec![signed_listing("Alpha"), signed_listing("Beta")];
+    listings.sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
+    let mut messy = StoreStateV1::default();
+    messy.listings.listings = vec![
+        listings[1].clone(),
+        listings[0].clone(),
+        listings[1].clone(),
+    ];
+
+    let folded = merge_store_reporting_discard(
+        messy,
+        &StoreStateV1::default(),
+        &store_params(&seller_vk()),
+        DiscardedSide::Predecessor,
     );
-
-    // The successor holds the neutered variant; the predecessor holds the
-    // genuine entry.
-    let mut successor = ReputationStateV1::default();
-    successor.feedback.push(neutered);
-    successor.used_nonces.insert(genuine.token.nonce);
-    let mut predecessor = ReputationStateV1::default();
-    predecessor.feedback.push(genuine.clone());
-    predecessor.used_nonces.insert(genuine.token.nonce);
-
-    let report = merge_reputation_reporting_exclusions(successor, &predecessor, &params);
+    assert!(!folded.discarded);
     assert_eq!(
-        report.excluded_variants,
-        vec![genuine.token.nonce],
-        "a genuine entry excluded by a token collision must be named, not dropped in \
-         silence during the one operation that exists to carry data forward"
-    );
-
-    // And says nothing when the two sides agree, so the report is evidence
-    // rather than noise.
-    let mut same = ReputationStateV1::default();
-    same.feedback.push(genuine.clone());
-    same.used_nonces.insert(genuine.token.nonce);
-    let quiet = merge_reputation_reporting_exclusions(same.clone(), &same, &params);
-    assert!(
-        quiet.excluded_variants.is_empty(),
-        "an identical entry on both sides is not an exclusion"
+        folded.state.listings.listings, listings,
+        "the fold must write the listings sorted and once each"
     );
 }
 

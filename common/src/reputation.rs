@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::feedback::{FeedbackCategory, FeedbackToken};
 
@@ -29,9 +29,38 @@ impl ReputationParameters {
             owner_verifying_key,
         }
     }
+
+    fn rsa_verifying_key(&self) -> Result<rsa::pss::VerifyingKey<sha2::Sha256>, String> {
+        use rsa::pkcs1::DecodeRsaPublicKey;
+        let key = rsa::RsaPublicKey::from_pkcs1_der(&self.rsa_public_key_der)
+            .map_err(|e| format!("invalid RSA public key: {e}"))?;
+        Ok(rsa::pss::VerifyingKey::<sha2::Sha256>::new(key))
+    }
 }
 
+/// Domain separation for [`FeedbackEntry::entry_signature`].
+const ENTRY_SIGNATURE_DOMAIN: &[u8] = b"harvest/feedback-entry/v1";
+/// Domain separation for [`FeedbackEntry::digest`].
+const ENTRY_DIGEST_DOMAIN: &[u8] = b"harvest/feedback-entry-digest/v1";
+
 /// A single piece of negative feedback submitted to a seller's reputation contract.
+///
+/// # Every field is signed
+///
+/// Two signatures, over two different things:
+///
+/// * `signature` is the seller's RSA blind signature over the CBOR-encoded
+///   `token`. It proves the seller issued this token, without the seller
+///   having seen it.
+/// * `entry_signature` is an Ed25519 signature by `token.entry_key` over
+///   everything else: the token, the RSA signature, the category, the comment
+///   and the timestamp. Only the buyer holds that key's secret.
+///
+/// Until harvest#22 only the first existed, so `category`, `comment` and
+/// `submitted_at` rode alongside the signed token unsigned. Anyone reading a
+/// published entry could re-submit the token with different words, each peer
+/// kept whichever arrived first, and a seller could push a neutered variant to
+/// peers that did not yet hold the real complaint and have them refuse it.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct FeedbackEntry {
     /// The unblinded feedback token.
@@ -44,19 +73,145 @@ pub struct FeedbackEntry {
     pub comment: String,
     /// When the feedback was submitted.
     pub submitted_at: DateTime<Utc>,
+    /// Ed25519 signature by `token.entry_key` over [`FeedbackEntry::signing_bytes`].
+    pub entry_signature: Vec<u8>,
+}
+
+/// The part of a [`FeedbackEntry`] its `entry_signature` covers: all of it but
+/// the signature itself.
+#[derive(Serialize)]
+struct SignedEntryTerms<'a> {
+    token: &'a FeedbackToken,
+    signature: &'a [u8],
+    category: &'a FeedbackCategory,
+    comment: &'a str,
+    submitted_at: &'a DateTime<Utc>,
+}
+
+impl FeedbackEntry {
+    /// Build an entry and sign it with the token's entry key.
+    ///
+    /// `entry_key` must be the secret half of `token.entry_key`, or the entry
+    /// will not verify.
+    pub fn sign(
+        token: FeedbackToken,
+        signature: Vec<u8>,
+        category: FeedbackCategory,
+        comment: String,
+        submitted_at: DateTime<Utc>,
+        entry_key: &ed25519_dalek::SigningKey,
+    ) -> Self {
+        use ed25519_dalek::Signer;
+        let mut entry = Self {
+            token,
+            signature,
+            category,
+            comment,
+            submitted_at,
+            entry_signature: Vec::new(),
+        };
+        entry.entry_signature = entry_key.sign(&entry.signing_bytes()).to_bytes().to_vec();
+        entry
+    }
+
+    /// The bytes `entry_signature` covers: a domain tag, then the CBOR of
+    /// every other field.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let terms = SignedEntryTerms {
+            token: &self.token,
+            signature: &self.signature,
+            category: &self.category,
+            comment: &self.comment,
+            submitted_at: &self.submitted_at,
+        };
+        let mut bytes = ENTRY_SIGNATURE_DOMAIN.to_vec();
+        // Infallible: plain data with no custom fallible encoding.
+        bytes.extend(crate::to_cbor(&terms).expect("feedback terms always serialize"));
+        bytes
+    }
+
+    /// Content digest of the whole entry, signatures included.
+    ///
+    /// This is what a summary names, rather than the token's nonce: two
+    /// entries for one token are two different things to exchange, and a
+    /// summary keyed on the nonce would tell a peer holding one variant that
+    /// it already has the other, so neither would ever be sent.
+    pub fn digest(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(ENTRY_DIGEST_DOMAIN);
+        hasher.update(&crate::to_cbor(self).expect("feedback entry always serializes"));
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Check both signatures: the seller issued the token, and the token's
+    /// entry key signed everything else.
+    pub fn verify(&self, rsa_key: &rsa::pss::VerifyingKey<sha2::Sha256>) -> Result<(), String> {
+        use rsa::signature::Verifier;
+
+        // Before the RSA check (PR #82 re-review), but not as a defence: an
+        // attacker picks `entry_key`, so it can always pass this. It saves the
+        // RSA verification only on junk and honest mistakes. What bounds RSA
+        // work per update is `apply_delta`'s digest skip: an entry already
+        // held is never verified again. The slot must be bound to the key, or the seller (who can sign any
+        // token) could mint one for a buyer's published slot with a key of its
+        // own. See `FeedbackToken::nonce`.
+        let bound = FeedbackToken::nonce_for(&self.token.entry_key);
+        // nonce-identity-waiver: checking that the nonce is DERIVED from the
+        // entry key, not deciding that two messages are the same one.
+        if bound != self.token.nonce {
+            return Err("feedback token nonce is not derived from its entry key".into());
+        }
+
+        let token_bytes =
+            crate::to_cbor(&self.token).map_err(|e| format!("serialize token: {e}"))?;
+        let signature = rsa::pss::Signature::try_from(self.signature.as_slice())
+            .map_err(|e| format!("invalid RSA signature bytes: {e}"))?;
+        rsa_key
+            .verify(&token_bytes, &signature)
+            .map_err(|e| format!("feedback signature invalid: {e}"))?;
+
+        let entry_key = VerifyingKey::from_bytes(&self.token.entry_key)
+            .map_err(|e| format!("invalid feedback entry key: {e}"))?;
+        let entry_signature = ed25519_dalek::Signature::from_slice(&self.entry_signature)
+            .map_err(|e| format!("invalid feedback entry signature bytes: {e}"))?;
+        // `verify_strict`: rejects small-order keys and non-canonical
+        // encodings, so the key's holder is the only party who can produce a
+        // second valid entry for a token.
+        entry_key
+            .verify_strict(&self.signing_bytes(), &entry_signature)
+            .map_err(|e| format!("feedback entry signature invalid: {e}"))
+    }
+
+    /// The encoding the per-token tie-break compares. See
+    /// [`ReputationStateV1::apply_delta`].
+    fn canonical_rank(&self) -> Vec<u8> {
+        crate::to_cbor(self).expect("feedback entry always serializes")
+    }
 }
 
 /// Per-seller reputation contract state. Append-only negative feedback.
 ///
-/// This is naturally commutative: adding feedback entries in any order produces the
-/// same final set (grow-only set with nonce-based deduplication).
+/// # Canonical form
+///
+/// At most one entry per token, `feedback` strictly ascending by
+/// `token.nonce`, and `used_nonces` exactly the set of those nonces. `verify`
+/// refuses anything else, and `apply_delta` only ever produces this form, so
+/// two peers holding the same feedback hold the same bytes.
+///
+/// # Two entries for one token
+///
+/// Only the buyer who holds the token's entry key can produce a second
+/// validly-signed entry for it. If they do, both are real, and the contract
+/// keeps the one whose CBOR encoding is smaller. That is a total order over
+/// the entry's own bytes, so which one survives does not depend on which a
+/// peer saw first: merge is commutative, associative and idempotent.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct ReputationStateV1 {
     /// Owner's ghostkey certificate PEM (for verifiers to check identity chain).
     pub owner_certificate_pem: String,
-    /// Append-only list of negative feedback entries.
+    /// Negative feedback entries, strictly ascending by `token.nonce`.
     pub feedback: Vec<FeedbackEntry>,
-    /// Used nonces for replay prevention (mirrors nonces from feedback entries).
+    /// The nonces of `feedback`, kept for replay prevention.
     ///
     /// **`BTreeSet`, not `HashSet`, and that is load-bearing.** This field is
     /// part of the contract STATE, so its CBOR encoding is bytes peers compare,
@@ -81,81 +236,62 @@ pub struct ReputationStateV1 {
     /// Note what is NOT true: two `to_cbor` calls on ONE `HashSet` value give
     /// identical bytes. Only independently-built instances diverge, which is
     /// the shape `used_nonces_encoding_is_deterministic` uses.
-    ///
-    /// `feedback` below is sorted for exactly this reason; a `HashSet` beside
-    /// it silently spent that sort.
     pub used_nonces: BTreeSet<[u8; 32]>,
 }
 
-/// Summary for delta computation: the set of known nonces.
+/// Summary for delta computation: the digest of every entry held.
 ///
-/// `BTreeSet` for the same reason as [`ReputationStateV1::used_nonces`]: a
-/// summary is encoded and sent, so its bytes must be a function of its
-/// contents alone.
+/// Digests, not nonces: see [`FeedbackEntry::digest`]. `BTreeSet` for the
+/// same reason as [`ReputationStateV1::used_nonces`]: a summary is encoded and
+/// sent, so its bytes must be a function of its contents alone.
 pub type ReputationSummary = BTreeSet<[u8; 32]>;
 
 /// Delta: new feedback entries to add.
 pub type ReputationDelta = Vec<FeedbackEntry>;
 
 impl ReputationStateV1 {
-    /// Verify the entire state: all feedback entries have valid RSA signatures
-    /// and consistent nonce tracking.
+    /// Verify the entire state: every entry's signatures, and the canonical
+    /// form described on the type.
     pub fn verify(&self, parameters: &ReputationParameters) -> Result<(), String> {
-        use rsa::pkcs1::DecodeRsaPublicKey;
-        use rsa::pss::{Signature, VerifyingKey as RsaVerifyingKey};
-        use rsa::signature::Verifier;
-        use sha2::Sha256;
-
-        let rsa_key = rsa::RsaPublicKey::from_pkcs1_der(&parameters.rsa_public_key_der)
-            .map_err(|e| format!("invalid RSA public key: {e}"))?;
-        let verifying_key = RsaVerifyingKey::<Sha256>::new(rsa_key);
+        let rsa_key = parameters.rsa_verifying_key()?;
 
         for entry in &self.feedback {
-            // Verify the RSA-PSS signature over the CBOR-encoded token
-            let token_bytes =
-                crate::to_cbor(&entry.token).map_err(|e| format!("serialize token: {e}"))?;
-            let signature = Signature::try_from(entry.signature.as_slice())
-                .map_err(|e| format!("invalid RSA signature bytes: {e}"))?;
-            verifying_key
-                .verify(&token_bytes, &signature)
-                .map_err(|e| format!("feedback signature invalid: {e}"))?;
+            entry.verify(&rsa_key)?;
+        }
 
-            // Verify nonce is tracked
-            // nonce-identity-waiver: reputation keys identity on `token.nonce` and has the
-            // same defect the mailbox re-key fixed -- see
-            // `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. Parked
-            // until the reputation contract's own re-key; NOT a site to copy.
-            if !self.used_nonces.contains(&entry.token.nonce) {
-                return Err(format!(
-                    "feedback entry nonce not in used_nonces set: {:?}",
-                    entry.token.nonce
-                ));
+        // Strictly ascending rejects both an out-of-order list and two
+        // entries for one token. Accepting either let two peers holding the
+        // same feedback hold different bytes (harvest#26 is the listings form
+        // of the same defect).
+        for pair in self.feedback.windows(2) {
+            if pair[0].token.nonce >= pair[1].token.nonce {
+                return Err(
+                    "feedback is not strictly ascending by token nonce (unsorted or a \
+                     token used twice)"
+                        .into(),
+                );
             }
         }
 
-        // Verify no duplicate nonces
-        if self.feedback.len() != self.used_nonces.len() {
-            return Err("feedback count does not match used_nonces count".into());
+        let nonces: BTreeSet<[u8; 32]> = self.feedback.iter().map(|e| e.token.nonce).collect();
+        if nonces != self.used_nonces {
+            return Err("used_nonces is not exactly the set of feedback nonces".into());
         }
 
         Ok(())
     }
 
-    /// Generate a summary (set of used nonces) for delta computation.
+    /// Generate a summary (the digest of every entry) for delta computation.
     pub fn summarize(&self) -> ReputationSummary {
-        self.used_nonces.clone()
+        self.feedback.iter().map(FeedbackEntry::digest).collect()
     }
 
-    /// Compute delta: feedback entries whose nonces are not in the old summary.
+    /// Compute delta: entries whose digest the old summary does not name.
     pub fn delta(&self, old_summary: &ReputationSummary) -> Option<ReputationDelta> {
         let new_entries: Vec<_> = self
             .feedback
             .iter()
-            // nonce-identity-waiver: reputation keys identity on `token.nonce` and has the
-            // same defect the mailbox re-key fixed -- see
-            // `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. Parked
-            // until the reputation contract's own re-key; NOT a site to copy.
-            .filter(|e| !old_summary.contains(&e.token.nonce))
+            .filter(|e| !old_summary.contains(&e.digest()))
             .cloned()
             .collect();
         if new_entries.is_empty() {
@@ -165,71 +301,77 @@ impl ReputationStateV1 {
         }
     }
 
-    /// Apply a delta: add new feedback entries, verifying each signature.
+    /// Apply a delta: verify every entry, then fold them in, leaving the state
+    /// in canonical form.
     pub fn apply_delta(
         &mut self,
         parameters: &ReputationParameters,
         delta: &Option<ReputationDelta>,
     ) -> Result<(), String> {
-        use rsa::pkcs1::DecodeRsaPublicKey;
-        use rsa::pss::{Signature, VerifyingKey as RsaVerifyingKey};
-        use rsa::signature::Verifier;
-        use sha2::Sha256;
-
         let Some(entries) = delta else {
             return Ok(());
         };
-
-        let rsa_key = rsa::RsaPublicKey::from_pkcs1_der(&parameters.rsa_public_key_der)
-            .map_err(|e| format!("invalid RSA public key: {e}"))?;
-        let verifying_key = RsaVerifyingKey::<Sha256>::new(rsa_key);
 
         // Verify the WHOLE delta before committing any of it. Verifying and
         // pushing in one pass left a delta of [valid, invalid] with the valid
         // entry -- and its nonce -- already in `self` when the error returned,
         // so a caller that keeps the state it passed in would take on entries
-        // from a delta it had been told to reject. The burnt nonce is the
-        // worse half: `used_nonces` is what suppresses a replay, so the
-        // genuine entry could then never be added. Same defect, and the same
+        // from a delta it had been told to reject. Same defect, and the same
         // fix, as `store::OrdersV1::apply_delta`.
-        let mut accepted: Vec<&FeedbackEntry> = Vec::new();
-        // Nonces this delta has already accounted for, so a delta naming one
-        // entry twice still stores it once. `self.used_nonces` used to be
-        // mutated in the loop and did this job; it cannot now, because nothing
-        // is committed until every entry has passed.
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
-
+        let held: BTreeSet<[u8; 32]> = self.summarize();
+        let mut incoming: Vec<&FeedbackEntry> = Vec::new();
+        let mut rsa_key = None;
         for entry in entries {
-            // Reject duplicate nonces
-            // nonce-identity-waiver: reputation keys identity on `token.nonce` and has the
-            // same defect the mailbox re-key fixed -- see
-            // `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. Parked
-            // until the reputation contract's own re-key; NOT a site to copy.
-            if self.used_nonces.contains(&entry.token.nonce) || !seen.insert(entry.token.nonce) {
+            // Already held byte for byte: nothing to verify or add.
+            if held.contains(&entry.digest()) {
                 continue;
             }
-
-            // Verify the RSA-PSS signature
-            let token_bytes =
-                crate::to_cbor(&entry.token).map_err(|e| format!("serialize token: {e}"))?;
-            let signature = Signature::try_from(entry.signature.as_slice())
-                .map_err(|e| format!("invalid RSA signature bytes: {e}"))?;
-            verifying_key
-                .verify(&token_bytes, &signature)
-                .map_err(|e| format!("feedback signature invalid: {e}"))?;
-
-            accepted.push(entry);
+            if rsa_key.is_none() {
+                rsa_key = Some(parameters.rsa_verifying_key()?);
+            }
+            entry.verify(rsa_key.as_ref().expect("set just above"))?;
+            incoming.push(entry);
         }
 
-        for entry in accepted {
-            self.used_nonces.insert(entry.token.nonce);
-            self.feedback.push(entry.clone());
+        // One slot per token. Rebuilding from `self` as well as the delta is
+        // what normalises a state that arrived out of order.
+        let mut by_token: BTreeMap<[u8; 32], FeedbackEntry> = BTreeMap::new();
+        for entry in self.feedback.drain(..).chain(incoming.into_iter().cloned()) {
+            match by_token.entry(entry.token.nonce) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(entry);
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    // Two entries for one token: keep the smaller encoding,
+                    // so the survivor is a function of the two entries and
+                    // not of arrival order.
+                    if entry.canonical_rank() < slot.get().canonical_rank() {
+                        slot.insert(entry);
+                    }
+                }
+            }
         }
 
-        // Sort deterministically by nonce for CRDT convergence
-        self.feedback
-            .sort_by(|a, b| a.token.nonce.cmp(&b.token.nonce));
+        self.used_nonces = by_token.keys().copied().collect();
+        self.feedback = by_token.into_values().collect();
+        Ok(())
+    }
 
+    /// Merge another full state into this one: every entry, plus the
+    /// certificate back-fill. This is the contract's `UpdateData::State` arm
+    /// and the migration fold's merge, in one place.
+    pub fn merge(
+        &mut self,
+        parameters: &ReputationParameters,
+        other: &ReputationStateV1,
+    ) -> Result<(), String> {
+        // Always through `apply_delta`, even with nothing to add: it is what
+        // puts `self` in canonical form, and a fold's base is a predecessor's
+        // state that nothing verified.
+        self.apply_delta(parameters, &Some(other.feedback.clone()))?;
+        if self.owner_certificate_pem.is_empty() {
+            self.owner_certificate_pem = other.owner_certificate_pem.clone();
+        }
         Ok(())
     }
 }
@@ -262,30 +404,56 @@ mod tests {
         (private, params)
     }
 
+    /// The secret half of `token(nonce).entry_key`. Deterministic so a test
+    /// can sign a second variant for a token it built earlier.
+    fn entry_key(nonce: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[nonce.wrapping_add(100); 32])
+    }
+
     fn token(nonce: u8) -> FeedbackToken {
-        FeedbackToken {
-            target_reputation_contract: [5u8; 32],
-            nonce: [nonce; 32],
-        }
+        FeedbackToken::new([5u8; 32], entry_key(nonce).verifying_key().to_bytes())
     }
 
+    fn timestamp() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp")
+    }
+
+    /// An entry carrying `signature` as its RSA signature, correctly signed by
+    /// the token's entry key. Whether it verifies is up to `signature`.
     fn entry(signature: Vec<u8>, nonce: u8) -> FeedbackEntry {
-        FeedbackEntry {
-            token: token(nonce),
+        FeedbackEntry::sign(
+            token(nonce),
             signature,
-            category: FeedbackCategory::NonDelivery,
-            comment: String::new(),
-            submitted_at: DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
-        }
+            FeedbackCategory::NonDelivery,
+            String::new(),
+            timestamp(),
+            &entry_key(nonce),
+        )
     }
 
-    /// A feedback entry whose RSA-PSS signature genuinely verifies.
-    fn signed_entry(private: &RsaPrivateKey, nonce: u8) -> FeedbackEntry {
+    fn rsa_sign(private: &RsaPrivateKey, nonce: u8) -> Vec<u8> {
         let mut rng = rsa::rand_core::OsRng;
         let signing_key = BlindedSigningKey::<Sha256>::new(private.clone());
         let bytes = crate::to_cbor(&token(nonce)).expect("serialize token");
-        let signature = signing_key.sign_with_rng(&mut rng, &bytes).to_vec();
-        entry(signature, nonce)
+        signing_key.sign_with_rng(&mut rng, &bytes).to_vec()
+    }
+
+    /// A feedback entry whose RSA-PSS and entry signatures genuinely verify.
+    fn signed_entry(private: &RsaPrivateKey, nonce: u8) -> FeedbackEntry {
+        entry(rsa_sign(private, nonce), nonce)
+    }
+
+    /// A second, equally genuine entry for the same token: what the buyer who
+    /// holds the entry key could produce by signing twice.
+    fn signed_variant(private: &RsaPrivateKey, nonce: u8, comment: &str) -> FeedbackEntry {
+        FeedbackEntry::sign(
+            token(nonce),
+            rsa_sign(private, nonce),
+            FeedbackCategory::Other("second thoughts".to_string()),
+            comment.to_string(),
+            timestamp(),
+            &entry_key(nonce),
+        )
     }
 
     /// The fixture has to be right, or the atomicity test below passes for the
@@ -379,34 +547,61 @@ mod tests {
         assert_eq!(state.feedback.len(), 1);
         assert_eq!(state.used_nonces.len(), 1);
     }
-    /// **KNOWN GAP, found by the 2026-09-05 identity sweep and NOT fixed
-    /// here: two feedback entries sharing a token do not converge.**
-    ///
-    /// The doc on `ReputationStateV1` says feedback is "naturally
-    /// commutative: adding feedback entries in any order produces the same
-    /// final set". It is not, and this is the counterexample.
-    ///
-    /// The RSA signature covers `entry.token` and nothing else, while
-    /// `category`, `comment` and `submitted_at` ride alongside it unsigned.
-    /// Identity is `token.nonce`. So anyone who reads a published entry --
-    /// the contract state is public -- can re-submit the same token and
-    /// signature with different words, and each peer keeps whichever it saw
-    /// FIRST. Two peers that saw the two orders keep different bytes forever.
-    ///
-    /// The consequence is not only convergence: a seller who reads negative
-    /// feedback can push a neutered variant to peers that do not hold the
-    /// original yet, and those peers will refuse the real one when it
-    /// arrives, because its nonce is already used.
-    ///
-    /// This is the same class as the mailbox's nonce identity, which the
-    /// 2026-09-05 change fixed by keying on a digest of the whole entry. It
-    /// is left alone here deliberately: it is a different contract with its
-    /// own re-key, the fix wants its own review, and for feedback the better
-    /// repair is probably to sign the whole entry rather than the token
-    /// alone, so the variant cannot be constructed at all. Recorded in
-    /// `docs/untested-invariants.md`.
+    /// **Seeded random merge laws, byte for byte** (PR #82 review, Should
+    /// Fix 3), over states built from genuinely signed entries, including
+    /// two buyer-signed entries for each of two tokens, and certificates that
+    /// are either empty or one value (a second non-empty certificate is
+    /// harvest#81 and is not claimed to converge).
     #[test]
-    fn known_gap_two_feedback_variants_sharing_a_token_do_not_converge() {
+    fn seeded_random_reputations_obey_the_merge_laws() {
+        use crate::merge_laws::{assert_laws, Rng};
+        let (private, params) = key_pair();
+        let mut pool: Vec<FeedbackEntry> = (1u8..=6).map(|n| signed_entry(&private, n)).collect();
+        pool.push(signed_variant(&private, 1, "second"));
+        pool.push(signed_variant(&private, 2, "second"));
+        let certs = ["", "-----BEGIN CERT-----"];
+
+        let mut rng = Rng::new(0x5eed_0022);
+        let states: Vec<ReputationStateV1> = (0..200)
+            .map(|_| {
+                let mut s = ReputationStateV1 {
+                    owner_certificate_pem: certs[rng.below(2)].to_string(),
+                    ..Default::default()
+                };
+                s.apply_delta(&params, &Some(rng.subset(&pool, 5)))
+                    .expect("apply");
+                s
+            })
+            .collect();
+        let merge = |a: &ReputationStateV1, b: &ReputationStateV1| {
+            let mut out = a.clone();
+            out.merge(&params, b).expect("merge");
+            out
+        };
+        let enc = |s: &ReputationStateV1| crate::to_cbor(s).expect("encode");
+        assert_laws(&states, 150, &mut rng, merge, enc);
+        // Through the summary and delta, as peers exchange it. A summary
+        // keyed on the nonce shows up here and not above.
+        let exchange = |a: &ReputationStateV1, b: &ReputationStateV1| {
+            let mut out = a.clone();
+            out.apply_delta(&params, &b.delta(&a.summarize()))
+                .expect("apply");
+            if out.owner_certificate_pem.is_empty() {
+                out.owner_certificate_pem = b.owner_certificate_pem.clone();
+            }
+            out
+        };
+        assert_laws(&states, 150, &mut rng, exchange, enc);
+    }
+
+    /// **Nobody but the buyer can change what an entry says (harvest#22).**
+    ///
+    /// Before the entry signature, the RSA signature covered `entry.token`
+    /// alone, so anyone reading a published entry could re-submit the token
+    /// with different words, and each peer kept whichever it saw first. Red
+    /// against that code: the neutered variant applied.
+    #[test]
+    fn a_third_party_cannot_rewrite_an_entry() {
         let (private, params) = key_pair();
         let genuine = signed_entry(&private, 1);
         let neutered = FeedbackEntry {
@@ -414,32 +609,372 @@ mod tests {
             comment: "actually it was fine".to_string(),
             ..genuine.clone()
         };
-        assert_eq!(
-            genuine.token.nonce, neutered.token.nonce,
-            "precondition: one token, two entries"
-        );
 
-        let mut saw_genuine_first = ReputationStateV1::default();
-        saw_genuine_first
-            .apply_delta(&params, &Some(vec![genuine.clone()]))
-            .expect("apply");
-        saw_genuine_first
+        let mut state = ReputationStateV1::default();
+        let err = state
             .apply_delta(&params, &Some(vec![neutered.clone()]))
-            .expect("apply");
+            .expect_err("an entry altered after signing must be refused");
+        assert!(err.contains("entry signature"), "got: {err}");
+        assert!(state.feedback.is_empty());
 
-        let mut saw_neutered_first = ReputationStateV1::default();
-        saw_neutered_first
-            .apply_delta(&params, &Some(vec![neutered]))
-            .expect("apply");
-        saw_neutered_first
-            .apply_delta(&params, &Some(vec![genuine]))
-            .expect("apply");
+        // Nor can it ride in on a whole state.
+        let forged = ReputationStateV1 {
+            owner_certificate_pem: String::new(),
+            used_nonces: [neutered.token.nonce].into_iter().collect(),
+            feedback: vec![neutered],
+        };
+        forged
+            .verify(&params)
+            .expect_err("a state holding an altered entry must not verify");
+    }
 
-        assert_ne!(
-            saw_genuine_first.feedback, saw_neutered_first.feedback,
-            "these two peers converged, so this known gap is CLOSED -- delete this test and \
-             correct the commutativity claim on `ReputationStateV1`"
+    /// **The seller cannot take over a buyer's slot (PR #82 review, Must
+    /// Fix 1).**
+    ///
+    /// The seller holds the RSA key, so it can blind-sign any token it likes,
+    /// including one carrying a buyer's PUBLISHED nonce and an `entry_key` of
+    /// the seller's own. With the nonce free, that token's entry was a
+    /// validly signed second entry for the buyer's slot, and grinding the key
+    /// until the entry sorted first made the tie-break pick it on every peer.
+    /// Red with the nonce-derivation check removed: the ground entry displaces
+    /// the buyer's.
+    #[test]
+    fn the_rsa_key_holder_cannot_mint_a_token_for_a_published_slot() {
+        use rsa::pss::BlindedSigningKey;
+        use rsa::signature::{RandomizedSigner, SignatureEncoding};
+
+        let (private, params) = key_pair();
+        let genuine = signed_entry(&private, 1);
+        let seller_rsa = BlindedSigningKey::<Sha256>::new(private.clone());
+
+        // Grind a seller key whose neutered entry sorts before the genuine
+        // one, which is what the tie-break keeps.
+        let forged = (0u8..=255)
+            .map(|seed| {
+                let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+                let token = FeedbackToken {
+                    target_reputation_contract: genuine.token.target_reputation_contract,
+                    nonce: genuine.token.nonce,
+                    entry_key: key.verifying_key().to_bytes(),
+                };
+                let rsa_signature = seller_rsa
+                    .sign_with_rng(
+                        &mut rsa::rand_core::OsRng,
+                        &crate::to_cbor(&token).expect("encode token"),
+                    )
+                    .to_vec();
+                FeedbackEntry::sign(
+                    token,
+                    rsa_signature,
+                    FeedbackCategory::Other("no complaint".to_string()),
+                    "all good".to_string(),
+                    timestamp(),
+                    &key,
+                )
+            })
+            .find(|e| e.canonical_rank() < genuine.canonical_rank())
+            .expect("half of all keys sort first");
+
+        let err = forged
+            .verify(&params.rsa_verifying_key().expect("key"))
+            .expect_err("a token whose nonce is not its key's must not verify");
+        assert!(err.contains("not derived"), "got: {err}");
+
+        for order in [
+            vec![genuine.clone(), forged.clone()],
+            vec![forged.clone(), genuine.clone()],
+        ] {
+            let mut state = ReputationStateV1::default();
+            for e in order {
+                let _ = state.apply_delta(&params, &Some(vec![e]));
+            }
+            assert_eq!(
+                state.feedback,
+                vec![genuine.clone()],
+                "the buyer's entry must survive, in either order"
+            );
+        }
+    }
+
+    /// **A weak entry key cannot be used to forge an entry** (PR #82
+    /// re-review). The identity point is a valid encoding that
+    /// `VerifyingKey::from_bytes` accepts, and under it the signature
+    /// `R = identity, s = 0` verifies for ANY message with the non-strict
+    /// check. A token issued for such a key -- by a buggy client, or minted
+    /// by the seller, who can blind-sign any token -- would let anyone write
+    /// its entry. `verify_strict` refuses small-order keys; this pins it.
+    #[test]
+    fn an_entry_under_a_small_order_key_is_refused() {
+        use ed25519_dalek::Verifier;
+        use rsa::pss::BlindedSigningKey;
+        use rsa::signature::{RandomizedSigner, SignatureEncoding};
+
+        let (private, params) = key_pair();
+        let rsa_key = params.rsa_verifying_key().expect("key");
+        let seller_rsa = BlindedSigningKey::<Sha256>::new(private);
+
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut identity_signbit = identity;
+        identity_signbit[31] = 0x80;
+        // The identity again, non-canonically encoded as y = 1 + p.
+        let mut identity_y_plus_p = [0xFFu8; 32];
+        identity_y_plus_p[0] = 0xEE;
+        identity_y_plus_p[31] = 0x7F;
+        let mut forged = [0u8; 64];
+        forged[0] = 1; // R = identity, s = 0
+
+        for key in [identity, identity_signbit, identity_y_plus_p] {
+            let token = FeedbackToken::new([5u8; 32], key);
+            let rsa_signature = seller_rsa
+                .sign_with_rng(
+                    &mut rsa::rand_core::OsRng,
+                    &crate::to_cbor(&token).expect("encode token"),
+                )
+                .to_vec();
+            let entry = FeedbackEntry {
+                token,
+                signature: rsa_signature,
+                category: FeedbackCategory::Other("forged".to_string()),
+                comment: "written by someone without a key".to_string(),
+                submitted_at: timestamp(),
+                entry_signature: forged.to_vec(),
+            };
+            let vk = VerifyingKey::from_bytes(&key).expect("the weak key decodes");
+            assert!(
+                vk.verify(
+                    &entry.signing_bytes(),
+                    &ed25519_dalek::Signature::from_bytes(&forged)
+                )
+                .is_ok(),
+                "precondition: the non-strict check accepts the forgery"
+            );
+            let err = entry
+                .verify(&rsa_key)
+                .expect_err("an entry under a small-order key must be refused");
+            assert!(err.contains("entry signature"), "got: {err}");
+        }
+    }
+
+    /// The nonce binding is checked before the RSA signature, so an entry
+    /// that fails it costs one hash rather than an RSA verification (PR #82
+    /// re-review). Observable as which error comes back for an entry that
+    /// fails both.
+    #[test]
+    fn the_cheap_nonce_check_runs_before_the_rsa_check() {
+        let (_, params) = key_pair();
+        let mut entry = entry(vec![0u8; 8], 1); // RSA signature: garbage
+        entry.token.nonce = [0u8; 32]; // not derived from the key
+        let err = entry
+            .verify(&params.rsa_verifying_key().expect("key"))
+            .expect_err("fails both");
+        assert!(
+            err.contains("not derived"),
+            "the nonce check must run first; got: {err}"
         );
+    }
+
+    /// Every field is covered, not only the ones the attack above changes.
+    /// One mutation per field the entry signature is meant to cover.
+    #[test]
+    fn every_field_of_an_entry_is_signed() {
+        let (private, params) = key_pair();
+        let rsa_key = params.rsa_verifying_key().expect("key");
+        let genuine = signed_entry(&private, 1);
+        genuine.verify(&rsa_key).expect("the fixture verifies");
+
+        let mut altered = Vec::new();
+        let mut e = genuine.clone();
+        e.category = FeedbackCategory::Counterfeit;
+        altered.push(("category", e));
+        let mut e = genuine.clone();
+        e.comment = "x".to_string();
+        altered.push(("comment", e));
+        let mut e = genuine.clone();
+        e.submitted_at = DateTime::from_timestamp(1_700_000_001, 0).expect("timestamp");
+        altered.push(("submitted_at", e));
+        // A second genuine RSA signature on the same token: the SELLER can
+        // produce these at will, so it must not be able to mint a variant.
+        let mut e = genuine.clone();
+        e.signature = rsa_sign(&private, 1);
+        assert_ne!(e.signature, genuine.signature, "PSS is randomized");
+        altered.push(("signature", e));
+        // Swapping in a key the attacker holds breaks the seller's signature.
+        let mut e = genuine.clone();
+        e.token.entry_key = entry_key(9).verifying_key().to_bytes();
+        altered.push(("token.entry_key", e));
+
+        for (field, entry) in altered {
+            assert!(
+                entry.verify(&rsa_key).is_err(),
+                "changing `{field}` after signing must break verification"
+            );
+        }
+    }
+
+    /// **Two genuine entries for one token converge, whichever arrives first.**
+    ///
+    /// Only the entry key's holder can produce a second entry now, but they
+    /// can, so the survivor has to be a function of the two entries rather
+    /// than of arrival order. This was the known-gap test on the old code,
+    /// asserting the two peers DIFFERED.
+    #[test]
+    fn two_signed_entries_for_one_token_converge() {
+        let (private, params) = key_pair();
+        let first = signed_entry(&private, 1);
+        let second = signed_variant(&private, 1, "changed my mind");
+
+        let mut saw_first = ReputationStateV1::default();
+        saw_first
+            .apply_delta(&params, &Some(vec![first.clone()]))
+            .expect("apply");
+        saw_first
+            .apply_delta(&params, &Some(vec![second.clone()]))
+            .expect("apply");
+
+        let mut saw_second = ReputationStateV1::default();
+        saw_second
+            .apply_delta(&params, &Some(vec![second]))
+            .expect("apply");
+        saw_second
+            .apply_delta(&params, &Some(vec![first]))
+            .expect("apply");
+
+        assert_eq!(saw_first.feedback.len(), 1, "one token, one entry");
+        assert_eq!(
+            crate::to_cbor(&saw_first).expect("encode"),
+            crate::to_cbor(&saw_second).expect("encode"),
+            "the two peers must hold identical bytes"
+        );
+        saw_first
+            .verify(&params)
+            .expect("the result is valid state");
+    }
+
+    /// **Two peers holding different entries for one token find out.**
+    ///
+    /// The test above applies deltas by hand. On the network a peer only sends
+    /// what the other's summary does not name, so a summary keyed on the
+    /// token's nonce told each peer the other already had its entry, and
+    /// nothing was ever sent. This drives the real summary/delta exchange.
+    #[test]
+    fn peers_holding_different_entries_for_one_token_exchange_them() {
+        let (private, params) = key_pair();
+        let mut a = ReputationStateV1::default();
+        a.apply_delta(&params, &Some(vec![signed_entry(&private, 1)]))
+            .expect("apply");
+        let mut b = ReputationStateV1::default();
+        b.apply_delta(&params, &Some(vec![signed_variant(&private, 1, "other")]))
+            .expect("apply");
+        assert_ne!(a, b, "precondition: the peers disagree");
+
+        let to_b = a.delta(&b.summarize());
+        let to_a = b.delta(&a.summarize());
+        assert!(
+            to_b.is_some() && to_a.is_some(),
+            "each summary must show the other peer something it lacks"
+        );
+        b.apply_delta(&params, &to_b).expect("apply");
+        a.apply_delta(&params, &to_a).expect("apply");
+        assert_eq!(a, b, "one exchange must leave both peers agreeing");
+        assert_eq!(
+            a.delta(&b.summarize()),
+            None,
+            "and then there is nothing left to send"
+        );
+    }
+
+    /// **`verify` refuses every non-canonical form (the #26 defect, here).**
+    ///
+    /// Each of these used to verify, and each lets two peers holding the same
+    /// feedback hold different bytes.
+    #[test]
+    fn verify_refuses_non_canonical_state() {
+        let (private, params) = key_pair();
+        // Nonces are derived from the entry keys, so order the pair by nonce
+        // rather than by the fixture number.
+        let mut pair = [
+            (1u8, signed_entry(&private, 1)),
+            (2u8, signed_entry(&private, 2)),
+        ];
+        pair.sort_by(|a, b| a.1.token.nonce.cmp(&b.1.token.nonce));
+        let [(first, one), (_, two)] = pair;
+        let nonces = |es: &[&FeedbackEntry]| es.iter().map(|e| e.token.nonce).collect();
+
+        let canonical = ReputationStateV1 {
+            owner_certificate_pem: String::new(),
+            feedback: vec![one.clone(), two.clone()],
+            used_nonces: nonces(&[&one, &two]),
+        };
+        canonical
+            .verify(&params)
+            .expect("the canonical form verifies");
+
+        let unsorted = ReputationStateV1 {
+            feedback: vec![two.clone(), one.clone()],
+            ..canonical.clone()
+        };
+        assert!(unsorted.verify(&params).is_err(), "out of order");
+
+        let variant = signed_variant(&private, first, "again");
+        let two_for_one_token = ReputationStateV1 {
+            feedback: vec![one.clone(), variant],
+            used_nonces: nonces(&[&one]),
+            ..canonical.clone()
+        };
+        assert!(
+            two_for_one_token.verify(&params).is_err(),
+            "one token twice"
+        );
+
+        let extra_nonce = ReputationStateV1 {
+            feedback: vec![one.clone()],
+            used_nonces: nonces(&[&one, &two]),
+            ..canonical.clone()
+        };
+        assert!(
+            extra_nonce.verify(&params).is_err(),
+            "a nonce with no entry"
+        );
+
+        let missing_nonce = ReputationStateV1 {
+            used_nonces: nonces(&[&one]),
+            ..canonical
+        };
+        assert!(
+            missing_nonce.verify(&params).is_err(),
+            "an entry with no nonce"
+        );
+    }
+
+    /// A state that arrived out of order leaves `apply_delta` canonical. The
+    /// migration fold decodes predecessor state without verifying it, so this
+    /// is where such a state is repaired rather than carried forward.
+    #[test]
+    fn apply_delta_normalises_the_state_it_is_applied_to() {
+        let (private, params) = key_pair();
+        let two = signed_entry(&private, 2);
+        // Descending by nonce, so the state is certainly out of order.
+        let mut held = vec![signed_entry(&private, 1), signed_entry(&private, 3)];
+        held.sort_by(|a, b| b.token.nonce.cmp(&a.token.nonce));
+        let mut state = ReputationStateV1 {
+            owner_certificate_pem: String::new(),
+            used_nonces: held.iter().map(|e| e.token.nonce).collect(),
+            feedback: held,
+        };
+        let before = state.clone();
+        state.apply_delta(&params, &Some(vec![two])).expect("apply");
+        state.verify(&params).expect("the result is canonical");
+
+        // `merge` normalises too, even when the other side brings nothing,
+        // which is the case the fold hits with an unverified base.
+        let mut merged = before;
+        merged
+            .merge(&params, &ReputationStateV1::default())
+            .expect("merge");
+        merged
+            .verify(&params)
+            .expect("merging nothing still normalises");
     }
 
     /// **Two peers given the same feedback in different orders must hold

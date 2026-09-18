@@ -83,6 +83,14 @@ impl ContractInterface for Contract {
         let store_state = from_reader::<StoreStateV1, &[u8]>(bytes)
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
+        if !harvest_common::is_canonical_cbor(&store_state, bytes) {
+            return Err(ContractError::InvalidUpdateWithInfo {
+                reason: "State verification failed: state is not in canonical CBOR encoding \
+                         (trailing bytes, an unknown key, or a non-minimal encoding)"
+                    .into(),
+            });
+        }
+
         let parameters = from_reader::<StoreParameters, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
@@ -212,6 +220,13 @@ impl ContractInterface for Contract {
         let parameters = from_reader::<StoreParameters, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
+        // Zero bytes in and nothing but zero bytes merged in is zero bytes
+        // out, not the encoded default: the two are one state, and answering
+        // one with the other made `merge(A, A) != A` for the empty state
+        // (`fdev verify-merge`, harvest#55). Anything non-empty arriving
+        // switches this off, so merging an encoded default in is still that
+        // encoding, whichever side it is on.
+        let mut nothing_here = state.as_ref().is_empty();
         let mut store_state = if state.as_ref().is_empty() {
             StoreStateV1::default()
         } else {
@@ -222,6 +237,14 @@ impl ContractInterface for Contract {
         for update in data {
             match update {
                 UpdateData::State(new_state) => {
+                    // Zero bytes means "there is no state here", the
+                    // convention every other entry point uses (harvest#55).
+                    // Decoding it failed, so a peer handed the valid empty
+                    // state to merge answered with a decode error.
+                    if new_state.as_ref().is_empty() {
+                        continue;
+                    }
+                    nothing_here = false;
                     let new_state = from_reader::<StoreStateV1, &[u8]>(new_state.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     store_state
@@ -234,6 +257,7 @@ impl ContractInterface for Contract {
                     if d.as_ref().is_empty() {
                         continue;
                     }
+                    nothing_here = false;
                     let delta = from_reader::<StoreStateV1Delta, &[u8]>(d.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     store_state
@@ -246,6 +270,15 @@ impl ContractInterface for Contract {
                     return Err(ContractError::InvalidUpdate);
                 }
             }
+        }
+
+        // The scaffold skips a child's `apply_delta` when a merge brings it
+        // nothing, so a stored state that is not canonical would otherwise be
+        // written back as it came (harvest#26).
+        store_state.listings.normalize();
+
+        if nothing_here {
+            return Ok(UpdateModification::valid(State::from(vec![])));
         }
 
         let mut updated_state = vec![];
@@ -281,10 +314,28 @@ impl ContractInterface for Contract {
     ) -> Result<StateDelta<'static>, ContractError> {
         let parameters = from_reader::<StoreParameters, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
+        // Zero bytes on either side means "there is no state here yet", not a
+        // malformed encoding (harvest#55). `summarize_state` answers an empty
+        // state with a zero-byte summary, which no `StoreStateV1Summary`
+        // encodes to, so decoding either one used to fail and a new
+        // subscriber's first exchange was answered with an error. The mailbox
+        // contract already guards both; this is the same pattern.
+        //
+        // A holder with nothing has nothing to send.
+        if state.as_ref().is_empty() {
+            return Ok(StateDelta::from(vec![]));
+        }
         let store_state = from_reader::<StoreStateV1, &[u8]>(state.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
-        let old_summary = from_reader::<StoreStateV1Summary, &[u8]>(summary.as_ref())
-            .map_err(|e| ContractError::Deser(e.to_string()))?;
+        // A requester with nothing knows nothing: the empty summary is the
+        // summary of the empty state, so the delta is everything held.
+        let old_summary = if summary.as_ref().is_empty() {
+            let empty = StoreStateV1::default();
+            empty.summarize(&empty, &parameters)
+        } else {
+            from_reader::<StoreStateV1Summary, &[u8]>(summary.as_ref())
+                .map_err(|e| ContractError::Deser(e.to_string()))?
+        };
 
         match store_state.delta(&store_state, &parameters, &old_summary) {
             Some(delta) => {
@@ -568,5 +619,241 @@ mod tests {
             ),
             other => panic!("a pre-order payment must not settle the order, got {other:?}"),
         }
+    }
+
+    /// A store state with details in it. Unsigned: `get_state_delta` only
+    /// reads, so nothing here needs the signature to verify.
+    fn state_with_details() -> State<'static> {
+        let mut state = StoreStateV1::default();
+        state.info.info.version = 3;
+        state.info.info.store_name = "Shop".to_string();
+        let mut bytes = vec![];
+        into_writer(&state, &mut bytes).expect("encode state");
+        State::from(bytes)
+    }
+
+    /// **A new subscriber's first exchange gets the state, not a decode
+    /// error (harvest#55).**
+    ///
+    /// The subscriber has no state, so `summarize_state` gives it a zero-byte
+    /// summary, which no `StoreStateV1Summary` encodes to. The empty summary
+    /// means "knows nothing", so the answer is everything held.
+    #[test]
+    fn an_empty_summary_is_answered_with_everything_held() {
+        let params = params_bytes(&seller_key());
+        let empty_summary =
+            Contract::summarize_state(Parameters::from(params.clone()), State::from(vec![]))
+                .expect("summarize the absent state");
+        assert!(
+            empty_summary.as_ref().is_empty(),
+            "precondition: the absent state's summary is zero bytes"
+        );
+
+        let delta = Contract::get_state_delta(
+            Parameters::from(params),
+            state_with_details(),
+            empty_summary,
+        )
+        .expect("an empty summary must not be a decode error");
+        let delta: StoreStateV1Delta = from_reader(delta.as_ref()).expect("decode delta");
+        assert_eq!(
+            delta.info.map(|i| i.info.store_name),
+            Some("Shop".to_string()),
+            "a requester that holds nothing is sent the store's details"
+        );
+    }
+
+    /// The mirror image: a holder with no state of its own answers with an
+    /// empty delta rather than failing to decode its own zero bytes.
+    #[test]
+    fn an_empty_state_answers_with_an_empty_delta() {
+        let params = params_bytes(&seller_key());
+        let some_summary =
+            Contract::summarize_state(Parameters::from(params.clone()), state_with_details())
+                .expect("summarize");
+        for summary in [some_summary, StateSummary::from(vec![])] {
+            let delta = Contract::get_state_delta(
+                Parameters::from(params.clone()),
+                State::from(vec![]),
+                summary,
+            )
+            .expect("an empty state must not be a decode error");
+            assert!(delta.as_ref().is_empty(), "nothing held, nothing to send");
+        }
+    }
+
+    /// **`update_state` writes canonical listings even when the merge brings
+    /// nothing (harvest#26).** The scaffold skips `ListingsV1::apply_delta`
+    /// then, so without the explicit normalise a stored unsorted state would be
+    /// written back unsorted, and the contract's own `verify` now refuses that.
+    #[test]
+    fn update_state_writes_canonical_listings_when_the_merge_brings_nothing() {
+        use harvest_common::listing::{AuthorizedListing, Listing, ListingId, ListingKind};
+
+        let seller = seller_key();
+        let make = |title: &str| {
+            let listing = Listing {
+                id: ListingId([0u8; 32]),
+                title: title.to_string(),
+                description: String::new(),
+                kind: ListingKind::Sale,
+                price: None,
+                created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            }
+            .with_derived_id();
+            AuthorizedListing {
+                listing,
+                scoped_payload: Vec::new(),
+                signature: Vec::new(),
+                certificate_pem: String::new(),
+            }
+        };
+        let mut listings = vec![make("Alpha"), make("Beta")];
+        listings.sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
+        listings.reverse();
+
+        let mut unsorted = StoreStateV1::default();
+        unsorted.listings.listings = listings;
+        let mut bytes = vec![];
+        into_writer(&unsorted, &mut bytes).expect("encode");
+
+        // Merging the empty state brings nothing, so nothing is verified and
+        // the unsigned fixture is enough.
+        let mut empty = vec![];
+        into_writer(&StoreStateV1::default(), &mut empty).expect("encode");
+        let out = Contract::update_state(
+            Parameters::from(params_bytes(&seller)),
+            State::from(bytes),
+            vec![UpdateData::State(State::from(empty))],
+        )
+        .expect("update");
+        let out: StoreStateV1 =
+            from_reader(out.unwrap_valid().as_ref()).expect("decode the result");
+        let ids: Vec<_> = out
+            .listings
+            .listings
+            .iter()
+            .map(|l| l.listing.id.clone())
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "the written state must be sorted by id");
+    }
+
+    /// **Merging a zero-byte state is a no-op, not a decode error
+    /// (harvest#55).** Zero bytes is a valid state (`validate_state` says
+    /// so), so a peer can be handed one to merge; the `State` arm decoded it
+    /// unconditionally and failed. The mailbox contract already guarded this.
+    #[test]
+    fn merging_a_zero_byte_state_changes_nothing() {
+        let held = state_with_details();
+        let out = Contract::update_state(
+            Parameters::from(params_bytes(&seller_key())),
+            held.clone(),
+            vec![UpdateData::State(State::from(vec![]))],
+        )
+        .expect("a zero-byte state must merge");
+        assert_eq!(out.unwrap_valid().as_ref(), held.as_ref());
+    }
+    /// **The empty state merged with itself is the empty state** (harvest#55,
+    /// found by `fdev verify-merge`). `update_state` answered zero bytes with
+    /// the encoded default, so `merge(A, A) != A` for the empty state. And an
+    /// encoded default merged in from either side stays that encoding, so
+    /// the rule does not break commutativity instead.
+    #[test]
+    fn the_empty_state_is_idempotent_and_the_rule_is_commutative() {
+        let merge = |state: Vec<u8>, other: Vec<u8>| -> Vec<u8> {
+            Contract::update_state(
+                Parameters::from(params_bytes(&seller_key())),
+                State::from(state),
+                vec![UpdateData::State(State::from(other))],
+            )
+            .expect("merge")
+            .unwrap_valid()
+            .as_ref()
+            .to_vec()
+        };
+        assert!(
+            merge(vec![], vec![]).is_empty(),
+            "merge(empty, empty) must be empty"
+        );
+        let mut default = vec![];
+        into_writer(&StoreStateV1::default(), &mut default).expect("encode");
+        assert_eq!(merge(vec![], default.clone()), default);
+        assert_eq!(merge(default.clone(), vec![]), default);
+    }
+
+    /// A non-empty delta applied to the empty state is an update, so the
+    /// result is the encoded state, not zero bytes. Without this the
+    /// empty-state rule above would swallow a delta's content.
+    #[test]
+    fn a_delta_applied_to_the_empty_state_is_encoded() {
+        let mut delta = vec![];
+        into_writer(
+            &StoreStateV1Delta {
+                info: None,
+                listings: None,
+                orders: None,
+            },
+            &mut delta,
+        )
+        .expect("encode");
+        let out = Contract::update_state(
+            Parameters::from(params_bytes(&seller_key())),
+            State::from(vec![]),
+            vec![UpdateData::Delta(StateDelta::from(delta))],
+        )
+        .expect("update")
+        .unwrap_valid()
+        .as_ref()
+        .to_vec();
+        let mut default = vec![];
+        into_writer(&StoreStateV1::default(), &mut default).expect("encode");
+        assert_eq!(out, default);
+    }
+
+    /// **`validate_state` refuses a state that is not byte-canonical (PR
+    /// #82 review, Should Fix 2).** Each of these decoded to a valid state
+    /// and was accepted, then rewritten by the next merge, while its summary
+    /// matched a canonical peer's so no delta ever repaired it.
+    #[test]
+    fn validate_state_refuses_non_canonical_bytes() {
+        let validate = |bytes: Vec<u8>| {
+            Contract::validate_state(
+                Parameters::from(params_bytes(&seller_key())),
+                State::from(bytes),
+                RelatedContracts::new(),
+            )
+        };
+        let mut canonical = vec![];
+        into_writer(&StoreStateV1::default(), &mut canonical).expect("encode");
+        assert!(
+            matches!(validate(canonical.clone()), Ok(ValidateResult::Valid)),
+            "the canonical encoding validates"
+        );
+
+        let mut trailing = canonical.clone();
+        trailing.push(0x00);
+        assert!(
+            validate(trailing).is_err(),
+            "a trailing byte must be refused"
+        );
+
+        #[derive(serde::Serialize)]
+        struct WithExtraKey<T> {
+            #[serde(flatten)]
+            state: T,
+            unknown: u8,
+        }
+        let mut extra = vec![];
+        into_writer(
+            &WithExtraKey {
+                state: StoreStateV1::default(),
+                unknown: 1,
+            },
+            &mut extra,
+        )
+        .expect("encode");
+        assert!(validate(extra).is_err(), "an unknown key must be refused");
     }
 }

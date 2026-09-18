@@ -5,7 +5,7 @@ use freenet_scaffold_macro::composable;
 use serde::{Deserialize, Serialize};
 
 use crate::listing::{verify_scoped_signature, AuthorizedListing, ListingId};
-use crate::payment::{AuthorizedOrder, OrderId, OrderStatus};
+use crate::payment::{AuthorizedOrder, OrderId};
 
 /// Immutable parameters for a store contract, set at creation time.
 ///
@@ -156,9 +156,19 @@ impl freenet_scaffold::ComposableState for AuthorizedStoreInfoV1 {
         _parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
     ) -> Result<(), String> {
-        // Version 0 is the default (empty/uninitialized) state -- skip verification
+        // Version 0 is "no details published", and it must be exactly the
+        // default. Nothing signs a version-0 info, so skipping verification
+        // for it (as this did until the PR #82 re-review) let anyone put a
+        // name, a certificate and an encryption key into a store whose
+        // seller had not published yet -- and since `apply_delta` ignores an
+        // incoming version that is not higher, two such injections never
+        // converged.
         if self.info.version == 0 {
-            return Ok(());
+            return if *self == Self::default() {
+                Ok(())
+            } else {
+                Err("store info at version 0 must be empty: nothing signs it".into())
+            };
         }
         verify_scoped_signature(
             &self.scoped_payload,
@@ -231,6 +241,24 @@ pub struct ListingsV1 {
     pub listings: Vec<AuthorizedListing>,
 }
 
+impl ListingsV1 {
+    /// Put the listings in the canonical form `verify` requires: sorted by id,
+    /// no id twice.
+    ///
+    /// `apply_delta` calls this, but the scaffold does not call `apply_delta`
+    /// at all when a merge brings nothing new, so the two places that can hold
+    /// a state nothing verified call it directly as well: the contract's
+    /// `update_state`, before it encodes its result, and the migration fold,
+    /// whose base may be a predecessor's state written under the old,
+    /// permissive `verify` (harvest#26). A stable sort keeps the first of two
+    /// equal ids, which is the one already held.
+    pub fn normalize(&mut self) {
+        self.listings
+            .sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
+        self.listings.dedup_by(|a, b| a.listing.id == b.listing.id);
+    }
+}
+
 impl freenet_scaffold::ComposableState for ListingsV1 {
     type ParentState = StoreStateV1;
     type Summary = Vec<ListingId>;
@@ -244,6 +272,26 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
     ) -> Result<(), String> {
         for authorized in &self.listings {
             authorized.verify(&parameters.seller_verifying_key)?;
+        }
+        // Canonical form: strictly ascending by id, which also means no id
+        // twice. `apply_delta` only ever produces this, but a state can reach
+        // a peer whole (a PUT, or `UpdateData::State`), and one that arrived
+        // unsorted or with a duplicate used to verify -- so two peers holding
+        // the same set of listings could hold different bytes and never agree
+        // (harvest#26).
+        //
+        // Rejecting in `verify` is safe here only because of the re-key: the
+        // new contract starts empty, and the migration fold builds its state
+        // through `apply_delta`, which normalises (see below), so no state
+        // this generation holds was written by the old, permissive code.
+        for pair in self.listings.windows(2) {
+            if pair[0].listing.id >= pair[1].listing.id {
+                return Err(format!(
+                    "listings are not strictly ascending by id (unsorted, or listing {} \
+                     twice)",
+                    pair[1].listing.id
+                ));
+            }
         }
         Ok(())
     }
@@ -305,11 +353,9 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
                 to_add.push(listing.clone());
             }
             self.listings.extend(to_add);
-
-            // Sort deterministically for CRDT convergence
-            self.listings
-                .sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
         }
+
+        self.normalize();
         Ok(())
     }
 }
@@ -332,21 +378,24 @@ pub const MAX_ORDERS: usize = 4096;
 /// a merge -- that comparison is over the full CBOR bytes, in
 /// `merge_order` -- it only has to be cheap enough to carry in every
 /// summary entry and to change whenever the record's bytes do.
-fn order_content_digest(record: &AuthorizedOrder) -> [u8; 8] {
+///
+/// The full 32 bytes (PR #82 review, Should Fix 4). It was truncated to 8,
+/// and two same-rank variants of one order whose truncated digests collide
+/// -- about 2^32 work for a birthday search -- read as the same record in
+/// each other's summaries, so the two peers holding them never exchanged
+/// them. Widening it was free during this re-key.
+fn order_content_digest(record: &AuthorizedOrder) -> [u8; 32] {
     // Infallible: `AuthorizedOrder` and everything it contains derives
     // `Serialize` over plain data (no custom fallible encoding), so CBOR
     // serialization of an in-memory value here cannot fail.
     let bytes = crate::to_cbor(record).expect("AuthorizedOrder always serializes to CBOR");
-    let hash = blake3::hash(&bytes);
-    let mut out = [0u8; 8];
-    out.copy_from_slice(&hash.as_bytes()[..8]);
-    out
+    *blake3::hash(&bytes).as_bytes()
 }
 
 /// Merge one already-verified incoming order record into `orders`.
 ///
 /// Keeps whichever of the existing and incoming record has the higher
-/// [`OrderStatus::rank`]. On an exact rank tie -- which happens when two
+/// [`crate::payment::OrderStatus::rank`]. On an exact rank tie -- which happens when two
 /// peers each independently assemble a different, but individually valid,
 /// proof for the same transition (e.g. two different sets of bridge claims
 /// that both establish `Paid`) -- the tie is broken by comparing the CBOR
@@ -448,44 +497,86 @@ fn merge_order(orders: &mut BTreeMap<OrderId, AuthorizedOrder>, incoming: Author
     }
 }
 
-/// Drop the least-relevant orders if `orders` is over [`MAX_ORDERS`].
+/// Drop the oldest orders if `orders` is over [`MAX_ORDERS`].
 ///
-/// Priority for keeping an order is, from least to most important: first,
-/// whether its status is terminal (`Cancelled`, `PaymentReversed` --
-/// nothing further will ever happen to it); second,
-/// how old it is (`Order::created_at`); third, its id, purely as a
-/// tie-breaker so the ordering is total. Terminal orders are dropped before
-/// any order still awaiting resolution, and within a tier the oldest goes
-/// first.
+/// Keeps the `MAX_ORDERS` orders with the newest `Order::created_at`, with the
+/// id as a tie-break so the order is total. Both come from the order's signed
+/// TERMS, which `OrderId` is derived from, so every version of one order ranks
+/// the same however far its status has moved.
 ///
-/// This ranking is a pure function of the *content* of `orders`, not of the
-/// sequence in which entries were inserted, so two replicas that converge
-/// to the same set of orders always prune to the same subset -- which is
-/// exactly what the associated test checks.
+/// # Why status takes no part (harvest#85)
+///
+/// This used to drop terminal orders (`Cancelled`, `PaymentReversed`) before
+/// active ones. That made the merge non-associative, which `fdev
+/// verify-merge` found. Terminal-ness is not monotone in the status rank
+/// `merge_order` maximises (Awaiting 0 active, Cancelled 1 terminal, Paid 2
+/// active, Reversed 3 terminal), so an order's keep-priority changed as it
+/// merged. And a key pruned on one peer came back from a peer that still held
+/// an older version of it, at a different priority. With P = {x Awaiting,
+/// newest}, Q = {x Cancelled} and R = a full cap of older orders, `(P+Q)+R`
+/// dropped x while `P+(Q+R)` kept it.
+///
+/// Top-N over a ranking that the per-key merge cannot change is associative:
+/// a key cut from one side ranks below that side's N-th key, so it ranks below
+/// the N-th key of any union containing that side and is cut again, whichever
+/// version of it comes back. So is a key kept: if it is in the top N of the
+/// union it was in the top N of each side that held it, so no side's version
+/// of it was lost to that side's own cap. Pinned by
+/// `the_order_cap_is_associative_when_a_status_changes_at_the_cap` and
+/// `the_order_cap_obeys_the_merge_laws_at_the_cap`.
+///
+/// What it costs: an old `Paid` order can now be dropped before a newer
+/// `Cancelled` one. Only the seller can sign an order, so only the seller can
+/// push old orders out, by creating more than `MAX_ORDERS` new ones.
 fn enforce_order_cap(orders: &mut BTreeMap<OrderId, AuthorizedOrder>) {
     if orders.len() <= MAX_ORDERS {
         return;
     }
-    let mut ranked: Vec<(bool, i64, OrderId)> = orders
+    let mut ranked: Vec<(i64, OrderId)> = orders
         .iter()
-        .map(|(id, record)| {
-            let terminal = matches!(
-                record.status,
-                OrderStatus::Cancelled | OrderStatus::PaymentReversed
-            );
-            // `!terminal` sorts terminal orders (false) ahead of active ones
-            // (true), so they are the first candidates dropped below.
-            (
-                !terminal,
-                record.order.created_at.timestamp_millis(),
-                id.clone(),
-            )
-        })
+        .map(|(id, record)| (record.order.created_at.timestamp_millis(), id.clone()))
         .collect();
+    // Ascending, so the oldest come first and are the ones dropped below.
     ranked.sort();
     let excess = orders.len() - MAX_ORDERS;
-    for (_, _, id) in ranked.into_iter().take(excess) {
+    for (_, id) in ranked.into_iter().take(excess) {
         orders.remove(&id);
+    }
+}
+
+/// 32 bytes that encode as ONE CBOR byte string rather than serde's default
+/// for `[u8; 32]`, which is an array of 32 integers.
+///
+/// Used for the order summary's id and digest (PR #82 re-review). The summary
+/// carries one entry per order, up to `MAX_ORDERS`, and is sent on every
+/// exchange; as integer arrays each 32-byte value cost about 50 bytes on the
+/// wire, and a byte string costs 34. Only the summary uses it: `OrderId`
+/// itself keeps its encoding, because it is inside every signed order and
+/// changing it would move every order's id and signature preimage.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Bytes32(pub [u8; 32]);
+
+impl Serialize for Bytes32 {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Bytes32 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = Bytes32;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a 32-byte byte string")
+            }
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Bytes32, E> {
+                <[u8; 32]>::try_from(v)
+                    .map(Bytes32)
+                    .map_err(|_| E::invalid_length(v.len(), &self))
+            }
+        }
+        deserializer.deserialize_bytes(Visitor)
     }
 }
 
@@ -495,7 +586,7 @@ fn enforce_order_cap(orders: &mut BTreeMap<OrderId, AuthorizedOrder>) {
 ///
 /// This is neither grow-only (like a claim set) nor last-writer-wins by an
 /// explicit version counter (like [`AuthorizedStoreInfoV1`]). It is a
-/// **per-key monotonic maximum on [`OrderStatus::rank`]**, the same shape as
+/// **per-key monotonic maximum on [`crate::payment::OrderStatus::rank`]**, the same shape as
 /// `freenet_bitcoin_common::address_state::ClaimSetV1`'s per-bridge scan
 /// watermark: merging two versions of the same order keeps whichever has
 /// the higher rank. A maximum over a total order is always associative,
@@ -522,12 +613,13 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
     /// not as a resend of every order that happens to hash into the same
     /// bucket. Instead this is bounded the way `MAX_CLAIMS` bounds
     /// `ClaimSetV1`: capped at a fixed number of entries rather than a fixed
-    /// number of bytes. At 25 bytes an entry (16-byte id, 1-byte rank,
-    /// 8-byte digest) this is still tiny next to a single order's own
+    /// number of bytes. At 70 encoded bytes an entry (a 32-byte id and a
+    /// 32-byte digest as CBOR byte strings, see [`Bytes32`], plus a 1-byte
+    /// rank) this is still tiny next to a single order's own
     /// encoded size once it carries an `OrderPaymentProof` -- an order can
     /// run into the hundreds of bytes to multiple KB; a summary entry never
     /// does.
-    type Summary = Vec<(OrderId, u8, [u8; 8])>;
+    type Summary = Vec<(Bytes32, u8, Bytes32)>;
     /// Full replacement records for whichever orders are new, ahead in rank,
     /// or -- at an exact rank tie -- differ in content (see `delta`).
     type Delta = Vec<AuthorizedOrder>;
@@ -564,9 +656,9 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
             .iter()
             .map(|(id, record)| {
                 (
-                    id.clone(),
+                    Bytes32(id.0),
                     record.status.rank(),
-                    order_content_digest(record),
+                    Bytes32(order_content_digest(record)),
                 )
             })
             .collect()
@@ -578,9 +670,9 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
         _parameters: &Self::Parameters,
         old_state_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let old: BTreeMap<&OrderId, (u8, [u8; 8])> = old_state_summary
+        let old: BTreeMap<[u8; 32], (u8, [u8; 32])> = old_state_summary
             .iter()
-            .map(|(id, rank, digest)| (id, (*rank, *digest)))
+            .map(|(id, rank, digest)| (id.0, (*rank, digest.0)))
             .collect();
 
         // Send an order whenever the requester's summary can't already
@@ -597,7 +689,7 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
             .iter()
             .filter(|(id, record)| {
                 let our_rank = record.status.rank();
-                match old.get(id) {
+                match old.get(&id.0) {
                     None => true,
                     Some((their_rank, their_digest)) => {
                         our_rank > *their_rank
@@ -675,7 +767,7 @@ mod order_tests {
         ClaimBody, OutPoint, SignedClaim, SignedTipEntry, TipEntryBody,
     };
 
-    use crate::payment::{Order, OrderPaymentProof};
+    use crate::payment::{Order, OrderPaymentProof, OrderStatus};
 
     fn seller_key() -> SigningKey {
         SigningKey::from_bytes(&[11u8; 32])
@@ -2310,37 +2402,344 @@ mod order_tests {
         )
     }
 
-    #[test]
-    fn pruning_drops_terminal_orders_before_active_ones() {
-        let mut orders: BTreeMap<OrderId, AuthorizedOrder> = BTreeMap::new();
-        let (id_active, rec_active) = synthetic_order(1, 1_000, OrderStatus::AwaitingPayment);
-        let (id_terminal, rec_terminal) = synthetic_order(2, 2_000, OrderStatus::Cancelled);
-        orders.insert(id_active.clone(), rec_active);
-        orders.insert(id_terminal.clone(), rec_terminal);
-
-        // Force the cap down to 1 for this test by pruning a 2-entry map
-        // down to `MAX_ORDERS - 1` worth of headroom is impractical to set
-        // up directly (MAX_ORDERS is a real constant), so instead call the
-        // pruning logic's underlying comparison directly by filling past
-        // the real cap with cheap synthetic entries sharing the terminal
-        // one's profile, then checking the terminal-tier one is gone and
-        // the active one survives.
-        for i in 3..(MAX_ORDERS as u16 + 3) {
-            let (id, rec) =
-                synthetic_order((i % 256) as u8, 3_000 + i as i64, OrderStatus::Cancelled);
-            orders.insert(id, rec);
+    /// What `OrdersV1::apply_delta` does once every incoming record has
+    /// verified: fold each into `base` by `merge_order`, then prune. The
+    /// synthetic records below are unsigned, so the merge laws are pinned at
+    /// this layer rather than through `apply_delta`.
+    fn merge_maps(
+        base: &BTreeMap<OrderId, AuthorizedOrder>,
+        other: &BTreeMap<OrderId, AuthorizedOrder>,
+    ) -> BTreeMap<OrderId, AuthorizedOrder> {
+        let mut out = base.clone();
+        for record in other.values() {
+            merge_order(&mut out, record.clone());
         }
-        assert!(orders.len() > MAX_ORDERS);
+        enforce_order_cap(&mut out);
+        out
+    }
+
+    /// `MAX_ORDERS` Awaiting orders, all older than anything else these
+    /// tests build.
+    fn full_of_old_orders() -> BTreeMap<OrderId, AuthorizedOrder> {
+        (0..MAX_ORDERS as u32)
+            .map(|i| {
+                synthetic_order(
+                    (i % 256) as u8,
+                    1_000 + i as i64,
+                    OrderStatus::AwaitingPayment,
+                )
+            })
+            .collect()
+    }
+
+    /// **The cap is associative (harvest#85).**
+    ///
+    /// The counterexample `fdev verify-merge` found against the old cap, which
+    /// dropped TERMINAL orders first: terminal-ness is not monotone in the
+    /// status rank the per-key merge maximises (Awaiting 0 active, Cancelled
+    /// 1 terminal, Paid 2 active, Reversed 3 terminal), so an order's
+    /// keep-priority changed as it merged, and a key pruned on one side came
+    /// back from a side that still held an older version of it.
+    ///
+    /// P = {x Awaiting, newest}, Q = {x Cancelled}, R = `MAX_ORDERS` older
+    /// Awaiting orders. Under the old cap `(P+Q)+R` dropped x (Cancelled,
+    /// terminal, dropped first) while `P+(Q+R)` kept x as Awaiting (Q+R
+    /// dropped the Cancelled x, and P brought the Awaiting one back as the
+    /// newest active order).
+    #[test]
+    fn the_order_cap_is_associative_when_a_status_changes_at_the_cap() {
+        let (_, x_awaiting) = synthetic_order(7, 1_000_000, OrderStatus::AwaitingPayment);
+        let (_, x_cancelled) = synthetic_order(7, 1_000_000, OrderStatus::Cancelled);
+        assert_eq!(
+            x_awaiting.order.id, x_cancelled.order.id,
+            "precondition: one order"
+        );
+        let p: BTreeMap<_, _> = [(x_awaiting.order.id.clone(), x_awaiting)].into();
+        let q: BTreeMap<_, _> = [(x_cancelled.order.id.clone(), x_cancelled)].into();
+        let r = full_of_old_orders();
+
+        let left = merge_maps(&merge_maps(&p, &q), &r);
+        let right = merge_maps(&p, &merge_maps(&q, &r));
+        assert_eq!(left.len(), MAX_ORDERS);
+        assert_eq!(
+            crate::to_cbor(&left).expect("encode"),
+            crate::to_cbor(&right).expect("encode"),
+            "(P+Q)+R and P+(Q+R) must be the same bytes"
+        );
+    }
+
+    /// The same laws over a spread of statuses and ages at the cap, so the
+    /// test above is not the only shape checked: every status on both sides
+    /// of the boundary, and keys held at different statuses by different
+    /// peers.
+    #[test]
+    fn the_order_cap_obeys_the_merge_laws_at_the_cap() {
+        let statuses = [
+            OrderStatus::AwaitingPayment,
+            OrderStatus::Cancelled,
+            OrderStatus::Paid,
+            OrderStatus::PaymentReversed,
+        ];
+        let base = full_of_old_orders();
+        // Twelve keys straddling the oldest end of `base` and the newest,
+        // each held at a different status by each of three peers.
+        let keys: Vec<(u8, i64)> = (0..12u8)
+            .map(|k| {
+                (
+                    200u8.wrapping_add(k),
+                    if k % 2 == 0 {
+                        500 + k as i64
+                    } else {
+                        5_000_000 + k as i64
+                    },
+                )
+            })
+            .collect();
+        let peer = |shift: usize, with_base: bool| {
+            let mut m = if with_base {
+                base.clone()
+            } else {
+                BTreeMap::new()
+            };
+            for (i, (seed, secs)) in keys.iter().enumerate() {
+                if (i + shift).is_multiple_of(3) {
+                    continue;
+                }
+                let (id, rec) = synthetic_order(*seed, *secs, statuses[(i + shift) % 4]);
+                m.insert(id, rec);
+            }
+            enforce_order_cap(&mut m);
+            m
+        };
+        // Plus the shape of the counterexample above: the same key newest and
+        // Awaiting on one peer, Cancelled on another.
+        let (_, x_awaiting) = synthetic_order(7, 1_000_000, OrderStatus::AwaitingPayment);
+        let (_, x_cancelled) = synthetic_order(7, 1_000_000, OrderStatus::Cancelled);
+        let states = [
+            peer(0, true),
+            peer(1, false),
+            [(x_awaiting.order.id.clone(), x_awaiting)].into(),
+            [(x_cancelled.order.id.clone(), x_cancelled)].into(),
+            BTreeMap::new(),
+        ];
+        let enc = |m: &BTreeMap<OrderId, AuthorizedOrder>| crate::to_cbor(m).expect("encode");
+        for a in &states {
+            assert_eq!(enc(&merge_maps(a, a)), enc(a), "idempotence");
+            for b in &states {
+                assert_eq!(
+                    enc(&merge_maps(a, b)),
+                    enc(&merge_maps(b, a)),
+                    "commutativity"
+                );
+                for c in &states {
+                    assert_eq!(
+                        enc(&merge_maps(&merge_maps(a, b), c)),
+                        enc(&merge_maps(a, &merge_maps(b, c))),
+                        "associativity"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The summary names an order's content by the full 32-byte BLAKE3 of
+    /// its encoding (PR #82 review, Should Fix 4), not a truncation a
+    /// birthday search could collide.
+    #[test]
+    fn the_order_summary_digest_is_the_full_hash() {
+        let (_, record) = synthetic_order(3, 1_000, OrderStatus::AwaitingPayment);
+        let expected = *blake3::hash(&crate::to_cbor(&record).expect("encode")).as_bytes();
+        assert_eq!(order_content_digest(&record), expected);
+    }
+
+    /// **Seeded random merge laws on the whole store, byte for byte** (PR #82
+    /// review, Should Fix 3). States combine genuinely signed store details
+    /// at three versions, signed listings, and signed orders at every status
+    /// with two different valid Paid proofs for one order (the equal-rank
+    /// tie-break). Merge is what `update_state` runs: the composable merge
+    /// and then `ListingsV1::normalize`.
+    #[test]
+    fn seeded_random_stores_obey_the_merge_laws() {
+        use crate::merge_laws::{assert_laws, Rng};
+        use freenet_scaffold::ComposableState;
+
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let p = params(&seller);
+        let info = |version: u32| {
+            let info = StoreInfoV1 {
+                version,
+                certificate_pem: "CERT".into(),
+                seller_fingerprint: "fp".into(),
+                reputation_contract_id: [7u8; 32],
+                store_name: format!("Shop v{version}"),
+                description: String::new(),
+                encryption_public_key: None,
+            };
+            let (scoped_payload, signature) = sign_scoped(&seller, &info);
+            AuthorizedStoreInfoV1 {
+                info,
+                scoped_payload,
+                signature,
+            }
+        };
+        let infos: Vec<_> = (1..=3).map(info).collect();
+        let listings: Vec<_> = ["A", "B", "C", "D"]
+            .iter()
+            .map(|t| make_listing(&seller, t))
+            .collect();
+        let x = make_order("buyer-x", 1_700_000_000, &[0x00, 0x14, 0x01, 0x01]);
+        let y = make_order("buyer-y", 1_700_000_100, &[0x00, 0x14, 0x02, 0x02]);
+        let orders = vec![
+            make_authorized_order(&seller, x.clone(), OrderStatus::AwaitingPayment, None),
+            make_authorized_order(&seller, x.clone(), OrderStatus::Cancelled, None),
+            make_authorized_order(
+                &seller,
+                x.clone(),
+                OrderStatus::Paid,
+                Some(make_payment_proof(&x, &bridge, 3)),
+            ),
+            make_authorized_order(
+                &seller,
+                x.clone(),
+                OrderStatus::Paid,
+                Some(make_payment_proof(&x, &bridge, 5)),
+            ),
+            make_authorized_order(&seller, y.clone(), OrderStatus::AwaitingPayment, None),
+        ];
+        for o in &orders {
+            o.verify(&p.seller_verifying_key)
+                .expect("fixture order verifies");
+        }
+
+        let merge = |a: &StoreStateV1, b: &StoreStateV1| {
+            let mut out = a.clone();
+            out.merge(&a.clone(), &p, b).expect("merge");
+            out.listings.normalize();
+            out
+        };
+        let mut rng = Rng::new(0x5eed_0026);
+        let states: Vec<StoreStateV1> = (0..200)
+            .map(|_| {
+                let mut s = StoreStateV1::default();
+                if rng.below(2) == 0 {
+                    s.info = infos[rng.below(infos.len())].clone();
+                }
+                let mut ls = ListingsV1 {
+                    listings: rng.subset(&listings, 3),
+                };
+                ls.normalize();
+                s.listings = ls;
+                for o in rng.subset(&orders, 3) {
+                    merge_order(&mut s.orders.orders, o);
+                }
+                s.verify(&s, &p).expect("fixture state verifies");
+                s
+            })
+            .collect();
+        assert_laws(&states, 300, &mut rng, merge, |s| {
+            crate::to_cbor(s).expect("encode")
+        });
+    }
+
+    /// The same at the order cap: random states of synthetic orders around
+    /// `MAX_ORDERS`, with shared keys at different statuses and tied
+    /// `created_at`, merged at the `merge_order` + cap layer.
+    #[test]
+    fn seeded_random_order_sets_at_the_cap_obey_the_merge_laws() {
+        use crate::merge_laws::{assert_laws, Rng};
+        let statuses = [
+            OrderStatus::AwaitingPayment,
+            OrderStatus::Cancelled,
+            OrderStatus::Paid,
+            OrderStatus::PaymentReversed,
+        ];
+        let base = full_of_old_orders();
+        let mut rng = Rng::new(0x5eed_4096);
+        let mut pool = Vec::new();
+        for k in 0..24u8 {
+            // Half older than the whole base, half newer, some tied.
+            let secs = if k % 2 == 0 {
+                900 + (k / 4) as i64
+            } else {
+                9_000_000 + (k / 4) as i64
+            };
+            for status in statuses {
+                pool.push(synthetic_order(100 + k, secs, status).1);
+            }
+        }
+        let states: Vec<BTreeMap<OrderId, AuthorizedOrder>> = (0..40)
+            .map(|_| {
+                let mut m = if rng.below(2) == 0 {
+                    base.clone()
+                } else {
+                    BTreeMap::new()
+                };
+                for rec in rng.subset(&pool, 6) {
+                    merge_order(&mut m, rec);
+                }
+                enforce_order_cap(&mut m);
+                m
+            })
+            .collect();
+        assert!(
+            states.iter().any(|m| m.len() == MAX_ORDERS),
+            "some state is at the cap"
+        );
+        assert_laws(&states, 60, &mut rng, merge_maps, |m| {
+            crate::to_cbor(m).expect("encode")
+        });
+    }
+
+    /// **The order summary at the cap stays small** (PR #82 re-review). Its
+    /// id and digest encode as CBOR byte strings: 70 bytes an entry, so
+    /// `MAX_ORDERS` entries come to about 280 KiB, where the default integer
+    /// arrays made it about 512 KiB. And it survives the round trip a peer
+    /// puts it through.
+    #[test]
+    fn the_order_summary_at_the_cap_is_byte_strings() {
+        use freenet_scaffold::ComposableState;
+        let orders = OrdersV1 {
+            orders: full_of_old_orders(),
+        };
+        let summary = orders.summarize(&StoreStateV1::default(), &params(&seller_key()));
+        let bytes = crate::to_cbor(&summary).expect("encode");
+        assert!(
+            bytes.len() <= MAX_ORDERS * 70 + 3,
+            "summary of {} bytes for {MAX_ORDERS} orders",
+            bytes.len()
+        );
+        let back: Vec<(Bytes32, u8, Bytes32)> = crate::from_cbor(&bytes).expect("decode");
+        assert_eq!(back, summary);
+        // One entry, byte for byte: array(3), bytes(32) id, rank, bytes(32).
+        let one = crate::to_cbor(&summary[0]).expect("encode");
+        assert_eq!(
+            &one[..3],
+            &[0x83, 0x58, 0x20],
+            "the id is a 32-byte byte string"
+        );
+    }
+
+    /// The cap keeps the newest orders by their signed `created_at`, whatever
+    /// their status. See `enforce_order_cap` for why status cannot take part.
+    #[test]
+    fn pruning_drops_the_oldest_orders_whatever_their_status() {
+        let mut orders = full_of_old_orders();
+        let (id_old_paid, old_paid) = synthetic_order(250, 10, OrderStatus::Paid);
+        let (id_new_cancelled, new_cancelled) =
+            synthetic_order(251, 9_000_000, OrderStatus::Cancelled);
+        orders.insert(id_old_paid.clone(), old_paid);
+        orders.insert(id_new_cancelled.clone(), new_cancelled);
 
         enforce_order_cap(&mut orders);
         assert_eq!(orders.len(), MAX_ORDERS);
         assert!(
-            orders.contains_key(&id_active),
-            "the only active (non-terminal) order must survive pruning"
+            orders.contains_key(&id_new_cancelled),
+            "the newest order survives"
         );
         assert!(
-            !orders.contains_key(&id_terminal),
-            "the oldest terminal order must be dropped before newer terminal ones"
+            !orders.contains_key(&id_old_paid),
+            "the oldest order goes, even Paid"
         );
     }
 
@@ -2705,6 +3104,161 @@ mod order_tests {
             1,
             "the same listing twice in one delta must be stored once"
         );
+    }
+
+    /// **Version 0 carries nothing** (PR #82 re-review). `verify` used to
+    /// skip version 0 entirely, so a state whose version-0 info held any
+    /// unsigned name, description or encryption key validated, anyone could
+    /// inject one into a store whose seller had not published details, and
+    /// two different injections never converged (`apply_delta` ignores an
+    /// incoming version that is not higher). Version 0 must now be exactly
+    /// the default.
+    #[test]
+    fn version_zero_info_must_be_the_default() {
+        use freenet_scaffold::ComposableState;
+        let p = params(&seller_key());
+        let parent = StoreStateV1::default();
+        AuthorizedStoreInfoV1::default()
+            .verify(&parent, &p)
+            .expect("the default verifies");
+
+        let mut named = AuthorizedStoreInfoV1::default();
+        named.info.store_name = "Totally Legit Farm".into();
+        let mut keyed = AuthorizedStoreInfoV1::default();
+        keyed.info.encryption_public_key = Some([0xAA; 32]);
+        let padded = AuthorizedStoreInfoV1 {
+            signature: vec![1],
+            ..Default::default()
+        };
+        for (what, info) in [("a name", named), ("a key", keyed), ("a signature", padded)] {
+            assert!(
+                info.verify(&parent, &p).is_err(),
+                "version-0 info carrying {what} must not verify"
+            );
+        }
+    }
+
+    /// Three listings in id order.
+    fn three_sorted_listings(seller: &SigningKey) -> Vec<AuthorizedListing> {
+        let mut listings = vec![
+            make_listing(seller, "Alpha"),
+            make_listing(seller, "Beta"),
+            make_listing(seller, "Gamma"),
+        ];
+        listings.sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
+        listings
+    }
+
+    /// **`verify` refuses listings that are not in canonical form
+    /// (harvest#26).**
+    ///
+    /// Both of these used to verify. A peer that took such a state whole (a
+    /// PUT, or `UpdateData::State`) then held different bytes from a peer
+    /// that reached the same set through deltas, and the two never agreed.
+    #[test]
+    fn verify_refuses_unsorted_or_repeated_listings() {
+        use freenet_scaffold::ComposableState;
+
+        let seller = seller_key();
+        let p = params(&seller);
+        let parent = StoreStateV1::default();
+        let sorted = three_sorted_listings(&seller);
+
+        ListingsV1 {
+            listings: sorted.clone(),
+        }
+        .verify(&parent, &p)
+        .expect("the canonical form verifies");
+
+        let mut reversed = sorted.clone();
+        reversed.reverse();
+        let err = ListingsV1 { listings: reversed }
+            .verify(&parent, &p)
+            .expect_err("unsorted listings must not verify");
+        assert!(err.contains("strictly ascending"), "got: {err}");
+
+        let repeated = vec![sorted[0].clone(), sorted[0].clone(), sorted[1].clone()];
+        ListingsV1 { listings: repeated }
+            .verify(&parent, &p)
+            .expect_err("a listing held twice must not verify");
+    }
+
+    /// **Merging lands on canonical form whatever it started from.**
+    ///
+    /// `verify` now refuses a non-canonical state, so anything this code
+    /// writes has to be canonical, including when the state it started from
+    /// was written by the old, permissive code: the migration fold merges a
+    /// predecessor's state that nothing verified. Covers both the path where
+    /// the merge brings something new and the one where it brings nothing,
+    /// which the scaffold skips `apply_delta` for entirely.
+    #[test]
+    fn merging_normalises_a_non_canonical_state() {
+        use freenet_scaffold::ComposableState;
+
+        let seller = seller_key();
+        let p = params(&seller);
+        let parent = StoreStateV1::default();
+        let sorted = three_sorted_listings(&seller);
+        let canonical = ListingsV1 {
+            listings: sorted.clone(),
+        };
+
+        // Unsorted, with a duplicate, missing one listing.
+        let messy = || ListingsV1 {
+            listings: vec![sorted[2].clone(), sorted[0].clone(), sorted[2].clone()],
+        };
+
+        // Brings something new.
+        let mut state = messy();
+        state
+            .apply_delta(&parent, &p, &Some(vec![sorted[1].clone()]))
+            .expect("apply");
+        assert_eq!(state, canonical);
+
+        // Brings nothing new: only `normalize` reaches this.
+        let mut state = messy();
+        let other = ListingsV1 {
+            listings: vec![sorted[0].clone()],
+        };
+        state.merge(&parent, &p, &other).expect("merge");
+        state.normalize();
+        assert_eq!(
+            state,
+            ListingsV1 {
+                listings: vec![sorted[0].clone(), sorted[2].clone()],
+            }
+        );
+        state.verify(&parent, &p).expect("the result verifies");
+    }
+
+    /// **Two peers reach the same bytes whichever order they merge in.**
+    ///
+    /// The property #26 is about, pinned in-process. `fdev verify-merge`
+    /// checks the same laws against the built WASM; this keeps a regression
+    /// visible in `cargo test`.
+    #[test]
+    fn listing_merge_is_commutative_including_non_canonical_inputs() {
+        use freenet_scaffold::ComposableState;
+
+        let seller = seller_key();
+        let p = params(&seller);
+        let parent = StoreStateV1::default();
+        let sorted = three_sorted_listings(&seller);
+        let a = ListingsV1 {
+            listings: vec![sorted[2].clone(), sorted[0].clone()],
+        };
+        let b = ListingsV1 {
+            listings: vec![sorted[1].clone()],
+        };
+
+        let merge = |x: &ListingsV1, y: &ListingsV1| {
+            let mut out = x.clone();
+            out.merge(&parent, &p, y).expect("merge");
+            out.normalize();
+            crate::to_cbor(&out).expect("encode")
+        };
+        assert_eq!(merge(&a, &b), merge(&b, &a));
+        assert_eq!(merge(&a, &a), merge(&a, &ListingsV1::default()));
     }
 }
 
