@@ -150,6 +150,12 @@ pub struct DerivedAddress {
     pub address: String,
 }
 
+/// How many consecutive derivation indices past the last published order the
+/// delegate scans before concluding there are none further up. Shared so the
+/// UI knows when an unmatched script may have come within reach again; see
+/// the delegate's `apply_published_floor`.
+pub const PUBLISHED_INDEX_GAP: u32 = 100;
+
 /// Requests the UI sends the delegate about Bitcoin payments.
 #[non_exhaustive]
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -191,7 +197,8 @@ pub enum BitcoinDelegateRequest {
     /// Record the seller's account xpub, so invoices can be given a fresh
     /// payment address each.
     ///
-    /// Replacing an existing xpub resets `next_index` to 0: indices are only
+    /// Replacing an existing xpub resets `next_index` to 0 (then raised past
+    /// any published order it derives, see `published_scripts`): indices are only
     /// meaningful relative to the key they were derived under, so carrying a
     /// counter across a key change would skip addresses in the new wallet for
     /// no reason. It does NOT invalidate invoices already issued -- those name
@@ -203,6 +210,11 @@ pub enum BitcoinDelegateRequest {
         /// The network the seller says it is for. Rejected if the xpub's own
         /// version prefix disagrees.
         network: BitcoinNetwork,
+        /// See [`Self::DeriveOrderAddress`]'s field of the same name. Carried
+        /// here too so the count the payments panel shows straight after the
+        /// key is entered already accounts for the store's own orders.
+        #[serde(default)]
+        published_scripts: Vec<Vec<u8>>,
     },
 
     /// The configured payment xpub, if any, and how far derivation has got.
@@ -213,7 +225,21 @@ pub enum BitcoinDelegateRequest {
     /// The network comes from the stored xpub rather than from the caller, so
     /// there is no way to ask for an address on a network the key does not
     /// belong to.
-    DeriveOrderAddress { request_id: u64 },
+    DeriveOrderAddress {
+        request_id: u64,
+        /// The payment scripts of every order the seller's own stores have
+        /// published, as the UI last read them from the network.
+        ///
+        /// The delegate's counter lives on one device, and a new device (or a
+        /// reinstall) starts it at 0 while the same wallet key's low addresses
+        /// already carry published, possibly paid, orders (harvest#77). The
+        /// delegate derives forward from its counter and moves it past the
+        /// highest index whose script appears here, so the count follows the
+        /// public record rather than the device. Public data: every script
+        /// here is already in a store contract.
+        #[serde(default)]
+        published_scripts: Vec<Vec<u8>>,
+    },
 }
 
 #[non_exhaustive]
@@ -244,6 +270,10 @@ pub enum BitcoinDelegateResponse {
     PaymentXpubSet {
         request_id: u64,
         result: Result<PaymentXpubStatus, String>,
+        /// The request's `published_scripts` that the delegate matched to an
+        /// index of this key. See `DeriveOrderAddress`.
+        #[serde(default)]
+        matched_scripts: Vec<Vec<u8>>,
     },
     /// `None` means no xpub is configured, which is the honest first-run
     /// answer -- distinct from "we have not asked yet", which the UI tracks
@@ -254,6 +284,12 @@ pub enum BitcoinDelegateResponse {
     OrderAddress {
         request_id: u64,
         result: Result<DerivedAddress, String>,
+        /// The request's `published_scripts` that the delegate matched to an
+        /// index of the stored key, i.e. that its counter now accounts for.
+        /// A script sent but not listed here was foreign, already below the
+        /// counter, or past the scan's gap, and the UI may offer it again.
+        #[serde(default)]
+        matched_scripts: Vec<Vec<u8>>,
     },
 }
 

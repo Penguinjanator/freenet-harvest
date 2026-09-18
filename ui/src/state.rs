@@ -272,6 +272,31 @@ pub struct AppState {
     /// say it is not testing the correlation at all.
     pub pending_invoices: std::collections::BTreeMap<u64, PendingInvoice>,
 
+    /// Invoices whose address has been derived and whose order is built,
+    /// waiting to learn whether that address has been used before. Keyed by
+    /// the address contract's instance id. See
+    /// [`AppState::check_address_before_signing`].
+    pub address_reuse_checks: HashMap<Vec<u8>, PendingReuseCheck>,
+    /// How many used addresses an invoice has already skipped, keyed by the
+    /// request id of the derivation that replaces the last one.
+    pub address_skips: HashMap<u64, u32>,
+    /// For each of this seller's own orders, the OTHER own orders on the same
+    /// payment address and network that are not cancelled, with their payment
+    /// windows. Output of [`AppState::refresh_same_address_orders`].
+    pub same_address_orders: HashMap<harvest_common::payment::OrderId, Vec<SameAddressOrder>>,
+    /// Ghost Key fingerprints whose `ListStores` has been answered this
+    /// session. Until every listed identity's has, a store it owns could be
+    /// missing from `my_stores`, so settlements are withheld
+    /// ([`AppState::unloaded_stores`]).
+    pub store_lists_answered: HashSet<String>,
+    /// Ghost Key fingerprints whose `ListStores` request failed to send.
+    /// Not retried: a reload does it.
+    pub store_list_failed: HashSet<String>,
+    /// Settlements a proof exists for but that were not auto-published
+    /// (see [`AppState::settlement_hold`]), by order, with their store, so
+    /// the seller can confirm them from the card.
+    pub withheld_settlements: HashMap<harvest_common::payment::OrderId, (Vec<u8>, AuthorizedOrder)>,
+
     /// Ghostkey certificates by fingerprint, as the delegate reports them.
     ///
     /// A store's details carry the seller's certificate so a buyer can check
@@ -558,12 +583,30 @@ fn spawn_order_address_request(request_id: u64) {
         if let Err(e) = crate::gateway::bitcoin_ops::derive_order_address(request_id).await {
             dioxus::logger::tracing::error!("Failed to request a payment address: {e}");
             let mut state = crate::gateway::APP_STATE.write();
-            state.pending_invoices.remove(&request_id);
-            state.bitcoin.in_flight.remove(&request_id);
+            state.abandon_address_request(request_id);
             state
                 .notifications
                 .push(format!("Could not issue the invoice: {e}"));
         }
+    });
+}
+
+/// Read a derived address's contract once, without subscribing, and end the
+/// wait after [`ADDRESS_REUSE_CHECK_TIMEOUT_MS`] whatever happens. The answer
+/// arrives through the ordinary response path (`on_contract_state`, or the
+/// `NotFound` arm in `gateway::response_handler`).
+#[cfg(target_arch = "wasm32")]
+fn spawn_address_reuse_check(contract_id: [u8; 32], request_id: u64) {
+    wasm_bindgen_futures::spawn_local(async move {
+        use dioxus::prelude::WritableExt;
+        let id = freenet_stdlib::prelude::ContractInstanceId::new(contract_id);
+        if let Err(e) = crate::gateway::get_contract(&id, false).await {
+            dioxus::logger::tracing::error!("Failed to ask about a payment address: {e}");
+        }
+        gloo_timers::future::TimeoutFuture::new(ADDRESS_REUSE_CHECK_TIMEOUT_MS).await;
+        crate::gateway::APP_STATE
+            .write()
+            .on_address_reuse_timeout(&contract_id, request_id);
     });
 }
 
@@ -971,6 +1014,115 @@ pub fn order_for_invoice(
     }
     .with_derived_id())
 }
+
+/// Why a payment that proves an order was not published as Paid on its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SettlementHold {
+    /// Other own orders on the same address have overlapping windows, so one
+    /// payment would prove them all and nothing on the chain says whose it is.
+    Twins(Vec<SameAddressOrder>),
+    /// Not everything this seller owns has loaded, so a twin could be in what
+    /// has not; each entry names it (see [`AppState::unloaded_stores`]).
+    StoresNotLoaded(Vec<String>),
+}
+
+/// Another own, uncancelled order on the same address and network.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SameAddressOrder {
+    pub id: harvest_common::payment::OrderId,
+    pub window: std::ops::RangeInclusive<u32>,
+    pub amount_sats: u64,
+    pub status: harvest_common::payment::OrderStatus,
+    /// Its Paid record was confirmed and sent from this tab but has not come
+    /// back yet. Set by [`AppState::settlement_hold`], never cached.
+    pub confirmed_by_you: bool,
+}
+
+impl SettlementHold {
+    /// What the card says above "Confirm paid". `amount_sats` is this
+    /// invoice's, `in_window_sats` the confirmed value inside its window.
+    /// Twins are listed with amount and status, Paid marked, so a seller does
+    /// not confirm an abandoned twin on a payment that already settled its
+    /// sibling (PR #83 round 5, Should Fix 1).
+    pub fn explain(&self, amount_sats: u64, in_window_sats: u64) -> String {
+        let reason = match self {
+            SettlementHold::Twins(twins) => format!(
+                "Your other invoice(s) on this same address: {}. One payment cannot pay for \
+                 more than one invoice.",
+                twins
+                    .iter()
+                    .map(|twin| format!(
+                        "{} for {} sats ({})",
+                        twin.id.short(),
+                        twin.amount_sats,
+                        match twin.status {
+                            // Sent, not back yet: as good as Paid for the
+                            // question "may I confirm this one too?".
+                            _ if twin.confirmed_by_you => "confirmed by you, publishing",
+                            harvest_common::payment::OrderStatus::Paid => "ALREADY PAID",
+                            harvest_common::payment::OrderStatus::PaymentReversed => "reversed",
+                            _ => "awaiting payment",
+                        }
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            SettlementHold::StoresNotLoaded(what) => format!(
+                "Not everything you own has loaded ({}), so Harvest cannot rule out another \
+                 invoice on this address. One payment cannot pay for more than one invoice.",
+                what.join("; ")
+            ),
+        };
+        format!(
+            "This invoice is for {amount_sats} sats, and {in_window_sats} sats confirmed at its \
+             address inside its payment window. {reason} Harvest will not mark it paid on its \
+             own: check your wallet for a separate payment per invoice, then confirm."
+        )
+    }
+}
+
+/// An invoice held back from signing until its payment address is known to
+/// be unused. See [`AppState::check_address_before_signing`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingReuseCheck {
+    /// The derivation request this check follows; identifies the check to
+    /// its own timer.
+    pub request_id: u64,
+    pub invoice: PendingInvoice,
+    pub order: harvest_common::payment::Order,
+    /// Used addresses this invoice has already skipped.
+    pub skipped: u32,
+}
+
+/// How many used addresses in a row one invoice may skip before giving up.
+///
+/// Each skip burns an index that a wallet will not see paid, and a run this
+/// long means something other than a stale counter is wrong (another device
+/// issuing from the same key right now, say), which the seller should hear
+/// about rather than have papered over.
+pub const MAX_REUSED_ADDRESS_SKIPS: u32 = 20;
+
+/// Whether an address contract's state shows the address was used: any claim
+/// at all. An empty state shows nothing; one that does not decode counts as
+/// used, since skipping costs one index and a wrong "unused" could put an old
+/// address on a new invoice.
+fn address_state_shows_use(state_bytes: &[u8]) -> bool {
+    if state_bytes.is_empty() {
+        return false;
+    }
+    freenet_bitcoin_common::from_cbor::<freenet_bitcoin_common::BitcoinAddressStateV1>(state_bytes)
+        .map(|state| !state.claims.claims.is_empty() || !state.claims.scanned.is_empty())
+        .unwrap_or(true)
+}
+
+/// How long to wait for a derived address's contract before signing anyway.
+///
+/// The expected answer for a fresh address is that its contract does not
+/// exist, and Freenet reports absence slowly or not at all (a GET that
+/// dead-ends produces no response). See
+/// [`AppState::on_address_reuse_timeout`] for why the wait ends in signing
+/// rather than refusing.
+pub const ADDRESS_REUSE_CHECK_TIMEOUT_MS: u32 = 15_000;
 
 /// The message a `SignResult`'s scoped payload was built around, i.e. the
 /// bytes the caller originally asked to have signed.
@@ -1546,6 +1698,8 @@ impl AppState {
         }
         self.migrated_contract_ids
             .insert(predecessor.to_vec(), successor.clone());
+        self.withheld_settlements
+            .retain(|_, (store, _)| store.as_slice() != predecessor);
 
         for stores in self.my_stores.values_mut() {
             for registration in stores.iter_mut() {
@@ -1766,6 +1920,18 @@ impl AppState {
 
     /// Handle full contract state received from a GET response.
     pub fn on_contract_state(&mut self, contract_id: Vec<u8>, state_bytes: Vec<u8>) {
+        // Before anything else, and before the empty check: an empty state is
+        // itself an answer to a reuse check (nothing registered there). An id
+        // that is ALSO a watched address goes on to the ordinary path below,
+        // so a check never swallows an update a watch was waiting for.
+        if self.on_address_reuse_state(&contract_id, &state_bytes)
+            && !self
+                .bitcoin
+                .address_contract_network
+                .contains_key(&contract_id)
+        {
+            return;
+        }
         if state_bytes.is_empty() {
             return;
         }
@@ -1830,6 +1996,7 @@ impl AppState {
             ) {
                 Ok(addr_state) => {
                     self.apply_address_state(contract_id, network, &addr_state);
+                    self.refresh_same_address_orders();
                     // A payment confirming is exactly the moment an order
                     // becomes provable, and this is the only notification
                     // that says so -- the store's own state does not change
@@ -1942,7 +2109,9 @@ impl AppState {
                     // prove. Here as well as on the address path below,
                     // because the two arrive independently: the claims may be
                     // in hand before the order is, or the other way round.
+                    self.refresh_same_address_orders();
                     self.publish_settled_orders(&contract_id);
+                    self.republish_withheld();
 
                     // And ask the bridge to watch the payment address of any
                     // new order this seller issued. Nothing else tells the
@@ -2963,6 +3132,174 @@ impl AppState {
         settled
     }
 
+    /// Recompute [`Self::same_address_orders`].
+    ///
+    /// One payment can prove two orders on one address whose windows overlap
+    /// (the contract's pinned known limit), and nothing on the chain says
+    /// which order a payment was for. So this does not try to attribute
+    /// payments: it records which orders COULD be confused, and
+    /// [`Self::settlement_hold`] leaves those to the seller.
+    ///
+    /// Own stores only (a stranger copying a script must not stall this
+    /// seller), same network only (signet and testnet4 share script bytes but
+    /// not payments), cancelled orders ignored, and orders with no anchor
+    /// ignored (no window). Stored because the card reads it on every render.
+    pub fn refresh_same_address_orders(&mut self) {
+        use harvest_common::payment::OrderStatus;
+        let mut by_script: HashMap<(BitcoinNetwork, &[u8]), Vec<SameAddressOrder>> = HashMap::new();
+        let mut seen = HashSet::new();
+        for registration in self.my_stores.values().flatten() {
+            let Some(store) = self.browsing_stores.get(&registration.store_contract_id) else {
+                continue;
+            };
+            for record in &store.orders {
+                let order = &record.order;
+                let Some(window) = order.payment_window() else {
+                    continue;
+                };
+                if record.status != OrderStatus::Cancelled
+                    && !order.payment_script_pubkey.is_empty()
+                    && seen.insert(&order.id)
+                {
+                    by_script
+                        .entry((order.network, order.payment_script_pubkey.as_slice()))
+                        .or_default()
+                        .push(SameAddressOrder {
+                            id: order.id.clone(),
+                            window,
+                            amount_sats: order.amount_sats,
+                            status: record.status,
+                            confirmed_by_you: false,
+                        });
+                }
+            }
+        }
+        let mut map = HashMap::new();
+        for orders in by_script.values().filter(|orders| orders.len() > 1) {
+            for order in orders {
+                let others = orders
+                    .iter()
+                    .filter(|o| o.id != order.id)
+                    .cloned()
+                    .collect();
+                map.insert(order.id.clone(), others);
+            }
+        }
+        self.same_address_orders = map;
+    }
+
+    /// The other own, uncancelled orders on the same address and network
+    /// whose payment window contains any of `heights`: for a Paid order's
+    /// in-window payment heights, the invoices whose payment it may have
+    /// been; for a late payment's height, whose it may be instead.
+    pub fn orders_whose_window_holds(
+        &self,
+        order_id: &harvest_common::payment::OrderId,
+        heights: &[u32],
+    ) -> Vec<harvest_common::payment::OrderId> {
+        self.same_address_orders
+            .get(order_id)
+            .into_iter()
+            .flatten()
+            .filter(|other| heights.iter().any(|h| other.window.contains(h)))
+            .map(|other| other.id.clone())
+            .collect()
+    }
+
+    /// What this seller owns that has not loaded, named for the card: store
+    /// lists not yet answered for a Ghost Key the vault lists (or whose
+    /// request failed, which is the same absence), and owned stores whose
+    /// state has not arrived. Empty when everything has.
+    ///
+    /// A store the node gave up on (`store_state_unavailable`) is still
+    /// counted, and named as unreachable, rather than dropped: it could hold
+    /// a twin, and auto-publishing past it is the one direction that cannot
+    /// be taken back. The seller sees which store it is and can confirm by
+    /// hand (PR #83 round 5, Should Fix 3).
+    pub fn unloaded_stores(&self) -> Vec<String> {
+        let mut unloaded: Vec<String> = self
+            .ghostkeys
+            .iter()
+            .filter(|key| !self.store_lists_answered.contains(&key.fingerprint))
+            .map(|key| {
+                if self.store_list_failed.contains(&key.fingerprint) {
+                    format!(
+                        "the store list for Ghost Key {}, whose request failed; reloading \
+                         the page retries it",
+                        key.fingerprint
+                    )
+                } else {
+                    format!("the store list for Ghost Key {}", key.fingerprint)
+                }
+            })
+            .collect();
+        for registration in self.my_stores.values().flatten() {
+            let id = &registration.store_contract_id;
+            if self
+                .browsing_stores
+                .get(id)
+                .is_none_or(|store| store.info.is_none())
+            {
+                let short: String = bs58::encode(id).into_string().chars().take(8).collect();
+                unloaded.push(if self.store_state_unavailable.contains(id) {
+                    format!("store {short}, which did not answer")
+                } else {
+                    format!("store {short}")
+                });
+            }
+        }
+        unloaded
+    }
+
+    /// Why a provable payment for `order` should not be published as Paid
+    /// without the seller confirming it, if it should not.
+    ///
+    /// Only when nothing is ambiguous: no other own, uncancelled order on the
+    /// same address and network with an overlapping window (a Paid one
+    /// counts: its payment may be the very one proving this order), and
+    /// everything owned loaded (a twin could be in what has not). Everything
+    /// else goes to the seller with the reason in front of them; the contract
+    /// accepts `Paid` on the evidence alone, so a confirmation needs no new
+    /// trust.
+    pub fn settlement_hold(
+        &self,
+        order: &harvest_common::payment::Order,
+    ) -> Option<SettlementHold> {
+        let window = order.payment_window()?;
+        let twins: Vec<_> = self
+            .same_address_orders
+            .get(&order.id)
+            .into_iter()
+            .flatten()
+            .filter(|other| {
+                window.start().max(other.window.start()) <= window.end().min(other.window.end())
+            })
+            .map(|other| SameAddressOrder {
+                confirmed_by_you: self.settlements_submitted.contains(&other.id),
+                ..other.clone()
+            })
+            .collect();
+        if !twins.is_empty() {
+            return Some(SettlementHold::Twins(twins));
+        }
+        let unloaded = self.unloaded_stores();
+        (!unloaded.is_empty()).then_some(SettlementHold::StoresNotLoaded(unloaded))
+    }
+
+    /// Re-run the publish for every owned store holding a withheld
+    /// settlement, so one whose hold has just cleared is published now rather
+    /// than at the next address re-read (PR #83 round 5, Should Fix 4).
+    pub fn republish_withheld(&mut self) {
+        let stores: HashSet<Vec<u8>> = self
+            .withheld_settlements
+            .values()
+            .map(|(store, _)| store.clone())
+            .collect();
+        for store in stores {
+            self.publish_settled_orders(&store);
+        }
+    }
+
     /// A settlement update that did not reach the node.
     ///
     /// Withdraws the record of having submitted it, so the settlement is
@@ -3061,33 +3398,74 @@ impl AppState {
             return Vec::new();
         }
 
+        // Anything ambiguous goes to the seller rather than out on its own;
+        // see `settlement_hold`. Rebuilt for this store on every call so an
+        // entry never outlives the proof or the reason behind it.
+        self.withheld_settlements
+            .retain(|_, (store, _)| store.as_slice() != store_contract_id);
         let mut published = Vec::new();
         for settled in self.settled_orders(store_contract_id) {
-            if !self.settlements_submitted.insert(settled.order.id.clone()) {
+            if self.settlement_hold(&settled.order).is_some() {
+                // Already confirmed and sent: do not offer it again.
+                if self.settlements_submitted.contains(&settled.order.id) {
+                    continue;
+                }
+                self.withheld_settlements.insert(
+                    settled.order.id.clone(),
+                    (store_contract_id.to_vec(), settled),
+                );
                 continue;
             }
-            published.push(settled.clone());
-            info!(
-                "Publishing the settled order {} -- the payment verifies",
-                settled.order.id.short()
-            );
-            #[cfg(target_arch = "wasm32")]
-            {
-                let store_id = store_contract_id.to_vec();
-                let order_id = settled.order.id.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    if let Err(e) =
-                        crate::gateway::store_ops::submit_order_by_id(&store_id, settled).await
-                    {
-                        dioxus::logger::tracing::error!("Failed to publish a settled order: {e}");
-                        crate::gateway::APP_STATE
-                            .write()
-                            .settlement_publish_failed(&order_id, &e);
-                    }
-                });
+            if self.dispatch_settlement(store_contract_id, settled.clone()) {
+                published.push(settled);
             }
         }
         published
+    }
+
+    /// The seller confirming a withheld settlement from its card: publishes
+    /// exactly the proof that was assembled and verified. Returns it, since
+    /// the send itself is wasm-only.
+    pub fn confirm_paid(
+        &mut self,
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Option<harvest_common::payment::AuthorizedOrder> {
+        let (store_contract_id, settled) = self.withheld_settlements.remove(order_id)?;
+        self.dispatch_settlement(&store_contract_id, settled.clone())
+            .then_some(settled)
+    }
+
+    /// Send one settlement, once per tab. Returns whether it was sent.
+    fn dispatch_settlement(
+        &mut self,
+        store_contract_id: &[u8],
+        settled: harvest_common::payment::AuthorizedOrder,
+    ) -> bool {
+        if !self.settlements_submitted.insert(settled.order.id.clone()) {
+            return false;
+        }
+        info!(
+            "Publishing the settled order {} -- the payment verifies",
+            settled.order.id.short()
+        );
+        #[cfg(target_arch = "wasm32")]
+        {
+            let store_id = store_contract_id.to_vec();
+            let order_id = settled.order.id.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(e) =
+                    crate::gateway::store_ops::submit_order_by_id(&store_id, settled).await
+                {
+                    dioxus::logger::tracing::error!("Failed to publish a settled order: {e}");
+                    crate::gateway::APP_STATE
+                        .write()
+                        .settlement_publish_failed(&order_id, &e);
+                }
+            });
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = (store_contract_id, settled);
+        true
     }
 
     /// The Bitcoin address contracts this node should be watching for one
@@ -4181,6 +4559,24 @@ impl AppState {
                     .to_string(),
             );
         }
+        // The delegate's address counter lives on this device and restarts at
+        // 0 on a new one, so each derivation also carries the scripts this
+        // seller's stores have already published and the delegate moves past
+        // them (harvest#77). That only works once the store has actually been
+        // read from the network: before then there is nothing to move past,
+        // and the address handed out could be one an old, possibly paid,
+        // order already names.
+        if self
+            .browsing_stores
+            .get(&invoice.store_contract_id)
+            .is_none_or(|store| store.info.is_none())
+        {
+            return Err(
+                "your store has not loaded from the network yet, so Harvest cannot see which \
+                 payment addresses its orders already use. Try again once it has."
+                    .to_string(),
+            );
+        }
         // An invoice answering a request must carry that conversation's listing
         // tag, which needs its key. Refused here, before a derivation index is
         // spent on an address, rather than when the order is built.
@@ -4205,6 +4601,142 @@ impl AppState {
         #[cfg(target_arch = "wasm32")]
         spawn_order_address_request(request_id);
         Ok(())
+    }
+
+    /// The request that asks the delegate for invoice `request_id`'s address.
+    ///
+    /// Built here rather than at the wasm call site so the one thing that
+    /// makes it safe -- carrying the published scripts -- is executed by
+    /// tests (PR #83 review, Must Fix 4): a `Vec::new()` at a wasm-only send
+    /// compiled, passed every test, and restored harvest#77. Sends only the
+    /// scripts the delegate has not already accounted for in this tab.
+    pub fn order_address_request(
+        &mut self,
+        request_id: u64,
+    ) -> harvest_common::BitcoinDelegateRequest {
+        let counter = self.current_address_counter();
+        let published_scripts: Vec<Vec<u8>> = self
+            .published_payment_scripts()
+            .into_iter()
+            .filter(|script| !self.bitcoin.accounted_scripts.contains(script))
+            .filter(|script| match self.bitcoin.unmatched_scripts.get(script) {
+                None => true,
+                Some(&offered_at) => {
+                    counter
+                        >= offered_at.saturating_add(
+                            harvest_common::bitcoin_delegate::PUBLISHED_INDEX_GAP / 2,
+                        )
+                }
+            })
+            .collect();
+        self.bitcoin
+            .scripts_in_flight
+            .insert(request_id, (published_scripts.clone(), counter));
+        harvest_common::BitcoinDelegateRequest::DeriveOrderAddress {
+            request_id,
+            published_scripts,
+        }
+    }
+
+    /// The request that records the seller's payment key. Always carries
+    /// EVERY published script: a new key resets the delegate's counter, and
+    /// what was accounted for under the old key says nothing about this one.
+    pub fn set_payment_xpub_request(
+        &mut self,
+        request_id: u64,
+        xpub: String,
+        network: BitcoinNetwork,
+    ) -> harvest_common::BitcoinDelegateRequest {
+        let published_scripts = self.published_payment_scripts();
+        self.bitcoin
+            .scripts_in_flight
+            .insert(request_id, (published_scripts.clone(), 0));
+        harvest_common::BitcoinDelegateRequest::SetPaymentXpub {
+            request_id,
+            xpub,
+            network,
+            published_scripts,
+        }
+    }
+
+    /// Forget everything held for an address request that will never be
+    /// answered usefully (PR #83 round 2, Should Fix 6).
+    pub fn abandon_address_request(&mut self, request_id: u64) {
+        self.pending_invoices.remove(&request_id);
+        self.bitcoin.in_flight.remove(&request_id);
+        self.bitcoin.scripts_in_flight.remove(&request_id);
+        self.address_skips.remove(&request_id);
+    }
+
+    /// The delegate's address counter as last reported, 0 when unknown.
+    fn current_address_counter(&self) -> u32 {
+        self.bitcoin
+            .payment_xpub
+            .as_ref()
+            .map_or(0, |status| status.next_index)
+    }
+
+    /// Record what the delegate did with the scripts it was offered.
+    fn note_scripts_answered(&mut self, request_id: u64, matched: Vec<Vec<u8>>, counter: u32) {
+        let Some((sent, _)) = self.bitcoin.scripts_in_flight.remove(&request_id) else {
+            return;
+        };
+        let matched: std::collections::BTreeSet<Vec<u8>> = matched.into_iter().collect();
+        for script in sent {
+            if matched.contains(&script) {
+                self.bitcoin.unmatched_scripts.remove(&script);
+                self.bitcoin.accounted_scripts.insert(script);
+            } else {
+                self.bitcoin.unmatched_scripts.insert(script, counter);
+            }
+        }
+    }
+
+    /// A reported count lower than the last one, or a different key, means
+    /// what was accounted for no longer describes the counter.
+    fn forget_accounted_scripts_if_counter_fell(
+        &mut self,
+        new: Option<&harvest_common::PaymentXpubStatus>,
+    ) {
+        let fell = match (self.bitcoin.payment_xpub.as_ref(), new) {
+            (Some(old), Some(new)) => new.xpub != old.xpub || new.next_index < old.next_index,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if fell {
+            self.bitcoin.accounted_scripts.clear();
+            self.bitcoin.unmatched_scripts.clear();
+        }
+    }
+
+    /// The payment scripts of every order this seller's own stores have
+    /// published, as last read from the network.
+    ///
+    /// Sent with every derivation (and with the payment key itself) so the
+    /// delegate can move its address counter past them: the counter is
+    /// device-local and a new device starts it at 0, while the same wallet
+    /// key's low addresses already carry these orders (harvest#77). Every
+    /// store the seller owns, under every Ghost Key, because one payment key
+    /// serves all of them.
+    ///
+    /// Only stores whose state has arrived contribute. `issue_invoice` refuses
+    /// until the store being invoiced has; a sibling store that has not loaded
+    /// contributes nothing. What catches that case is the address-contract
+    /// check before signing (`check_address_before_signing`), with the store
+    /// contract's payment window behind it.
+    pub fn published_payment_scripts(&self) -> Vec<Vec<u8>> {
+        let mut scripts = std::collections::BTreeSet::new();
+        for registration in self.my_stores.values().flatten() {
+            let Some(store) = self.browsing_stores.get(&registration.store_contract_id) else {
+                continue;
+            };
+            for record in &store.orders {
+                if !record.order.payment_script_pubkey.is_empty() {
+                    scripts.insert(record.order.payment_script_pubkey.clone());
+                }
+            }
+        }
+        scripts.into_iter().collect()
     }
 
     /// Turn a freshly-derived address into a signed, published invoice.
@@ -4261,6 +4793,179 @@ impl AppState {
                 return;
             }
         };
+        let skipped = self.address_skips.remove(&request_id).unwrap_or(0);
+        self.check_address_before_signing(PendingReuseCheck {
+            request_id,
+            invoice,
+            order,
+            skipped,
+        });
+    }
+
+    /// Hold a built invoice back until its address is known to be unused.
+    ///
+    /// # Why the address contract, on top of the recovered counter
+    ///
+    /// The delegate's counter is recovered from the store's published orders
+    /// (harvest#77), and that is not the whole record: a re-created store's
+    /// first state is its own fresh PUT, an order pruned at `MAX_ORDERS` is
+    /// gone, a sibling store may not have loaded, and a published order
+    /// beyond the recovery scan's gap is not found (PR #83 review, Must Fix
+    /// 3). The bridge's address contract for the derived script is the
+    /// ground truth for reuse: it exists and holds claims only if the address
+    /// was registered with the bridge before, i.e. put on an invoice that
+    /// was published. So an address whose contract holds ANY claim -- a
+    /// payment, a retraction, or only a `ScannedTo` from a watch nobody paid
+    /// -- is skipped, and a fresh one is derived. The recovered counter stays
+    /// as the first line; this catches what it cannot see.
+    ///
+    /// # What it does not see
+    ///
+    /// The contract id is derived from the script AND the order's bridge set
+    /// and address-contract build, so an address used under a different
+    /// bridge set or an earlier address-contract generation is a different
+    /// contract and reads as unused. And a timed-out check signs anyway (see
+    /// [`Self::on_address_reuse_timeout`]). The payment window in
+    /// `verify_on_chain_proof` is what bounds those.
+    fn check_address_before_signing(&mut self, check: PendingReuseCheck) {
+        let Some(contract_id) = check.order.bitcoin_address_instance_id() else {
+            // Every order `order_for_invoice` builds names a build, so this
+            // is unreachable from the UI. An order that names none can never
+            // be settled at all, so there is nothing a reuse check protects.
+            self.sign_checked_order(check);
+            return;
+        };
+        // Already watched on this node: no need to ask the network.
+        if let Some(view) = self.bitcoin.addresses.get(contract_id.as_slice()) {
+            if !view.claims.is_empty() {
+                self.skip_used_address(check);
+                return;
+            }
+        }
+        // Two invoices waiting on the SAME address means the delegate handed
+        // it out twice, which is reuse by definition. Skip this one rather
+        // than silently replacing the other's check (PR #83 round 2, Should
+        // Fix 6).
+        if self
+            .address_reuse_checks
+            .contains_key(contract_id.as_slice())
+        {
+            self.skip_used_address(check);
+            return;
+        }
+        let request_id = check.request_id;
+        self.address_reuse_checks
+            .insert(contract_id.to_vec(), check);
+        #[cfg(target_arch = "wasm32")]
+        spawn_address_reuse_check(contract_id, request_id);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = request_id;
+    }
+
+    /// A state arrived for a contract id. If it answers a pending reuse check,
+    /// settle that check; returns whether the id was one.
+    ///
+    /// Any claim at all means the address was used. A state that does not
+    /// decode as an address contract's is also treated as used: that costs
+    /// one skipped index, while treating it as unused could put an old
+    /// address on a new invoice.
+    pub fn on_address_reuse_state(&mut self, contract_id: &[u8], state_bytes: &[u8]) -> bool {
+        let Some(check) = self.address_reuse_checks.remove(contract_id) else {
+            return false;
+        };
+        let used = address_state_shows_use(state_bytes);
+        if used {
+            self.skip_used_address(check);
+        } else {
+            self.sign_checked_order(check);
+        }
+        true
+    }
+
+    /// The node answered that nothing is stored for this contract.
+    ///
+    /// Treated like the timeout, not as proof: on Freenet a GET that
+    /// dead-ends can report `NotFound` for a contract that exists. So it
+    /// signs, failing open for the reasons on [`Self::on_address_reuse_timeout`],
+    /// and logs that it did.
+    pub fn on_address_reuse_absent(&mut self, contract_id: &[u8]) {
+        if let Some(check) = self.address_reuse_checks.remove(contract_id) {
+            warn!(
+                "The node found nothing for address {}; issuing the invoice without proof \
+                 it was never used",
+                check.order.payment_address
+            );
+            self.sign_checked_order(check);
+        }
+    }
+
+    /// No answer within [`ADDRESS_REUSE_CHECK_TIMEOUT_MS`]: sign anyway.
+    ///
+    /// # Why this fails OPEN
+    ///
+    /// Silence is the expected answer for a fresh address, which is almost
+    /// every address: its contract does not exist, and Freenet's "not found"
+    /// arrives slowly or never. Failing closed would refuse nearly every
+    /// invoice, which would be the check disabling the product. A used
+    /// address, by contrast, has a contract the bridge PUT and at least one
+    /// party subscribed to, so it is findable and usually answers in time.
+    /// When it does not, what is left is exactly what this check adds to:
+    /// the recovered counter (which usually already moved past it) and the
+    /// payment window in `verify_on_chain_proof`, which stops a payment made
+    /// before the order from settling it.
+    ///
+    /// Keyed to the check it was started for (`request_id`): a timer left
+    /// over from an earlier check on the same address must not end a newer
+    /// one early.
+    pub fn on_address_reuse_timeout(&mut self, contract_id: &[u8], request_id: u64) {
+        if self
+            .address_reuse_checks
+            .get(contract_id)
+            .is_some_and(|check| check.request_id == request_id)
+        {
+            let Some(check) = self.address_reuse_checks.remove(contract_id) else {
+                return;
+            };
+            warn!(
+                "No answer about address {} in {} ms; issuing the invoice without knowing \
+                 whether it was used before",
+                check.order.payment_address, ADDRESS_REUSE_CHECK_TIMEOUT_MS
+            );
+            self.sign_checked_order(check);
+        }
+    }
+
+    /// The address was used before: derive another one for the same invoice.
+    fn skip_used_address(&mut self, check: PendingReuseCheck) {
+        let skipped = check.skipped + 1;
+        warn!(
+            "Payment address {} has been used before; deriving another for this invoice",
+            check.order.payment_address
+        );
+        if skipped > MAX_REUSED_ADDRESS_SKIPS {
+            self.notifications.push(format!(
+                "Could not issue the invoice: the last {skipped} payment addresses from your \
+                 key had all been used before. Is another device issuing invoices from the \
+                 same key?"
+            ));
+            return;
+        }
+        let request_id = self.bitcoin.next_request_id();
+        self.bitcoin.in_flight.insert(request_id);
+        self.pending_invoices.insert(request_id, check.invoice);
+        self.address_skips.insert(request_id, skipped);
+        #[cfg(target_arch = "wasm32")]
+        spawn_order_address_request(request_id);
+    }
+
+    /// Queue a checked invoice for the seller's signature.
+    fn sign_checked_order(&mut self, check: PendingReuseCheck) {
+        let PendingReuseCheck {
+            request_id: _,
+            invoice,
+            order,
+            skipped: _,
+        } = check;
         info!(
             "Issuing invoice {} for '{}' ({} sats) to {}",
             order.id.short(),
@@ -4497,7 +5202,11 @@ impl AppState {
                     stores.len(),
                     ghostkey_fingerprint
                 );
+                self.store_lists_answered
+                    .insert(ghostkey_fingerprint.clone());
                 self.merge_store_registrations(&ghostkey_fingerprint, stores);
+                self.refresh_same_address_orders();
+                self.republish_withheld();
 
                 // Nothing else re-fetches these after a reload: the seller's
                 // own store is subscribed at creation time and never again,
@@ -4708,6 +5417,14 @@ impl AppState {
                             dioxus::logger::tracing::error!(
                                 "Failed to list stores for {fingerprint}: {e}"
                             );
+                            // Named in any settlement hold it causes, so the
+                            // seller is not told to wait for an answer that
+                            // is not coming.
+                            use dioxus::prelude::WritableExt;
+                            crate::gateway::APP_STATE
+                                .write()
+                                .store_list_failed
+                                .insert(fingerprint.clone());
                         }
                         if let Some(vk) = vk.as_ref() {
                             crate::gateway::migrate_ops::start_identity_migration(&fingerprint, vk);
@@ -5179,10 +5896,19 @@ impl AppState {
                 // listener.
             }
 
-            BitcoinDelegateResponse::PaymentXpubSet { request_id, result } => {
+            BitcoinDelegateResponse::PaymentXpubSet {
+                request_id,
+                result,
+                matched_scripts,
+            } => {
                 self.bitcoin.in_flight.remove(&request_id);
                 match result {
                     Ok(status) => {
+                        // Replaced, not extended: the counter now belongs to
+                        // this key and was floored against exactly these.
+                        self.bitcoin.accounted_scripts.clear();
+                        self.bitcoin.unmatched_scripts.clear();
+                        self.note_scripts_answered(request_id, matched_scripts, status.next_index);
                         info!(
                             "Payment key recorded for {}, next index {}",
                             status.network.as_str(),
@@ -5195,27 +5921,43 @@ impl AppState {
                     // on -- the wrong export, the wrong network, the wrong
                     // depth -- so it is shown verbatim rather than reduced to
                     // "invalid key".
-                    Err(e) => self
-                        .notifications
-                        .push(format!("Couldn't use that payment key: {e}")),
+                    Err(e) => {
+                        self.bitcoin.scripts_in_flight.remove(&request_id);
+                        self.notifications
+                            .push(format!("Couldn't use that payment key: {e}"))
+                    }
                 }
             }
 
             BitcoinDelegateResponse::PaymentXpub { status } => {
+                self.forget_accounted_scripts_if_counter_fell(status.as_ref());
                 self.bitcoin.payment_xpub = status;
                 self.bitcoin.payment_xpub_loaded = true;
             }
 
-            BitcoinDelegateResponse::OrderAddress { request_id, result } => {
+            BitcoinDelegateResponse::OrderAddress {
+                request_id,
+                result,
+                matched_scripts,
+            } => {
                 self.bitcoin.in_flight.remove(&request_id);
                 match result {
-                    Ok(derived) => self.complete_invoice(request_id, derived),
+                    Ok(derived) => {
+                        // The counter the delegate had once it had scanned:
+                        // this address's index plus one.
+                        self.note_scripts_answered(
+                            request_id,
+                            matched_scripts,
+                            derived.index.saturating_add(1),
+                        );
+                        self.complete_invoice(request_id, derived)
+                    }
                     Err(e) => {
                         // Drop the invoice: without an address there is
                         // nothing to sign, and leaving it queued would leave
                         // the form looking as though something were still in
                         // progress.
-                        self.pending_invoices.remove(&request_id);
+                        self.abandon_address_request(request_id);
                         self.notifications
                             .push(format!("Couldn't get a payment address: {e}"));
                     }
@@ -6237,6 +6979,23 @@ pub struct BitcoinState {
     pub watches_loaded: bool,
     /// The account public key invoices derive their payment addresses from.
     pub payment_xpub: Option<harvest_common::PaymentXpubStatus>,
+    /// Published payment scripts the delegate has MATCHED to an index of the
+    /// current key, in this tab. They are not sent again, so the recovery
+    /// scan and the request size are not paid on every invoice (PR #83
+    /// review, Should Fix 7). Replaced wholesale when a payment key is set,
+    /// and cleared when the delegate reports a lower count than before,
+    /// because "accounted for" only means anything relative to one counter.
+    pub accounted_scripts: std::collections::BTreeSet<Vec<u8>>,
+    /// Published scripts the delegate was offered and did NOT match, with the
+    /// counter it had when they were offered. Foreign, below-counter and
+    /// beyond-gap scripts all land here; only the last kind can ever raise
+    /// the counter, and it can do so only once the counter has come within
+    /// the delegate's scan gap of it, so each is offered again after the
+    /// counter has advanced by half the gap (PR #83 round 2, Should Fix 2).
+    pub unmatched_scripts: std::collections::BTreeMap<Vec<u8>, u32>,
+    /// The scripts sent with each outstanding `DeriveOrderAddress` /
+    /// `SetPaymentXpub` and the counter at the time, keyed by request id.
+    pub scripts_in_flight: HashMap<u64, (Vec<Vec<u8>>, u32)>,
     /// Whether `GetPaymentXpub` has answered at least once. Distinguishes "no
     /// key configured" from "we have not asked yet", so the seller is not
     /// prompted to add one before we know whether they already have.
@@ -8170,7 +8929,30 @@ mod invoice_tests {
         // refuses to issue without, pinned by
         // `a_seller_whose_bridge_generation_has_not_resolved_cannot_issue_an_invoice`.
         state.bitcoin.address_generation = resolved_address_generation();
+        // And the store's own state has arrived from the network, which
+        // `issue_invoice` waits for so the delegate can be told which
+        // addresses its published orders already use (harvest#77). Pinned by
+        // `an_invoice_waits_for_the_store_to_load`.
+        store_state_arrived(&mut state, &STORE_ID);
         state
+    }
+
+    /// Mark `store` as read from the network, the way `on_contract_state`
+    /// does: its details are known.
+    pub(super) fn store_state_arrived(state: &mut AppState, store: &[u8]) {
+        state
+            .browsing_stores
+            .entry(store.to_vec())
+            .or_default()
+            .info = Some(harvest_common::store::StoreInfoV1 {
+            version: 1,
+            certificate_pem: String::new(),
+            seller_fingerprint: SELLER.to_string(),
+            reputation_contract_id: [10u8; 32],
+            store_name: "Store".to_string(),
+            description: String::new(),
+            encryption_public_key: None,
+        });
     }
 
     /// The height every test in this module treats as the current tip.
@@ -8203,10 +8985,26 @@ mod invoice_tests {
         }
     }
 
+    /// Answer every pending address-reuse check with "nothing is stored
+    /// there", which is what the node says about a fresh address. Tests of the
+    /// invoice path that are not about reuse call this after the address
+    /// arrives; `address_reuse_tests` is what exercises the check itself.
+    pub(super) fn settle_reuse_checks_as_fresh(state: &mut AppState) {
+        for id in state
+            .address_reuse_checks
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            state.on_address_reuse_absent(&id);
+        }
+    }
+
     fn address_answer(request_id: u64, index: u32) -> BitcoinDelegateResponse {
         BitcoinDelegateResponse::OrderAddress {
             request_id,
             result: Ok(derived(index)),
+            matched_scripts: Vec::new(),
         }
     }
 
@@ -8284,6 +9082,7 @@ mod invoice_tests {
         state.issue_invoice(invoice()).expect("accepted");
         let request_id = *state.pending_invoices.keys().next().expect("one entry");
         state.on_bitcoin_delegate_response(address_answer(request_id, 0));
+        settle_reuse_checks_as_fresh(&mut state);
 
         let queued = state
             .pending_signatures
@@ -8298,6 +9097,645 @@ mod invoice_tests {
             queued.anchor,
             Some(anchor(TIP_HEIGHT)),
             "the invoice must be anchored to the newest block the seller can see"
+        );
+    }
+
+    /// **harvest#77: no address is derived before the store has loaded.**
+    ///
+    /// The delegate's counter is device-local and restarts at 0 on a new
+    /// device; what moves it past addresses already on published orders is
+    /// the list of those orders' scripts sent with the request. Before the
+    /// store's state has arrived that list is empty, and deriving then is
+    /// exactly how a fresh install re-issued an address that already held a
+    /// payment. So the invoice is refused, and no index is spent.
+    #[test]
+    fn an_invoice_waits_for_the_store_to_load() {
+        let mut state = seller_with_a_store();
+        state
+            .browsing_stores
+            .get_mut(STORE_ID.as_slice())
+            .expect("the fixture's store")
+            .info = None;
+
+        let err = state
+            .issue_invoice(invoice())
+            .expect_err("an invoice before the store has loaded must be refused");
+        assert!(err.contains("not loaded"), "unhelpful refusal: {err}");
+        assert!(
+            state.pending_invoices.is_empty(),
+            "a refused invoice must not ask the delegate for an address"
+        );
+    }
+
+    /// A published order paying `script`, as a store holds it.
+    fn with_script(script: &[u8]) -> harvest_common::payment::AuthorizedOrder {
+        let order = harvest_common::payment::Order {
+            id: harvest_common::payment::OrderId([0u8; 32]),
+            buyer_fingerprint: String::new(),
+            seller_fingerprint: SELLER.to_string(),
+            amount_sats: 50_000,
+            network: BitcoinNetwork::Signet,
+            payment_script_pubkey: script.to_vec(),
+            payment_address: "tb1qexample".to_string(),
+            required_confirmations: 1,
+            payment_hash: None,
+            trusted_bridges: Vec::new(),
+            bitcoin_address_code_hash: None,
+            anchor: Some(anchor(TIP_HEIGHT)),
+            order_binding: None,
+            listing_tag: None,
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("time"),
+        }
+        .with_derived_id();
+        harvest_common::payment::AuthorizedOrder {
+            order,
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            status: harvest_common::payment::OrderStatus::AwaitingPayment,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        }
+    }
+
+    /// **What the delegate is told has been used.** Every order in every store
+    /// this seller owns, under every Ghost Key, because one payment key serves
+    /// all of them; not a store they are merely browsing, whose orders pay
+    /// some other wallet; each script once; and nothing for an order with no
+    /// on-chain script.
+    #[test]
+    fn the_published_scripts_are_every_owned_stores_orders() {
+        let mut state = seller_with_a_store();
+        const SECOND_STORE: [u8; 32] = [0x5e; 32];
+        const SOMEONE_ELSES: [u8; 32] = [0x77; 32];
+        state.my_stores.insert(
+            "another-ghost-key".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: SECOND_STORE.to_vec(),
+                reputation_contract_id: vec![12u8; 32],
+                mailbox_contract_id: vec![13u8; 32],
+                store_contract_key: None,
+            }],
+        );
+        state
+            .browsing_stores
+            .get_mut(STORE_ID.as_slice())
+            .expect("store")
+            .orders = vec![with_script(&[0x00, 0x14, 1]), with_script(&[0x00, 0x14, 2])];
+        state
+            .browsing_stores
+            .entry(SECOND_STORE.to_vec())
+            .or_default()
+            .orders = vec![with_script(&[0x00, 0x14, 2]), with_script(&[0x00, 0x14, 3])];
+        state
+            .browsing_stores
+            .entry(SOMEONE_ELSES.to_vec())
+            .or_default()
+            .orders = vec![with_script(&[0x00, 0x14, 9])];
+        let mut no_script = with_script(&[]);
+        no_script.order.payment_hash = Some([1u8; 32]);
+        state
+            .browsing_stores
+            .get_mut(STORE_ID.as_slice())
+            .expect("store")
+            .orders
+            .push(no_script);
+
+        assert_eq!(
+            state.published_payment_scripts(),
+            vec![
+                vec![0x00, 0x14, 1],
+                vec![0x00, 0x14, 2],
+                vec![0x00, 0x14, 3],
+            ]
+        );
+    }
+
+    /// **PR #83 review, Must Fix 4.** The derivation request is built by
+    /// `order_address_request`, not at the wasm send, and it carries the
+    /// published scripts. A request built without them is how harvest#77
+    /// came back.
+    #[test]
+    fn the_address_request_carries_the_published_scripts() {
+        let mut state = seller_with_a_store();
+        state
+            .browsing_stores
+            .get_mut(STORE_ID.as_slice())
+            .expect("store")
+            .orders = vec![with_script(&[0x00, 0x14, 1]), with_script(&[0x00, 0x14, 2])];
+
+        match state.order_address_request(7) {
+            harvest_common::BitcoinDelegateRequest::DeriveOrderAddress {
+                request_id,
+                published_scripts,
+            } => {
+                assert_eq!(request_id, 7);
+                assert_eq!(
+                    published_scripts,
+                    vec![vec![0x00, 0x14, 1], vec![0x00, 0x14, 2]]
+                );
+            }
+            other => panic!("expected DeriveOrderAddress, got {other:?}"),
+        }
+        match state.set_payment_xpub_request(8, "vpub".into(), BitcoinNetwork::Signet) {
+            harvest_common::BitcoinDelegateRequest::SetPaymentXpub {
+                published_scripts, ..
+            } => assert_eq!(published_scripts.len(), 2),
+            other => panic!("expected SetPaymentXpub, got {other:?}"),
+        }
+    }
+
+    /// **PR #83 review, Should Fix 7, and round 2, Should Fix 2.** A script
+    /// the delegate MATCHED is not sent again in this tab. One it was sent but
+    /// did not match (foreign, below its counter, or beyond its scan gap) is
+    /// held back until the counter has advanced by half the gap, which is
+    /// when a beyond-gap order can have come within reach. A refused
+    /// derivation records nothing. Setting a key sends everything and
+    /// starts the record again, and so does the delegate reporting a lower
+    /// count than before.
+    #[test]
+    fn only_scripts_the_delegate_matched_are_not_sent_again() {
+        use harvest_common::bitcoin_delegate::PUBLISHED_INDEX_GAP;
+        fn scripts(request: harvest_common::BitcoinDelegateRequest) -> Vec<Vec<u8>> {
+            match request {
+                harvest_common::BitcoinDelegateRequest::DeriveOrderAddress {
+                    published_scripts,
+                    ..
+                }
+                | harvest_common::BitcoinDelegateRequest::SetPaymentXpub {
+                    published_scripts,
+                    ..
+                } => published_scripts,
+                other => panic!("unexpected request {other:?}"),
+            }
+        }
+        fn answered(state: &mut AppState, request_id: u64, index: u32, matched: Vec<Vec<u8>>) {
+            state.on_bitcoin_delegate_response(BitcoinDelegateResponse::OrderAddress {
+                request_id,
+                result: Ok(derived(index)),
+                matched_scripts: matched,
+            });
+            settle_reuse_checks_as_fresh(state);
+        }
+        fn counter_is(state: &mut AppState, next_index: u32) {
+            state.on_bitcoin_delegate_response(BitcoinDelegateResponse::PaymentXpub {
+                status: Some(PaymentXpubStatus {
+                    xpub: "vpub-placeholder".to_string(),
+                    network: BitcoinNetwork::Signet,
+                    next_index,
+                }),
+            });
+        }
+        let mut state = seller_with_a_store();
+        let mine = vec![0x00, 0x14, 1];
+        let unmatched = vec![0x00, 0x14, 2];
+        state
+            .browsing_stores
+            .get_mut(STORE_ID.as_slice())
+            .expect("store")
+            .orders = vec![with_script(&mine), with_script(&unmatched)];
+
+        // Refused: nothing is recorded, both go again.
+        assert_eq!(
+            scripts(state.order_address_request(1)),
+            vec![mine.clone(), unmatched.clone()]
+        );
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::OrderAddress {
+            request_id: 1,
+            result: Err("refused".into()),
+            matched_scripts: Vec::new(),
+        });
+        assert_eq!(
+            scripts(state.order_address_request(2)),
+            vec![mine.clone(), unmatched.clone()]
+        );
+
+        // Answered, matching only `mine`: neither is sent straight away...
+        answered(&mut state, 2, 0, vec![mine.clone()]);
+        counter_is(&mut state, 1);
+        assert!(scripts(state.order_address_request(3)).is_empty());
+        // ...and the unmatched one comes back once the counter has moved on.
+        counter_is(&mut state, 1 + PUBLISHED_INDEX_GAP / 2);
+        assert_eq!(
+            scripts(state.order_address_request(4)),
+            vec![unmatched.clone()]
+        );
+
+        // Setting a key sends everything and starts the record again.
+        assert_eq!(
+            scripts(state.set_payment_xpub_request(5, "vpub".into(), BitcoinNetwork::Signet)),
+            vec![mine.clone(), unmatched.clone()]
+        );
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::PaymentXpubSet {
+            request_id: 5,
+            result: Ok(PaymentXpubStatus {
+                xpub: "vpub-placeholder".into(),
+                network: BitcoinNetwork::Signet,
+                next_index: 2,
+            }),
+            matched_scripts: vec![mine.clone(), unmatched.clone()],
+        });
+        assert!(scripts(state.order_address_request(6)).is_empty());
+
+        // A lower count than before (another tab reset it): send everything.
+        counter_is(&mut state, 0);
+        assert_eq!(
+            scripts(state.order_address_request(7)),
+            vec![mine, unmatched]
+        );
+    }
+
+    /// The accounted record is also dropped when the delegate reports a
+    /// DIFFERENT key at a count that did not fall, and when it reports no
+    /// key at all: either way it no longer describes the counter.
+    #[test]
+    fn a_new_or_cleared_key_forgets_what_was_accounted() {
+        for next in [
+            Some(PaymentXpubStatus {
+                xpub: "vpub-another".to_string(),
+                network: BitcoinNetwork::Signet,
+                next_index: 5,
+            }),
+            None,
+        ] {
+            let mut state = seller_with_a_store();
+            state.bitcoin.accounted_scripts.insert(vec![0x00, 0x14, 1]);
+            state
+                .bitcoin
+                .unmatched_scripts
+                .insert(vec![0x00, 0x14, 2], 0);
+            state.on_bitcoin_delegate_response(BitcoinDelegateResponse::PaymentXpub {
+                status: next.clone(),
+            });
+            assert!(state.bitcoin.accounted_scripts.is_empty(), "{next:?}");
+            assert!(state.bitcoin.unmatched_scripts.is_empty(), "{next:?}");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // The address-contract reuse check (PR #83 review, Must Fix 3)
+    // -----------------------------------------------------------------
+
+    /// Issue one invoice and answer its derivation with `derived(index)`,
+    /// leaving the reuse check pending. Returns the check's contract id.
+    fn invoice_awaiting_reuse_check(state: &mut AppState, index: u32) -> Vec<u8> {
+        state.issue_invoice(invoice()).expect("accepted");
+        let request_id = *state.pending_invoices.keys().next().expect("one entry");
+        state.on_bitcoin_delegate_response(address_answer(request_id, index));
+        assert!(
+            state.pending_signatures.is_empty(),
+            "nothing is signed before the address has been checked"
+        );
+        assert_eq!(state.address_reuse_checks.len(), 1);
+        state
+            .address_reuse_checks
+            .keys()
+            .next()
+            .cloned()
+            .expect("one check")
+    }
+
+    /// An address contract state holding one claim: a bridge's scan
+    /// watermark, which is what a registered-but-never-paid address holds.
+    /// Unsigned, because the reuse check reads presence, not validity.
+    fn a_used_address_state() -> Vec<u8> {
+        let bridge = freenet_bitcoin_common::BridgeId([7u8; 32]);
+        let mut state = freenet_bitcoin_common::BitcoinAddressStateV1::default();
+        state.claims.scanned.insert(
+            bridge,
+            freenet_bitcoin_common::SignedClaim {
+                body_cbor: vec![1, 2, 3],
+                bridge,
+                signature: vec![4, 5, 6],
+            },
+        );
+        freenet_bitcoin_common::to_cbor(&state).expect("encode")
+    }
+
+    /// **The reuse check.** The derived address's contract already holds a
+    /// claim, so the address was on an invoice before: nothing is signed, and
+    /// a fresh address is asked for in its place. When that one reads as
+    /// fresh, the invoice is signed with it.
+    #[test]
+    fn an_address_used_before_is_skipped_and_another_derived() {
+        let mut state = seller_with_a_store();
+        let first = invoice_awaiting_reuse_check(&mut state, 0);
+
+        state.on_contract_state(first, a_used_address_state());
+        assert!(
+            state.pending_signatures.is_empty(),
+            "a used address was signed"
+        );
+        let (&retry_id, _) = state
+            .pending_invoices
+            .iter()
+            .next()
+            .expect("a fresh derivation for the same invoice");
+        assert_eq!(state.address_skips.get(&retry_id), Some(&1));
+
+        state.on_bitcoin_delegate_response(address_answer(retry_id, 1));
+        settle_reuse_checks_as_fresh(&mut state);
+        assert_eq!(
+            queued_order(&state).payment_script_pubkey,
+            derived(1).script_pubkey
+        );
+    }
+
+    /// A contract the node answers with no state, is absent, or does not
+    /// answer in time, is signed. Absence is the ordinary answer for a fresh
+    /// address; the timeout fails open, for the reason on
+    /// `on_address_reuse_timeout`.
+    #[test]
+    fn a_fresh_or_unanswered_address_is_signed() {
+        for settle in [
+            |s: &mut AppState, id: Vec<u8>| s.on_contract_state(id, Vec::new()),
+            |s: &mut AppState, id: Vec<u8>| s.on_address_reuse_absent(&id),
+            |s: &mut AppState, id: Vec<u8>| {
+                let request_id = s.address_reuse_checks[&id].request_id;
+                s.on_address_reuse_timeout(&id, request_id)
+            },
+        ] {
+            let mut state = seller_with_a_store();
+            let id = invoice_awaiting_reuse_check(&mut state, 0);
+            settle(&mut state, id);
+            assert_eq!(
+                queued_order(&state).payment_script_pubkey,
+                derived(0).script_pubkey
+            );
+            assert!(state.address_reuse_checks.is_empty());
+        }
+    }
+
+    /// **Round 3, Should Fix 5.** A timer left over from an earlier check on
+    /// the same address does not end a newer check early.
+    #[test]
+    fn a_stale_timer_does_not_end_a_newer_check_on_the_same_address() {
+        let mut state = seller_with_a_store();
+        let id = invoice_awaiting_reuse_check(&mut state, 0);
+        let first = state.address_reuse_checks[&id].request_id;
+        state.on_address_reuse_absent(&id);
+        // A second invoice handed the same address, checked afresh.
+        state.issue_invoice(invoice()).expect("accepted");
+        let second = *state.pending_invoices.keys().next().expect("one entry");
+        state.on_bitcoin_delegate_response(address_answer(second, 0));
+        assert_eq!(state.address_reuse_checks[&id].request_id, second);
+
+        state.on_address_reuse_timeout(&id, first);
+        assert!(
+            state.address_reuse_checks.contains_key(&id),
+            "the first check's timer ended the second check"
+        );
+        state.on_address_reuse_timeout(&id, second);
+        assert!(state.address_reuse_checks.is_empty());
+    }
+
+    /// A state that does not decode as an address contract's counts as used:
+    /// one skipped index is cheap, a reused address is not.
+    #[test]
+    fn an_undecodable_address_state_counts_as_used() {
+        let mut state = seller_with_a_store();
+        let id = invoice_awaiting_reuse_check(&mut state, 0);
+        state.on_contract_state(id, vec![0xff, 0x00, 0x13]);
+        assert!(state.pending_signatures.is_empty());
+        assert_eq!(
+            state.pending_invoices.len(),
+            1,
+            "a fresh derivation was asked for"
+        );
+    }
+
+    /// An address this node already watches, with claims, is skipped without
+    /// asking the network.
+    #[test]
+    fn an_address_already_watched_with_claims_is_skipped_at_once() {
+        let mut state = seller_with_a_store();
+        state.issue_invoice(invoice()).expect("accepted");
+        let request_id = *state.pending_invoices.keys().next().expect("one entry");
+        // Work out the contract id the order will name, and give the node a
+        // view of it holding a claim.
+        let probe = order_for_invoice(
+            &invoice(),
+            &derived(0),
+            Some(anchor(TIP_HEIGHT)),
+            chrono::Utc::now(),
+            &resolved_address_generation(),
+            None,
+        )
+        .expect("order");
+        let id = probe.bitcoin_address_instance_id().expect("names a build");
+        let used: freenet_bitcoin_common::BitcoinAddressStateV1 =
+            freenet_bitcoin_common::from_cbor(&a_used_address_state()).expect("decode");
+        state.bitcoin.addresses.insert(
+            id.to_vec(),
+            AddressView {
+                network: BitcoinNetwork::Signet,
+                claims: used.claims.scanned.values().cloned().collect(),
+                scanned_to: None,
+                confirmed_sats: 0,
+                pending_sats: 0,
+                txs: Vec::new(),
+            },
+        );
+
+        state.on_bitcoin_delegate_response(address_answer(request_id, 0));
+        assert!(
+            state.address_reuse_checks.is_empty(),
+            "the network was asked needlessly"
+        );
+        assert!(state.pending_signatures.is_empty());
+        assert_eq!(
+            state.pending_invoices.len(),
+            1,
+            "a fresh derivation was asked for"
+        );
+    }
+
+    /// **Which orders are ambiguous.** Any other own, uncancelled order on the
+    /// same address and network whose window overlaps, whatever its status.
+    /// Windows overlap exactly when the later anchor is less than a window
+    /// after the earlier; a partial overlap counts. A stranger's store flags
+    /// nothing. `another_own_order_window_holds` reads the same map.
+    #[test]
+    fn an_order_is_ambiguous_with_any_overlapping_uncancelled_own_twin() {
+        use harvest_common::payment::{OrderStatus, PAYMENT_WINDOW_BLOCKS};
+        fn anchored(height: u32, amount: u64) -> harvest_common::payment::AuthorizedOrder {
+            let mut record = with_script(&[0x00, 0x14, 1]);
+            record.order.anchor = Some(anchor(height));
+            record.order.amount_sats = amount;
+            record.order = record.order.with_derived_id();
+            record
+        }
+        fn twins_of(
+            a: &harvest_common::payment::AuthorizedOrder,
+            b: harvest_common::payment::AuthorizedOrder,
+            elsewhere: bool,
+        ) -> Option<Vec<harvest_common::payment::OrderId>> {
+            let mut state = seller_with_a_store();
+            let store = if elsewhere {
+                vec![0x77; 32]
+            } else {
+                STORE_ID.to_vec()
+            };
+            state
+                .browsing_stores
+                .get_mut(STORE_ID.as_slice())
+                .expect("store")
+                .orders = vec![a.clone()];
+            state
+                .browsing_stores
+                .entry(store)
+                .or_default()
+                .orders
+                .push(b);
+            state.refresh_same_address_orders();
+            match state.settlement_hold(&a.order) {
+                Some(SettlementHold::Twins(twins)) => {
+                    Some(twins.into_iter().map(|t| t.id).collect())
+                }
+                _ => None,
+            }
+        }
+        let a = anchored(100, 1);
+        let late = anchored(100 + PAYMENT_WINDOW_BLOCKS - 1, 2);
+        let twins = Some(vec![late.order.id.clone()]);
+        assert_eq!(
+            twins_of(&a, late.clone(), false),
+            twins,
+            "a partial overlap"
+        );
+        assert_eq!(
+            twins_of(&a, anchored(100 + PAYMENT_WINDOW_BLOCKS, 2), false),
+            None
+        );
+
+        let mut paid = late.clone();
+        paid.status = OrderStatus::Paid;
+        assert_eq!(twins_of(&a, paid, false), twins, "a paid twin counts");
+        let mut cancelled = late.clone();
+        cancelled.status = OrderStatus::Cancelled;
+        assert_eq!(twins_of(&a, cancelled, false), None, "a cancelled twin");
+        let mut other_net = late.clone();
+        other_net.order.network = BitcoinNetwork::Testnet4;
+        other_net.order = other_net.order.with_derived_id();
+        assert_eq!(twins_of(&a, other_net, false), None, "another network");
+        assert_eq!(twins_of(&a, late.clone(), true), None, "a stranger's store");
+
+        // `another_own_order_window_holds`, by height, from the same map.
+        let mut state = seller_with_a_store();
+        let apart = anchored(100 + PAYMENT_WINDOW_BLOCKS, 2);
+        let mut unrelated = with_script(&[0x00, 0x14, 9]);
+        unrelated.order.anchor = Some(anchor(100 + PAYMENT_WINDOW_BLOCKS));
+        unrelated.order = unrelated.order.with_derived_id();
+        state
+            .browsing_stores
+            .get_mut(STORE_ID.as_slice())
+            .expect("store")
+            .orders = vec![a.clone(), apart, unrelated];
+        state.refresh_same_address_orders();
+        let apart_id = state.browsing_stores[STORE_ID.as_slice()].orders[1]
+            .order
+            .id
+            .clone();
+        assert_eq!(
+            state.orders_whose_window_holds(&a.order.id, &[150, 100 + PAYMENT_WINDOW_BLOCKS + 1]),
+            vec![apart_id],
+            "only the same-address order whose window holds a height is named"
+        );
+        assert!(state
+            .orders_whose_window_holds(&a.order.id, &[150])
+            .is_empty());
+        assert!(state
+            .orders_whose_window_holds(&a.order.id, &[100 + 3 * PAYMENT_WINDOW_BLOCKS])
+            .is_empty());
+    }
+
+    /// **Round 2, Should Fix 6.** Two invoices handed the same address: the
+    /// second does not replace the first's check, it is skipped.
+    #[test]
+    fn a_second_invoice_on_an_address_already_being_checked_is_skipped() {
+        let mut state = seller_with_a_store();
+        state.issue_invoice(invoice()).expect("accepted");
+        state.issue_invoice(invoice()).expect("accepted");
+        let ids: Vec<u64> = state.pending_invoices.keys().copied().collect();
+        state.on_bitcoin_delegate_response(address_answer(ids[0], 0));
+        state.on_bitcoin_delegate_response(address_answer(ids[1], 0));
+        assert_eq!(state.address_reuse_checks.len(), 1);
+        let (&retry_id, _) = state.pending_invoices.iter().next().expect("a retry");
+        assert_eq!(state.address_skips.get(&retry_id), Some(&1));
+    }
+
+    /// **Round 2, Should Fix 6: the skip-limit boundary.** One short of the
+    /// limit still derives again; the limit itself gives up.
+    #[test]
+    fn one_short_of_the_skip_limit_still_derives_again() {
+        let mut state = seller_with_a_store();
+        state.issue_invoice(invoice()).expect("accepted");
+        let request_id = *state.pending_invoices.keys().next().expect("one entry");
+        state
+            .address_skips
+            .insert(request_id, MAX_REUSED_ADDRESS_SKIPS - 1);
+        state.on_bitcoin_delegate_response(address_answer(request_id, 0));
+        let id = state
+            .address_reuse_checks
+            .keys()
+            .next()
+            .cloned()
+            .expect("check");
+        state.on_contract_state(id, a_used_address_state());
+        let (&retry_id, _) = state.pending_invoices.iter().next().expect("derived again");
+        assert_eq!(
+            state.address_skips.get(&retry_id),
+            Some(&MAX_REUSED_ADDRESS_SKIPS)
+        );
+    }
+
+    /// **Round 2, Should Fix 6.** A refused derivation drops the skip count
+    /// and in-flight scripts held for it, not only the invoice.
+    #[test]
+    fn a_refused_derivation_forgets_everything_held_for_it() {
+        let mut state = seller_with_a_store();
+        state.issue_invoice(invoice()).expect("accepted");
+        let request_id = *state.pending_invoices.keys().next().expect("one entry");
+        state.address_skips.insert(request_id, 3);
+        let _ = state.order_address_request(request_id);
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::OrderAddress {
+            request_id,
+            result: Err("refused".into()),
+            matched_scripts: Vec::new(),
+        });
+        assert!(state.pending_invoices.is_empty());
+        assert!(state.address_skips.is_empty());
+        assert!(state.bitcoin.scripts_in_flight.is_empty());
+    }
+
+    /// A long run of used addresses stops rather than burning indices
+    /// forever, and says so.
+    #[test]
+    fn a_long_run_of_used_addresses_gives_up_and_says_so() {
+        let mut state = seller_with_a_store();
+        state.issue_invoice(invoice()).expect("accepted");
+        let request_id = *state.pending_invoices.keys().next().expect("one entry");
+        state
+            .address_skips
+            .insert(request_id, MAX_REUSED_ADDRESS_SKIPS);
+        state.on_bitcoin_delegate_response(address_answer(request_id, 0));
+        let id = state
+            .address_reuse_checks
+            .keys()
+            .next()
+            .cloned()
+            .expect("check");
+
+        state.on_contract_state(id, a_used_address_state());
+        assert!(state.pending_invoices.is_empty(), "it kept deriving");
+        assert!(state.pending_signatures.is_empty());
+        assert!(
+            state
+                .notifications
+                .iter()
+                .any(|n| n.contains("had all been used before")),
+            "the seller was not told: {:?}",
+            state.notifications
         );
     }
 
@@ -8323,6 +9761,7 @@ mod invoice_tests {
         state.issue_invoice(invoice()).expect("accepted");
         let request_id = *state.pending_invoices.keys().next().expect("one entry");
         state.on_bitcoin_delegate_response(address_answer(request_id, 0));
+        settle_reuse_checks_as_fresh(&mut state);
 
         assert!(
             state.pending_signatures.is_empty(),
@@ -8368,6 +9807,7 @@ mod invoice_tests {
             state.issue_invoice(invoice()).expect("accepted");
             let request_id = *state.pending_invoices.keys().next().expect("one entry");
             state.on_bitcoin_delegate_response(address_answer(request_id, 0));
+            settle_reuse_checks_as_fresh(&mut state);
 
             assert!(
                 state.pending_signatures.is_empty(),
@@ -8501,6 +9941,7 @@ mod invoice_tests {
         state.issue_invoice(answering).expect("accepted");
         let request_id = *state.pending_invoices.keys().next().expect("one entry");
         state.on_bitcoin_delegate_response(address_answer(request_id, 3));
+        settle_reuse_checks_as_fresh(&mut state);
 
         assert_eq!(
             queued_order(&state).listing_tag,
@@ -8536,6 +9977,7 @@ mod invoice_tests {
         // to work -- and answering the LATER one first is what distinguishes
         // a real lookup from "take whichever invoice is at hand".
         state.on_bitcoin_delegate_response(address_answer(second_id, 5));
+        settle_reuse_checks_as_fresh(&mut state);
 
         let order = queued_order(&state);
         assert_eq!(order.amount_sats, 20_000);
@@ -8548,6 +9990,7 @@ mod invoice_tests {
 
         // And the one left behind gets its OWN address, not the leftover.
         state.on_bitcoin_delegate_response(address_answer(first_id, 9));
+        settle_reuse_checks_as_fresh(&mut state);
         let both: Vec<(String, String)> = state
             .pending_signatures
             .iter()
@@ -8579,6 +10022,7 @@ mod invoice_tests {
         let waiting = *state.pending_invoices.keys().next().expect("one entry");
 
         state.on_bitcoin_delegate_response(address_answer(waiting + 1000, 0));
+        settle_reuse_checks_as_fresh(&mut state);
 
         assert!(state.pending_invoices.contains_key(&waiting));
         assert!(
@@ -8598,6 +10042,7 @@ mod invoice_tests {
         state.on_bitcoin_delegate_response(BitcoinDelegateResponse::OrderAddress {
             request_id: waiting,
             result: Err("no payment key is set".to_string()),
+            matched_scripts: Vec::new(),
         });
 
         assert!(state.pending_invoices.is_empty());
@@ -8628,6 +10073,7 @@ mod invoice_tests {
         state.issue_invoice(invoice()).expect("accepted");
         let waiting = *state.pending_invoices.keys().next().expect("one entry");
         state.on_bitcoin_delegate_response(address_answer(waiting, 0));
+        settle_reuse_checks_as_fresh(&mut state);
         assert_eq!(state.pending_signatures.len(), 2);
 
         let order_request = state
@@ -8726,6 +10172,7 @@ mod invoice_tests {
                 network: BitcoinNetwork::Signet,
                 next_index: 4,
             }),
+            matched_scripts: Vec::new(),
         });
         assert_eq!(
             state.bitcoin.payment_xpub.as_ref().map(|s| s.next_index),
@@ -8760,7 +10207,9 @@ mod invoice_tests {
             .expect("two entries");
 
         state.on_bitcoin_delegate_response(address_answer(first_id, 0));
+        settle_reuse_checks_as_fresh(&mut state);
         state.on_bitcoin_delegate_response(address_answer(second_id, 1));
+        settle_reuse_checks_as_fresh(&mut state);
 
         let ids: Vec<_> = state
             .pending_signatures
@@ -8858,6 +10307,7 @@ mod invoice_tests {
         state.on_bitcoin_delegate_response(BitcoinDelegateResponse::PaymentXpubSet {
             request_id: 1,
             result: Err("that is a legacy account key (xpub/tpub)".to_string()),
+            matched_scripts: Vec::new(),
         });
 
         assert!(state.bitcoin.payment_xpub.is_none());
@@ -11717,6 +13167,7 @@ mod buy_flow_tests {
             .expect("seal the request");
 
         state.begin_browsing(STORE.to_vec());
+        super::invoice_tests::store_state_arrived(&mut state, STORE);
         let store = state.browsing_stores.get_mut(STORE).expect("the store");
         store.mailbox_contract_id = Some(vec![11u8; 32]);
         store.mailbox_messages = vec![request.clone()];
@@ -11819,7 +13270,9 @@ mod buy_flow_tests {
                 script_pubkey: vec![0x00, 0x14, 0x01],
                 address: "tb1qexample".to_string(),
             }),
+            matched_scripts: Vec::new(),
         });
+        super::invoice_tests::settle_reuse_checks_as_fresh(&mut state);
         let queued = match state.pending_signatures.front() {
             Some(PendingSignature::Order(order)) => order.clone(),
             other => panic!("expected an order awaiting signature, got {other:?}"),
@@ -12529,9 +13982,14 @@ mod buy_flow_tests {
             BlockHash, ClaimBody, SignedClaim, SignedTipEntry, TipEntryBody,
         };
 
+        // Anchored two blocks below the tip and paid in the block after
+        // that: the order has to exist BEFORE its payment, or
+        // `verify_on_chain_proof` refuses the payment as one made for
+        // something else (harvest#77). Still well inside
+        // `MAX_ANCHOR_AGE_BLOCKS`, so the buyer's own freshness check holds.
         let mut order = commitment(
             &seller_signing_key(),
-            Some(anchor(TIP_HEIGHT)),
+            Some(anchor(TIP_HEIGHT - 2)),
             OrderStatus::AwaitingPayment,
         );
         order.order.trusted_bridges = vec![freenet_bitcoin_common::BridgeId(
@@ -12677,6 +14135,257 @@ mod buy_flow_tests {
             .expect("a settled order must verify as Paid");
     }
 
+    /// This seller's store, loaded, holding a provable payment for `order`,
+    /// plus `twin` (if any) on the same address with the given status.
+    fn seller_holding_a_paid_order(
+        twin_status: Option<OrderStatus>,
+    ) -> (AppState, AuthorizedOrder) {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+        state.my_stores.insert(
+            "seller-fp".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+            }],
+        );
+        super::invoice_tests::store_state_arrived(&mut state, STORE);
+        if let Some(status) = twin_status {
+            let mut twin = order.clone();
+            twin.order.amount_sats += 1;
+            let mut twin = resigned(twin, &seller_signing_key());
+            twin.status = status;
+            state
+                .browsing_stores
+                .get_mut(STORE)
+                .expect("store")
+                .orders
+                .push(twin);
+        }
+        state.refresh_same_address_orders();
+        (state, order)
+    }
+
+    /// **PR #83 round 4.** With no twin and every owned store loaded, a
+    /// provable payment is published on its own.
+    #[test]
+    fn an_unambiguous_payment_is_auto_published() {
+        let (mut state, order) = seller_holding_a_paid_order(None);
+        let published = state.publish_settled_orders(STORE);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].order.id, order.order.id);
+        assert!(state.withheld_settlements.is_empty());
+    }
+
+    /// **Round 4, blocking.** A twin on the same address with an overlapping
+    /// window -- a PAID one included, since its payment may be the very one
+    /// proving this order, and an abandoned one awaiting payment forever --
+    /// means nothing is auto-published. The seller's "Confirm paid" then
+    /// publishes exactly the proof that was assembled, and it verifies, so no
+    /// case is left stuck. A cancelled twin does not count.
+    #[test]
+    fn a_twin_withholds_the_settlement_and_the_seller_can_confirm_it() {
+        for twin in [OrderStatus::Paid, OrderStatus::AwaitingPayment] {
+            let (mut state, order) = seller_holding_a_paid_order(Some(twin));
+            let assembled = state
+                .settled_orders(STORE)
+                .into_iter()
+                .find(|r| r.order.id == order.order.id)
+                .expect("the proof assembles");
+            assert!(
+                state
+                    .publish_settled_orders(STORE)
+                    .iter()
+                    .all(|r| r.order.id != order.order.id),
+                "one payment was auto-published for an order with a {twin:?} twin"
+            );
+            assert!(matches!(
+                state.settlement_hold(&order.order),
+                Some(SettlementHold::Twins(_))
+            ));
+
+            let confirmed = state
+                .confirm_paid(&order.order.id)
+                .expect("confirm publishes");
+            assert_eq!(confirmed, assembled);
+            confirmed
+                .verify(&seller_signing_key().verifying_key())
+                .expect("the confirmed record verifies as Paid");
+        }
+
+        let (mut state, _) = seller_holding_a_paid_order(Some(OrderStatus::Cancelled));
+        assert_eq!(
+            state.publish_settled_orders(STORE).len(),
+            1,
+            "a cancelled twin counted"
+        );
+    }
+
+    /// **Round 4.** An owned store that has not loaded could hold a twin, so
+    /// nothing is auto-published until it has; the seller can still confirm.
+    #[test]
+    fn an_owned_store_not_loaded_withholds_the_settlement() {
+        let (mut state, order) = seller_holding_a_paid_order(None);
+        state.my_stores.insert(
+            "another-ghost-key".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: vec![0x5e; 32],
+                reputation_contract_id: vec![12u8; 32],
+                mailbox_contract_id: vec![13u8; 32],
+                store_contract_key: None,
+            }],
+        );
+        assert!(state.publish_settled_orders(STORE).is_empty());
+        match state.settlement_hold(&order.order) {
+            Some(SettlementHold::StoresNotLoaded(what)) => {
+                assert_eq!(what.len(), 1, "{what:?}");
+            }
+            other => panic!("expected StoresNotLoaded, got {other:?}"),
+        }
+        assert!(state.confirm_paid(&order.order.id).is_some());
+    }
+
+    /// **Round 5, Should Fix 1.** The copy above "Confirm paid" gives this
+    /// invoice's amount, the confirmed value in its window, and each twin's
+    /// amount and status with a Paid twin marked.
+    #[test]
+    fn the_confirm_copy_names_the_amounts_and_a_paid_twin() {
+        let (state, order) = seller_holding_a_paid_order(Some(OrderStatus::Paid));
+        let hold = state.settlement_hold(&order.order).expect("held");
+        let text = hold.explain(order.order.amount_sats, 1234);
+        assert!(
+            text.contains(&format!("{} sats", order.order.amount_sats)),
+            "{text}"
+        );
+        assert!(text.contains("1234 sats confirmed"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "{} sats (ALREADY PAID)",
+                order.order.amount_sats + 1
+            )),
+            "{text}"
+        );
+    }
+
+    /// **Round 5, Should Fix 2 and 4.** A Ghost Key the vault lists whose
+    /// store list has not been answered holds settlements, named; when the
+    /// answer arrives, every withheld store is published again at once.
+    #[test]
+    fn an_unanswered_store_list_holds_until_it_arrives_then_publishes() {
+        let (mut state, order) = seller_holding_a_paid_order(None);
+        state.ghostkeys.push(ghostkey_common::GhostKeyInfo {
+            fingerprint: "seller-fp".to_string(),
+            label: None,
+            notary_info: String::new(),
+            verifying_key_bytes: None,
+            backed_up: false,
+        });
+        assert!(state.publish_settled_orders(STORE).is_empty());
+        match state.settlement_hold(&order.order) {
+            Some(SettlementHold::StoresNotLoaded(what)) => {
+                assert!(what[0].contains("seller-fp"), "{what:?}")
+            }
+            other => panic!("expected StoresNotLoaded, got {other:?}"),
+        }
+
+        state.on_delegate_response(HarvestDelegateResponse::StoreList {
+            ghostkey_fingerprint: "seller-fp".to_string(),
+            stores: Vec::new(),
+        });
+        assert!(
+            state.settlements_submitted.contains(&order.order.id),
+            "the hold cleared and nothing published it"
+        );
+        assert!(state.withheld_settlements.is_empty());
+    }
+
+    /// **Final re-check, Low 1.** A twin this tab has confirmed but whose
+    /// Paid record has not come back is shown as confirmed, not as awaiting
+    /// payment, so the seller is not invited to confirm this one on the same
+    /// payment.
+    #[test]
+    fn a_twin_confirmed_here_is_labelled_as_such() {
+        let (mut state, order) = seller_holding_a_paid_order(Some(OrderStatus::AwaitingPayment));
+        let twin_id = state.browsing_stores[STORE].orders[1].order.id.clone();
+        state.settlements_submitted.insert(twin_id);
+        let text = state
+            .settlement_hold(&order.order)
+            .expect("held")
+            .explain(order.order.amount_sats, 0);
+        assert!(text.contains("confirmed by you, publishing"), "{text}");
+        assert!(!text.contains("awaiting payment"), "{text}");
+    }
+
+    /// **Final re-check, Low 2.** A store-list request that failed to send
+    /// is named as failed, with how to retry, not left as a wait.
+    #[test]
+    fn a_failed_store_list_request_says_so() {
+        let (mut state, order) = seller_holding_a_paid_order(None);
+        state.ghostkeys.push(ghostkey_common::GhostKeyInfo {
+            fingerprint: "seller-fp".to_string(),
+            label: None,
+            notary_info: String::new(),
+            verifying_key_bytes: None,
+            backed_up: false,
+        });
+        state.store_list_failed.insert("seller-fp".to_string());
+        match state.settlement_hold(&order.order) {
+            Some(SettlementHold::StoresNotLoaded(what)) => {
+                assert!(what[0].contains("request failed"), "{what:?}");
+                assert!(what[0].contains("reloading"), "{what:?}");
+            }
+            other => panic!("expected StoresNotLoaded, got {other:?}"),
+        }
+    }
+
+    /// **Round 5, Should Fix 3.** A store the node gave up on still holds
+    /// settlements, and is named as not answering rather than left as a wait.
+    #[test]
+    fn a_store_that_did_not_answer_is_named() {
+        let (mut state, order) = seller_holding_a_paid_order(None);
+        state
+            .my_stores
+            .get_mut("seller-fp")
+            .expect("seller")
+            .push(StoreRegistration {
+                store_contract_id: vec![0x5e; 32],
+                reputation_contract_id: vec![12u8; 32],
+                mailbox_contract_id: vec![13u8; 32],
+                store_contract_key: None,
+            });
+        state.store_state_unavailable.insert(vec![0x5e; 32]);
+        match state.settlement_hold(&order.order) {
+            Some(SettlementHold::StoresNotLoaded(what)) => {
+                assert!(what[0].contains("did not answer"), "{what:?}")
+            }
+            other => panic!("expected StoresNotLoaded, got {other:?}"),
+        }
+    }
+
+    /// **Round 5, Should Fix 5, and Consider.** A confirmed settlement is not
+    /// offered again by the next publish run; and withheld entries for a
+    /// store that migrated away are dropped.
+    #[test]
+    fn a_confirmed_settlement_is_not_offered_again_and_migration_drops_entries() {
+        let (mut state, order) = seller_holding_a_paid_order(Some(OrderStatus::AwaitingPayment));
+        state.publish_settled_orders(STORE);
+        assert!(state.confirm_paid(&order.order.id).is_some());
+        state.publish_settled_orders(STORE);
+        assert!(
+            !state.withheld_settlements.contains_key(&order.order.id),
+            "Confirm paid came back after it was sent"
+        );
+
+        let (mut state, order) = seller_holding_a_paid_order(Some(OrderStatus::AwaitingPayment));
+        state.publish_settled_orders(STORE);
+        assert!(state.withheld_settlements.contains_key(&order.order.id));
+        state.adopt_migrated_contract_id(STORE, vec![0x99; 32]);
+        assert!(state.withheld_settlements.is_empty());
+    }
+
     /// **An order whose payment has not confirmed is not settled.**
     ///
     /// Two cases, and the second is the one that would otherwise go
@@ -12691,6 +14400,29 @@ mod buy_flow_tests {
     /// Publishing `Paid` on evidence that does not carry it is a state every
     /// peer refuses, which on the buyer's screen looks like the payment
     /// never registering.
+    /// **harvest#77, through the state that publishes.** The same payment
+    /// that settles [`a_paid_order`] does not settle an order signed AFTER it
+    /// confirmed, which is what an address issued twice looks like from here:
+    /// the node holds genuine, verifying claims of the full amount at the
+    /// order's own script, and they are for something else.
+    #[test]
+    fn a_payment_older_than_the_order_does_not_settle_it() {
+        let (paid, claims, tip) = a_paid_order();
+        // The payment confirmed at TIP_HEIGHT - 1; this order was signed at
+        // the tip, one block later, on the same address.
+        let mut later = paid.clone();
+        later.order.anchor = Some(anchor(TIP_HEIGHT));
+        let later = resigned(later, &seller_signing_key());
+
+        let (mut state, _) = buyer_after_acceptance(&later);
+        give_the_node_the_chain(&mut state, &later, claims, tip);
+
+        assert!(
+            state.settled_orders(STORE).is_empty(),
+            "a payment that confirmed before the order was signed settled it"
+        );
+    }
+
     #[test]
     fn an_unpaid_order_is_not_settled() {
         let (order, claims, tip) = a_paid_order();
@@ -12876,6 +14608,9 @@ mod buy_flow_tests {
             .get_mut(STORE)
             .expect("the store")
             .orders = vec![order.clone()];
+        // Read from the network, so its settlements are not withheld for a
+        // store that has not loaded (`settlement_hold`).
+        super::invoice_tests::store_state_arrived(&mut state, STORE);
         state
             .bitcoin
             .tips

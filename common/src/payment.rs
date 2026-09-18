@@ -302,6 +302,38 @@ const _: () = assert!(
     "the freshness tolerance must fit inside the tip contract's retained window"
 );
 
+/// How long after an order's anchor a buyer's payment may take to confirm and
+/// still be this order's payment, beyond the time the buyer has to send it.
+///
+/// Two weeks of blocks, Bitcoin Core's default mempool expiry
+/// (`-mempoolexpiry=336` hours): a transaction still unconfirmed after that is
+/// dropped from default mempools. That is not the end of it -- wallets
+/// rebroadcast, and a fee bump can revive it -- so this is a chosen bound, not
+/// a natural one: past it, a payment that finally confirms is left for the
+/// two parties to settle between themselves rather than proven here. A low-fee payment during
+/// congestion can genuinely take days, and a payment refused for landing
+/// late is the buyer's money arriving with nothing on the public record to
+/// say so, which is why this is generous rather than tight.
+pub const PAYMENT_CONFIRMATION_SLACK_BLOCKS: u32 = 2016;
+
+/// How many blocks after an order's anchor a payment may confirm and still
+/// settle it: see [`Order::payment_window`].
+///
+/// [`MAX_ANCHOR_AGE_BLOCKS`] is how long a buyer will still SEND to the order
+/// (their software refuses older anchors), and
+/// [`PAYMENT_CONFIRMATION_SLACK_BLOCKS`] is how long a payment sent at the
+/// last moment may take to confirm.
+///
+/// # What it costs, stated plainly
+///
+/// The window is also the span over which a REUSED address is dangerous: two
+/// orders on one address whose anchors are closer than this can both be
+/// settled by one payment that confirms inside both windows (harvest#83
+/// review, Must Fix 1). Narrowing it shrinks that span and strands more
+/// honest late payments; the address recovery and the address-contract check
+/// in the UI are what make reuse rare enough to take the generous side.
+pub const PAYMENT_WINDOW_BLOCKS: u32 = MAX_ANCHOR_AGE_BLOCKS + PAYMENT_CONFIRMATION_SLACK_BLOCKS;
+
 /// The immutable terms of an order, as agreed and published by the seller.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Order {
@@ -423,6 +455,15 @@ pub struct Order {
     /// See `harvest_ui::state::AppState::payment_blockers`. This field
     /// carries the fact; the verdict is not a contract's to form.
     ///
+    /// # The one thing the contract DOES use it for
+    ///
+    /// A comparison between two heights, which needs no clock: a payment that
+    /// confirmed at or below this block was made before the order, so it does
+    /// not settle it (harvest#77, and `verify_on_chain_proof`). Backdating the
+    /// anchor only widens what the SELLER's own order accepts, so the seller
+    /// has no reason to; the rule protects the seller from their own address
+    /// being issued twice, not the buyer from the seller.
+    ///
     /// # Why `Option`, and why it skips when absent
     ///
     /// `None` for every order signed before this field existed.
@@ -435,7 +476,8 @@ pub struct Order {
     /// which was observed red against the naive `#[serde(default)]`-only
     /// form.
     ///
-    /// A buyer refuses to pay an order with no anchor, so absence is the safe
+    /// A buyer refuses to pay an order with no anchor, and an on-chain proof
+    /// for one is refused (`ProofError::NoAnchor`), so absence is the safe
     /// direction rather than a silent downgrade.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<BlockAnchor>,
@@ -501,6 +543,41 @@ impl Order {
     pub fn with_derived_id(mut self) -> Self {
         self.id = OrderId::from_terms(&self);
         self
+    }
+
+    /// The block heights at which a confirmation can be this order's payment:
+    /// strictly after the anchor, and at most [`PAYMENT_WINDOW_BLOCKS`] after
+    /// it. `None` for an order with no anchor, which no on-chain payment can
+    /// settle.
+    ///
+    /// # Why each edge is where it is
+    ///
+    /// **The lower edge excludes the anchor block itself.** The seller signs
+    /// only after seeing the anchor block, and the buyer learns the address
+    /// only from the signed order, so an honest payment confirms at
+    /// `anchor + 1` at the earliest; anything at or below the anchor was
+    /// broadcast before the order existed and paid for something else. That
+    /// is harvest#77: a reissued address already held an old invoice's
+    /// confirmed payment. The one honest payment this refuses needs a reorg
+    /// that replaces the anchor block with one carrying the buyer's
+    /// transaction; the order then names a block no longer on the chain. That
+    /// buyer HAS paid, so refusing strands their payment rather than merely
+    /// costing a reissue, and it is accepted only because it needs a reorg at
+    /// exactly the anchor height within minutes of the order.
+    ///
+    /// **The upper edge exists so one payment cannot settle two orders.**
+    /// Without it, an OLDER order on a reused address would be settled by the
+    /// NEWER order's payment, since that payment also confirmed after the old
+    /// order's anchor. A per-order bound is the merge-safe way to say this: a
+    /// rule across orders ("no outpoint settles two") would let two peer
+    /// states that are each valid become invalid when merged, and a `Paid`
+    /// record cannot be demoted under the max-rank merge.
+    ///
+    /// Used by the verifier and by the UI's own reading of an address, so the
+    /// card a seller reads and the rule that settles the order agree.
+    pub fn payment_window(&self) -> Option<std::ops::RangeInclusive<u32>> {
+        let anchor = self.anchor?.height;
+        Some(anchor.saturating_add(1)..=anchor.saturating_add(PAYMENT_WINDOW_BLOCKS))
     }
 
     /// The instance id of the `BitcoinAddressContract` that observes this
@@ -749,6 +826,27 @@ pub enum ProofError {
         have_bytes: usize,
         budget: usize,
     },
+    /// An on-chain order with no [`Order::anchor`]: nothing says when it was
+    /// made, so no payment can be shown to have come after it.
+    NoAnchor,
+    /// The value that reached the script confirmed in a block at or below
+    /// the order's anchor, i.e. before the order existed. See
+    /// [`verify_on_chain_proof`] for why that payment cannot be this order's.
+    PaymentPredatesOrder {
+        /// The highest block height, among the refused outpoints, at which
+        /// one of them confirmed.
+        confirmed_at: u32,
+        order_anchor: u32,
+    },
+    /// The value that reached the script confirmed after the order's payment
+    /// window closed ([`Order::payment_window`]), so it is not taken as this
+    /// order's payment.
+    PaymentAfterWindow {
+        /// The lowest block height, among the refused outpoints, at which one
+        /// of them confirmed.
+        confirmed_at: u32,
+        window_end: u32,
+    },
 }
 
 impl std::fmt::Display for ProofError {
@@ -798,6 +896,28 @@ impl std::fmt::Display for ProofError {
                     "payment evidence is {have_bytes} bytes, budget is {budget}"
                 )
             }
+            ProofError::NoAnchor => write!(
+                f,
+                "the order names no Bitcoin block it was made at, so no payment can be shown \
+                 to have come after it"
+            ),
+            ProofError::PaymentPredatesOrder {
+                confirmed_at,
+                order_anchor,
+            } => write!(
+                f,
+                "the payment at this address confirmed in block {confirmed_at}, at or before \
+                 block {order_anchor} when this order was made, so it paid for something else"
+            ),
+            ProofError::PaymentAfterWindow {
+                confirmed_at,
+                window_end,
+            } => write!(
+                f,
+                "the payment at this address confirmed in block {confirmed_at}, after this \
+                 order's payment window closed at block {window_end}, so it is not taken as \
+                 this order's payment"
+            ),
         }
     }
 }
@@ -991,6 +1111,13 @@ fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u
     if order.trusted_bridges.is_empty() {
         return Err(ProofError::NoTrustedBridges);
     }
+    // The block the seller signed this order at. Required, because the
+    // payment window in the fold below has nothing to measure against without
+    // it. Fails closed: a buyer already refuses to pay an order with no
+    // anchor (`harvest_ui::state::AppState::payment_blockers`), and every
+    // order the UI issues carries one (`order_for_invoice` refuses to build
+    // one without), so the only orders this refuses are ones nobody would pay.
+    let order_anchor_height = order.anchor.ok_or(ProofError::NoAnchor)?.height;
 
     // Bound the work BEFORE doing any crypto at all -- see
     // `MAX_PROOF_CLAIM_BYTES` and `MAX_PROOF_CLAIMS` for what each bounds and
@@ -1077,15 +1204,63 @@ fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u
     // CONFIRMED by it. A retraction of something never confirmed -- a dust
     // sighting, an evicted mempool transaction -- reverses nothing.
     let mut retracted_a_confirmed_outpoint = false;
+    // The heights among outpoints refused below for confirming outside this
+    // order's window, kept only so the error can say what happened.
+    let mut predating: Option<u32> = None;
+    let mut too_late: Option<u32> = None;
+    // Checked for `Some` at the top of this function; the window exists.
+    let window = order.payment_window().ok_or(ProofError::NoAnchor)?;
 
     for claims in by_outpoint.values() {
-        // The value the proof attests this outpoint once held, if it holds a
-        // confirmation for it at all. Taking the minimum across duplicates is
-        // the conservative direction for a value that will be used to ADMIT a
-        // reversal; in practice the choice is moot, because `SignedClaim::
-        // verify` checks each `ConfirmedOutput` against an SPV proof binding
-        // `value_sats` to that exact txid and vout, so two verified
-        // confirmations of one outpoint cannot disagree about the value.
+        // # Only a payment that confirmed inside the order's window is its payment
+        //
+        // A payment's evidence is scoped to a SCRIPT, not to an order, so
+        // whatever has ever been paid to this order's address is presented
+        // here as if it were for this order. Normally each order has a fresh
+        // address and that is the same thing. It stops being the same thing
+        // the moment an address is issued twice -- which a seller reinstalling
+        // Harvest and re-entering the same wallet key used to do from index 0
+        // (harvest#77): the new invoice named an address that already held a
+        // confirmed payment for an old one, and settled itself with nobody
+        // paying anything. See [`Order::payment_window`] for the two edges of
+        // the window and why each is where it is.
+        //
+        // An outpoint outside the window is dropped from this order's fold
+        // entirely: it adds nothing to what was paid, and -- because
+        // `ever_confirmed` below counts only in-window confirmations -- a
+        // later retraction of it cannot read as this order's payment being
+        // reversed either.
+        //
+        // ## Judged by the fold's WINNING confirmation, not by every one
+        //
+        // An outpoint's claims can disagree about where it confirmed: a
+        // bridge that briefly followed a stale fork, or a reorg that re-mined
+        // the transaction at another height. The fold already decides which
+        // claim is current (`fold_outpoint_status`), and the window is
+        // applied to that one. An earlier version refused an outpoint if ANY
+        // of its confirmations fell at or below the anchor. That let a single
+        // stale-fork claim veto an honest payment forever (claims are
+        // grow-only, and `assemble_on_chain_proof` has to include them all),
+        // while protecting nothing against a dishonest submitter, who can
+        // simply leave the stale claim out of an unsigned proof. What this
+        // concedes is a transaction that confirmed before the order, was
+        // reorged out, and was re-mined inside the window: a reorg deep
+        // enough to cross an order's anchor, landing on a reused address.
+        //
+        // ## What the window does NOT bound
+        //
+        // The anchor is a lower bound on when the order was made, set by the
+        // seller's own view of the tip. A tip that lags reality makes the
+        // anchor older than the order, so a payment that confirmed inside that
+        // lag still reads as after it; a buyer refuses anchors more than
+        // [`MAX_ANCHOR_AGE_BLOCKS`] behind, which caps that but does not close
+        // it. A payment broadcast before the order but still unconfirmed when
+        // it was made confirms inside the window and is counted. And two
+        // orders on one address whose windows overlap can both be settled by
+        // one payment that lands in the overlap. All three need an address
+        // issued twice, which is why the UI also recovers its derivation index
+        // and checks the address contract before publishing; this rule is the
+        // backstop, not a substitute for not reusing addresses.
         let ever_confirmed: Option<u64> = claims
             .iter()
             .filter_map(|b| match &b.claim {
@@ -1094,21 +1269,30 @@ fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u
                 // which gates whether a retraction reads as a REVERSAL, so a
                 // field added to `ConfirmedOutput` upstream must stop the
                 // build rather than arrive here unexamined.
+                //
+                // Only confirmations inside this order's window count as the
+                // order ever having been covered: a retracted payment that
+                // confirmed before the order was never this order's payment,
+                // so its retraction reverses nothing here.
                 Claim::ConfirmedOutput {
                     outpoint: _,
                     value_sats,
-                    anchor: _,
+                    anchor,
                     spv: _,
-                } => Some(*value_sats),
+                } if window.contains(&anchor.height) => Some(*value_sats),
                 _ => None,
             })
+            // The minimum is the conservative direction for a value that will
+            // be used to ADMIT a reversal; in practice moot, because
+            // `SignedClaim::verify` checks each `ConfirmedOutput` against an
+            // SPV proof binding `value_sats` to that exact txid and vout.
             .min();
         if let Some(v) = ever_confirmed {
             ever_confirmed_total = ever_confirmed_total.saturating_add(v);
         }
 
         match fold_outpoint_status(claims.iter()) {
-            // Destructured WITHOUT `..`, and both `_` bindings below are
+            // Destructured WITHOUT `..`, and the `_` binding below is
             // deliberate rather than lazy.
             //
             // No `..`, because that is the only reason the arrival of
@@ -1116,23 +1300,30 @@ fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u
             // here with E0027 instead of compiling and quietly declining a
             // security fix. A `..` would let the next field arrive silently.
             //
-            // `anchor` and `attested_depth` bound to `_` because the depth is
-            // computed by `confirmations_at`, which uses BOTH -- it caps the
-            // tip-derived count at the depth the BRIDGE attested inside its
-            // own signature. Do NOT read those underscores as "ignored", and
-            // do not re-derive the cap here: `confirmations(&anchor, tip)` is
-            // the uncapped observed depth, which grows with the chain, so a
-            // submitter presenting a pre-reorg confirmation against a fresh
-            // tip can make an assertion the bridge made at depth 1 read as
-            // arbitrarily deep. Computing the cap by hand would also be a
-            // second copy of a rule that belongs upstream.
+            // `attested_depth` is bound to `_` because the depth is computed
+            // by `confirmations_at`, which uses it together with `anchor` --
+            // it caps the tip-derived count at the depth the BRIDGE attested
+            // inside its own signature. Do not re-derive the cap here:
+            // `confirmations(&anchor, tip)` is the uncapped observed depth,
+            // which grows with the chain, so a submitter presenting a
+            // pre-reorg confirmation against a fresh tip can make an assertion
+            // the bridge made at depth 1 read as arbitrarily deep. `anchor`
+            // itself is read only for the window check.
             Some(
                 status @ OutpointStatus::Confirmed {
                     value_sats,
-                    anchor: _,
+                    anchor,
                     attested_depth: _,
                 },
             ) => {
+                if anchor.height < *window.start() {
+                    predating = Some(predating.map_or(anchor.height, |p| p.max(anchor.height)));
+                    continue;
+                }
+                if anchor.height > *window.end() {
+                    too_late = Some(too_late.map_or(anchor.height, |p| p.min(anchor.height)));
+                    continue;
+                }
                 let confs = status.confirmations_at(tip_height);
                 confirmed_total = confirmed_total.saturating_add(value_sats);
                 shallowest = Some(shallowest.map_or(confs, |s: u32| s.min(confs)));
@@ -1188,6 +1379,21 @@ fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u
         return Err(ProofError::Reversed);
     }
     if confirmed_total < order.amount_sats {
+        // Said as its own error when refusing an out-of-window payment is
+        // what left the order short, because "short of the amount" is not what a
+        // seller looking at a funded address needs to be told.
+        if let Some(confirmed_at) = predating {
+            return Err(ProofError::PaymentPredatesOrder {
+                confirmed_at,
+                order_anchor: order_anchor_height,
+            });
+        }
+        if let Some(confirmed_at) = too_late {
+            return Err(ProofError::PaymentAfterWindow {
+                confirmed_at,
+                window_end: *window.end(),
+            });
+        }
         return Err(ProofError::InsufficientValue {
             have_sats: confirmed_total,
             need_sats: order.amount_sats,
@@ -2219,7 +2425,12 @@ mod proof_assembly_tests {
             payment_hash: None,
             trusted_bridges: vec![BridgeId(bridge().verifying_key().to_bytes())],
             bitcoin_address_code_hash: Some([4u8; 32]),
-            anchor: None,
+            // One below the lowest height a fixture here confirms at, so each
+            // payment reads as made after its order (see `verify_on_chain_proof`).
+            anchor: Some(BlockAnchor {
+                height: 99,
+                hash: BlockHash([0x99; 32]),
+            }),
             order_binding: None,
             listing_tag: None,
             created_at,
