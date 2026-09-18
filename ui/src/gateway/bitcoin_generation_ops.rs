@@ -41,9 +41,18 @@ const REFRESH_EVERY_MS: u32 = 10 * 60_000;
 /// local work happens unless something is due.
 const WATCH_CHECK_EVERY_MS: u32 = 60_000;
 
+/// How often to look for an unsettled order's payment address that is due to
+/// be asked for again (#67).
+///
+/// The tick rate, not the ask rate: which addresses are actually due is
+/// `crate::address_reread`'s decision, and that is where this constant lives
+/// and is checked against the waits it has to keep up with.
+const ADDRESS_REREAD_CHECK_EVERY_MS: u32 = crate::address_reread::CHECK_EVERY_MS as u32;
+
 thread_local! {
     static GENERATIONS: RefCell<Option<BridgeGenerations>> = const { RefCell::new(None) };
     static WATCH_CHECK: RefCell<Option<gloo_timers::callback::Interval>> = const { RefCell::new(None) };
+    static ADDRESS_REREAD: RefCell<Option<gloo_timers::callback::Interval>> = const { RefCell::new(None) };
     static REFRESH: RefCell<Option<gloo_timers::callback::Interval>> = const { RefCell::new(None) };
     static FAILURES: RefCell<std::collections::HashMap<Resolve, u32>> = RefCell::new(Default::default());
 }
@@ -86,6 +95,33 @@ pub fn start() {
                 };
                 if could_act {
                     APP_STATE.write().send_due_watch_requests();
+                }
+            })
+        });
+    });
+    // Asking again for the payment address of an order still awaiting
+    // payment. A subscription's one answer can be stale for tens of minutes,
+    // and no repair was announced to the app in the case that prompted this,
+    // so asking again is how a healed node reaches the screen. See
+    // `crate::address_reread`, which says what is observed and what is
+    // inferred.
+    ADDRESS_REREAD.with(|timer| {
+        timer.borrow_mut().get_or_insert_with(|| {
+            gloo_timers::callback::Interval::new(ADDRESS_REREAD_CHECK_EVERY_MS, || {
+                // Decided under a READ, and the answer carried into the
+                // write. Taking the state for writing re-renders every
+                // component, and once the wait has widened most ticks have
+                // nothing to send -- so deciding under the write would
+                // repaint a buyer's screen every minute while an order is
+                // unpaid. Deciding here also means the walk happens once
+                // rather than once to ask and once to act.
+                let now = crate::state::now_ms();
+                let (wanted, due) = {
+                    use dioxus::prelude::ReadableExt;
+                    APP_STATE.peek().due_address_rereads(now)
+                };
+                if !due.is_empty() {
+                    APP_STATE.write().send_address_rereads(&wanted, &due, now);
                 }
             })
         });

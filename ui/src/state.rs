@@ -3,7 +3,7 @@
 //! Centralizes all reactive state so the response handler and UI components
 //! can read/write from a single source of truth.
 
-use dioxus::logger::tracing::{info, warn};
+use dioxus::logger::tracing::{debug, info, warn};
 use harvest_common::listing::AuthorizedListing;
 use harvest_common::mailbox::EncryptedMessage;
 use harvest_common::payment::AuthorizedOrder;
@@ -205,6 +205,12 @@ pub struct AppState {
     /// In-flight only. See [`AppState::publish_settled_orders`] for why it is
     /// deliberately not durable.
     pub settlements_submitted: HashSet<harvest_common::payment::OrderId>,
+    /// Orders whose failed settlement publish the seller has been told about.
+    ///
+    /// Separate from `settlements_submitted`, which is withdrawn on failure
+    /// so the publish is retried: the retry is silent, and this is what keeps
+    /// it silent. See [`AppState::settlement_publish_failed`].
+    pub settlement_failures_reported: HashSet<harvest_common::payment::OrderId>,
 
     /// `ForgetBuyerConversation` requests in flight, as request id -> the
     /// store and routing tag asked about.
@@ -403,7 +409,7 @@ fn request_certificate(fingerprint: String) {
 pub const WATCH_PAST_ANCHOR_BLOCKS: u32 = harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS + 144;
 
 /// Milliseconds since the Unix epoch by this machine's clock.
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)
 }
 
@@ -2957,6 +2963,56 @@ impl AppState {
         settled
     }
 
+    /// A settlement update that did not reach the node.
+    ///
+    /// Withdraws the record of having submitted it, so the settlement is
+    /// derived and sent again on the next address state to arrive -- which,
+    /// since the re-reads landed, is a few minutes away rather than never.
+    /// The submitted-set exists to stop one arrival publishing twice, not to
+    /// make a failed publish permanent: the payment is on chain and the
+    /// evidence is not going anywhere. Leaving it recorded is how a confirmed
+    /// payment could stay `AwaitingPayment` for a whole session, which is
+    /// #67's own shape one step further down the path, where the re-read
+    /// loop cannot reach it.
+    ///
+    /// A method rather than three lines inside the spawned task so it can be
+    /// tested: everything in that task is wasm-only, and a native test cannot
+    /// reach it.
+    ///
+    /// The seller is told once per order, and the retry after that is
+    /// silent. Retrying is the right response to a send that failed, and
+    /// most failures here are transient -- but not all of them are: a store
+    /// published under an older contract resolves to a key naming a contract
+    /// that does not exist (`store_ops::store_contract_key`), which fails
+    /// the same way every time. Without the guard that order would post an
+    /// apology at the re-read cadence onto a list nothing clears, which is
+    /// exactly the pile-up just removed from the buyer's side.
+    pub fn settlement_publish_failed(
+        &mut self,
+        order_id: &harvest_common::payment::OrderId,
+        why: &str,
+    ) {
+        self.settlements_submitted.remove(order_id);
+        if self.settlement_failures_reported.insert(order_id.clone()) {
+            self.notifications.push(format!(
+                "Your payment was seen on chain, but the order could not be updated to say so: \
+                 {why}"
+            ));
+        }
+    }
+
+    /// Whether one of this node's identities owns `store_contract_id`.
+    ///
+    /// The same question `crate::gateway::store_ops::owned_store_key` asks
+    /// before it will sign anything for a store, kept here so a decision that
+    /// depends on it can be made without a browser.
+    pub fn owns_store(&self, store_contract_id: &[u8]) -> bool {
+        self.my_stores
+            .values()
+            .flat_map(|stores| stores.iter())
+            .any(|s| s.store_contract_id == store_contract_id)
+    }
+
     /// [`Self::settled_orders`], published.
     ///
     /// Each order once per tab. Between dispatching the update and the
@@ -2980,6 +3036,31 @@ impl AppState {
         &mut self,
         store_contract_id: &[u8],
     ) -> Vec<harvest_common::payment::AuthorizedOrder> {
+        // Only a tab that owns the store can publish TODAY, which is not the
+        // same as saying only the seller may.
+        //
+        // `Paid` is authorized by evidence rather than by a signature, and
+        // the store contract accepts it from anyone holding the claims --
+        // [`Self::settled_orders`] says so, and says the buyer is simply the
+        // party who cares soonest. What stops a buyer is not the contract but
+        // `store_ops::owned_store_key`, which resolves the contract key from
+        // `my_stores`, so a buyer's send has never once succeeded.
+        //
+        // Given that, dispatching from a buyer's tab only produces a failure
+        // and an apology for a payment that was fine. That mattered little
+        // when it happened once per session; `publish_settled_orders` now
+        // runs on every address state arrival, and an unsettled order
+        // produces one every few minutes, so it would have become a growing
+        // wall of apologies on the screen of the buyer whose payment worked.
+        //
+        // The cost of stopping here is real and is not hidden: until a buyer
+        // can publish (freenet/harvest#75), an order reaches `Paid` on the
+        // network only when the seller opens the app. Recorded in
+        // `docs/untested-invariants.md` rather than left to be discovered.
+        if !self.owns_store(store_contract_id) {
+            return Vec::new();
+        }
+
         let mut published = Vec::new();
         for settled in self.settled_orders(store_contract_id) {
             if !self.settlements_submitted.insert(settled.order.id.clone()) {
@@ -2993,6 +3074,7 @@ impl AppState {
             #[cfg(target_arch = "wasm32")]
             {
                 let store_id = store_contract_id.to_vec();
+                let order_id = settled.order.id.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     if let Err(e) =
                         crate::gateway::store_ops::submit_order_by_id(&store_id, settled).await
@@ -3000,11 +3082,7 @@ impl AppState {
                         dioxus::logger::tracing::error!("Failed to publish a settled order: {e}");
                         crate::gateway::APP_STATE
                             .write()
-                            .notifications
-                            .push(format!(
-                                "Your payment was seen on chain, but the order could not be \
-                             updated to say so: {e}"
-                            ));
+                            .settlement_publish_failed(&order_id, &e);
                     }
                 });
             }
@@ -3037,9 +3115,49 @@ impl AppState {
     /// decidable without a browser. [`Self::watch_purchase_addresses`] is the
     /// half that needs one.
     pub fn address_contracts_to_watch(&self, store_contract_id: &[u8]) -> Vec<[u8; 32]> {
+        self.our_order_addresses(store_contract_id, |_| true)
+    }
+
+    /// The address contracts of orders that are ours and still unsettled, so
+    /// a node whose copy was stale can be asked again (#67).
+    ///
+    /// The strict subset of [`Self::address_contracts_to_watch`] still worth
+    /// a question. An order that has moved past `AwaitingPayment` has its
+    /// answer, and one whose anchor has aged out of the payable window will
+    /// never get one, so both stop being asked about: that is what bounds a
+    /// tab left open on an invoice nobody paid, and it is the same rule
+    /// [`Self::worth_watching_for_payment`] applies to watch requests rather
+    /// than a second copy of it that could disagree.
+    pub fn address_contracts_to_reread(&self, store_contract_id: &[u8]) -> Vec<[u8; 32]> {
+        use harvest_common::payment::OrderStatus;
+        self.our_order_addresses(store_contract_id, |order| {
+            order.status == OrderStatus::AwaitingPayment && self.worth_watching_for_payment(order)
+        })
+    }
+
+    /// [`Self::address_contracts_to_watch`], for the orders `keep` accepts.
+    ///
+    /// One copy of the rule for which orders are this node's own, because two
+    /// copies could disagree about whose payment addresses this node
+    /// advertises an interest in, and that is the question the scoping exists
+    /// to answer.
+    fn our_order_addresses(
+        &self,
+        store_contract_id: &[u8],
+        keep: impl Fn(&harvest_common::payment::AuthorizedOrder) -> bool,
+    ) -> Vec<[u8; 32]> {
         let Some(store) = self.browsing_stores.get(store_contract_id) else {
             return Vec::new();
         };
+        // `keep` is cheap (a status and some heights) and the ownership
+        // tests below are not, so nothing is decided about ownership until
+        // some order could survive it. This runs on a timer now, once a
+        // minute for the life of the tab, and `buyer_purchases` decrypts
+        // every message of every conversation on its way to answering.
+        if !store.orders.iter().any(&keep) {
+            return Vec::new();
+        }
+
         let mine: std::collections::HashSet<&str> = self
             .my_stores
             .iter()
@@ -3050,17 +3168,26 @@ impl AppState {
             })
             .map(|(fingerprint, _)| fingerprint.as_str())
             .collect();
-        let bought: std::collections::HashSet<harvest_common::payment::OrderId> = self
-            .buyer_purchases(store_contract_id)
-            .into_iter()
-            .map(|purchase| purchase.order_id)
-            .collect();
+        // Likewise deferred: a seller's own orders are decided by
+        // fingerprint alone, so a seller's tab never pays for this.
+        let bought: std::collections::HashSet<harvest_common::payment::OrderId> = if store
+            .orders
+            .iter()
+            .any(|o| keep(o) && !mine.contains(o.order.seller_fingerprint.as_str()))
+        {
+            self.buyer_purchases(store_contract_id)
+                .into_iter()
+                .map(|purchase| purchase.order_id)
+                .collect()
+        } else {
+            Default::default()
+        };
 
         let mut ids = Vec::new();
         for order in &store.orders {
             let ours = bought.contains(&order.order.id)
                 || mine.contains(order.order.seller_fingerprint.as_str());
-            if !ours {
+            if !ours || !keep(order) {
                 continue;
             }
             // `None` for an order naming no contract build: there is nothing
@@ -3105,6 +3232,136 @@ impl AppState {
                 }
             });
         }
+    }
+
+    /// Every address contract worth asking about again, across every store
+    /// this tab is showing, and which of them are due now (#67).
+    ///
+    /// Takes `&self` so the periodic tick can decide under a READ of the
+    /// state. Taking it for writing re-renders every component in the app,
+    /// and with the wait widened to minutes most ticks have nothing to send,
+    /// so a tick that wrote first would repaint a buyer's screen once a
+    /// minute for the life of an unpaid order. The walk is also not cheap
+    /// (it decrypts conversations and verifies a signature per purchase), so
+    /// it is done once here and its answer handed to
+    /// [`Self::send_address_rereads`] rather than computed twice.
+    pub fn due_address_rereads(&self, now_ms: u64) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
+        let mut wanted: Vec<[u8; 32]> = Vec::new();
+        for store_contract_id in self.browsing_stores.keys() {
+            for id in self.address_contracts_to_reread(store_contract_id) {
+                // Defensive rather than a live guard: an address instance id
+                // derives from the code hash and the order's own script, so
+                // two stores naming one id is not a case anybody has
+                // constructed.
+                if !wanted.contains(&id) {
+                    wanted.push(id);
+                }
+            }
+        }
+        let due = self.bitcoin.address_rereads.due(&wanted, now_ms);
+        (wanted, due)
+    }
+
+    /// Send the GETs for `due`, recording each as asked for.
+    ///
+    /// Each id is registered in `address_contract_network` on the way out,
+    /// for the same reason [`Self::watch_purchase_addresses`] registers it:
+    /// an arriving state is routed to an address view by that map, so an
+    /// answer to an unregistered id would be tried as store state and
+    /// discarded. The subscription normally registers it first; this does not
+    /// depend on that having happened, which is why the network comes from
+    /// the order itself rather than from the build's default.
+    ///
+    /// `wanted` is what prunes the tracker, so it must be the full set and
+    /// not just `due`.
+    pub fn send_address_rereads(&mut self, wanted: &[[u8; 32]], due: &[[u8; 32]], now_ms: u64) {
+        // An order that settled, or aged out, stops being asked about and
+        // stops being remembered.
+        self.bitcoin.address_rereads.retain(wanted);
+
+        for id in due {
+            let network = self
+                .address_network_for(id)
+                .unwrap_or_else(crate::gateway::bitcoin_config::default_network);
+            self.bitcoin
+                .address_contract_network
+                .entry(id.to_vec())
+                .or_insert(network);
+            // Recorded BEFORE the send, so one tick cannot ask twice, and
+            // withdrawn below if the send turns out not to have happened.
+            self.bitcoin.address_rereads.note_asked(*id, now_ms);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        for id in due.iter().copied() {
+            wasm_bindgen_futures::spawn_local(async move {
+                use dioxus::prelude::WritableExt;
+
+                let instance = freenet_stdlib::prelude::ContractInstanceId::new(id);
+                // Read WITHOUT subscribing. The subscription was made when
+                // the order first appeared and the node dedups a repeat, but
+                // re-subscribing on a timer asks the node to register this
+                // client's interest again every few minutes, and that
+                // registration is documented in core as non-idempotent. A
+                // re-read needs the answer, not another subscription.
+                if let Err(e) = crate::gateway::get_contract(&instance, false).await {
+                    dioxus::logger::tracing::warn!(
+                        "could not ask again for an order's payment address: {e}"
+                    );
+                    // Nothing is in flight, so the ask recorded above would
+                    // otherwise widen the wait for a request that never left
+                    // the tab -- leaving a disconnected tab at its slowest
+                    // exactly when it reconnects. Withdrawn by the moment it
+                    // was recorded, so a later tick's ask is left alone.
+                    crate::gateway::APP_STATE
+                        .write()
+                        .bitcoin
+                        .address_rereads
+                        .forget(&id, now_ms);
+                }
+            });
+        }
+    }
+
+    /// The Bitcoin parameters of an order naming this address contract.
+    ///
+    /// The parameters are what an address contract's claims are signed over,
+    /// so folding two copies of one contract together needs them. Found from
+    /// the order rather than carried alongside the view, because the order is
+    /// what decides the address in the first place.
+    fn address_params_for(
+        &self,
+        contract_id: &[u8],
+    ) -> Option<freenet_bitcoin_common::BitcoinAddressParameters> {
+        self.browsing_stores.values().find_map(|store| {
+            store
+                .orders
+                .iter()
+                .find(|order| {
+                    order
+                        .order
+                        .bitcoin_address_instance_id()
+                        .is_some_and(|id| id.as_slice() == contract_id)
+                })
+                .map(|order| order.order.bitcoin_params())
+        })
+    }
+
+    /// The network of an order naming this address contract.
+    ///
+    /// The id alone does not say which network it belongs to, and the map it
+    /// is registered in decides how an arriving state is read. Today every
+    /// settleable order is on one network so this and the build default
+    /// agree; they stop agreeing the moment a second one is settleable, and
+    /// the wrong answer there would be read into a balance.
+    fn address_network_for(&self, id: &[u8; 32]) -> Option<BitcoinNetwork> {
+        self.browsing_stores.values().find_map(|store| {
+            store
+                .orders
+                .iter()
+                .find(|order| order.order.bitcoin_address_instance_id().as_ref() == Some(id))
+                .map(|order| order.order.network)
+        })
     }
 
     /// Whether one of the SELLER's own orders has stopped being payable and
@@ -4982,6 +5239,97 @@ impl AppState {
             .get(&network)
             .and_then(|t| t.tip_height)
             .unwrap_or(0);
+        // Fold the arriving claims into the ones already held, rather than
+        // replacing them.
+        //
+        // Claims are signed and additive: a payment is a claim, and a reorg
+        // RETRACTION is another claim rather than the removal of one. So a
+        // copy of this contract that is behind -- missing a payment, or
+        // missing a retraction -- differs from a current one only by absence.
+        // Replacing the view with it therefore un-does whichever of the two
+        // it has not caught up with, and `publish_settled_orders` runs
+        // immediately afterwards: one direction publishes `Paid` for a
+        // payment that was reversed, the other drops a confirmed payment and
+        // un-settles an order that was about to be published.
+        //
+        // Both were reachable, and reading the same contract every few
+        // minutes (`crate::address_reread`) is what made them ordinary
+        // rather than theoretical, so the guard belongs to that change. A
+        // union needs no ordering between copies, which is what an earlier
+        // watermark comparison here got wrong: the watermark advances only
+        // on a strictly greater height, so two copies of one scan window --
+        // exactly the same-height reorg case -- compare equal while one of
+        // them is missing a claim.
+        //
+        // Every claim is checked against the contract's own parameters and
+        // the ones that do not verify are DROPPED, rather than the fold
+        // being abandoned because of them. That distinction is the whole
+        // guard: `from_claims` fails on the first bad claim, so falling back
+        // to the arriving state on its error would mean one unverifiable
+        // claim -- the cheapest thing in the world to produce -- restores
+        // exactly the replace-the-view behaviour this exists to remove, and
+        // with it the erasure. Filtering first makes the fold unable to
+        // fail for that reason.
+        //
+        // This holds only where the parameters can be resolved, which means
+        // an order in view names this address. A manually watched address
+        // names no order, nothing can be verified against, and the arriving
+        // state is used as it came -- which is what every address did before
+        // this change, and is why the watch list's balances are not evidence
+        // of anything. `assemble_on_chain_proof` re-verifies before any of
+        // this reaches the network.
+        let merged;
+        let state = match self.address_params_for(&contract_id) {
+            Some(params) => {
+                let held = self
+                    .bitcoin
+                    .addresses
+                    .get(&contract_id)
+                    .map(|view| view.claims.clone())
+                    .unwrap_or_default();
+                let union: Vec<freenet_bitcoin_common::SignedClaim> = state
+                    .claims
+                    .scanned
+                    .values()
+                    .chain(state.claims.claims.values())
+                    .cloned()
+                    .chain(held)
+                    .filter(|claim| claim.verify(&params).is_ok())
+                    .collect();
+                match freenet_bitcoin_common::BitcoinAddressStateV1::from_claims(&params, union) {
+                    Ok(folded) => {
+                        merged = folded;
+                        &merged
+                    }
+                    Err(e) => {
+                        // Unreachable by way of an unverifiable claim, which
+                        // the filter above has already removed -- it is the
+                        // same check `from_claims` makes, against the same
+                        // parameters. Kept because the alternative on an
+                        // error nobody has foreseen should be to change
+                        // nothing: refusing an update costs a late
+                        // settlement, and replacing the view with something
+                        // that could not be folded costs a payment.
+                        //
+                        // Note this is NOT the path taken when everything
+                        // fails to verify. That leaves an empty union, which
+                        // folds successfully to an empty state and does
+                        // overwrite the view -- correctly, since the held
+                        // claims were re-verified too, so the only way to
+                        // reach it is a view built where no parameters were
+                        // available to check anything against.
+                        warn!(
+                            "could not fold an address state for {:?} into the one held, keeping \
+                             what is held: {e}",
+                            &contract_id[..8.min(contract_id.len())]
+                        );
+                        return;
+                    }
+                }
+            }
+            None => state,
+        };
+
         let confirmed_sats = state.claims.confirmed_value_sats(tip_height, 1);
         let pending_sats = state.claims.pending_value_sats(tip_height, 1);
 
@@ -5287,22 +5635,7 @@ impl AppState {
                             && !o.order.payment_script_pubkey.is_empty()
                             && o.order.trusted_bridges.contains(&bridge)
                     })
-                    .filter(|o| {
-                        let tip = self
-                            .bitcoin
-                            .tips
-                            .get(&o.order.network)
-                            .and_then(|tip| tip.tip_height);
-                        match (tip, o.order.anchor) {
-                            (Some(tip), Some(anchor)) => {
-                                tip.saturating_sub(anchor.height) <= WATCH_PAST_ANCHOR_BLOCKS
-                            }
-                            (None, Some(_)) => true,
-                            // No buyer pays an order with no anchor, so there
-                            // is nothing to watch for, now or later.
-                            (_, None) => false,
-                        }
-                    })
+                    .filter(|o| self.worth_watching_for_payment(o))
                     .collect();
                 orders.sort_by_key(|o| std::cmp::Reverse(o.order.anchor.map(|a| a.height)));
                 let wanted: Vec<crate::bitcoin_inbox::WatchWanted> = orders
@@ -5327,6 +5660,42 @@ impl AppState {
             }
         }
         groups
+    }
+
+    /// Whether a payment to this order could still arrive and matter.
+    ///
+    /// Extracted from [`Self::watches_wanted`], whose filter this was, so the
+    /// address re-reads apply the same rule rather than a second copy that
+    /// could disagree about when an invoice is finished.
+    ///
+    /// A buyer pays only while the anchor is within
+    /// [`harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS`], and a payment made
+    /// at that moment must still be found while it is buried, which is what
+    /// [`WATCH_PAST_ANCHOR_BLOCKS`] allows for. Past that nothing more is
+    /// coming, so both the watch requests and the re-reads stop.
+    ///
+    /// Without a tip this answers `true`: a node that cannot see the chain
+    /// has not established that the window has closed, and treating that
+    /// silence as a verdict would stop watching an order that is still being
+    /// paid. The unknown is resolved in the direction that costs a request,
+    /// not the one that loses a payment. It does mean this is not a bound
+    /// until a tip is known -- see `crate::address_reread`, which says so
+    /// where a reader of the re-read loop will meet it.
+    fn worth_watching_for_payment(&self, order: &harvest_common::payment::AuthorizedOrder) -> bool {
+        let tip = self
+            .bitcoin
+            .tips
+            .get(&order.order.network)
+            .and_then(|tip| tip.tip_height);
+        match (tip, order.order.anchor) {
+            (Some(tip), Some(anchor)) => {
+                tip.saturating_sub(anchor.height) <= WATCH_PAST_ANCHOR_BLOCKS
+            }
+            (None, Some(_)) => true,
+            // No buyer pays an order with no anchor, so there is nothing to
+            // watch for, now or later.
+            (_, None) => false,
+        }
     }
 
     /// Decide what the watch-request loop does now, queueing for signature
@@ -5858,6 +6227,12 @@ pub struct BitcoinState {
     /// back, or one it could not use. See
     /// `AppState::stop_watch_requests_for`.
     pub watch_requests_stopped: HashSet<String>,
+    /// When each unsettled order's address contract was last asked for again.
+    ///
+    /// A subscription's one answer can be stale for tens of minutes, and
+    /// nothing tells the app when the node catches up, so an unsettled order
+    /// asks again on a widening interval. See `crate::address_reread`.
+    pub address_rereads: crate::address_reread::AddressRereads,
 }
 
 impl BitcoinState {
@@ -12298,7 +12673,12 @@ mod buy_flow_tests {
     #[test]
     fn a_settlement_is_published_once_per_tab() {
         let (order, claims, tip) = a_paid_order();
-        let (mut state, _) = buyer_after_acceptance(&order);
+        // The SELLER's tab. Only they can publish -- the store contract takes
+        // an update signed with the store's own key -- so this is the tab
+        // where the guard has anything to guard. This test used a buyer's
+        // tab until the re-reads landed, which pinned an attempt that could
+        // only ever fail; see `a_buyers_tab_does_not_try_to_publish`.
+        let mut state = seller_holding(&order);
         give_the_node_the_chain(&mut state, &order, claims, tip);
 
         assert_eq!(
@@ -12318,6 +12698,920 @@ mod buy_flow_tests {
         assert!(
             state.publish_settled_orders(STORE).is_empty(),
             "a second notification must not send a second update"
+        );
+    }
+
+    /// An address contract's state as the bridge would publish it: a scanned
+    /// watermark at `scanned_height`, plus whatever claims are given.
+    ///
+    /// The watermark is what orders two copies of the same contract, so it is
+    /// named rather than defaulted: a test about a stale answer is a test
+    /// about exactly this number.
+    fn address_state_scanned_to(
+        order: &AuthorizedOrder,
+        scanned_height: u32,
+        claims: Vec<freenet_bitcoin_common::SignedClaim>,
+    ) -> freenet_bitcoin_common::BitcoinAddressStateV1 {
+        use freenet_bitcoin_common::{BlockAnchor, BlockHash, Claim, ClaimBody, SignedClaim};
+
+        let params = order.order.bitcoin_params();
+        let watermark = SignedClaim::sign(
+            &settling_bridge(),
+            &ClaimBody {
+                script_id: params.script_id(),
+                network: order.order.network,
+                as_of: BlockAnchor {
+                    height: scanned_height,
+                    hash: BlockHash([5u8; 32]),
+                },
+                claim: Claim::ScannedTo,
+            },
+        )
+        .expect("sign the watermark");
+
+        let mut all = vec![watermark];
+        all.extend(claims);
+        freenet_bitcoin_common::BitcoinAddressStateV1::from_claims(&params, all)
+            .expect("the fixture's claims verify")
+    }
+
+    /// [`address_state_scanned_to`] at the tip the fixtures use.
+    fn address_state_carrying(
+        order: &AuthorizedOrder,
+        claims: Vec<freenet_bitcoin_common::SignedClaim>,
+    ) -> freenet_bitcoin_common::BitcoinAddressStateV1 {
+        address_state_scanned_to(order, TIP_HEIGHT, claims)
+    }
+
+    /// A seller's own tab, holding `order` in their store.
+    fn seller_holding(order: &AuthorizedOrder) -> AppState {
+        let mut state = AppState::default();
+        state.begin_browsing(STORE.to_vec());
+        state.my_stores.insert(
+            "seller-fp".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+            }],
+        );
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .orders = vec![order.clone()];
+        state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
+        state
+    }
+
+    /// A seller's own tab: their store, their identity, and one invoice they
+    /// issued that is still awaiting payment.
+    fn seller_with_an_issued_invoice() -> (AppState, AuthorizedOrder) {
+        let issued = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let mut state = AppState::default();
+        state.begin_browsing(STORE.to_vec());
+        state.my_stores.insert(
+            "seller-fp".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+            }],
+        );
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .orders = vec![issued.clone()];
+        state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
+        (state, issued)
+    }
+
+    /// What the periodic tick does: decide under a read, and send only if
+    /// something is due.
+    ///
+    /// The `is_empty` check is not a detail -- it is why a tick with nothing
+    /// to send never takes the state for writing, and it means `retain` does
+    /// not run on such a tick either. A version of this helper without it
+    /// made `a_settled_order_stops_being_asked_about` assert a pruning that
+    /// production does not perform.
+    fn tick_rereads(state: &mut AppState, now_ms: u64) -> Vec<[u8; 32]> {
+        let (wanted, due) = state.due_address_rereads(now_ms);
+        if !due.is_empty() {
+            state.send_address_rereads(&wanted, &due, now_ms);
+        }
+        due
+    }
+
+    /// **An order still awaiting payment asks for its address again.**
+    ///
+    /// The bug (#67): Harvest asked for an order's payment address once and
+    /// believed the answer for the life of the tab. A node that misses one
+    /// update serves its stale copy for tens of minutes and says nothing when
+    /// it heals, so a payment that had confirmed and been attested sat on
+    /// screen as "awaiting payment", and a reload did not help because a
+    /// reload also asks once.
+    ///
+    /// Asked with the address view already present and empty, which is the
+    /// exact shape of the live failure: a served answer, carrying no claims,
+    /// that nothing would ever question again.
+    #[test]
+    fn an_unsettled_order_asks_for_its_payment_address_again() {
+        let (order, _, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, Vec::new(), tip);
+        let id = order
+            .order
+            .bitcoin_address_instance_id()
+            .expect("the fixture names a build");
+
+        assert!(
+            !state.due_address_rereads(0).1.is_empty(),
+            "an unsettled order is a reason to look"
+        );
+        assert_eq!(
+            tick_rereads(&mut state, 0),
+            vec![id],
+            "the unsettled order's address is asked for again"
+        );
+        // And the answer can be routed when it arrives: an id the address
+        // map does not know is tried as store state and thrown away.
+        assert!(state
+            .bitcoin
+            .address_contract_network
+            .contains_key(id.as_slice()));
+    }
+
+    /// **An order that has been paid stops being asked about.**
+    ///
+    /// The re-read exists to settle an order. Once one is settled there is
+    /// nothing left to learn, and asking anyway would be a GET a minute for
+    /// every order a busy store ever completed.
+    #[test]
+    fn a_settled_order_stops_being_asked_about() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+
+        assert!(
+            !tick_rereads(&mut state, 0).is_empty(),
+            "asked while awaiting"
+        );
+
+        // Publish the settlement back into the store's state, as the network
+        // would once the update lands.
+        let settled = state.settled_orders(STORE).pop().expect("settles");
+        let store = state.browsing_stores.get_mut(STORE).expect("the store");
+        for existing in store.orders.iter_mut() {
+            if existing.order.id == settled.order.id {
+                *existing = settled.clone();
+            }
+        }
+
+        assert!(
+            tick_rereads(&mut state, 60_000).is_empty(),
+            "a paid order is not asked about again"
+        );
+        let (wanted, due) = state.due_address_rereads(0);
+        assert!(
+            due.is_empty() && wanted.is_empty(),
+            "and the tick finds nothing to send, so it never takes the state for writing"
+        );
+        // Its tracker entry outlives it, which is the honest state of
+        // affairs rather than an oversight: pruning happens on a tick that
+        // has something to send, and a tab whose last order just settled has
+        // nothing. Asserted so that a future change claiming to prune here
+        // has to change this line and say so.
+        assert_eq!(
+            state.bitcoin.address_rereads.tracked(),
+            1,
+            "the entry is pruned by a later acting tick, not by settling"
+        );
+    }
+
+    /// **An order nobody can pay any more stops being asked about.**
+    ///
+    /// What bounds a tab left open. The window is the one the watch requests
+    /// already use, so the two cannot disagree about when an invoice is
+    /// finished.
+    #[test]
+    fn an_order_past_the_payable_window_stops_being_asked_about() {
+        let (order, _, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, Vec::new(), tip);
+        assert!(
+            !tick_rereads(&mut state, 0).is_empty(),
+            "asked while payable"
+        );
+
+        // The chain moves past the anchor's payable window, with room to
+        // bury a payment made at the last possible moment.
+        let far_past = TIP_HEIGHT + WATCH_PAST_ANCHOR_BLOCKS + 1;
+        state
+            .bitcoin
+            .tips
+            .entry(BitcoinNetwork::Signet)
+            .and_modify(|view| view.tip_height = Some(far_past));
+
+        assert!(
+            tick_rereads(&mut state, 10 * 60_000).is_empty(),
+            "an invoice nobody paid stops being asked about"
+        );
+    }
+
+    /// **The same address is not asked for twice in a minute.**
+    ///
+    /// The tick fires every minute for as long as anything is unsettled, so
+    /// without the spacing this is one GET per tick per order, and the
+    /// spacing is what makes a widening wait possible at all.
+    #[test]
+    fn the_same_address_is_not_asked_for_twice_in_a_minute() {
+        let (order, _, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, Vec::new(), tip);
+
+        assert_eq!(tick_rereads(&mut state, 0).len(), 1, "asked once");
+        assert!(
+            tick_rereads(&mut state, 1_000).is_empty(),
+            "and not again a second later"
+        );
+        assert!(
+            tick_rereads(&mut state, crate::address_reread::FIRST_RETRY_MS - 1).is_empty(),
+            "nor a millisecond before the shortest wait"
+        );
+        // Asserted as a range rather than an instant because this order's
+        // address carries a per-address offset (see
+        // `address_reread::stagger`), so the exact moment depends on its id.
+        assert_eq!(
+            tick_rereads(
+                &mut state,
+                crate::address_reread::FIRST_RETRY_MS + crate::address_reread::MAX_RETRY_MS
+            )
+            .len(),
+            1,
+            "and again once the wait and the address's own offset have passed"
+        );
+    }
+
+    /// **An address state that arrives is routed, and settles the order.**
+    ///
+    /// The payoff of the whole change, and the step no other test covered:
+    /// an arriving state is routed to an address view by the
+    /// `address_contract_network` map, so an answer to an id the re-read
+    /// asked for but never registered would be tried as store state and
+    /// thrown away. Asserting the map has an entry proves the entry, not the
+    /// routing. This drives the real bytes through `on_contract_state`.
+    #[test]
+    fn a_re_read_answer_is_routed_and_settles_the_order() {
+        let (order, claims, tip) = a_paid_order();
+        // The seller's tab: the party that was stuck in the live incident,
+        // and the only one that can publish the settlement.
+        let mut state = seller_holding(&order);
+        // The chain, but NOT the address view: this is a tab that has asked
+        // and not yet been answered.
+        let mut tip_view = tip_at(TIP_HEIGHT);
+        tip_view.signed_tip = Some(tip);
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip_view);
+
+        let id = order
+            .order
+            .bitcoin_address_instance_id()
+            .expect("the fixture names a build");
+        assert_eq!(tick_rereads(&mut state, 0), vec![id], "the re-read asks");
+        assert!(
+            state.settled_orders(STORE).is_empty(),
+            "and nothing settles until the answer arrives"
+        );
+
+        // The node answers, with the state the healed copy would carry.
+        let answer = address_state_carrying(&order, claims);
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&answer).expect("cbor"),
+        );
+
+        assert!(
+            state.bitcoin.addresses.contains_key(id.as_slice()),
+            "the answer was read as address state rather than guessed at as a store"
+        );
+        assert!(
+            state.settlements_submitted.contains(&order.order.id),
+            "and arriving state settles the order, which is the point of asking"
+        );
+    }
+
+    /// **A re-read that arrives short of the amount does not settle, and does
+    /// not restart the clock.**
+    ///
+    /// Both halves matter. Publishing `Paid` on evidence that does not carry
+    /// it is a state every peer refuses. And arriving state must not reset
+    /// the spacing, or a node serving the same stale answer forever would
+    /// hold the fastest cadence forever -- which is exactly the case the
+    /// widening exists to bound.
+    #[test]
+    fn an_answer_that_does_not_settle_does_not_reset_the_wait() {
+        let (order, _, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        let mut tip_view = tip_at(TIP_HEIGHT);
+        tip_view.signed_tip = Some(tip);
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip_view);
+        let id = order
+            .order
+            .bitcoin_address_instance_id()
+            .expect("the fixture names a build");
+
+        assert_eq!(tick_rereads(&mut state, 0), vec![id], "asked");
+        let answer = address_state_carrying(&order, an_underpayment(&order));
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&answer).expect("cbor"),
+        );
+
+        assert!(
+            state.settled_orders(STORE).is_empty(),
+            "an underpayment is not a payment"
+        );
+        assert!(
+            tick_rereads(&mut state, 1_000).is_empty(),
+            "and the answer did not put the address back at the front of the queue"
+        );
+    }
+
+    /// **The SELLER's own unsettled order is asked about too.**
+    ///
+    /// The party that was actually stuck in the live incident. Only the
+    /// seller can publish the settlement (`submit_order_by_id` requires the
+    /// store to be theirs), so a fix that worked only on a buyer's tab would
+    /// not have fixed the reported bug at all.
+    #[test]
+    fn a_sellers_own_unsettled_order_is_asked_about() {
+        let (mut state, order) = seller_with_an_issued_invoice();
+        let id = order
+            .order
+            .bitcoin_address_instance_id()
+            .expect("the fixture names a build");
+
+        assert_eq!(
+            tick_rereads(&mut state, 0),
+            vec![id],
+            "the seller's own invoice is re-read"
+        );
+    }
+
+    /// **The watch set is not narrowed to the re-read set.**
+    ///
+    /// The two share one walk, so the filter is the only thing keeping them
+    /// different. `settled_orders` delegates its scoping to what the watch
+    /// path subscribed to, so narrowing the watch set to "still unsettled"
+    /// would quietly stop filling `bitcoin.addresses` for the very orders
+    /// whose settlement is being published. Found by mutation: this is the
+    /// change that CI did not previously notice.
+    #[test]
+    fn the_watch_set_still_covers_orders_the_re_read_skips() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+        let id = order
+            .order
+            .bitcoin_address_instance_id()
+            .expect("the fixture names a build");
+
+        // Move the order past the point where it is worth re-reading.
+        let settled = state.settled_orders(STORE).pop().expect("settles");
+        let store = state.browsing_stores.get_mut(STORE).expect("the store");
+        for existing in store.orders.iter_mut() {
+            if existing.order.id == settled.order.id {
+                *existing = settled.clone();
+            }
+        }
+
+        assert!(
+            state.address_contracts_to_reread(STORE).is_empty(),
+            "a paid order is not re-read"
+        );
+        assert!(
+            state.address_contracts_to_watch(STORE).contains(&id),
+            "but it is still watched, which is what settled_orders relies on"
+        );
+    }
+
+    /// **A stale answer cannot erase what is already known.**
+    ///
+    /// The one way re-reading could make a settlement WRONG rather than
+    /// merely late. A reorg retraction is an extra signed claim, not a
+    /// removal, so a copy that predates the retraction simply lacks it. If
+    /// the view were replaced by that copy the retraction would be undone,
+    /// with `publish_settled_orders` running immediately afterwards -- so a
+    /// reversed payment would be published as `Paid`.
+    ///
+    /// Reading the same contract over and over is what this change
+    /// introduces, so this is its risk to carry. See
+    /// `a_copy_missing_a_payment_does_not_erase_it` for the other
+    /// direction.
+    #[test]
+    fn a_stale_answer_cannot_erase_what_is_known() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        let mut tip_view = tip_at(TIP_HEIGHT);
+        tip_view.signed_tip = Some(tip);
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip_view);
+        let id = order
+            .order
+            .bitcoin_address_instance_id()
+            .expect("the fixture names a build");
+
+        // Asked for, which is what registers the id so an answer routes.
+        assert_eq!(tick_rereads(&mut state, 0), vec![id], "asked");
+
+        // The good answer lands first.
+        let fresh = address_state_carrying(&order, claims);
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&fresh).expect("cbor"),
+        );
+        let seen = state.bitcoin.addresses.get(id.as_slice()).expect("a view");
+        let confirmed = seen.confirmed_sats;
+        let claim_count = seen.claims.len();
+        assert!(confirmed > 0, "the fixture pays the order");
+
+        // Then a copy from before it, carrying nothing.
+        let stale = address_state_scanned_to(&order, TIP_HEIGHT - 10, Vec::new());
+        assert!(
+            stale.scanned_to() < fresh.scanned_to(),
+            "the fixture's stale copy really is behind"
+        );
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&stale).expect("cbor"),
+        );
+
+        let after = state.bitcoin.addresses.get(id.as_slice()).expect("a view");
+        assert_eq!(after.claims.len(), claim_count, "claims are not erased");
+        assert_eq!(
+            after.confirmed_sats, confirmed,
+            "and the balance does not go backwards"
+        );
+    }
+
+    /// **A settlement whose update never landed is published again.**
+    ///
+    /// The step after the re-read, and the one the re-read cannot rescue
+    /// from outside: the submitted-set is checked before the send and was
+    /// never withdrawn when the send failed, so a settlement that did not
+    /// reach the node was never retried for the life of the tab. That is
+    /// #67's own symptom -- a confirmed payment reading as awaiting payment
+    /// -- one step further down the path.
+    ///
+    /// Asserted through `settlement_publish_failed` because the send itself
+    /// is wasm-only; that method exists at all so this can be tested rather
+    /// than only described.
+    #[test]
+    fn a_settlement_that_failed_to_send_is_published_again() {
+        let (order, claims, tip) = a_paid_order();
+        let mut state = seller_holding(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+
+        assert_eq!(
+            state.publish_settled_orders(STORE).len(),
+            1,
+            "published once"
+        );
+        assert!(
+            state.publish_settled_orders(STORE).is_empty(),
+            "and not again while that send is in flight"
+        );
+
+        // The send failed.
+        state.settlement_publish_failed(&order.order.id, "put timed out");
+
+        assert_eq!(
+            state.publish_settled_orders(STORE).len(),
+            1,
+            "so the next arrival publishes it again rather than giving up for the session"
+        );
+
+        // A failure that repeats -- a store whose recorded key names a
+        // contract that does not exist fails identically every time -- keeps
+        // retrying, and stops talking about it.
+        for _ in 0..5 {
+            state.settlement_publish_failed(&order.order.id, "put timed out");
+            assert_eq!(
+                state.publish_settled_orders(STORE).len(),
+                1,
+                "still retried"
+            );
+        }
+        assert_eq!(
+            state.notifications.len(),
+            1,
+            "the seller was told once, not once per retry at the re-read cadence"
+        );
+    }
+
+    /// **A copy missing a payment cannot erase one that arrived.**
+    ///
+    /// The direction that loses money rather than misreporting it, and the
+    /// one a watermark comparison could not catch: the bridge stamps its
+    /// watermark only when it advances, so two copies of a single scan
+    /// window carry the SAME watermark while one of them is missing a
+    /// claim. Ordering them is impossible; folding them is not.
+    ///
+    /// Found by review of the watermark guard this replaced, and it failed
+    /// against that guard.
+    #[test]
+    fn a_copy_missing_a_payment_does_not_erase_it() {
+        let (order, claims, tip) = a_paid_order();
+        let mut state = seller_holding(&order);
+        let mut tip_view = tip_at(TIP_HEIGHT);
+        tip_view.signed_tip = Some(tip);
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip_view);
+        let id = order.order.bitcoin_address_instance_id().expect("id");
+        assert_eq!(tick_rereads(&mut state, 0), vec![id]);
+
+        let paid = address_state_scanned_to(&order, TIP_HEIGHT, claims);
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&paid).expect("cbor"),
+        );
+        let before = state
+            .bitcoin
+            .addresses
+            .get(id.as_slice())
+            .expect("view")
+            .confirmed_sats;
+        assert!(before > 0, "the fixture pays");
+
+        let empty = address_state_scanned_to(&order, TIP_HEIGHT, Vec::new());
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&empty).expect("cbor"),
+        );
+        let after = state
+            .bitcoin
+            .addresses
+            .get(id.as_slice())
+            .expect("view")
+            .confirmed_sats;
+        assert_eq!(
+            after, before,
+            "a copy at the same watermark carrying no payment must not erase one"
+        );
+        assert_eq!(
+            state.settled_orders(STORE).len(),
+            1,
+            "and the order stays settleable"
+        );
+    }
+
+    /// **One unverifiable claim cannot erase a payment.**
+    ///
+    /// The fold is what stops a copy that is behind from taking anything
+    /// away, and it is built on `from_claims`, which fails on the FIRST
+    /// claim that does not verify. So an arriving copy carrying one piece of
+    /// junk -- signed by nobody, costing nothing to produce -- would abandon
+    /// the fold, and any fallback that used the arriving copy would restore
+    /// the erasure in full. Found in review, by probe, against exactly this
+    /// shape.
+    #[test]
+    fn a_claim_that_does_not_verify_cannot_erase_a_payment() {
+        use freenet_bitcoin_common::{BlockAnchor, BlockHash, Claim, ClaimBody, OutPoint};
+
+        let (order, claims, tip) = a_paid_order();
+        let mut state = seller_holding(&order);
+        let mut tip_view = tip_at(TIP_HEIGHT);
+        tip_view.signed_tip = Some(tip);
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip_view);
+        let id = order
+            .order
+            .bitcoin_address_instance_id()
+            .expect("the fixture names a build");
+        assert_eq!(tick_rereads(&mut state, 0), vec![id], "asked");
+
+        let paid = address_state_carrying(&order, claims);
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&paid).expect("cbor"),
+        );
+        let before = state
+            .bitcoin
+            .addresses
+            .get(id.as_slice())
+            .expect("a view")
+            .confirmed_sats;
+        assert!(before > 0, "the fixture pays the order");
+
+        // A copy carrying no payment, plus one claim signed by a key no
+        // bridge holds. Assembled by hand rather than through
+        // `from_claims`, which would refuse it -- which is the point.
+        let mut poisoned = address_state_carrying(&order, Vec::new());
+        let stranger = SigningKey::from_bytes(&[77u8; 32]);
+        let junk = freenet_bitcoin_common::SignedClaim::sign(
+            &stranger,
+            &ClaimBody {
+                script_id: order.order.bitcoin_params().script_id(),
+                network: order.order.network,
+                as_of: BlockAnchor {
+                    height: TIP_HEIGHT,
+                    hash: BlockHash([5u8; 32]),
+                },
+                claim: Claim::MempoolOutput {
+                    outpoint: OutPoint {
+                        txid: freenet_bitcoin_common::Txid([9u8; 32]),
+                        vout: 0,
+                    },
+                    value_sats: 999_999,
+                },
+            },
+        )
+        .expect("sign");
+        poisoned.claims.claims.insert(
+            freenet_bitcoin_common::address_state::ClaimKey(junk.digest()),
+            junk,
+        );
+
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&poisoned).expect("cbor"),
+        );
+
+        let after = state.bitcoin.addresses.get(id.as_slice()).expect("a view");
+        assert_eq!(
+            after.confirmed_sats, before,
+            "the payment survives a copy carrying an unverifiable claim"
+        );
+        assert!(
+            after.pending_sats < 999_999,
+            "and the unverifiable claim is not counted"
+        );
+        assert_eq!(
+            state.settled_orders(STORE).len(),
+            1,
+            "and the order is still settleable"
+        );
+    }
+
+    /// **A payment still lands when it arrives beside an unverifiable claim.**
+    ///
+    /// The other half of filtering rather than refusing, and the half that
+    /// makes it worth doing: dropping the bad claim keeps the good one, where
+    /// giving up on the fold would ignore a payment that had genuinely
+    /// arrived. Without this test, deleting the filter and relying on the
+    /// error path passes everything else -- the erasure test is satisfied by
+    /// changing nothing at all, which is precisely what the error path does.
+    #[test]
+    fn a_payment_arriving_beside_a_bad_claim_still_settles() {
+        use freenet_bitcoin_common::{BlockAnchor, BlockHash, Claim, ClaimBody, OutPoint};
+
+        let (order, claims, tip) = a_paid_order();
+        let mut state = seller_holding(&order);
+        let mut tip_view = tip_at(TIP_HEIGHT);
+        tip_view.signed_tip = Some(tip);
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip_view);
+        let id = order
+            .order
+            .bitcoin_address_instance_id()
+            .expect("the fixture names a build");
+        assert_eq!(tick_rereads(&mut state, 0), vec![id], "asked");
+
+        // Nothing seen yet, so there is a view to fold into.
+        let nothing_yet = address_state_carrying(&order, Vec::new());
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&nothing_yet).expect("cbor"),
+        );
+        assert!(state.settled_orders(STORE).is_empty(), "nothing yet");
+
+        // Then the payment, arriving alongside a claim signed by nobody.
+        let mut answer = address_state_carrying(&order, claims);
+        let stranger = SigningKey::from_bytes(&[78u8; 32]);
+        let junk = freenet_bitcoin_common::SignedClaim::sign(
+            &stranger,
+            &ClaimBody {
+                script_id: order.order.bitcoin_params().script_id(),
+                network: order.order.network,
+                as_of: BlockAnchor {
+                    height: TIP_HEIGHT,
+                    hash: BlockHash([5u8; 32]),
+                },
+                claim: Claim::MempoolOutput {
+                    outpoint: OutPoint {
+                        txid: freenet_bitcoin_common::Txid([11u8; 32]),
+                        vout: 0,
+                    },
+                    value_sats: 999_999,
+                },
+            },
+        )
+        .expect("sign");
+        answer.claims.claims.insert(
+            freenet_bitcoin_common::address_state::ClaimKey(junk.digest()),
+            junk,
+        );
+
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&answer).expect("cbor"),
+        );
+
+        assert_eq!(
+            state.settled_orders(STORE).len(),
+            1,
+            "the good claim was kept and the order settles"
+        );
+    }
+
+    /// **A copy from before a retraction cannot un-retract it.**
+    ///
+    /// The direction the fold was written for, asserted rather than only
+    /// described: a reorg retraction is an extra signed claim, so a copy
+    /// that predates it differs only by absence, and replacing the view with
+    /// that copy would publish `Paid` for a payment that has been reversed.
+    #[test]
+    fn a_copy_from_before_a_retraction_cannot_undo_it() {
+        use freenet_bitcoin_common::{BlockAnchor, BlockHash, Claim, ClaimBody, SignedClaim};
+
+        let (order, claims, tip) = a_paid_order();
+        let mut state = seller_holding(&order);
+        let mut tip_view = tip_at(TIP_HEIGHT);
+        tip_view.signed_tip = Some(tip);
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip_view);
+        let id = order
+            .order
+            .bitcoin_address_instance_id()
+            .expect("the fixture names a build");
+        assert_eq!(tick_rereads(&mut state, 0), vec![id], "asked");
+
+        // The payment, and then the bridge retracting it after a reorg.
+        let outpoint = claims
+            .iter()
+            .find_map(|c| match c.body().expect("body").claim {
+                Claim::ConfirmedOutput { outpoint, .. } => Some(outpoint),
+                _ => None,
+            })
+            .expect("the fixture confirms an output");
+        let retraction = SignedClaim::sign(
+            &settling_bridge(),
+            &ClaimBody {
+                script_id: order.order.bitcoin_params().script_id(),
+                network: order.order.network,
+                as_of: BlockAnchor {
+                    height: TIP_HEIGHT,
+                    hash: BlockHash([6u8; 32]),
+                },
+                claim: Claim::Retracted { outpoint },
+            },
+        )
+        .expect("sign the retraction");
+
+        let mut with_retraction = claims.clone();
+        with_retraction.push(retraction);
+        let reversed = address_state_carrying(&order, with_retraction);
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&reversed).expect("cbor"),
+        );
+        assert!(
+            state.settled_orders(STORE).is_empty(),
+            "a retracted payment does not settle the order"
+        );
+
+        // A copy from before the reorg, at the same watermark.
+        let pre_reorg = address_state_carrying(&order, claims);
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&pre_reorg).expect("cbor"),
+        );
+
+        assert!(
+            state.settled_orders(STORE).is_empty(),
+            "and a copy that predates the retraction must not bring it back"
+        );
+    }
+
+    /// **A buyer's tab does not try to publish a settlement.**
+    ///
+    /// It cannot succeed: the store contract takes an update signed with the
+    /// store's own key, which only the seller has. Before the re-reads that
+    /// cost one failed send and one apology per session. After them
+    /// `publish_settled_orders` runs on every address state arrival, so an
+    /// unsettled order produces one every few minutes, and the apology --
+    /// "your payment was seen on chain, but the order could not be updated
+    /// to say so" -- would pile up on the screen of the buyer whose payment
+    /// worked perfectly, for as long as the seller took to publish.
+    #[test]
+    fn a_buyers_tab_does_not_try_to_publish() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+
+        assert_eq!(
+            state.settled_orders(STORE).len(),
+            1,
+            "the buyer can see the payment settles the order"
+        );
+        assert!(
+            state.publish_settled_orders(STORE).is_empty(),
+            "but does not attempt a publish only the seller can make"
+        );
+        assert!(
+            state.settlements_submitted.is_empty(),
+            "and nothing is recorded as submitted"
+        );
+    }
+
+    /// **A claim added within one scan window still lands.**
+    ///
+    /// The other side of `an_answer_that_scanned_less_far_is_ignored`, and
+    /// the branch whose failure direction is losing a payment rather than
+    /// delaying one. The watermark only advances on a strictly greater
+    /// height, so a bridge that sees a payment while scanning at the height
+    /// it has already reported publishes a state with the SAME watermark and
+    /// one more claim. A guard written as `>` rather than `>=` would refuse
+    /// that forever -- recreating #67 inside the guard meant to make #67
+    /// safe. Mutation-checked: `>` leaves the rest of the suite green.
+    #[test]
+    fn an_answer_at_the_same_height_still_lands() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        let mut tip_view = tip_at(TIP_HEIGHT);
+        tip_view.signed_tip = Some(tip);
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip_view);
+        let id = order
+            .order
+            .bitcoin_address_instance_id()
+            .expect("the fixture names a build");
+        assert_eq!(tick_rereads(&mut state, 0), vec![id], "asked");
+
+        // Scanned to the tip, nothing seen yet.
+        let nothing_yet = address_state_scanned_to(&order, TIP_HEIGHT, Vec::new());
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&nothing_yet).expect("cbor"),
+        );
+        assert!(
+            state.settled_orders(STORE).is_empty(),
+            "nothing to settle yet"
+        );
+
+        // The payment, seen at the same height.
+        let now_paid = address_state_scanned_to(&order, TIP_HEIGHT, claims);
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&now_paid).expect("cbor"),
+        );
+
+        let view = state
+            .bitcoin
+            .addresses
+            .get(id.as_slice())
+            .expect("the view");
+        assert!(
+            view.confirmed_sats >= order.order.amount_sats,
+            "the payment at the same watermark was applied, not refused"
+        );
+    }
+
+    /// **A stranger's order is never asked about.**
+    ///
+    /// The scoping rule of `address_contracts_to_watch`: subscribing to
+    /// every order a busy seller ever issued would advertise this node's
+    /// interest in payment addresses it has nothing to do with. The re-read
+    /// runs through the same walk, so this is the test that would fail if
+    /// the shared filter ever stopped applying it to one of the two callers.
+    #[test]
+    fn a_strangers_order_is_never_asked_about() {
+        let (order, _, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, Vec::new(), tip);
+
+        // Stop being the buyer of it, and own no store that issued it.
+        state.my_stores.clear();
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .conversations
+            .clear();
+
+        assert!(
+            state.address_contracts_to_watch(STORE).is_empty(),
+            "the fixture no longer makes this order ours"
+        );
+        assert!(
+            tick_rereads(&mut state, 0).is_empty(),
+            "and a stranger's payment address is not asked about"
         );
     }
 
