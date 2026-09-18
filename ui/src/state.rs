@@ -3893,6 +3893,59 @@ impl AppState {
             .retain(|pending| !pending.signed_bytes().is_ok_and(|queued| queued == bytes));
     }
 
+    /// Whether a publish for this store is waiting on its certificate or on
+    /// the ghostkey delegate's `SignResult` -- the certificate/sign phase
+    /// only, NOT the whole publish.
+    ///
+    /// # What this does and does not cover
+    ///
+    /// `pending_store_edit` is cleared by `take()` once
+    /// `start_store_edit_if_ready` queues the signature, or by every ghostkey
+    /// failure arm (`Error`, `AccessDenied`, `NoIdentityAvailable`,
+    /// `PermissionDenied`); the matching `pending_signatures` entry is
+    /// removed the moment a `SignResult` matches it (`state.rs`'s response
+    /// handler, `pending_signatures.remove(at)`), by
+    /// `withdraw_pending_signature` if the send itself fails, or by those
+    /// same failure arms clearing the whole queue. So this reports `false`
+    /// again as soon as either of those happens -- there is no separate
+    /// "clear the flag" step for a caller to forget.
+    ///
+    /// But the `SignResult` match removes the `pending_signatures` entry --
+    /// so this function starts reporting `false` again -- *before* the
+    /// network write it authorizes has even started: `submit_store_info_by_id`
+    /// is only spawned after the match. So a second click landing during
+    /// that in-flight network write reads as "not in flight" and can queue a
+    /// second, real publish. That duplicate carries identical content at the
+    /// next sequenced version, so it is wasted work, not data corruption --
+    /// the store contract just discards or applies-as-a-no-op the extra
+    /// write.
+    ///
+    /// This also stays `true` for the rest of the session if the delegate
+    /// never answers the `SignResult` request at all -- there is no
+    /// timeout on either `pending_store_edit` or a queued `StoreInfo`
+    /// signature, so a delegate that goes silent leaves the button
+    /// disabled with no message until the page is reloaded.
+    ///
+    /// Used to gate a one-click publish button (My Store's "Publish details"
+    /// for `StoreDetailsGap::NoEncryptionKey`, PR #80) against a double-click
+    /// firing two real publishes -- NOT to block the ordinary multi-edit
+    /// flow, where a seller may deliberately submit a second edit before the
+    /// first round-trips (see `publish_store_details`'s use of
+    /// `last_queued_store_version`); that flow calls `publish_store_details`
+    /// directly and is unaffected by this check.
+    pub fn store_publish_in_flight(&self, store_contract_id: &[u8]) -> bool {
+        self.pending_store_edit
+            .as_ref()
+            .is_some_and(|edit| edit.store_contract_id == store_contract_id)
+            || self.pending_signatures.iter().any(|pending| {
+                matches!(
+                    pending,
+                    PendingSignature::StoreInfo(info)
+                        if info.store_contract_id == store_contract_id
+                )
+            })
+    }
+
     /// Publish new details for a store the seller owns -- the entry point for
     /// both editing a working store and repairing one whose details never
     /// reached the network.
@@ -7448,6 +7501,68 @@ mod tests {
         );
 
         assert!(state.pending_store_edit.is_none());
+    }
+
+    /// `store_publish_in_flight` is what gates My Store's one-click "Publish
+    /// details" button against a double-click (PR #80 review). It must be
+    /// `true` for the whole window a publish is outstanding -- both while
+    /// waiting on the certificate (`pending_store_edit`) and, once that
+    /// arrives, while waiting on the delegate's `SignResult`
+    /// (`pending_signatures`) -- and it must never report `true` for an
+    /// unrelated store.
+    #[test]
+    fn publish_in_flight_covers_the_certificate_and_signature_wait() {
+        let mut state = seller_with_store(Some(published_info(0, "", [0u8; 32])));
+        let other_store = [9u8; 32];
+
+        assert!(!state.store_publish_in_flight(&STORE_ID));
+        assert!(!state.store_publish_in_flight(&other_store));
+
+        state
+            .publish_store_details(&STORE_ID, typed_details())
+            .expect("the seller owns this store");
+
+        assert!(
+            state.store_publish_in_flight(&STORE_ID),
+            "waiting on the certificate is still in flight"
+        );
+        assert!(
+            !state.store_publish_in_flight(&other_store),
+            "a different store must not read as in flight"
+        );
+
+        state.on_ghostkey_response(certificate(FINGERPRINT));
+
+        assert!(state.pending_store_edit.is_none(), "the edit went ahead");
+        assert!(
+            state.store_publish_in_flight(&STORE_ID),
+            "queued for the delegate's SignResult is still in flight"
+        );
+    }
+
+    /// A publish that never gets a `SignResult` -- because the vault refused
+    /// it -- must not leave the button stuck disabled forever.
+    #[test]
+    fn publish_in_flight_clears_when_the_vault_denies_the_prompt() {
+        let mut state = seller_with_store(Some(published_info(0, "", [0u8; 32])));
+        state.harvest_delegate_key = Some(delegate_key(0xA1));
+        state.ghostkey_delegate_key = Some(delegate_key(0xB2));
+        state
+            .publish_store_details(&STORE_ID, typed_details())
+            .expect("the seller owns this store");
+        assert!(state.store_publish_in_flight(&STORE_ID));
+
+        from_ghostkey(
+            &mut state,
+            &ghostkey_common::GhostkeyResponse::AccessDenied {
+                requestor: harvest_common::expected_harvest_requestor(),
+            },
+        );
+
+        assert!(
+            !state.store_publish_in_flight(&STORE_ID),
+            "a denied prompt must release the button, not strand it disabled"
+        );
     }
 
     // -----------------------------------------------------------------

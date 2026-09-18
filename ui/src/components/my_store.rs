@@ -30,6 +30,11 @@ struct StoreCard {
     /// publish, and only the buyer's storefront says the identity is
     /// unbacked. Reading the same verdict here is what closes that gap.
     certificate: crate::ghostkey_cert::CertificateStatus,
+    /// Whether a publish for this store is already on its way to the
+    /// delegate or the network. Gates the `PublishNow` button so a second
+    /// click can't queue a duplicate publish -- see
+    /// `state::AppState::store_publish_in_flight`.
+    publish_in_flight: bool,
 }
 
 #[component]
@@ -244,6 +249,7 @@ fn IdentityCard(
                     certificate: browsing
                         .map(|browsing| browsing.certificate_status.clone())
                         .unwrap_or_default(),
+                    publish_in_flight: app_state.store_publish_in_flight(&store.store_contract_id),
                     contract_id: store.store_contract_id.clone(),
                 })
             })
@@ -344,18 +350,69 @@ fn IdentityCard(
 
                             button {
                                 class: if card.gap.is_some() { "btn btn-sm btn-primary" } else { "btn btn-sm btn-outline" },
+                                // Only the `PublishNow` path can double-fire a
+                                // real network request on a double-click --
+                                // `ToggleForm` just flips a local signal, so
+                                // it is left enabled. See
+                                // `state::AppState::store_publish_in_flight`
+                                // for why this can never get stuck disabled.
+                                disabled: store_details_button_action(
+                                        card.gap,
+                                        editing_store() == Some(card.contract_id.clone()),
+                                    ) == StoreDetailsAction::PublishNow
+                                    && card.publish_in_flight,
                                 onclick: {
                                     let id = card.contract_id.clone();
+                                    let details = card.details.clone();
+                                    let gap = card.gap;
                                     move |_| {
                                         let id = id.clone();
-                                        if editing_store() == Some(id.clone()) {
-                                            editing_store.set(None);
-                                        } else {
-                                            editing_store.set(Some(id));
+                                        // Recomputed at click time, not
+                                        // captured from the render that drew
+                                        // this button: `editing_store` can
+                                        // change between renders, and this is
+                                        // what keeps a store whose form is
+                                        // open from being silently published
+                                        // with the old, on-record details
+                                        // when `NoEncryptionKey` appears while
+                                        // the seller has unsaved edits open
+                                        // (#80 review).
+                                        let is_editing = editing_store() == Some(id.clone());
+                                        match store_details_button_action(gap, is_editing) {
+                                            // See `store_details_button_action`
+                                            // for why this publishes instead
+                                            // of opening the form (#78).
+                                            StoreDetailsAction::PublishNow => {
+                                                // Fresh read, not
+                                                // `card.publish_in_flight`:
+                                                // that was snapshotted when
+                                                // this render started, and two
+                                                // clicks can land before
+                                                // Dioxus re-renders the
+                                                // `disabled` attribute above
+                                                // (#80 review).
+                                                if APP_STATE.read().store_publish_in_flight(&id) {
+                                                    return;
+                                                }
+                                                publish_store_details(id, details.clone());
+                                            }
+                                            StoreDetailsAction::ToggleForm => {
+                                                if is_editing {
+                                                    editing_store.set(None);
+                                                } else {
+                                                    editing_store.set(Some(id));
+                                                }
+                                            }
                                         }
                                     }
                                 },
-                                if editing_store() == Some(card.contract_id.clone()) {
+                                if store_details_button_action(
+                                    card.gap,
+                                    editing_store() == Some(card.contract_id.clone()),
+                                ) == StoreDetailsAction::PublishNow
+                                {
+                                    "Publish details"
+                                } else if editing_store() == Some(card.contract_id.clone()) {
                                     "Cancel"
                                 } else if card.gap.is_some() {
                                     "Publish details"
@@ -482,6 +539,63 @@ fn StoreDetailsForm(
                 "{submit_label}"
             }
         }
+    }
+}
+
+/// What clicking the store-details button should do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreDetailsAction {
+    /// Publish the details already on record, unchanged.
+    PublishNow,
+    /// Open (or close) the edit/repair form so the seller can type something.
+    ToggleForm,
+}
+
+/// Decide what the store-details button does, given the gap (if any) a
+/// store's published details currently have.
+///
+/// # Why `NoEncryptionKey` is special (#78)
+///
+/// `StoreDetailsGap::NoEncryptionKey`'s own message says publishing "adds the
+/// key your delegate already holds; nothing else about the store changes" --
+/// the key comes from the delegate, not from anything the seller types, so
+/// there is nothing to fill in and nothing to review. Before this fix every
+/// gap opened the same edit form and made the seller click a SECOND,
+/// undisclosed "Publish" button inside it to actually publish. For this one
+/// gap that meant clicking the button labelled "Publish details" produced no
+/// network call, no vault prompt, and no notification -- indistinguishable
+/// from the button being broken, and exactly what was reported in #78.
+///
+/// Every other gap (`NeverPublished`, `NoName`, `NoReputationLink`) needs the
+/// seller to actually provide something -- at minimum a store name -- so
+/// those still open the form, as does an ordinary "Edit details" click
+/// (`gap` is `None`).
+///
+/// # Why `is_editing` overrides the gap (PR #80 review)
+///
+/// `is_editing` is whether THIS store's edit/repair form is already open.
+/// When it is, the button is always `ToggleForm` (closing it), regardless of
+/// what `gap` says. Without this, the gap arriving or changing while the form
+/// is open -- `EncryptionKeyReady` lands asynchronously, independent of
+/// anything the seller is doing -- could flip a card from `None`/some other
+/// gap to `NoEncryptionKey` while the seller has unsaved edits sitting in the
+/// open form: the button would silently relabel to "Publish details" and, on
+/// the next click, publish `card.details` -- the OLD, already-published
+/// values read from the network, not what the seller typed -- discarding the
+/// edit. Closing the form is always safe and always what the button's own
+/// label ("Cancel") promises; it is the seller's job to reopen and resubmit
+/// once done, at which point the gap is read fresh.
+fn store_details_button_action(
+    gap: Option<StoreDetailsGap>,
+    is_editing: bool,
+) -> StoreDetailsAction {
+    if is_editing {
+        return StoreDetailsAction::ToggleForm;
+    }
+    if gap == Some(StoreDetailsGap::NoEncryptionKey) {
+        StoreDetailsAction::PublishNow
+    } else {
+        StoreDetailsAction::ToggleForm
     }
 }
 
@@ -913,6 +1027,87 @@ fn truncate_fingerprint(fp: &str) -> String {
         format!("{}...", &fp[..12])
     } else {
         fp.to_string()
+    }
+}
+
+#[cfg(test)]
+mod store_details_button_tests {
+    use super::{store_details_button_action, StoreDetailsAction};
+    use crate::state::StoreDetailsGap;
+
+    /// The regression test for #78. Before the fix, this function did not
+    /// exist -- the button always toggled the form open -- so clicking
+    /// "Publish details" for a store missing only its encryption key never
+    /// reached the delegate: no vault prompt, no notification, no change.
+    /// Reverting the fix (making this always return `ToggleForm`) makes this
+    /// fail.
+    #[test]
+    fn no_encryption_key_gap_publishes_immediately() {
+        assert_eq!(
+            store_details_button_action(Some(StoreDetailsGap::NoEncryptionKey), false),
+            StoreDetailsAction::PublishNow
+        );
+    }
+
+    /// Every other gap needs the seller to type something -- at minimum a
+    /// store name -- so those still open the form rather than republishing
+    /// blank or stale fields.
+    #[test]
+    fn gaps_needing_seller_input_open_the_form() {
+        for gap in [
+            StoreDetailsGap::NeverPublished,
+            StoreDetailsGap::NoName,
+            StoreDetailsGap::NoReputationLink,
+        ] {
+            assert_eq!(
+                store_details_button_action(Some(gap), false),
+                StoreDetailsAction::ToggleForm,
+                "{gap:?} should still open the form"
+            );
+        }
+    }
+
+    /// An ordinary "Edit details" click (no gap at all) is unaffected: it
+    /// still opens the form so the seller can change something on purpose.
+    #[test]
+    fn no_gap_opens_the_edit_form() {
+        assert_eq!(
+            store_details_button_action(None, false),
+            StoreDetailsAction::ToggleForm
+        );
+    }
+
+    /// The regression test for the PR #80 review finding. `EncryptionKeyReady`
+    /// can arrive at any time, independent of the seller -- if the button
+    /// ignored `is_editing` it would flip to `PublishNow` and, on the next
+    /// click, publish the OLD on-record details over whatever the seller has
+    /// typed into the still-open form. Reverting the `is_editing` check (so
+    /// this only looks at `gap`) makes this fail.
+    #[test]
+    fn an_open_form_always_cancels_even_if_the_gap_is_now_no_encryption_key() {
+        assert_eq!(
+            store_details_button_action(Some(StoreDetailsGap::NoEncryptionKey), true),
+            StoreDetailsAction::ToggleForm
+        );
+    }
+
+    /// `is_editing` overrides every gap, not just `NoEncryptionKey` -- an
+    /// open form is always closable.
+    #[test]
+    fn an_open_form_always_cancels_regardless_of_gap() {
+        for gap in [
+            None,
+            Some(StoreDetailsGap::NeverPublished),
+            Some(StoreDetailsGap::NoName),
+            Some(StoreDetailsGap::NoReputationLink),
+            Some(StoreDetailsGap::NoEncryptionKey),
+        ] {
+            assert_eq!(
+                store_details_button_action(gap, true),
+                StoreDetailsAction::ToggleForm,
+                "{gap:?} while editing should still be Cancel"
+            );
+        }
     }
 }
 
