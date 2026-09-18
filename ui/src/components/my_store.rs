@@ -238,9 +238,6 @@ fn IdentityCard(
                     details: StoreDetails {
                         store_name: info.map(|i| i.store_name.clone()).unwrap_or_default(),
                         description: info.map(|i| i.description.clone()).unwrap_or_default(),
-                        payment_instructions: info
-                            .map(|i| i.payment_instructions.clone())
-                            .unwrap_or_default(),
                     },
                     details_resolved: app_state
                         .store_details_are_resolved(&store.store_contract_id),
@@ -294,9 +291,19 @@ fn IdentityCard(
                     div { class: "store-share-row",
                         span { class: "store-share-label", "{card.label}" }
                         if let Some(ref link) = card.link {
+                            // Styled as a value to copy rather than a form
+                            // field: it is readonly, and dressed as an input
+                            // it read as something to edit.
                             input {
-                                class: "form-input",
+                                class: "copy-field",
                                 readonly: true,
+                                spellcheck: false,
+                                // Named, because `aria-label` REPLACES the
+                                // visible label beside it: a seller with two
+                                // stores would otherwise hear the same string
+                                // for both, which is the distinction the row
+                                // above exists to draw.
+                                aria_label: "{card.label} store link, select to copy",
                                 value: "{link}",
                             }
                         }
@@ -426,7 +433,6 @@ fn StoreDetailsForm(
 ) -> Element {
     let mut store_name = use_signal(|| initial.store_name.clone());
     let mut description = use_signal(|| initial.description.clone());
-    let mut payment_instructions = use_signal(|| initial.payment_instructions.clone());
 
     rsx! {
         div { class: "card",
@@ -451,15 +457,16 @@ fn StoreDetailsForm(
                     value: "{description}",
                     oninput: move |e| description.set(e.value()),
                 }
-            }
-
-            div { class: "form-group",
-                label { class: "form-label", "Payment Instructions" }
-                textarea {
-                    class: "form-textarea",
-                    placeholder: "How should buyers pay? e.g. BTC: bc1q..., or contact me to arrange",
-                    value: "{payment_instructions}",
-                    oninput: move |e| payment_instructions.set(e.value()),
+                // Said here because a feature nobody is told about is one
+                // nobody uses, and this is the only field a store has.
+                p { class: "text-muted", style: "font-size: 0.8rem;",
+                    "Markdown works here: "
+                    code { "# heading" }
+                    ", "
+                    code { "- list" }
+                    ", "
+                    code { "**bold**" }
+                    ", and links."
                 }
             }
 
@@ -470,7 +477,6 @@ fn StoreDetailsForm(
                     on_submit.call(StoreDetails {
                         store_name: store_name().trim().to_string(),
                         description: description().trim().to_string(),
-                        payment_instructions: payment_instructions().trim().to_string(),
                     });
                 },
                 "{submit_label}"
@@ -563,7 +569,6 @@ fn initiate_store_creation(_fingerprint: String, _details: StoreDetails) {
                 certificate_pem: String::new(),
                 store_name: details.store_name,
                 description: details.description,
-                payment_instructions: details.payment_instructions,
                 rsa_public_key_der: None,
                 // Filled by `EncryptionKeyReady` below. Creation does not
                 // wait for it -- see the field's own documentation.

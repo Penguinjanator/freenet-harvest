@@ -70,7 +70,10 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                 div { class: "store-header-inner",
                     div {
                         h3 { class: "store-name", "{info.store_name}" }
-                        p { class: "store-desc", "{info.description}" }
+                        crate::markdown::Markdown {
+                            source: info.description.clone(),
+                            class: "store-desc",
+                        }
                     }
                     div { class: "store-meta",
                         if store.feedback.is_empty() {
@@ -97,12 +100,6 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                 if !store.certificate_status.is_verified() {
                     p { class: "text-warning",
                         "{certificate_warning(&store.certificate_status)}"
-                    }
-                }
-                if !info.payment_instructions.is_empty() {
-                    p { class: "payment-info",
-                        strong { "Payment: " }
-                        "{info.payment_instructions}"
                     }
                 }
             }
@@ -296,7 +293,10 @@ fn ListingCard(
                     "This listing's ghostkey certificate is not this seller's."
                 }
             }
-            p { class: "listing-desc", "{l.description}" }
+            crate::markdown::Markdown {
+                source: l.description.clone(),
+                class: "listing-desc",
+            }
             div { class: "listing-footer",
                 if let Some(ref price) = l.price {
                     span { class: "listing-price", "{price.amount} {price.currency}" }
@@ -424,7 +424,10 @@ fn example_listings_section() -> Element {
                             h4 { "{title}" }
                             span { class: "badge {kind_badge_class(&kind)}", "{kind_label(&kind)}" }
                         }
-                        p { class: "listing-desc", "{desc}" }
+                        crate::markdown::Markdown {
+                            source: desc,
+                            class: "listing-desc",
+                        }
                         if let Some(ref p) = price {
                             p { class: "listing-price", "{p.amount} {p.currency}" }
                         }
@@ -454,7 +457,6 @@ mod buy_control_tests {
                 reputation_contract_id: [0u8; 32],
                 store_name: "Hot sauce".to_string(),
                 description: String::new(),
-                payment_instructions: String::new(),
                 encryption_public_key: encryption_key,
             }),
             seller_verifying_key: identity,
@@ -526,7 +528,6 @@ mod listing_buy_gate_tests {
                 reputation_contract_id: [0u8; 32],
                 store_name: "Hot sauce".to_string(),
                 description: String::new(),
-                payment_instructions: String::new(),
                 encryption_public_key: Some([1u8; 32]),
             }),
             seller_verifying_key: Some([2u8; 32]),
