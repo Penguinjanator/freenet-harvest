@@ -38,6 +38,10 @@ pub async fn connect(
     *CONNECTION_STATUS.write() = ConnectionStatus::Connecting;
 
     let base_url = get_websocket_url();
+    // What the log may say: the node's address with no query string. The
+    // URL actually dialled carries `authToken=` for a node that requires one,
+    // and `info!` survives release builds (harvest#96 review).
+    let node_address = base_url.split('?').next().unwrap_or_default().to_string();
     let websocket_url = match get_auth_token() {
         Some(token) => {
             if base_url.contains('?') {
@@ -49,10 +53,13 @@ pub async fn connect(
         None => base_url,
     };
 
-    info!("Connecting to Freenet node at: {}", websocket_url);
+    info!("Connecting to Freenet node at: {node_address}");
 
+    // Not the browser's error text: Chrome's SyntaxError quotes the whole
+    // URL ("The URL '<url>' is invalid."), token included, and this string
+    // is logged by the caller and shown as the connection status.
     let websocket = web_sys::WebSocket::new(&websocket_url)
-        .map_err(|e| format!("Failed to create WebSocket: {:?}", e))?;
+        .map_err(|_| format!("could not open the websocket to {node_address}"))?;
 
     let (response_tx, response_rx) = mpsc::unbounded();
     let (ready_tx, ready_rx) = futures::channel::oneshot::channel();

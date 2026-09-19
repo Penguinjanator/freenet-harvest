@@ -28,7 +28,10 @@ pub fn handle_response(response: Result<HostResponse, String>) {
             // Node queries -- not used by Harvest yet
         }
         Ok(other) => {
-            info!("Unhandled host response: {:?}", other);
+            info!(
+                "Unhandled host response: {}",
+                super::log_summary::host_response_summary(&other)
+            );
         }
         Err(e) => {
             error!("Gateway error: {}", e);
@@ -197,6 +200,68 @@ fn check_for_reputation_link(state_bytes: &[u8]) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// **An undecodable payload's error quotes nothing from it** (review of
+    /// harvest#96). Where serde's visitor sees a string it did not expect --
+    /// an enum that receives an unknown variant name -- its message quotes
+    /// the string, and on version skew that string can be an xpub or a
+    /// signing key PEM sitting where the old build expected an enum.
+    #[test]
+    fn a_decode_error_does_not_quote_the_payload() {
+        #[derive(serde::Serialize)]
+        struct SkewedStatus {
+            xpub: String,
+            network: String,
+            next_index: u32,
+        }
+        #[derive(serde::Serialize)]
+        enum Skewed {
+            PaymentXpub {
+                status: Option<SkewedStatus>,
+            },
+            PermissionGranted {
+                fingerprint: String,
+                requestor: String,
+            },
+        }
+        const SECRET: &str = "vpubSECRETXPUB";
+        let harvest = harvest_common::to_cbor(&Skewed::PaymentXpub {
+            status: Some(SkewedStatus {
+                xpub: "vpub".into(),
+                network: SECRET.into(),
+                next_index: 1,
+            }),
+        })
+        .expect("cbor");
+        let ghostkey = harvest_common::to_cbor(&Skewed::PermissionGranted {
+            fingerprint: "fp-one".into(),
+            requestor: SECRET.into(),
+        })
+        .expect("cbor");
+        // Precondition: serde really does quote it, so the assertions below
+        // are about the error text we build and not about serde's.
+        for serde_says in [
+            from_cbor::<harvest_common::BitcoinDelegateResponse>(&harvest).err(),
+            from_cbor::<ghostkey_common::GhostkeyResponse>(&ghostkey).err(),
+        ] {
+            let serde_says = serde_says.expect("must not decode");
+            assert!(serde_says.contains(SECRET), "{serde_says}");
+        }
+
+        for (sender, payload, variant) in [
+            (DelegateSender::Harvest, &harvest, "PaymentXpub"),
+            (DelegateSender::Ghostkey, &ghostkey, "PermissionGranted"),
+        ] {
+            let Err(error) = decode_delegate_message(sender, payload) else {
+                panic!("a skewed payload decoded");
+            };
+            assert!(!error.contains(SECRET), "{error}");
+            assert!(
+                error.contains(&format!("variant `{variant}`, {} bytes", payload.len())),
+                "{error}"
+            );
+        }
+    }
+
     /// An unsigned version-0 reputation id is not followed; a signed one is
     /// (PR #82 round-3 review).
     #[test]
@@ -278,7 +343,10 @@ pub(crate) enum DelegateSender {
 }
 
 /// One decoded delegate message, already attributed to its sender.
-#[derive(Debug)]
+///
+/// Deliberately not `Debug`: it holds whole delegate responses, and one of
+/// them (`GhostkeyResponse`) prints every secret it carries. Log it with
+/// `log_summary` (harvest#94).
 pub(crate) enum DelegateResponse {
     Harvest(HarvestDelegateResponse),
     Bitcoin(harvest_common::BitcoinDelegateResponse),
@@ -315,19 +383,29 @@ pub(crate) fn decode_delegate_message(
     match sender {
         DelegateSender::Harvest => from_cbor::<HarvestDelegateResponse>(payload)
             .map(DelegateResponse::Harvest)
-            .or_else(|harvest_err| {
+            .or_else(|_| {
                 from_cbor::<harvest_common::BitcoinDelegateResponse>(payload)
                     .map(DelegateResponse::Bitcoin)
-                    .map_err(|btc_err| {
+                    // Not serde's messages: on version skew they quote the
+                    // value that failed, which can be a backup string or an
+                    // xpub (harvest#94). The payload's shape is enough to
+                    // tell skew from rubbish.
+                    .map_err(|_| {
                         format!(
-                            "not a harvest delegate response ({harvest_err}) nor a Bitcoin \
-                             one ({btc_err})"
+                            "not a harvest delegate response nor a Bitcoin one ({})",
+                            super::log_summary::payload_shape(payload)
                         )
                     })
             }),
         DelegateSender::Ghostkey => from_cbor::<ghostkey_common::GhostkeyResponse>(payload)
             .map(DelegateResponse::Ghostkey)
-            .map_err(|e| format!("not a ghostkey delegate response ({e})")),
+            // As above: serde would quote a signing key PEM.
+            .map_err(|_| {
+                format!(
+                    "not a ghostkey delegate response ({})",
+                    super::log_summary::payload_shape(payload)
+                )
+            }),
         DelegateSender::Unknown => {
             Err("message from a delegate this app never registered".to_string())
         }
@@ -339,16 +417,27 @@ pub(crate) fn apply_delegate_response(
     response: DelegateResponse,
 ) {
     match response {
+        // Never `{:?}` of a response here: several carry secrets, and
+        // `info!` survives release builds (harvest#94). See `log_summary`.
         DelegateResponse::Harvest(r) => {
-            info!("Harvest delegate response: {:?}", r);
+            info!(
+                "Harvest delegate response: {}",
+                super::log_summary::harvest_response_summary(&r)
+            );
             app.on_delegate_response(r);
         }
         DelegateResponse::Bitcoin(r) => {
-            info!("Bitcoin delegate response: {:?}", r);
+            info!(
+                "Bitcoin delegate response: {}",
+                super::log_summary::bitcoin_response_summary(&r)
+            );
             app.on_bitcoin_delegate_response(r);
         }
         DelegateResponse::Ghostkey(r) => {
-            info!("Ghostkey response: {:?}", r);
+            info!(
+                "Ghostkey response: {}",
+                super::log_summary::ghostkey_response_summary(&r)
+            );
             app.on_ghostkey_response(r);
         }
     }
@@ -387,11 +476,14 @@ fn handle_delegate_response(
                         }
                         apply_delegate_response(&mut APP_STATE.write(), response)
                     }
-                    Err(e) => error!("Undecodable delegate response from {:?}: {e}", key),
+                    Err(e) => error!("Undecodable delegate response from {sender:?}: {e}"),
                 }
             }
             freenet_stdlib::prelude::OutboundDelegateMsg::RequestUserInput(req) => {
-                info!("Delegate requesting user input: {:?}", req.message);
+                info!(
+                    "Delegate requesting user input: {}",
+                    super::log_summary::user_input_summary(&req)
+                );
                 // Permission prompts from the ghostkey delegate will arrive here.
                 // The Freenet runtime handles displaying these to the user and
                 // routing the response back to the delegate.

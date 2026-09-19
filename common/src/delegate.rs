@@ -195,7 +195,8 @@ pub enum HarvestDelegateRequest {
     /// buyer on a new node has the string and nothing to relate it to.
     ImportBuyerConversation {
         request_id: RequestId,
-        backup: String,
+        /// The pasted string. Prints as `BackupString(redacted)`.
+        backup: BackupString,
     },
 
     /// Record that the buyer holds a copy of THIS conversation outside this
@@ -406,12 +407,13 @@ pub enum HarvestDelegateResponse {
     /// One conversation, as a string the buyer can save.
     ///
     /// `Ok` carries the backup itself. It holds a secret: see
-    /// [`HarvestDelegateRequest::ExportBuyerConversation`].
+    /// [`HarvestDelegateRequest::ExportBuyerConversation`]. That is why it is
+    /// a [`BackupString`], which does not print itself.
     BuyerConversationExported {
         request_id: RequestId,
         store_contract_id: Vec<u8>,
         buyer_public_key: [u8; 32],
-        result: Result<String, String>,
+        result: Result<BackupString, String>,
     },
 
     /// What a pasted backup did.
@@ -549,7 +551,10 @@ pub enum HarvestDelegateResponse {
 /// would put the seller a second delegate round trip away from replying, and
 /// answering a single undirected key would let a copy of the buyer's own
 /// message read as a reply -- see [`crate::mailbox::MessageDirection`].
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+///
+/// `Debug` prints the peer key and redacts both conversation keys; see
+/// [`Redacted`].
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct ConversationKey {
     /// The buyer ephemeral public key these were derived against, echoed back
     /// so the caller does not have to rely on ordering.
@@ -568,7 +573,10 @@ pub struct ConversationKey {
 /// secret handed back on every reload would be a secret in every browser log
 /// and bug report for no gain. Pinned by
 /// `the_secret_never_leaves_the_delegate`.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+///
+/// The two direction keys are still secrets -- each reads or forges one side
+/// of the thread -- so `Debug` redacts them; see [`Redacted`].
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct RecalledConversation {
     /// The conversation's routing tag, which is what matches it to messages
     /// in the mailbox.
@@ -708,12 +716,13 @@ impl ImportedConversation {
 ///
 /// # Why a newtype rather than `[u8; 32]`
 ///
-/// `HarvestDelegateRequest` derives `Debug`, and the responses are logged
-/// verbatim (`gateway::response_handler::apply_delegate_response`). A bare
-/// array would print, so the one secret in this protocol that a buyer cannot
-/// replace would land in any console log pasted into a bug report. This type
-/// prints as `ConversationSecret(redacted)` instead; pinned by
-/// `a_conversation_secret_does_not_print_itself`.
+/// `HarvestDelegateRequest` derives `Debug`, and until harvest#94 the UI
+/// logged delegate traffic verbatim. A bare array would print, so the one
+/// secret in this protocol that a buyer cannot replace would land in any
+/// console log pasted into a bug report. This type prints as
+/// `ConversationSecret(redacted)` instead; pinned by
+/// `a_conversation_secret_does_not_print_itself` and
+/// `no_delegate_message_prints_a_secret`.
 ///
 /// `#[serde(transparent)]` so the wire encoding is exactly the 32 bytes --
 /// the newtype is a compile-time and log-time property, not a format change.
@@ -724,6 +733,92 @@ pub struct ConversationSecret(pub [u8; 32]);
 impl core::fmt::Debug for ConversationSecret {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("ConversationSecret(redacted)")
+    }
+}
+
+/// A conversation backup string: what `ExportBuyerConversation` answers and
+/// `ImportBuyerConversation` takes.
+///
+/// It contains the conversation's X25519 secret, so it is worth exactly as
+/// much as [`ConversationSecret`] and gets the same treatment: `Debug` prints
+/// `BackupString(redacted)`, so neither the response nor the request that
+/// carries it can put it into a log (harvest#94).
+///
+/// `#[serde(transparent)]`: on the wire it is exactly the string.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct BackupString(pub String);
+
+impl core::fmt::Debug for BackupString {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("BackupString(redacted)")
+    }
+}
+
+/// Stands in for a secret field in a hand-written `Debug`.
+///
+/// The types that hold key material in this protocol write their `Debug` by
+/// hand and print this in place of each secret, so the field is visibly
+/// present but its bytes never reach a formatter. Pinned by
+/// `no_delegate_message_prints_a_secret`.
+pub(crate) struct Redacted;
+
+impl core::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("redacted")
+    }
+}
+
+impl core::fmt::Debug for ConversationKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ConversationKey")
+            .field("peer_public_key", &self.peer_public_key)
+            .field("buyer_to_seller", &Redacted)
+            .field("seller_to_buyer", &Redacted)
+            .finish()
+    }
+}
+
+impl core::fmt::Debug for TransactionRecord {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Destructured, so a new field does not compile until somebody
+        // decides whether it may print.
+        let Self {
+            transaction_id,
+            our_token,
+            our_blinded_token: _,
+            blind_signature,
+            created_at,
+        } = self;
+        f.debug_struct("TransactionRecord")
+            .field("transaction_id", transaction_id)
+            .field("our_token", our_token)
+            .field("our_blinded_token", &Redacted)
+            .field(
+                "blind_signature",
+                &blind_signature.as_ref().map(|_| Redacted),
+            )
+            .field("created_at", created_at)
+            .finish()
+    }
+}
+
+impl core::fmt::Debug for RecalledConversation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Listed field by field rather than derived so a field added later is
+        // left out until someone decides it is safe to print -- the failure
+        // is a missing field in a log, not a key in one.
+        f.debug_struct("RecalledConversation")
+            .field("buyer_public_key", &self.buyer_public_key)
+            .field("conversation_id", &self.conversation_id)
+            .field("buyer_to_seller", &Redacted)
+            .field("seller_to_buyer", &Redacted)
+            // A commitment, safe to publish; see the field's docs.
+            .field("order_binding", &self.order_binding)
+            .field("created_at", &self.created_at)
+            .field("imported", &self.imported)
+            .field("backed_up", &self.backed_up)
+            .finish()
     }
 }
 
@@ -740,7 +835,12 @@ pub struct StoreRegistration {
 }
 
 /// A record of a feedback token exchange, stored locally by the delegate.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+///
+/// `Debug` redacts the blinded token and the blind signature: printed beside
+/// the unblinded token they are exactly the link blind signing exists to
+/// break (which buyer holds which feedback slot). The token itself redacts
+/// its own key and nonce; see [`FeedbackToken`].
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct TransactionRecord {
     pub transaction_id: String,
     /// Our unblinded feedback token (can be submitted to counterparty's reputation contract).
@@ -758,8 +858,8 @@ mod tests {
 
     /// **A conversation secret must not print itself.**
     ///
-    /// It travels inside a `Debug`-deriving request enum, and the UI logs
-    /// delegate traffic verbatim. This is the one secret in the protocol a
+    /// It travels inside a `Debug`-deriving request enum, so any `{:?}` of
+    /// that request would reach a log. This is the one secret in the protocol a
     /// buyer cannot replace -- lose it and the seller's reply, which after
     /// Phase 2 carries their only capability to complain, is unreadable
     /// forever.
@@ -799,6 +899,650 @@ mod tests {
         assert_eq!(
             crate::to_cbor(&ConversationSecret(bytes)).expect("cbor"),
             crate::to_cbor(&bytes).expect("cbor"),
+        );
+    }
+    // === harvest#94: nothing the delegate protocol carries prints a secret ===
+
+    /// Every field of a sample below that must not print is filled with
+    /// this byte, or with [`SECRET_TEXT`] if it is a string.
+    ///
+    /// **Adding a field that holds key material (or anything else that must
+    /// not reach a log)? Fill it with `SECRET` / `SECRET_TEXT` in its
+    /// variant's sample.** Classification below is per VARIANT, so a second
+    /// secret field on a variant already marked secret-bearing is checked
+    /// only if its sample carries the sentinel there too -- nothing else in
+    /// this test can notice it.
+    const SECRET_BYTE: u8 = 0xA7;
+    const SECRET: [u8; 32] = [SECRET_BYTE; 32];
+    const SECRET_TEXT: &str = "hvbk1-SECRET-BACKUP-TEXT";
+
+    /// What a printed secret looks like: `{:?}` of a byte array is decimal,
+    /// and a hand-rolled hex dump would be the other obvious slip. Three in a
+    /// row, because a single `167` occurs by chance in any hash.
+    ///
+    /// Whitespace is removed first: `{:#?}` puts every array element on its
+    /// own line, so `167, 167, 167` never appears in pretty output even when
+    /// every byte of the key does.
+    fn leaked(printed: &str) -> Option<&'static str> {
+        let squashed: String = printed.chars().filter(|c| !c.is_whitespace()).collect();
+        ["167,167,167", "a7a7a7", "A7A7A7", "SECRET"]
+            .into_iter()
+            .find(|needle| squashed.contains(needle))
+    }
+
+    /// Whether `value`'s wire encoding carries the sentinel secret -- proof
+    /// that a sample classified as secret-bearing really holds one, so a
+    /// clean `Debug` of it means something. ciborium writes a byte array as
+    /// an array of integers, each `0x18 0xA7`.
+    fn carries_secret<T: Serialize>(value: &T) -> bool {
+        let wire = crate::to_cbor(value).expect("cbor");
+        let array: Vec<u8> = [0x18, SECRET_BYTE].repeat(32);
+        wire.windows(array.len()).any(|w| w == array.as_slice())
+            || wire
+                .windows(SECRET_TEXT.len())
+                .any(|w| w == SECRET_TEXT.as_bytes())
+    }
+
+    /// Every response variant, as `(index, carries key material)`.
+    ///
+    /// Exhaustive with no wildcard, so a new variant does not compile until
+    /// somebody decides here whether it carries a secret -- and then
+    /// [`no_delegate_message_prints_a_secret`] fails until
+    /// [`response_samples`] has one of it.
+    fn classify_response(r: &HarvestDelegateResponse) -> (usize, bool) {
+        use HarvestDelegateResponse as R;
+        match r {
+            R::ReputationKeysInitialized { .. } => (0, false),
+            R::RsaPublicKey { .. } => (1, false),
+            R::EncryptionKeyReady { .. } => (2, false),
+            R::BuyerConversationStored { .. } => (3, false),
+            // Both direction keys of every recalled conversation.
+            R::BuyerConversationList { .. } => (4, true),
+            // The backup string, which contains the X25519 secret.
+            R::BuyerConversationExported { .. } => (5, true),
+            R::BuyerConversationImported { .. } => (6, false),
+            R::BuyerConversationMarkedBackedUp { .. } => (7, false),
+            R::BuyerConversationForgotten { .. } => (8, false),
+            // Both direction keys for every buyer asked about.
+            R::ConversationKeys { .. } => (9, true),
+            R::BlindSignatureResult { .. } => (10, false),
+            R::ListingCreated { .. } => (11, false),
+            R::TransactionRecorded { .. } => (12, false),
+            R::BlindSignatureRecorded { .. } => (13, false),
+            // Our unblinded token (nonce, entry key) beside the blinded one:
+            // together they link the buyer to their feedback slot.
+            R::TransactionList { .. } => (14, true),
+            R::ContractUpdate { .. } => (15, false),
+            R::ContractState { .. } => (16, false),
+            R::StoreRegistered { .. } => (17, false),
+            R::StoreList { .. } => (18, false),
+            R::RememberedStores { .. } => (19, false),
+            R::MigrationMarker { .. } => (20, false),
+            R::MigrationMarkerRecorded { .. } => (21, false),
+            R::Error { .. } => (22, false),
+        }
+    }
+    const RESPONSE_VARIANTS: usize = 23;
+
+    /// Every request variant, as for [`classify_response`].
+    fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
+        use HarvestDelegateRequest as Q;
+        match r {
+            Q::InitReputationKeys { .. } => (0, false),
+            Q::GetRsaPublicKey { .. } => (1, false),
+            Q::BlindSignFeedbackToken { .. } => (2, false),
+            Q::InitEncryptionKey { .. } => (3, false),
+            Q::DeriveConversationKeys { .. } => (4, false),
+            // The buyer's ephemeral X25519 secret.
+            Q::StoreBuyerConversation { .. } => (5, true),
+            Q::ListBuyerConversations { .. } => (6, false),
+            Q::ForgetBuyerConversation { .. } => (7, false),
+            Q::ExportBuyerConversation { .. } => (8, false),
+            // The pasted backup string.
+            Q::ImportBuyerConversation { .. } => (9, true),
+            Q::MarkConversationBackedUp { .. } => (10, false),
+            Q::CreateListing { .. } => (11, false),
+            // The unblinded token (nonce, entry key); see `TransactionList`.
+            Q::BeginTransaction { .. } => (12, true),
+            Q::RecordBlindSignature { .. } => (13, false),
+            Q::ListTransactions => (14, false),
+            Q::RegisterStore { .. } => (15, false),
+            Q::ListStores { .. } => (16, false),
+            Q::GetMigrationMarker { .. } => (17, false),
+            Q::SetMigrationMarker { .. } => (18, false),
+            Q::RememberStore { .. } => (19, false),
+            Q::SetStoreArchived { .. } => (20, false),
+            Q::ListRememberedStores => (21, false),
+        }
+    }
+    const REQUEST_VARIANTS: usize = 22;
+
+    /// A feedback token whose private parts are the sentinel. Built
+    /// directly rather than with `FeedbackToken::new`, which would derive
+    /// the nonce and so put a hash, not the sentinel, where it must not
+    /// print.
+    fn private_token() -> FeedbackToken {
+        FeedbackToken {
+            target_reputation_contract: [9u8; 32],
+            nonce: SECRET,
+            entry_key: SECRET,
+        }
+    }
+
+    fn recalled() -> RecalledConversation {
+        RecalledConversation {
+            buyer_public_key: [1u8; 32],
+            conversation_id: [2u8; 32],
+            buyer_to_seller: SECRET,
+            seller_to_buyer: SECRET,
+            order_binding: [4u8; 32],
+            created_at: 1_700_000_000,
+            imported: false,
+            backed_up: true,
+        }
+    }
+
+    fn response_samples() -> Vec<HarvestDelegateResponse> {
+        use HarvestDelegateResponse as R;
+        let fp = || "fp-one".to_string();
+        let store = || vec![3u8; 32];
+        vec![
+            R::ReputationKeysInitialized {
+                ghostkey_fingerprint: fp(),
+                rsa_public_key_der: vec![5u8; 8],
+            },
+            R::RsaPublicKey {
+                ghostkey_fingerprint: fp(),
+                rsa_public_key_der: vec![5u8; 8],
+            },
+            R::EncryptionKeyReady {
+                ghostkey_fingerprint: fp(),
+                x25519_public_key: vec![6u8; 32],
+            },
+            R::BuyerConversationStored {
+                request_id: 42,
+                result: Ok(()),
+                evicted: vec![EvictedConversation {
+                    buyer_public_key: [1u8; 32],
+                    was_backed_up: false,
+                }],
+            },
+            R::BuyerConversationList {
+                request_id: 42,
+                store_contract_id: store(),
+                conversations: vec![recalled()],
+            },
+            R::BuyerConversationExported {
+                request_id: 42,
+                store_contract_id: store(),
+                buyer_public_key: [1u8; 32],
+                result: Ok(BackupString(SECRET_TEXT.to_string())),
+            },
+            R::BuyerConversationImported {
+                request_id: 42,
+                result: Ok(ImportedConversation::Imported {
+                    store_contract_id: store(),
+                    buyer_public_key: [1u8; 32],
+                }),
+            },
+            R::BuyerConversationMarkedBackedUp {
+                request_id: 42,
+                store_contract_id: store(),
+                buyer_public_key: [1u8; 32],
+                result: Ok(true),
+            },
+            R::BuyerConversationForgotten {
+                request_id: 42,
+                result: Ok(()),
+            },
+            R::ConversationKeys {
+                request_id: 42,
+                ghostkey_fingerprint: fp(),
+                result: Ok(vec![ConversationKey {
+                    peer_public_key: vec![1u8; 32],
+                    buyer_to_seller: SECRET,
+                    seller_to_buyer: SECRET,
+                }]),
+            },
+            R::BlindSignatureResult {
+                request_id: 42,
+                result: Ok(vec![8u8; 16]),
+            },
+            R::ListingCreated {
+                request_id: 42,
+                result: Err("not signed".into()),
+            },
+            R::TransactionRecorded {
+                request_id: 42,
+                result: Ok(()),
+            },
+            R::BlindSignatureRecorded {
+                request_id: 42,
+                result: Ok(()),
+            },
+            R::TransactionList {
+                transactions: vec![TransactionRecord {
+                    transaction_id: "tx-one".into(),
+                    our_token: private_token(),
+                    our_blinded_token: SECRET.to_vec(),
+                    blind_signature: Some(SECRET.to_vec()),
+                    created_at: DateTime::<Utc>::from_timestamp(1_700_000_000, 0)
+                        .expect("timestamp"),
+                }],
+            },
+            R::ContractUpdate {
+                contract_key: store(),
+                update_data: vec![13u8; 8],
+            },
+            R::ContractState {
+                contract_key: store(),
+                state: vec![14u8; 8],
+            },
+            R::StoreRegistered {
+                ghostkey_fingerprint: fp(),
+            },
+            R::StoreList {
+                ghostkey_fingerprint: fp(),
+                stores: vec![StoreRegistration {
+                    store_contract_id: store(),
+                    reputation_contract_id: vec![15u8; 32],
+                    mailbox_contract_id: vec![16u8; 32],
+                    store_contract_key: None,
+                }],
+            },
+            R::RememberedStores {
+                stores: vec![RememberedStore {
+                    store_code: "abcdefghijkl".into(),
+                    archived: false,
+                }],
+            },
+            R::MigrationMarker {
+                marker: "marker-one".into(),
+                present: true,
+            },
+            R::MigrationMarkerRecorded {
+                marker: "marker-one".into(),
+                recorded: true,
+            },
+            R::Error {
+                message: "refused".into(),
+            },
+        ]
+    }
+
+    fn request_samples() -> Vec<HarvestDelegateRequest> {
+        use HarvestDelegateRequest as Q;
+        let fp = || "fp-one".to_string();
+        let store = || vec![3u8; 32];
+        vec![
+            Q::InitReputationKeys {
+                ghostkey_fingerprint: fp(),
+            },
+            Q::GetRsaPublicKey {
+                ghostkey_fingerprint: fp(),
+            },
+            Q::BlindSignFeedbackToken {
+                request_id: 42,
+                ghostkey_fingerprint: fp(),
+                blinded_token: vec![11u8; 16],
+            },
+            Q::InitEncryptionKey {
+                ghostkey_fingerprint: fp(),
+            },
+            Q::DeriveConversationKeys {
+                request_id: 42,
+                ghostkey_fingerprint: fp(),
+                peer_public_keys: vec![vec![1u8; 32]],
+            },
+            Q::StoreBuyerConversation {
+                request_id: 42,
+                store_contract_id: store(),
+                secret: ConversationSecret(SECRET),
+                seller_public_key: [9u8; 32],
+                conversation_id: [2u8; 32],
+                created_at: 1_700_000_000,
+            },
+            Q::ListBuyerConversations {
+                request_id: 42,
+                store_contract_id: store(),
+            },
+            Q::ForgetBuyerConversation {
+                request_id: 42,
+                store_contract_id: store(),
+                buyer_public_key: [1u8; 32],
+            },
+            Q::ExportBuyerConversation {
+                request_id: 42,
+                store_contract_id: store(),
+                buyer_public_key: [1u8; 32],
+            },
+            Q::ImportBuyerConversation {
+                request_id: 42,
+                backup: BackupString(SECRET_TEXT.to_string()),
+            },
+            Q::MarkConversationBackedUp {
+                request_id: 42,
+                store_contract_id: store(),
+                buyer_public_key: [1u8; 32],
+            },
+            Q::CreateListing {
+                request_id: 42,
+                ghostkey_fingerprint: fp(),
+                listing: Listing {
+                    id: crate::listing::ListingId([17u8; 32]),
+                    title: "a mug".into(),
+                    description: "blue".into(),
+                    kind: crate::listing::ListingKind::Sale,
+                    price: None,
+                    created_at: DateTime::<Utc>::from_timestamp(1_700_000_000, 0)
+                        .expect("timestamp"),
+                },
+            },
+            Q::BeginTransaction {
+                request_id: 42,
+                transaction_id: "tx-one".into(),
+                our_token: private_token(),
+                // Not the sentinel: the seller holds the blinded token
+                // already, and with the token's own key and nonce redacted
+                // it links nothing on its own.
+                our_blinded_token: vec![11u8; 16],
+            },
+            Q::RecordBlindSignature {
+                request_id: 42,
+                transaction_id: "tx-one".into(),
+                blind_signature: vec![12u8; 16],
+            },
+            Q::ListTransactions,
+            Q::RegisterStore {
+                ghostkey_fingerprint: fp(),
+                store_contract_id: store(),
+                reputation_contract_id: vec![15u8; 32],
+                mailbox_contract_id: vec![16u8; 32],
+            },
+            Q::ListStores {
+                ghostkey_fingerprint: fp(),
+            },
+            Q::GetMigrationMarker {
+                marker: "marker-one".into(),
+            },
+            Q::SetMigrationMarker {
+                marker: "marker-one".into(),
+                note: "done".into(),
+            },
+            Q::RememberStore {
+                store_code: "abcdefghijkl".into(),
+            },
+            Q::SetStoreArchived {
+                store_code: "abcdefghijkl".into(),
+                archived: true,
+            },
+            Q::ListRememberedStores,
+        ]
+    }
+
+    /// Check one sample: classified correctly, and nothing printed from it
+    /// shows the secret.
+    fn check_sample<T: Serialize + core::fmt::Debug>(what: &str, value: &T, secret_bearing: bool) {
+        assert_eq!(
+            carries_secret(value),
+            secret_bearing,
+            "{what}: classified as secret-bearing={secret_bearing}, but its sample \
+             {} the sentinel secret. Fill every field holding key material with \
+             SECRET / SECRET_TEXT, and classify the variant by what it carries",
+            if secret_bearing {
+                "does not carry"
+            } else {
+                "carries"
+            },
+        );
+        for printed in [format!("{value:?}"), format!("{value:#?}")] {
+            if let Some(needle) = leaked(&printed) {
+                panic!("{what} printed its secret ({needle:?} found): {printed}");
+            }
+        }
+    }
+
+    /// Every Bitcoin-surface response variant, as for [`classify_response`].
+    fn classify_bitcoin_response(r: &crate::BitcoinDelegateResponse) -> (usize, bool) {
+        use crate::BitcoinDelegateResponse as B;
+        match r {
+            B::Watched { .. } => (0, false),
+            B::Unwatched { .. } => (1, false),
+            B::WatchList { .. } => (2, false),
+            B::OrderAssociated { .. } => (3, false),
+            B::BridgeConfigured { .. } => (4, false),
+            B::Bridge { .. } => (5, false),
+            // The payment xpub, which links every address it derives.
+            B::PaymentXpubSet { .. } => (6, true),
+            B::PaymentXpub { .. } => (7, true),
+            B::OrderAddress { .. } => (8, false),
+        }
+    }
+    const BITCOIN_RESPONSE_VARIANTS: usize = 9;
+
+    /// Every Bitcoin-surface request variant, as for [`classify_response`].
+    fn classify_bitcoin_request(r: &crate::BitcoinDelegateRequest) -> (usize, bool) {
+        use crate::BitcoinDelegateRequest as B;
+        match r {
+            B::Watch { .. } => (0, false),
+            B::Unwatch { .. } => (1, false),
+            B::ListWatched => (2, false),
+            B::AssociateOrder { .. } => (3, false),
+            B::ConfigureBridge { .. } => (4, false),
+            B::GetBridge => (5, false),
+            // The payment xpub, as pasted.
+            B::SetPaymentXpub { .. } => (6, true),
+            B::GetPaymentXpub => (7, false),
+            B::DeriveOrderAddress { .. } => (8, false),
+        }
+    }
+    const BITCOIN_REQUEST_VARIANTS: usize = 9;
+
+    fn watch() -> crate::WatchedPayment {
+        crate::WatchedPayment {
+            network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+            script_pubkey: vec![0x00, 0x14, 0xde, 0xad],
+            address: "tb1qexample".into(),
+            label: Some("rent".into()),
+            order_id: None,
+            expected_amount_sats: Some(50_000),
+            contract_id: None,
+            added_at_ms: 1_700_000_000_000,
+            bridge_synced: false,
+            last_error: None,
+        }
+    }
+
+    fn xpub_status() -> crate::PaymentXpubStatus {
+        crate::PaymentXpubStatus {
+            xpub: SECRET_TEXT.into(),
+            network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+            next_index: 3,
+        }
+    }
+
+    fn bitcoin_response_samples() -> Vec<crate::BitcoinDelegateResponse> {
+        use crate::BitcoinDelegateResponse as B;
+        let endpoint = crate::BridgeEndpoint {
+            url: "https://bridge.example".into(),
+            bridge_id: freenet_bitcoin_common::BridgeId([1u8; 32]),
+            network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+            auth: crate::BridgeAuthMode::Open,
+        };
+        vec![
+            B::Watched {
+                request_id: 42,
+                result: Ok(watch()),
+            },
+            B::Unwatched {
+                request_id: 42,
+                result: Ok(()),
+            },
+            B::WatchList {
+                watches: vec![watch()],
+            },
+            B::OrderAssociated {
+                request_id: 42,
+                result: Ok(()),
+            },
+            B::BridgeConfigured {
+                request_id: 42,
+                result: Ok(()),
+            },
+            B::Bridge {
+                endpoint: Some(endpoint),
+            },
+            B::PaymentXpubSet {
+                request_id: 42,
+                result: Ok(xpub_status()),
+                matched_scripts: vec![vec![2u8; 22]],
+            },
+            B::PaymentXpub {
+                status: Some(xpub_status()),
+            },
+            B::OrderAddress {
+                request_id: 42,
+                result: Ok(crate::DerivedAddress {
+                    index: 3,
+                    network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                    script_pubkey: vec![2u8; 22],
+                    address: "tb1qexample".into(),
+                }),
+                matched_scripts: vec![],
+            },
+        ]
+    }
+
+    fn bitcoin_request_samples() -> Vec<crate::BitcoinDelegateRequest> {
+        use crate::BitcoinDelegateRequest as B;
+        vec![
+            B::Watch {
+                request_id: 42,
+                watch: watch(),
+            },
+            B::Unwatch {
+                request_id: 42,
+                network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                script_pubkey: vec![2u8; 22],
+            },
+            B::ListWatched,
+            B::AssociateOrder {
+                request_id: 42,
+                network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                script_pubkey: vec![2u8; 22],
+                order_id: crate::OrderId([5u8; 32]),
+                expected_amount_sats: 50_000,
+            },
+            B::ConfigureBridge {
+                request_id: 42,
+                endpoint: crate::BridgeEndpoint {
+                    url: "https://bridge.example".into(),
+                    bridge_id: freenet_bitcoin_common::BridgeId([1u8; 32]),
+                    network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                    auth: crate::BridgeAuthMode::Open,
+                },
+            },
+            B::GetBridge,
+            B::SetPaymentXpub {
+                request_id: 42,
+                xpub: SECRET_TEXT.into(),
+                network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                published_scripts: vec![vec![2u8; 22]],
+            },
+            B::GetPaymentXpub,
+            B::DeriveOrderAddress {
+                request_id: 42,
+                published_scripts: vec![],
+            },
+        ]
+    }
+
+    /// Run every sample through [`check_sample`] and fail on any variant
+    /// `classify` knows of that has no sample.
+    fn check_all<T: Serialize + core::fmt::Debug>(
+        what: &str,
+        samples: Vec<T>,
+        classify: impl Fn(&T) -> (usize, bool),
+        variants: usize,
+    ) {
+        let mut seen = vec![false; variants];
+        for sample in samples {
+            let (index, secret_bearing) = classify(&sample);
+            seen[index] = true;
+            check_sample(&format!("{what} variant {index}"), &sample, secret_bearing);
+        }
+        let missing: Vec<usize> = (0..variants).filter(|i| !seen[*i]).collect();
+        assert!(
+            missing.is_empty(),
+            "no sample of {what} variant(s) {missing:?}"
+        );
+    }
+
+    /// **No request or response the harvest delegate speaks prints a
+    /// secret, under `{:?}` or `{:#?}`** (harvest#94).
+    ///
+    /// Covers both enums on each of its two surfaces. Every variant is
+    /// sampled -- the `classify_*` functions are exhaustive, and the coverage
+    /// check fails until a new variant has a sample -- and each sample puts
+    /// the sentinel in every field that must not print. `carries_secret` then
+    /// confirms the sentinel really is in the value, so a clean print is a
+    /// redaction and not an absent secret.
+    ///
+    /// The UI's one-line log summaries are tested beside them in
+    /// `harvest-ui`'s `gateway::log_summary`.
+    #[test]
+    fn no_delegate_message_prints_a_secret() {
+        check_all(
+            "response",
+            response_samples(),
+            classify_response,
+            RESPONSE_VARIANTS,
+        );
+        check_all(
+            "request",
+            request_samples(),
+            classify_request,
+            REQUEST_VARIANTS,
+        );
+        check_all(
+            "bitcoin response",
+            bitcoin_response_samples(),
+            classify_bitcoin_response,
+            BITCOIN_RESPONSE_VARIANTS,
+        );
+        check_all(
+            "bitcoin request",
+            bitcoin_request_samples(),
+            classify_bitcoin_request,
+            BITCOIN_REQUEST_VARIANTS,
+        );
+
+        // And the secret-bearing types on their own, which is how they would
+        // reach a log from anywhere but the enums.
+        check_sample("RecalledConversation", &recalled(), true);
+        check_sample(
+            "ConversationKey",
+            &ConversationKey {
+                peer_public_key: vec![1u8; 32],
+                buyer_to_seller: SECRET,
+                seller_to_buyer: SECRET,
+            },
+            true,
+        );
+        check_sample("BackupString", &BackupString(SECRET_TEXT.into()), true);
+        check_sample("ConversationSecret", &ConversationSecret(SECRET), true);
+        check_sample("FeedbackToken", &private_token(), true);
+        check_sample("PaymentXpubStatus", &xpub_status(), true);
+    }
+
+    /// The redaction is a `Debug` property only: a `BackupString` is exactly
+    /// its text on the wire, so a backup made by an earlier build still
+    /// imports and one made now still pastes into an earlier build.
+    #[test]
+    fn a_backup_string_encodes_as_its_text() {
+        assert_eq!(
+            crate::to_cbor(&BackupString("hvbk1-abc".into())).expect("cbor"),
+            crate::to_cbor(&"hvbk1-abc").expect("cbor"),
         );
     }
 }
