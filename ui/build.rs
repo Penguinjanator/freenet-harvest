@@ -32,7 +32,19 @@ const CONTRACT_REGISTRIES: &[(&str, &str, &str)] = &[
         "legacy_mailbox_contract.rs",
         "LEGACY_MAILBOX_CONTRACT",
     ),
+    (
+        "index_contract.toml",
+        "legacy_index_contract.rs",
+        "LEGACY_INDEX_CONTRACT",
+    ),
 ];
+
+/// Registries that may have no rows yet, and why. An artifact belongs here
+/// only while it genuinely has no predecessor generation: the Ghost Key index
+/// is new in harvest#93 phase 1c, so nothing was ever published at an
+/// earlier address. Its FIRST superseded generation must be recorded as a
+/// row, and this entry removed, in the change that supersedes it.
+const MAY_BE_EMPTY: &[&str] = &["index_contract.toml"];
 
 const DELEGATE_REGISTRY: (&str, &str, &str) = (
     "harvest_delegate.toml",
@@ -52,7 +64,24 @@ fn main() {
 
     for (file, out, const_name) in CONTRACT_REGISTRIES {
         let path = legacy.join(file);
-        require_entries(&path);
+        if MAY_BE_EMPTY.contains(file) {
+            // The allowance expires the moment it is not needed: the first
+            // superseded generation appends a row here, and that row must
+            // also take this file out of `MAY_BE_EMPTY`, or the next
+            // artifact added to the list inherits a permanent exemption.
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!("cannot read migration registry {}: {e}", path.display())
+            });
+            assert!(
+                !text.contains("[[entry]]"),
+                "migration registry {} has rows but is still listed in MAY_BE_EMPTY. Remove it \
+                 from that list: the allowance exists only while an artifact has no \
+                 predecessor at all.",
+                path.display()
+            );
+        } else {
+            require_entries(&path);
+        }
         freenet_migrate_build::codegen()
             .entry_registry(&path, freenet_migrate_build::Component::Contract)
             .out_file(*out)

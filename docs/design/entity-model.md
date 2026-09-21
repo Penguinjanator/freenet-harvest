@@ -1618,6 +1618,15 @@ could be republished to the Ghost Key record as a derived value, but that
 would be a cache with its own staleness, not a second source of truth, and it
 is not needed today.
 
+**What a reader can enumerate.** The index is public, as every contract is,
+and it is addressed by the Ghost Key alone, so anyone who learns a Ghost Key
+can read every store that key has backed. That is deliberate and costs
+nothing that section 2 does not already give away: both stores show the same
+Ghost Key anyway, and a seller who wants two stores kept apart uses two Ghost
+Keys, which share no index. Harvest's own UI reads only the indexes of keys
+the user holds (phase 1c), because a buyer has no use for a seller's other
+stores and following a stranger's index is a crawl anyone could aim.
+
 **Confidence.** High.
 
 ---
@@ -1986,3 +1995,104 @@ from the phase 1 API sketch and what it leaves for later.
 - A retirement cannot take back a key someone has already unwrapped. A
   compromised backing key means the store key is exposed too, and the
   answer is the closed flag (section 6.4), not a rotation.
+
+## Phase 1c: what was built
+
+Phase 1c of #93 is the Ghost Key record, built as the minimal index that
+decision 6.8 settled on: a contract addressed by the Ghost Key alone, listing
+the stores the key has backed. It holds no complaints, and it reads no other
+contract (decision 6.7).
+
+### The index contract
+
+- A new artifact, `index_contract` (`contracts/index-contract`, rules in
+  `common/src/ghostkey_index.rs`). Its only parameter is the Ghost Key's
+  verifying key, so anyone holding the key derives the address.
+- An entry is the `BackingStatement` the Ghost Key signed through the vault
+  when it backed a store, with that signature: the backer's half of the
+  store's own `AuthorizedBacking`. Publishing one needs no second vault
+  prompt. The contract checks that the statement names this Ghost Key, that
+  its signature verifies, and that the certificate is within the backing
+  bound.
+- One entry per store key, grow-only, the smaller encoding on a clash. At
+  most 64 entries: past that, the entries with the smallest store keys are
+  kept. That is top-N over the slot, the argument `MAX_BACKINGS` rests on,
+  so the merge is total and order-independent. Only the Ghost Key's holder
+  can add an entry, so only that holder can reach the bound.
+- **Retirement is not recorded in the index.** The design sketch said the
+  index would list the stores a key "has backed and retired". Retirements
+  are signed by the STORE key and live in the store, so the index lists
+  places to look and the store says whether the backing stands, whether
+  it is retired and whether it is current. A second copy of the retirement
+  would be a second source that can disagree, the thing decision 6.8
+  removes.
+- **An entry does not prove a backing.** The Ghost Key alone signs it, so
+  it can name any store key. A reader never takes an entry as a backing. It
+  follows it to the store, where the backing needs the store key's
+  acceptance.
+
+### How the UI uses it (`ui/src/index_flow.rs`)
+
+- **Only the user's own Ghost Keys.** This tab reads the index of a key the
+  user holds, and no other. An index entry is cheap to make (the contract
+  length-checks a certificate and nothing more), so following a stranger's
+  index, and then every store it lists, and then those stores' backers'
+  indexes, is a crawl anyone could publish and aim at a visitor, with
+  `refresh_backing_verdicts` re-running over everything loaded. A buyer has
+  no use for a seller's other stores, so nothing follows a store to another
+  key's index.
+- **Finding the user's own stores.** For every connected Ghost Key the UI
+  reads its index and loads every store listed. Phase 1b's custody then
+  recovers the store key from a store the key backs (where a wrapped copy
+  exists), which registers the store again. The Harvest delegate's store
+  list stays as a cache. A store with no copy for a key this device has
+  loads but is not registered.
+- **One current store per Ghost Key.** Loading the user's own stores is
+  what lets `refresh_backing_verdicts` apply decision 6.2 across them,
+  which is the case that matters: the seller is the one who can retire a
+  backing (My Store offers it). A buyer keeps the rule over the stores
+  their tab has loaded, as before.
+- **Keeping the index complete, and the migration onto it.** When one of
+  our stores loads (this device holds its store key) and its current backer
+  is connected here, the store's backing is published into that key's
+  index unless the index already lists it, at most once per session. That
+  single rule covers a new store, a moved store, and every store made
+  before the index existed, with no vault prompt.
+- An index state is routed by its contract id, never by guessing at the
+  bytes, and is used only if every entry verifies.
+
+### Re-key bookkeeping
+
+- `legacy/index_contract.toml` exists with no rows: nothing was ever
+  published at an earlier index address. `ui/build.rs` allows that one
+  registry to be empty (`MAY_BE_EMPTY`), and the change that first
+  supersedes the index must add its row and remove that allowance. The
+  migration probe is wired for the index (`Artifact::Index`) so that
+  change only has to append a row.
+- The build script, `check-code-hashes.sh`, `harvest-addresses`, the
+  address guard's placeholders, and the CI and drift workflows list the
+  new artifact. The drift guard builds the merge base with this branch's
+  script. The index crate does not exist at the base, so
+  `HARVEST_ALLOW_MISSING_CRATES=1` (set by the drift guard only) skips it
+  there, and the comparison reports the artifact as NEW rather than
+  missing.
+- Every other artifact moved with `harvest-common`. No new rows are added
+  for them: 1a, 1b and 1c publish together, and the generation they replace
+  is the one `main` records.
+
+### What phase 1c leaves
+
+- A buyer applies decision 6.2 only across the stores their tab has
+  loaded, as before 1c. Reading the seller's index would cover more, and
+  is deliberately not done: see "Only the user's own Ghost Keys" above.
+  Section 6.2 also asked for "still being checked" in that window, which is
+  not built.
+- **A full index keeps the smallest store keys**, so once a Ghost Key has
+  64 entries a new store whose key sorts after all of them can never be
+  listed. The UI says so once and stops trying; the seller's way out is to
+  retire a backing they no longer use, or to back the store with another
+  Ghost Key. Reaching this takes 64 stores under one key.
+- My Store still lists registered stores. A store found through the index
+  shows there once custody has recovered its key.
+- The migration rehearsal harness compiles the index lineage but does not
+  exercise the index contract.
