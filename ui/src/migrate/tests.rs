@@ -2114,9 +2114,9 @@ fn an_unverifiable_merge_keeps_the_primary() {
 /// The blocking finding of the fold gate: `merge_mailbox` warned, `merge_store`
 /// never had a warning at all, and the reputation fold's report covered token
 /// collisions but not this path -- measured at 0 of 3 predecessor entries
-/// carried, 2 of them verifiable, with nothing said. **And this migration
-/// SEALS**, so a generation dropped quietly on the sealing run is never looked
-/// at again.
+/// carried, 2 of them verifiable, with nothing said. The refusal is
+/// deterministic, so it repeats on every walk and nothing ever recovers the
+/// generation: the person affected has to be told.
 ///
 /// Asserted through one shared helper (`fold_or_keep_primary`) rather than
 /// three arms, so there is one place to forget instead of three. The mailbox
@@ -2620,4 +2620,69 @@ fn folding_an_identical_generation_changes_nothing() {
     let folded = super::merge_mailbox(held.clone(), &held);
     assert_eq!(folded.messages.len(), 2);
     folded.verify().expect("valid");
+}
+
+// --- harvest#121: telling the seller once --------------------------------
+
+/// A notice's id is a valid delegate marker id, stable for the same notice
+/// about the same lineage, and different when the text or the lineage changes
+/// -- including the lineage's own code hash, so this artifact's next re-key
+/// is news again. So a repeated walk re-finds the same id, while a second
+/// store's identical "Recovered your store" is still shown. Mutated red by
+/// leaving the text, and then the lineage, out of the hash.
+#[test]
+fn a_notice_id_is_stable_for_the_same_notice_and_new_for_a_different_one() {
+    let lineage = marker_key(
+        Artifact::Store,
+        &ContractInstanceId::new([1u8; 32]),
+        &[2u8; 32],
+    );
+    let other_store = marker_key(
+        Artifact::Store,
+        &ContractInstanceId::new([9u8; 32]),
+        &[2u8; 32],
+    );
+    let rekeyed = marker_key(
+        Artifact::Store,
+        &ContractInstanceId::new([1u8; 32]),
+        &[3u8; 32],
+    );
+    let text = "Recovered your store from an earlier version of Harvest.";
+    let id = notice_marker(&lineage, text);
+    assert_eq!(id, notice_marker(&lineage, text));
+    assert!(id.starts_with(NOTICE_MARKER_PREFIX), "{id}");
+    assert!(
+        id.is_ascii() && !id.is_empty(),
+        "the delegate refuses non-ASCII ids: {id}"
+    );
+    assert_ne!(
+        id,
+        notice_marker(
+            &lineage,
+            "Recovered your mailbox from an earlier version of Harvest."
+        )
+    );
+    assert_ne!(
+        id,
+        notice_marker(&other_store, text),
+        "a second store's identical words are a different notice"
+    );
+    assert_ne!(
+        id,
+        notice_marker(&rekeyed, text),
+        "this artifact's re-key is news"
+    );
+    assert!(
+        !lineage.starts_with(NOTICE_MARKER_PREFIX),
+        "a lineage marker and a notice id must never collide: {lineage}"
+    );
+}
+
+/// Only a definite `Present` suppresses a notice. Mutated red by suppressing
+/// on `Unavailable`.
+#[test]
+fn only_a_definite_present_suppresses_a_notice() {
+    assert_eq!(notice_gate(MarkerLookup::Present), NoticeGate::Suppress);
+    assert_eq!(notice_gate(MarkerLookup::Absent), NoticeGate::Show);
+    assert_eq!(notice_gate(MarkerLookup::Unavailable), NoticeGate::Show);
 }
