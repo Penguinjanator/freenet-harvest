@@ -220,6 +220,9 @@ fn PurchaseCard(purchase: BuyerPurchase, bitcoin: crate::state::BitcoinState) ->
             p { class: "text-muted", style: "font-size: 0.8rem;",
                 "Order {short}, from conversation {crate::state::short_conversation_tag(&purchase.conversation)}"
             }
+            if let Some(settled) = purchase.settled() {
+                SettledPurchase { order: settled.clone(), bitcoin: bitcoin.clone() }
+            } else {
             match (purchase.blockers.is_empty(), purchase.commitment.as_ref()) {
                 // Everything checks out, so the payment details are shown --
                 // through the same `OrderCard` the seller's own panel uses,
@@ -258,6 +261,34 @@ fn PurchaseCard(purchase: BuyerPurchase, bitcoin: crate::state::BitcoinState) ->
                     }
                 },
             }
+            }
+        }
+    }
+}
+
+/// A purchase that has moved past payment, as its buyer sees it: where it
+/// stands against the reader-side windows (harvest#53), and no payment
+/// address, since there is nothing left to pay.
+#[component]
+fn SettledPurchase(
+    order: harvest_common::payment::AuthorizedOrder,
+    bitcoin: crate::state::BitcoinState,
+) -> Element {
+    let tip_height = bitcoin
+        .tips
+        .get(&order.order.network)
+        .and_then(|tip| tip.tip_height);
+    let sight = APP_STATE.read().payment_sight(&order);
+    let stage = crate::fulfilment::order_stage(&order, tip_height, sight);
+    // Every status that reaches here is past AwaitingPayment, and `describe`
+    // has a sentence for each of those; the fallback is for safety only.
+    let note = stage
+        .describe(tip_height, order.status)
+        .unwrap_or_else(|| "This order is no longer awaiting payment.".to_string());
+    let amount = super::bitcoin_view::format_sats(order.order.amount_sats);
+    rsx! {
+        p { class: if stage.needs_attention() { "text-warning" } else { "" },
+            "{amount} \u{00b7} {note}"
         }
     }
 }

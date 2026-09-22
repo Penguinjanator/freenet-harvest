@@ -535,8 +535,13 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
     let reading = AddressReading::of(o, live.as_ref());
     // All of this is about the seller's own orders; see
     // `AppState::settlement_hold` and `refresh_same_address_orders`.
-    let (hold, late_is_another_orders, paid_maybe_twins) = {
+    let (hold, late_is_another_orders, paid_maybe_twins, tip_height) = {
         let state = APP_STATE.read();
+        let tip_height = state
+            .bitcoin
+            .tips
+            .get(&o.network)
+            .and_then(|tip| tip.tip_height);
         let hold = state
             .withheld_settlements
             .contains_key(&o.id)
@@ -557,9 +562,17 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
         } else {
             String::new()
         };
-        (hold, late, paid_maybe_twins)
+        (hold, late, paid_maybe_twins, tip_height)
     };
-    let (status_class, status_text) = status_pill(order.status, &reading, hold.is_some());
+    // Where the order stands after the payment question (harvest#53):
+    // reader-side windows against this reader's own tip.
+    let sight = APP_STATE.read().payment_sight(&order);
+    let stage = crate::fulfilment::order_stage(&order, tip_height, sight);
+    let stage_note = stage
+        .describe(tip_height, order.status)
+        .or_else(|| crate::fulfilment::closed_window_note(&order, tip_height, sight));
+    let offers_address = crate::fulfilment::offers_payment_address(&order, tip_height);
+    let (status_class, status_text) = card_pill(order.status, &reading, hold.is_some(), stage);
     let order_id = o.id.clone();
 
     rsx! {
@@ -569,6 +582,9 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                 span { class: "{status_class}", "{status_text}" }
             }
             p { class: "text-muted", "Order {o.id.short()} · {o.network.as_str()}" }
+            if let Some(note) = stage_note {
+                p { class: if stage.needs_attention() { "text-warning" } else { "" }, "{note}" }
+            }
             if order.status == OrderStatus::AwaitingPayment {
                 if let Some(note) = reading.outside_note(late_is_another_orders) {
                     p { class: "text-warning", "{note}" }
@@ -598,7 +614,12 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
             // this order. Showing one that is not would be handing somebody a
             // destination whose payment the order can never recognise -- see
             // `address_matches_script`.
-            if destination.payable() {
+            if !offers_address {
+                // Nothing to pay: the stage note above says why. The address
+                // of a cancelled, lapsed or settled order is not offered, so
+                // nobody sends coin the order will not recognise or does not
+                // need (harvest#53).
+            } else if destination.payable() {
                 // A readonly input rather than a paragraph, so the address can
                 // be selected and copied without hand-transcribing 42
                 // characters -- the same thing the store share link does, and
@@ -657,6 +678,21 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                 },
             }
         }
+    }
+}
+
+/// The pill an order card shows, once the order's stage is known: a lapsed
+/// invoice's pill says so, rather than "Awaiting payment" above a line saying
+/// it can no longer be paid (harvest#53 review).
+pub(crate) fn card_pill(
+    status: OrderStatus,
+    reading: &AddressReading,
+    awaiting_confirmation: bool,
+    stage: crate::fulfilment::OrderStage,
+) -> (&'static str, &'static str) {
+    match stage {
+        crate::fulfilment::OrderStage::Lapsed { .. } => ("btc-pill cancelled", "Lapsed"),
+        _ => status_pill(status, reading, awaiting_confirmation),
     }
 }
 
@@ -728,6 +764,9 @@ pub(crate) struct AddressReading {
     /// Unconfirmed value. Not window-checked, because an unconfirmed
     /// transaction has no height yet; the pill says only "unconfirmed".
     pub pending_sats: u64,
+    /// Value in mempool rows only. Unlike `pending_sats`, never overlaps
+    /// `in_window_sats`; see [`Self::sight`].
+    pub unconfirmed_sats: u64,
     /// Highest confirmation height of value that confirmed at or before the
     /// anchor, if any.
     pub before_order: Option<u32>,
@@ -755,6 +794,10 @@ impl AddressReading {
         // so no confirmed value is counted as its payment.
         for tx in &live.txs {
             let TxRowStatus::Confirmed { anchor_height } = tx.status else {
+                if tx.status == TxRowStatus::Unconfirmed {
+                    reading.unconfirmed_sats =
+                        reading.unconfirmed_sats.saturating_add(tx.value_sats);
+                }
                 continue;
             };
             match &window {
@@ -780,6 +823,36 @@ impl AddressReading {
             }
         }
         reading
+    }
+
+    /// What this reading shows that would settle `order`: the full amount
+    /// confirmed inside its window, or unconfirmed value making up the
+    /// amount while the window is still open for it to confirm in. Partial
+    /// value and dust are nothing here -- see
+    /// [`crate::fulfilment::PaymentSight`].
+    ///
+    /// Unconfirmed value is not window-checked (an unconfirmed transaction
+    /// has no height), which is why it only counts while a payment sent now
+    /// could still confirm in the window.
+    pub(crate) fn sight(
+        &self,
+        order: &harvest_common::payment::Order,
+        tip_height: Option<u32>,
+    ) -> crate::fulfilment::PaymentSight {
+        let covered = self.in_window_sats > 0 && self.in_window_sats >= self.amount_sats;
+        // Mempool rows only, NOT `pending_sats`: that figure also counts a
+        // confirmed output this reader's tip has not yet reached, which is
+        // already in `in_window_sats`, so adding the two counted one payment
+        // twice (review round 3).
+        let in_flight = order.payment_window().is_some()
+            && crate::fulfilment::accepts_new_payment(order, tip_height)
+            && self.unconfirmed_sats > 0
+            && self.in_window_sats.saturating_add(self.unconfirmed_sats) >= self.amount_sats;
+        crate::fulfilment::PaymentSight {
+            covered,
+            in_flight,
+            ambiguous: false,
+        }
     }
 
     /// What to tell the seller when the address holds confirmed value that is
@@ -1264,7 +1337,7 @@ fn GhostKeyGate(on_dismiss: EventHandler<()>) -> Element {
 // Formatting helpers
 // ---------------------------------------------------------------------------
 
-fn format_sats(sats: u64) -> String {
+pub(crate) fn format_sats(sats: u64) -> String {
     format!("{:.8} BTC", sats as f64 / 100_000_000.0)
 }
 
@@ -1570,6 +1643,82 @@ mod address_reading_tests {
         assert_ne!(
             super::status_pill(OrderStatus::AwaitingPayment, &full, true).0,
             "btc-pill paid"
+        );
+    }
+
+    /// harvest#53 review round 2: only a payment that would SETTLE the order
+    /// is in sight. Dust and part-payments are not -- anyone can send dust to
+    /// a public address -- and unconfirmed value counts only while the window
+    /// is still open for it to confirm in.
+    #[test]
+    fn only_a_settling_payment_is_in_sight() {
+        let order = order_anchored_at(150);
+        let window_end = order.payment_window().expect("anchored").end().to_owned();
+        let dust = AddressReading::of(&order, Some(&address_with(&[(151, 546)])));
+        assert!(!dust.sight(&order, Some(160)).settles());
+        let full = AddressReading::of(&order, Some(&address_with(&[(151, 10_000)])));
+        assert!(full.sight(&order, Some(window_end + 50)).covered);
+        let with_mempool = |confirmed: u64, unconfirmed: u64| {
+            let mut view = address_with(&[(151, confirmed)]);
+            view.txs.push(TxRow {
+                txid_display: "mempool".into(),
+                value_sats: unconfirmed,
+                status: TxRowStatus::Unconfirmed,
+            });
+            view.pending_sats = unconfirmed;
+            view
+        };
+        let pending = AddressReading::of(&order, Some(&with_mempool(4_000, 6_000)));
+        assert!(pending.sight(&order, Some(160)).in_flight);
+        assert!(pending.sight(&order, None).in_flight);
+        assert!(
+            !pending.sight(&order, Some(window_end)).settles(),
+            "value still in flight at the window's end can never settle it"
+        );
+        assert!(
+            !AddressReading::of(&order, Some(&with_mempool(4_000, 5_999)))
+                .sight(&order, Some(160))
+                .settles()
+        );
+        // Review round 3: `pending_sats` also counts a CONFIRMED output the
+        // reader's tip has not reached (the address state arriving before
+        // the tip reads every confirmation as zero deep). That output is
+        // already in the window total; counting it again read a 6k
+        // underpayment of a 10k invoice as 12k.
+        let mut before_tip = address_with(&[(151, 6_000)]);
+        before_tip.pending_sats = 6_000;
+        assert!(!AddressReading::of(&order, Some(&before_tip))
+            .sight(&order, Some(160))
+            .settles());
+    }
+
+    /// harvest#53 review: a lapsed invoice's pill does not say "Awaiting
+    /// payment" above a line saying it can no longer be paid.
+    #[test]
+    fn a_lapsed_invoice_pills_as_lapsed() {
+        use crate::fulfilment::OrderStage;
+        use harvest_common::payment::OrderStatus;
+        let order = order_anchored_at(150);
+        let nothing = AddressReading::of(&order, None);
+        assert_eq!(
+            super::card_pill(
+                OrderStatus::AwaitingPayment,
+                &nothing,
+                false,
+                OrderStage::Lapsed { closed_at: 2_214 }
+            ),
+            ("btc-pill cancelled", "Lapsed")
+        );
+        assert_eq!(
+            super::card_pill(
+                OrderStatus::AwaitingPayment,
+                &nothing,
+                false,
+                OrderStage::AwaitingPayment {
+                    settle_until: 2_214
+                }
+            ),
+            ("btc-pill waiting", "Awaiting payment")
         );
     }
 
