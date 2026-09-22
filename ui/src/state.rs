@@ -478,6 +478,13 @@ pub struct AppState {
     /// `start_store_edit_if_ready`.
     pub pending_store_edit: Option<PendingStoreEdit>,
 
+    /// New listings waiting on the certificate of the Ghost Key backing their
+    /// store, which they have to carry (#118). Sent for signing when it
+    /// arrives, and dropped with a notification if it cannot be had or does
+    /// not come within `LISTING_CERTIFICATE_TIMEOUT_MS`. See
+    /// `queue_listing_signature`.
+    pub listings_awaiting_certificate: Vec<ListingAwaitingCertificate>,
+
     /// Signed listings ready to be submitted to the store contract.
     /// The UI should pick these up and send them as contract updates.
     pub signed_listings_ready: Vec<AuthorizedListing>,
@@ -603,13 +610,13 @@ pub(crate) fn spawn_store_creation(
 
 /// Ask the ghostkey delegate for an identity's certificate.
 ///
-/// Every failure arm releases the edit parked on the answer. Nothing answers
+/// Every failure arm releases the edit and the listings parked on the answer. Nothing answers
 /// a request that never left the tab, and a parked `pending_store_edit` gates
 /// `vault_work_outstanding()`, so a silent failure here stopped all custody
 /// and all Bitcoin watch requests for the session (#101 re-review, marker
 /// sweep B1).
 #[cfg(target_arch = "wasm32")]
-fn request_certificate(fingerprint: String) {
+pub(crate) fn request_certificate(fingerprint: String) {
     wasm_bindgen_futures::spawn_local(async move {
         use dioxus::prelude::{ReadableExt, WritableExt};
 
@@ -1455,14 +1462,40 @@ pub struct PendingStoreInfo {
     pub store_contract_id: Vec<u8>,
 }
 
-/// A listing awaiting signature from the ghostkey delegate.
+/// A listing awaiting the store key's signature, or the backing Ghost Key's
+/// certificate that has to be attached to it.
 #[derive(Clone, Debug)]
 pub struct PendingListing {
     pub fingerprint: String,
     pub listing: harvest_common::listing::Listing,
     /// Store contract ID to submit the signed listing to.
     pub store_contract_id: Option<Vec<u8>>,
+    /// The certificate of the Ghost Key `fingerprint`, which the published
+    /// listing carries so a buyer can check it against the store's backers.
+    ///
+    /// Captured before the listing is sent for signing, and never empty once
+    /// it is (`queue_listing_signature`): the store key signs listings since
+    /// harvest#93, and its answer carries no certificate, so there is nothing
+    /// to fill it in from afterwards. A listing published without one reads
+    /// to every buyer as "not this seller's" and cannot be bought (#118).
+    pub certificate_pem: String,
 }
+
+/// A listing waiting on its Ghost Key's certificate (#118), and since when.
+#[derive(Clone, Debug)]
+pub struct ListingAwaitingCertificate {
+    /// When it started waiting, in ms since the epoch.
+    pub since_ms: u64,
+    pub pending: PendingListing,
+}
+
+/// How long a listing waits on its certificate before it is given up.
+///
+/// A `GetCertificate` needs no prompt once the Ghost Key is connected, so an
+/// answer normally comes in well under a second; the vault's own permission
+/// prompt, when there is one, auto-denies after a minute. Two minutes covers
+/// both, and bounds how long a lost request holds the vault.
+pub(crate) const LISTING_CERTIFICATE_TIMEOUT_MS: u64 = 2 * 60 * 1000;
 
 /// Why a buyer's software will not let them pay an order yet.
 ///
@@ -6144,23 +6177,9 @@ impl AppState {
             })
     }
 
-    /// Publish new details for a store the seller owns -- the entry point for
-    /// both editing a working store and repairing one whose details never
-    /// reached the network.
-    ///
-    /// Everything except what the seller typed is taken from state rather
-    /// than passed in, which is what makes this safe to call from a form:
-    /// the store has to be one of theirs (`my_stores` is the only source of
-    /// the owning fingerprint), and the reputation contract id comes from
-    /// that registration rather than from the store's published state, which
-    /// is exactly the field that is missing whenever there is anything to
-    /// repair.
-    ///
-    /// Errors are returned rather than swallowed so the form can say why
-    /// nothing happened.
     /// The certificate request for `fingerprint` could not be SENT.
     ///
-    /// Release the edit parked on its answer and say so. Split out so the
+    /// Release the edit and the listings parked on its answer and say so. Split out so the
     /// state change is testable off-target; only the send needs a browser.
     ///
     /// Nothing else answers a request that never left the tab, and
@@ -6182,8 +6201,28 @@ impl AppState {
                  Ghost Key's certificate ({why})."
             ));
         }
+        self.drop_listings_awaiting_certificate(
+            Some(fingerprint),
+            &format!("this device could not ask for your Ghost Key's certificate: {why}"),
+        );
+        // The vault may be free now for a deferred custody request.
+        self.start_custody_where_needed();
     }
 
+    /// Publish new details for a store the seller owns -- the entry point for
+    /// both editing a working store and repairing one whose details never
+    /// reached the network.
+    ///
+    /// Everything except what the seller typed is taken from state rather
+    /// than passed in, which is what makes this safe to call from a form:
+    /// the store has to be one of theirs (`my_stores` is the only source of
+    /// the owning fingerprint), and the reputation contract id comes from
+    /// that registration rather than from the store's published state, which
+    /// is exactly the field that is missing whenever there is anything to
+    /// repair.
+    ///
+    /// Errors are returned rather than swallowed so the form can say why
+    /// nothing happened.
     pub fn publish_store_details(
         &mut self,
         store_contract_id: &[u8],
@@ -7388,18 +7427,28 @@ impl AppState {
         match matched {
             Some(PendingSignature::Listing(pending)) => {
                 // The listing carries the certificate of the Ghost Key backing
-                // the store, as it always has; the store key signs it, and the
-                // store key has no certificate of its own.
-                let certificate_pem = self
-                    .certificates
-                    .get(&pending.fingerprint)
-                    .cloned()
-                    .unwrap_or(certificate_pem);
+                // the store, captured when it was queued: the store key signs
+                // it, and the store key has no certificate of its own.
+                //
+                // `queue_listing_signature` never queues one without it, so
+                // this is a backstop. Publishing a listing with no
+                // certificate is worse than not publishing it: every buyer
+                // is told it is not the seller's, and it cannot be bought
+                // (#118).
+                if pending.certificate_pem.trim().is_empty() {
+                    warn!("a signed listing has no certificate -- not publishing it");
+                    self.notifications.push(format!(
+                        "Your listing \"{}\" was not published: it has no Ghost Key \
+                         certificate, so buyers could not buy it. Add it again.",
+                        pending.listing.title
+                    ));
+                    return;
+                }
                 let authorized = AuthorizedListing {
                     listing: pending.listing,
                     scoped_payload,
                     signature,
-                    certificate_pem,
+                    certificate_pem: pending.certificate_pem,
                 };
                 info!(
                     "Constructed AuthorizedListing: {}",
@@ -7588,6 +7637,13 @@ impl AppState {
         // tries again.
         self.pending_custody.clear();
         self.custody_started_ms.clear();
+        // So do listings waiting on a certificate (#118): a failed
+        // `GetCertificate` surfaces as one of the refusals that call this, and
+        // nothing else would ever release them.
+        self.drop_listings_awaiting_certificate(
+            None,
+            "the Ghost Key vault refused a request while it waited for your certificate",
+        );
     }
 
     /// Handle a response from the ghostkey delegate.
@@ -7792,6 +7848,10 @@ impl AppState {
                 }
                 self.start_store_creation_if_ready();
                 self.start_store_edit_if_ready();
+                self.release_listings_awaiting_certificate(&fingerprint);
+                // The vault may be free now for a custody request deferred
+                // while the edit or the listings waited on it.
+                self.start_custody_where_needed();
             }
 
             ghostkey_common::GhostkeyResponse::GhostKeyDetail {
@@ -7810,6 +7870,10 @@ impl AppState {
                 }
                 self.start_store_creation_if_ready();
                 self.start_store_edit_if_ready();
+                self.release_listings_awaiting_certificate(&fingerprint);
+                // The vault may be free now for a custody request deferred
+                // while the edit or the listings waited on it.
+                self.start_custody_where_needed();
             }
 
             ghostkey_common::GhostkeyResponse::Error { message }
@@ -8913,9 +8977,10 @@ impl AppState {
             || !self.watches_wanted(inbox.bridge).is_empty()
     }
 
-    /// Whether the seller has a signature of their own outstanding: anything
-    /// queued that is not a watch request, a store being created or edited, or
-    /// an access prompt.
+    /// Whether the seller has vault work of their own outstanding. That is any
+    /// of: a vault signature that is not a watch request, a store being
+    /// created or edited, a listing waiting on its certificate (#118), an
+    /// access prompt, or a custody request.
     pub(crate) fn user_signature_under_way(&self) -> bool {
         // Only what the VAULT was asked to sign. A store-key signature is the
         // Harvest delegate's to answer, so a vault refusal cannot be about it.
@@ -8927,6 +8992,7 @@ impl AppState {
                 && !matches!(pending, PendingSignature::InboxEntry(_))
         }) || self.pending_store_creation.is_some()
             || self.pending_store_edit.is_some()
+            || !self.listings_awaiting_certificate.is_empty()
             || self.request_any_access_in_flight
             || !self.pending_custody.is_empty()
     }
@@ -8965,8 +9031,22 @@ impl AppState {
     /// The delegate refused to sign a watch request. Drop the requests it can
     /// be about (those for `fingerprint`, if it named one, else all of them,
     /// which are only ever one key's) and stop asking their keys.
+    ///
+    /// A refusal naming a key is taken as the watch request's even while a
+    /// listing waits on that key's certificate (see
+    /// `named_refusal_is_a_watch_request`), so it could as well be the
+    /// certificate's. Those listings
+    /// are dropped too, visibly, rather than left waiting on an answer that
+    /// may never come; if the certificate does arrive, it is cached, and
+    /// adding the listing again goes straight through.
     fn watch_signature_failed(&mut self, fingerprint: Option<&str>, reason: &str) {
         warn!("the ghostkey delegate did not sign a watch request: {reason}");
+        if let Some(fingerprint) = fingerprint {
+            self.drop_listings_awaiting_certificate(
+                Some(fingerprint),
+                &format!("the Ghost Key vault refused: {reason}"),
+            );
+        }
         let mut refused = Vec::new();
         self.pending_signatures.retain(|pending| match pending {
             PendingSignature::InboxEntry(entry)
@@ -8980,6 +9060,11 @@ impl AppState {
         for fingerprint in refused {
             self.stop_watch_requests_for(&fingerprint, reason);
         }
+        // Custody is deliberately NOT restarted here, though what was refused
+        // may have been all that held it back: a refusal naming this key can
+        // mean its grant is gone, and a custody wrap for the same key would put
+        // a second prompt in front of the seller moments after they said no.
+        // The next store update starts it, as before (#122 review round 3).
     }
 
     /// Stop asking `fingerprint` to sign watch requests for the rest of the
@@ -9772,6 +9857,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
             },
             store_contract_id: None,
+            certificate_pem: "-----BEGIN CERT-----".to_string(),
         })
     }
 
@@ -9937,6 +10023,357 @@ mod tests {
             1,
             "the queued listing must still be waiting for its own answer"
         );
+    }
+
+    /// The store the #118 tests list into: one of ours, with a store key.
+    const LISTING_STORE: [u8; 32] = [0x71; 32];
+
+    fn seller_with_a_signable_store() -> AppState {
+        let mut state = AppState::default();
+        state.my_stores.insert(
+            FINGERPRINT.to_string(),
+            vec![StoreRegistration {
+                store_contract_id: LISTING_STORE.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(test_store_key()),
+            }],
+        );
+        state
+    }
+
+    fn new_listing(title: &str) -> harvest_common::listing::Listing {
+        harvest_common::listing::Listing {
+            id: harvest_common::listing::ListingId([0u8; 32]),
+            title: title.to_string(),
+            description: String::new(),
+            kind: harvest_common::listing::ListingKind::Sale,
+            price: None,
+            created_at: chrono::Utc::now(),
+        }
+        .with_derived_id()
+    }
+
+    fn queued_listings(state: &AppState) -> Vec<&PendingListing> {
+        state
+            .pending_signatures
+            .iter()
+            .filter_map(|pending| match pending {
+                PendingSignature::Listing(listing) => Some(listing),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// harvest#118, the launch blocker. A seller adds a listing in a session
+    /// that never fetched their Ghost Key's certificate -- they did not
+    /// create the store or edit its details this session, which is the
+    /// ordinary visit. The listing must not go out with an empty certificate
+    /// (every buyer then reads it as "not this seller's" and gets no Buy
+    /// button); it waits for the certificate and carries it.
+    ///
+    /// Mutated red by restoring the pre-fix `queue_listing_signature` (sign
+    /// straight away, certificate filled from the cache at signature time).
+    #[test]
+    fn a_listing_added_without_a_cached_certificate_waits_for_it_and_carries_it() {
+        let mut state = seller_with_a_signable_store();
+        assert!(state.certificates.is_empty(), "a fresh session");
+
+        state
+            .queue_listing_signature(
+                LISTING_STORE.to_vec(),
+                FINGERPRINT.to_string(),
+                new_listing("Beans"),
+            )
+            .expect("accepted");
+
+        assert!(
+            queued_listings(&state).is_empty(),
+            "nothing may be signed before the certificate is in hand"
+        );
+        assert_eq!(state.listings_awaiting_certificate.len(), 1);
+        assert!(
+            state.user_signature_under_way(),
+            "a listing waiting on the vault is vault work, so a refusal is taken as its"
+        );
+
+        state.on_ghostkey_response(certificate(FINGERPRINT));
+
+        assert!(state.listings_awaiting_certificate.is_empty());
+        let queued = queued_listings(&state);
+        assert_eq!(queued.len(), 1, "released for signing");
+        assert_eq!(queued[0].certificate_pem, "-----BEGIN CERT-----");
+        let request = PendingSignature::Listing(queued[0].clone());
+
+        state.on_delegate_response(store_key_answer_for(&request));
+
+        let published = state
+            .signed_listings_ready
+            .first()
+            .expect("the signed listing is published");
+        assert_eq!(published.listing.title, "Beans");
+        assert_eq!(
+            published.certificate_pem, "-----BEGIN CERT-----",
+            "the published listing carries the Ghost Key's certificate"
+        );
+    }
+
+    /// With the certificate already cached (the seller edited the store's
+    /// details first), the listing goes straight to signing, carrying it.
+    #[test]
+    fn a_listing_with_a_cached_certificate_is_signed_at_once() {
+        let mut state = seller_with_a_signable_store();
+        state
+            .certificates
+            .insert(FINGERPRINT.to_string(), "CACHED".to_string());
+
+        state
+            .queue_listing_signature(
+                LISTING_STORE.to_vec(),
+                FINGERPRINT.to_string(),
+                new_listing("Beans"),
+            )
+            .expect("accepted");
+
+        assert!(state.listings_awaiting_certificate.is_empty());
+        let queued = queued_listings(&state);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].certificate_pem, "CACHED");
+    }
+
+    /// Two listings added before the answer both wait, both are released by
+    /// the one certificate, and another Ghost Key's certificate releases
+    /// neither.
+    #[test]
+    fn every_listing_waiting_on_a_certificate_is_released_by_it_alone() {
+        let mut state = seller_with_a_signable_store();
+        for title in ["Beans", "Rice"] {
+            state
+                .queue_listing_signature(
+                    LISTING_STORE.to_vec(),
+                    FINGERPRINT.to_string(),
+                    new_listing(title),
+                )
+                .expect("accepted");
+        }
+
+        state.on_ghostkey_response(certificate("someone-else"));
+        assert_eq!(state.listings_awaiting_certificate.len(), 2);
+        assert!(queued_listings(&state).is_empty());
+
+        state.on_ghostkey_response(certificate(FINGERPRINT));
+        assert!(state.listings_awaiting_certificate.is_empty());
+        let titles: Vec<_> = queued_listings(&state)
+            .iter()
+            .map(|pending| pending.listing.title.clone())
+            .collect();
+        assert_eq!(titles, vec!["Beans".to_string(), "Rice".to_string()]);
+    }
+
+    /// If the certificate cannot be had, the listing is dropped VISIBLY --
+    /// named in a notification so the seller can add it again -- and the
+    /// vault is free again. Covers the vault's refusal and a request that
+    /// never left the tab.
+    ///
+    /// Mutated red by removing the drop from `drop_vault_signatures` and from
+    /// `on_certificate_request_failed` in turn.
+    #[test]
+    fn a_listing_whose_certificate_cannot_be_had_is_dropped_visibly() {
+        let mut state = seller_with_a_signable_store();
+        state
+            .queue_listing_signature(
+                LISTING_STORE.to_vec(),
+                FINGERPRINT.to_string(),
+                new_listing("Beans"),
+            )
+            .expect("accepted");
+        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::Error {
+            message: "vault locked".to_string(),
+        });
+        assert!(state.listings_awaiting_certificate.is_empty());
+        assert!(queued_listings(&state).is_empty(), "nothing published");
+        assert!(!state.user_signature_under_way());
+        assert!(
+            state
+                .notifications
+                .iter()
+                .any(|n| n.contains("\"Beans\" was not published")),
+            "the seller is told which listing: {:?}",
+            state.notifications
+        );
+
+        let mut state = seller_with_a_signable_store();
+        state
+            .queue_listing_signature(
+                LISTING_STORE.to_vec(),
+                FINGERPRINT.to_string(),
+                new_listing("Rice"),
+            )
+            .expect("accepted");
+        state.on_certificate_request_failed("someone-else", "no vault");
+        assert_eq!(
+            state.listings_awaiting_certificate.len(),
+            1,
+            "not its request"
+        );
+        state.on_certificate_request_failed(FINGERPRINT, "no vault");
+        assert!(state.listings_awaiting_certificate.is_empty());
+        assert!(!state.user_signature_under_way());
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("\"Rice\" was not published") && n.contains("no vault")));
+    }
+
+    /// A vault that answers with an empty certificate has answered: nothing
+    /// better is coming, so the listing is dropped visibly rather than left
+    /// waiting, or worse, published with it.
+    #[test]
+    fn an_empty_certificate_drops_the_listing_rather_than_publishing_it() {
+        let mut state = seller_with_a_signable_store();
+        state
+            .queue_listing_signature(
+                LISTING_STORE.to_vec(),
+                FINGERPRINT.to_string(),
+                new_listing("Beans"),
+            )
+            .expect("accepted");
+        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::Certificate {
+            fingerprint: FINGERPRINT.to_string(),
+            certificate_pem: String::new(),
+        });
+        assert!(state.listings_awaiting_certificate.is_empty());
+        assert!(queued_listings(&state).is_empty());
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("\"Beans\" was not published")));
+    }
+
+    /// `GhostKeyDetail` carries the certificate too, and releases the
+    /// listings waiting on it exactly as `Certificate` does.
+    ///
+    /// Mutated red by removing the release from the `GhostKeyDetail` arm.
+    #[test]
+    fn a_ghost_key_detail_releases_a_waiting_listing() {
+        let mut state = seller_with_a_signable_store();
+        state
+            .queue_listing_signature(
+                LISTING_STORE.to_vec(),
+                FINGERPRINT.to_string(),
+                new_listing("Beans"),
+            )
+            .expect("accepted");
+        let detail = ghostkey_common::GhostkeyResponse::GhostKeyDetail {
+            fingerprint: FINGERPRINT.to_string(),
+            certificate_pem: "DETAIL-CERT".to_string(),
+            notary_info: String::new(),
+            label: None,
+        };
+        state.on_ghostkey_response(detail);
+        assert!(state.listings_awaiting_certificate.is_empty());
+        let queued = queued_listings(&state);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].certificate_pem, "DETAIL-CERT");
+    }
+
+    /// A store that stops being signable while its listing waits (its
+    /// registration gone by the time the certificate lands) is reported,
+    /// not signed for with nothing.
+    #[test]
+    fn a_listing_whose_store_went_away_while_it_waited_is_reported() {
+        let mut state = seller_with_a_signable_store();
+        state
+            .queue_listing_signature(
+                LISTING_STORE.to_vec(),
+                FINGERPRINT.to_string(),
+                new_listing("Beans"),
+            )
+            .expect("accepted");
+        state.my_stores.clear();
+        state.on_ghostkey_response(certificate(FINGERPRINT));
+        assert!(state.listings_awaiting_certificate.is_empty());
+        assert!(queued_listings(&state).is_empty());
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("\"Beans\" was not published") && n.contains("no store key")));
+    }
+
+    /// A listing for a store this device cannot sign for is refused up
+    /// front, and nothing waits or is asked of the vault.
+    #[test]
+    fn a_listing_for_a_store_without_a_key_is_refused_without_waiting() {
+        let mut state = AppState::default();
+        let err = state
+            .queue_listing_signature(
+                LISTING_STORE.to_vec(),
+                FINGERPRINT.to_string(),
+                new_listing("Beans"),
+            )
+            .expect_err("no store key here");
+        assert!(err.contains("no store key"), "{err}");
+        assert!(state.listings_awaiting_certificate.is_empty());
+        assert!(queued_listings(&state).is_empty());
+    }
+
+    /// A certificate that never comes gives the listing up after
+    /// `LISTING_CERTIFICATE_TIMEOUT_MS`, visibly, and frees the vault. Not
+    /// before.
+    ///
+    /// Mutated red by making `expire_listings_awaiting_certificate` expire
+    /// nothing, and by off-by-one on the bound.
+    #[test]
+    fn a_listing_whose_certificate_never_comes_is_given_up_in_time() {
+        let mut state = seller_with_a_signable_store();
+        state
+            .queue_listing_signature(
+                LISTING_STORE.to_vec(),
+                FINGERPRINT.to_string(),
+                new_listing("Beans"),
+            )
+            .expect("accepted");
+        let since = state.listings_awaiting_certificate[0].since_ms;
+
+        state.expire_listings_awaiting_certificate(since + LISTING_CERTIFICATE_TIMEOUT_MS - 1);
+        assert_eq!(state.listings_awaiting_certificate.len(), 1, "not yet due");
+        assert!(state.notifications.is_empty());
+
+        state.expire_listings_awaiting_certificate(since + LISTING_CERTIFICATE_TIMEOUT_MS);
+        assert!(state.listings_awaiting_certificate.is_empty());
+        assert!(!state.user_signature_under_way());
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("\"Beans\" was not published") && n.contains("in time")));
+    }
+
+    /// The backstop in `on_signature`: a signed listing with no certificate
+    /// is not published, whatever queued it.
+    ///
+    /// Mutated red by removing the check.
+    #[test]
+    fn a_signed_listing_with_no_certificate_is_not_published() {
+        let mut state = AppState::default();
+        let PendingSignature::Listing(mut listing) = pending_listing() else {
+            unreachable!()
+        };
+        listing.certificate_pem = String::new();
+        let listing = PendingSignature::Listing(listing);
+        state.pending_signatures.push_back(listing.clone());
+
+        state.on_delegate_response(store_key_answer_for(&listing));
+
+        assert!(state.signed_listings_ready.is_empty());
+        assert!(
+            state.pending_signatures.is_empty(),
+            "the request is settled"
+        );
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("\"Beans\" was not published")));
     }
 
     fn pending_creation() -> PendingStoreCreation {
@@ -12970,6 +13407,7 @@ mod invoice_tests {
                     created_at: chrono::Utc::now(),
                 },
                 store_contract_id: None,
+                certificate_pem: "CERT".to_string(),
             }));
         state.issue_invoice(invoice()).expect("accepted");
         let waiting = *state.pending_invoices.keys().next().expect("one entry");
@@ -20366,6 +20804,51 @@ mod buy_flow_tests {
             about_watching, 1,
             "the watch-request notice is not repeated"
         );
+    }
+
+    /// **A named refusal taken as a watch request's also drops a listing
+    /// waiting on that key's certificate** (#118): it may as well have been
+    /// the certificate request's, and a listing left waiting on an answer
+    /// that is not coming holds the vault for the rest of the session.
+    ///
+    /// Mutated red by removing the drop from `watch_signature_failed`.
+    #[test]
+    fn a_named_watch_refusal_drops_a_listing_waiting_on_that_keys_certificate() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_selling(vec![an_order_naming_the_test_bridge(3)], gk.id().0);
+        state.pending_store_creation = None;
+        serve_inbox(&mut state, &inbox::open_inbox());
+        assert_eq!(queued_watch_requests(&state).len(), 1);
+        state
+            .listings_awaiting_certificate
+            .push(ListingAwaitingCertificate {
+                since_ms: now_ms(),
+                pending: PendingListing {
+                    fingerprint: "seller-fp".into(),
+                    listing: harvest_common::listing::Listing {
+                        id: harvest_common::listing::ListingId([0u8; 32]),
+                        title: "Beans".to_string(),
+                        description: String::new(),
+                        kind: harvest_common::listing::ListingKind::Sale,
+                        price: None,
+                        created_at: chrono::Utc::now(),
+                    },
+                    store_contract_id: None,
+                    certificate_pem: String::new(),
+                },
+            });
+
+        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::PermissionDenied {
+            fingerprint: "seller-fp".into(),
+            requestor: harvest_common::expected_harvest_requestor(),
+        });
+
+        assert!(state.listings_awaiting_certificate.is_empty());
+        assert!(!state.user_signature_under_way());
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("\"Beans\" was not published")));
     }
 
     /// **With the seller's own signature outstanding, a refusal is theirs to
