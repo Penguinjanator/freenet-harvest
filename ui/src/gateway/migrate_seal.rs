@@ -8,7 +8,7 @@
 //! the host can run it -- the same split `crate::migrate` already makes
 //! against the rest of the probe.
 
-use crate::migrate::Seal;
+use crate::migrate::{Artifact, Seal};
 
 /// Whether the recovered state actually reached the successor.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -82,6 +82,95 @@ pub enum Disposition {
 /// this takes the token and may return [`ForwardPut::Acknowledged`].
 pub fn put_response_evidence() -> ForwardPut {
     ForwardPut::AcknowledgedForInstance
+}
+
+/// How long a MAILBOX forward PUT is waited on before it is given up as
+/// unconfirmed.
+///
+/// **Not the probe's 12 s** (harvest#152). A GET of a predecessor is a read,
+/// usually served from the node's own copy; a PUT on a `freenet network` node
+/// is answered only after its remote hops, and the node tries peers one at a
+/// time, each for up to its own operation lifetime (60 s, freenet-core
+/// `config.rs` `OPERATION_TTL`). With the probe's deadline a mailbox write
+/// that was slow but landed was discarded: nothing was adopted, and the
+/// successor mailbox, which is where buyers write, was not routed for that
+/// load -- harvest#148's symptom again, on exactly the loads the isolated
+/// rehearsal node (which answers a PUT at once) cannot produce.
+///
+/// A node that never answers is given up after this and resolves as it
+/// always did, [`ForwardPut::Unconfirmed`], walk again next load. What an
+/// answer is worth does not change: see [`put_response_evidence`].
+pub const MAILBOX_FORWARD_GIVE_UP_MS: u32 = 10 * 60 * 1000;
+
+/// When an unanswered forward PUT is logged as slow, and when every artifact
+/// but the mailbox gives up: the probe's deadline, as before harvest#152.
+pub const FORWARD_SLOW_NOTICE_MS: u32 = freenet_migrate::RECOMMENDED_PROBE_TIMEOUT_MS as u32;
+
+/// How long a forward PUT of `artifact` is waited on.
+///
+/// # Why only the mailbox waits longer
+///
+/// Both kinds of adopt can land mid-session once the wait is long, and both
+/// move something the seller writes. They differ in what that costs:
+///
+/// * **A store, reputation or index adopt** repoints `my_stores`. An invoice
+///   accepted into the predecessor store while the forward was outstanding is
+///   then outside everything that watches, re-reads and settles this seller's
+///   orders for the rest of the session, and a write waiting on a signature
+///   fails with "not one of yours" (#154 review round 1). A payment to that
+///   invoice can be missed for good. So these keep the probe's deadline: a
+///   slow load stays on the predecessor throughout, consistently, and the
+///   next load's walk folds in whatever it wrote.
+/// * **A mailbox adopt** moves where the seller's replies and invoice accepts
+///   are sent (`browsing_stores[..].mailbox_contract_id`). One sent to the
+///   predecessor before a late adopt is not seen by a buyer on the current
+///   build, and drops out of the seller's own inbox when the successor's
+///   state replaces it, until the next load's walk carries the predecessor's
+///   messages forward (#154 review round 2). That is a delay, not a loss.
+///   Against it: without the wait, a slow load routes only the predecessor
+///   mailbox for the WHOLE load, so every buyer request written to the
+///   successor meanwhile goes unseen, which is harvest#152 itself. The wait
+///   is the better side of that trade.
+///
+/// The longer wait also widens the window in which a `PutResponse` for the
+/// same instance from some OTHER put of this tab is taken as ours (see
+/// [`put_response_evidence`]). For the mailbox that is
+/// `store_ops::create_store_contracts`, which PUTs a default state to the
+/// mailbox derived from the seller's key, so a seller who creates a store
+/// during the wait can have the successor adopted with our forward
+/// unconfirmed: the successor is the right place to point anyway, and
+/// nothing seals, so the next load walks again. For the index,
+/// `index_flow` publishes the seller's entry to the current index on every
+/// load that finds it unlisted, which is the normal state after an index
+/// re-key: another reason the rule is per artifact.
+pub fn forward_give_up_ms(artifact: Artifact) -> u32 {
+    match artifact {
+        Artifact::Mailbox => MAILBOX_FORWARD_GIVE_UP_MS,
+        Artifact::Store | Artifact::Reputation | Artifact::Index => FORWARD_SLOW_NOTICE_MS,
+    }
+}
+
+/// What a forward PUT's timer means when it fires.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ForwardTimer {
+    /// The node may still answer. Keep the forward outstanding, so an answer
+    /// that arrives later still adopts.
+    StillWaiting,
+    /// Past [`forward_give_up_ms`]: settle it as [`ForwardPut::Unconfirmed`].
+    GiveUp,
+}
+
+/// What a timer fired `elapsed_ms` after a forward PUT of `artifact` was sent
+/// means.
+///
+/// The one place the wait is decided, so it can be tested off-target: the
+/// timers themselves are wasm-only (`migrate_ops::send_forward`).
+pub fn forward_timer(artifact: Artifact, elapsed_ms: u32) -> ForwardTimer {
+    if elapsed_ms >= forward_give_up_ms(artifact) {
+        ForwardTimer::GiveUp
+    } else {
+        ForwardTimer::StillWaiting
+    }
 }
 
 /// The sealing rule, in one place.
@@ -246,6 +335,66 @@ mod tests {
             ForwardPut::Acknowledged,
             "the client API carries nothing that attributes a PutResponse to a put"
         );
+    }
+
+    /// harvest#152. A mailbox forward PUT on a network node is answered only
+    /// after its remote hops, and the node tries peers one after another,
+    /// each for up to 60 s. The wait used to be the probe's 12 s, so an answer
+    /// after that found the forward already discarded, and a migrated
+    /// seller's successor mailbox went unrouted for the load. Red with the
+    /// mailbox give-up put back at the probe timeout.
+    #[test]
+    fn a_mailbox_forward_answered_after_the_probe_timeout_is_still_waited_for() {
+        let probe_timeout = freenet_migrate::RECOMMENDED_PROBE_TIMEOUT_MS as u32;
+        let several_node_attempts = 5 * 60_000;
+        for elapsed in [
+            probe_timeout,
+            60_000,
+            several_node_attempts,
+            MAILBOX_FORWARD_GIVE_UP_MS - 1,
+        ] {
+            assert_eq!(
+                forward_timer(Artifact::Mailbox, elapsed),
+                ForwardTimer::StillWaiting,
+                "a mailbox forward unanswered after {elapsed} ms may still land"
+            );
+        }
+    }
+
+    /// The other half: a node that never answers does not hold the forward
+    /// for the rest of the session. It resolves as an unanswered forward
+    /// always has, unconfirmed, which discards.
+    #[test]
+    fn a_mailbox_forward_nobody_answers_is_given_up_as_unconfirmed() {
+        assert_eq!(
+            forward_timer(Artifact::Mailbox, MAILBOX_FORWARD_GIVE_UP_MS),
+            ForwardTimer::GiveUp
+        );
+        assert_eq!(
+            forward_timer(Artifact::Mailbox, u32::MAX),
+            ForwardTimer::GiveUp
+        );
+        const { assert!(FORWARD_SLOW_NOTICE_MS < MAILBOX_FORWARD_GIVE_UP_MS) };
+    }
+
+    /// **Only the mailbox waits longer** (#154 review round 1). Adopting a
+    /// store, reputation or index contract moves where the seller's own
+    /// writes go, so a late adopt would strand an invoice accepted meanwhile
+    /// outside everything that watches and settles it. Those keep the
+    /// probe's deadline. Red with the long wait applied to every artifact.
+    #[test]
+    fn a_contract_the_seller_writes_to_keeps_the_probe_deadline() {
+        for artifact in [Artifact::Store, Artifact::Reputation, Artifact::Index] {
+            assert_eq!(
+                forward_timer(artifact, FORWARD_SLOW_NOTICE_MS - 1),
+                ForwardTimer::StillWaiting
+            );
+            assert_eq!(
+                forward_timer(artifact, FORWARD_SLOW_NOTICE_MS),
+                ForwardTimer::GiveUp,
+                "{artifact:?} gives up at the probe deadline"
+            );
+        }
     }
 
     /// Stated as an implication over the whole input space rather than as

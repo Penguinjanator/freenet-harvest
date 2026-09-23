@@ -810,14 +810,61 @@ pub(crate) fn request_certificate(fingerprint: String) {
     });
 }
 
-/// How long past its anchor an order's payment address stays watched.
+/// How long past its anchor an order's payment address stays watched: the
+/// bridge watch renewed, and the address re-read.
 ///
-/// A buyer pays only while the anchor is within
-/// [`harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS`], and a payment made at
-/// that moment must still be found while it is buried. A day of blocks past
-/// the payable window is ample for that and bounds how long a seller keeps
-/// asking about an invoice nobody paid.
-pub const WATCH_PAST_ANCHOR_BLOCKS: u32 = harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS + 144;
+/// The payment window the contract enforces,
+/// [`harvest_common::payment::PAYMENT_WINDOW_BLOCKS`], plus
+/// [`harvest_common::payment::MAX_REQUIRED_CONFIRMATIONS`]. A payment that
+/// confirms in the window's last block still settles the order, and it
+/// becomes provable only once it is as deep as the order requires, so the
+/// address has to stay re-read until then. (The bridge itself keeps a watch
+/// while a payment it has seen is shallow, so the renewal only has to reach
+/// the window's end; the re-reads, which find the deeper claims on a node
+/// whose copy went stale, have to reach the depth.) The most any order may
+/// require is used rather than this order's own count so the bound is one
+/// number for every order; it costs at most 143 blocks of watching.
+///
+/// This used to be `MAX_ANCHOR_AGE_BLOCKS + 144`, 192 blocks: it measured
+/// from the end of the time a buyer may SEND, not from the end of the time a
+/// payment may CONFIRM, so an honest seller stopped renewing the watch 1872
+/// blocks before a late payment stopped counting, and a buyer who paid
+/// inside the window was never seen as paid (harvest#146).
+///
+/// It is still a bound: the anchor never moves, so an invoice nobody pays
+/// stops being watched about fifteen days after it was issued. It is NOT a
+/// bound while this node has no chain tip; see
+/// `AppState::worth_watching_for_payment`. And the renewal it bounds runs
+/// only while the seller's tab is open: a bridge ends a watch about a day
+/// after the request that last asked for it (freenet-bitcoin
+/// `WATCH_LIFETIME_MS`), so a seller who closes Harvest for longer than that
+/// stops being watched for, whatever this says. See
+/// `docs/complaint-threat-model.md` section 7.4.
+pub const WATCH_PAST_ANCHOR_BLOCKS: u32 = harvest_common::payment::PAYMENT_WINDOW_BLOCKS
+    + harvest_common::payment::MAX_REQUIRED_CONFIRMATIONS;
+
+/// The most payment scripts one Ghost Key asks a bridge to watch, the newest
+/// orders first.
+///
+/// A bridge holds at most 1000 scripts per Ghost Key (freenet-bitcoin
+/// `bridge/src/inbox.rs`, `MAX_WATCHES_PER_GHOSTKEY`) and fills its places
+/// first come, first served: a renewal of a script it holds always succeeds,
+/// and a NEW script past the cap is refused, silently, since the request is
+/// read and removed like any other. With every unpaid invoice now renewed
+/// for about fifteen days ([`WATCH_PAST_ANCHOR_BLOCKS`]), a seller with more
+/// than about 65 unpaid invoices a day would fill the cap with stale ones and
+/// have the bridge refuse the fresh invoice a buyer is about to pay (#154
+/// review round 1).
+///
+/// So only the newest this many are renewed. The rest stop being asked
+/// about, and the bridge lets each go about a day after its last renewal,
+/// which is what the headroom below the cap is for: a key keeps renewing
+/// 500, and the ones it has just dropped hold at most another day's worth
+/// of places. The cost is stated rather than hidden: past this many unpaid
+/// invoices, the oldest are not watched through their whole window, and a
+/// very late payment to one of them is not observed. A fresh invoice is
+/// preferred because it is the one most likely to be paid.
+pub const WATCHES_PER_GHOSTKEY: usize = 500;
 
 /// Milliseconds since the Unix epoch by this machine's clock.
 pub(crate) fn now_ms() -> u64 {
@@ -6764,7 +6811,7 @@ impl AppState {
     ///
     /// The strict subset of [`Self::address_contracts_to_watch`] still worth
     /// a question. An order that has moved past `AwaitingPayment` has its
-    /// answer, and one whose anchor has aged out of the payable window will
+    /// answer, and one whose anchor is past [`WATCH_PAST_ANCHOR_BLOCKS`] will
     /// never get one, so both stop being asked about: that is what bounds a
     /// tab left open on an invoice nobody paid, and it is the same rule
     /// [`Self::worth_watching_for_payment`] applies to watch requests rather
@@ -11890,11 +11937,11 @@ impl AppState {
     /// The payment scripts each of this node's sellers needs `bridge` to
     /// watch, grouped by the Ghost Key that will ask, newest orders first.
     ///
-    /// An order is wanted while it awaits payment, names `bridge`, and could
-    /// still be paid and buried: a buyer pays only within
-    /// [`harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS`] of its anchor, and a
-    /// payment made at the last moment still has to be found while it is
-    /// buried, which [`WATCH_PAST_ANCHOR_BLOCKS`] allows a day for. Without a
+    /// An order is wanted while it awaits payment, names `bridge`, and a
+    /// payment to it could still settle it: until the tip is
+    /// [`WATCH_PAST_ANCHOR_BLOCKS`] past its anchor, which covers the whole
+    /// payment window the contract allows and the depth a payment confirming
+    /// at its end needs. Without a
     /// view of the chain the age is unknown, so the order is kept: asking the
     /// bridge to watch an expired address costs a read, and not asking for a
     /// live one costs the sale. An order with no anchor is never payable, so it
@@ -11973,6 +12020,38 @@ impl AppState {
                 }
             }
         }
+        // Newest first across every store of the key, not only within one,
+        // each script once (a reused address is one watch at the bridge, so
+        // it must not spend two places of the budget), and no more than the
+        // bridge will hold for the key with room for the ones just dropped:
+        // see [`WATCHES_PER_GHOSTKEY`].
+        for (_, _, wanted) in &mut groups {
+            wanted.sort_by_key(|w| std::cmp::Reverse(w.anchor_height));
+            // The entry kept for a reused script takes the EARLIEST anchor
+            // of the orders paying to it: the anchor is sent as the height
+            // the bridge may start scanning from, and the older order's
+            // payment can be no earlier than its own anchor, not the newer's.
+            let mut first: std::collections::HashMap<(BitcoinNetwork, Vec<u8>), usize> =
+                std::collections::HashMap::new();
+            let mut kept: Vec<crate::bitcoin_inbox::WatchWanted> = Vec::new();
+            for w in wanted.drain(..) {
+                match first.get(&(w.network, w.script.clone())) {
+                    Some(&at) => {
+                        let held = &mut kept[at].anchor_height;
+                        *held = match (*held, w.anchor_height) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        };
+                    }
+                    None => {
+                        first.insert((w.network, w.script.clone()), kept.len());
+                        kept.push(w);
+                    }
+                }
+            }
+            *wanted = kept;
+            wanted.truncate(WATCHES_PER_GHOSTKEY);
+        }
         groups
     }
 
@@ -11982,11 +12061,12 @@ impl AppState {
     /// address re-reads apply the same rule rather than a second copy that
     /// could disagree about when an invoice is finished.
     ///
-    /// A buyer pays only while the anchor is within
-    /// [`harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS`], and a payment made
-    /// at that moment must still be found while it is buried, which is what
-    /// [`WATCH_PAST_ANCHOR_BLOCKS`] allows for. Past that nothing more is
-    /// coming, so both the watch requests and the re-reads stop.
+    /// A payment settles the order only if it confirms within
+    /// [`harvest_common::payment::PAYMENT_WINDOW_BLOCKS`] of the anchor, and
+    /// one confirming at the end of that window still has to be seen while
+    /// it is buried, which is what [`WATCH_PAST_ANCHOR_BLOCKS`] allows for.
+    /// Past that nothing more is coming, so both the watch requests and the
+    /// re-reads stop.
     ///
     /// Without a tip this answers `true`: a node that cannot see the chain
     /// has not established that the window has closed, and treating that
@@ -24372,6 +24452,197 @@ mod buy_flow_tests {
             browsing.watches_wanted(inbox::bridge()).is_empty(),
             "a store this node only browses is not its to ask about"
         );
+    }
+
+    /// **A payment that confirms in the last block of the window is still
+    /// watched for, and re-read, until it is provable** (harvest#146).
+    ///
+    /// The ages come from the contract's own rule (`Order::payment_window`)
+    /// and the order's own confirmation count, not from the constant under
+    /// test, so a bound that measures from the wrong end cannot pass by
+    /// agreeing with itself. Red with the old bound
+    /// (`MAX_ANCHOR_AGE_BLOCKS + 144`): a buyer who paid 200 blocks after the
+    /// anchor, inside the window, was never seen as paid.
+    #[test]
+    fn a_payment_confirming_at_the_end_of_the_window_is_still_watched_for() {
+        let gk = inbox::authority().mint();
+        let probe = an_order_naming_the_test_bridge(0);
+        let anchored_at = probe.order.anchor.expect("anchored").height;
+        let window = probe.order.payment_window().expect("anchored");
+        let last_settling = *window.end() - anchored_at;
+        // The fixture needs one confirmation, so this equals `last_settling`;
+        // the deep-confirmation case is the next test.
+        let provable = last_settling + probe.order.required_confirmations.saturating_sub(1);
+        // Past the old bound, well inside the window.
+        let past_the_old_bound = harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS + 145;
+        for (why, age) in [
+            (
+                "a payment sent late and confirmed slowly",
+                past_the_old_bound,
+            ),
+            (
+                "a payment confirming in the window's last block",
+                last_settling,
+            ),
+            ("the same payment, at the depth the order needs", provable),
+        ] {
+            let state = a_seller_selling(vec![an_order_naming_the_test_bridge(age)], gk.id().0);
+            assert_eq!(
+                state.watches_wanted(inbox::bridge()).len(),
+                1,
+                "{why}: the watch is still renewed"
+            );
+            assert_eq!(
+                state.address_contracts_to_reread(STORE).len(),
+                1,
+                "{why}: the address is still re-read"
+            );
+        }
+
+        // Still bounded: the anchor does not move, so the tip passes the end.
+        let state = a_seller_selling(
+            vec![an_order_naming_the_test_bridge(
+                crate::state::WATCH_PAST_ANCHOR_BLOCKS + 1,
+            )],
+            gk.id().0,
+        );
+        assert!(state.watches_wanted(inbox::bridge()).is_empty());
+        assert!(state.address_contracts_to_reread(STORE).is_empty());
+    }
+
+    /// **An order needing the most confirmations any order may ask for is
+    /// still watched until a payment at the window's end is that deep**, and
+    /// not a block after the bound. The case the confirmation term of the
+    /// bound exists for, run through the predicate rather than only the
+    /// constant: red with that term dropped from `WATCH_PAST_ANCHOR_BLOCKS`
+    /// (review round 1, testing lens).
+    #[test]
+    fn an_order_needing_the_deepest_confirmations_is_watched_until_that_deep() {
+        use harvest_common::payment::MAX_REQUIRED_CONFIRMATIONS;
+        let gk = inbox::authority().mint();
+        let deep = |age: u32| {
+            let mut order = an_order_naming_the_test_bridge(age);
+            order.order.required_confirmations = MAX_REQUIRED_CONFIRMATIONS;
+            resigned(order, &seller_signing_key())
+        };
+        let probe = deep(0);
+        let anchored_at = probe.order.anchor.expect("anchored").height;
+        let last_settling = *probe.order.payment_window().expect("anchored").end() - anchored_at;
+        let provable = last_settling + MAX_REQUIRED_CONFIRMATIONS - 1;
+
+        let state = a_seller_selling(vec![deep(provable)], gk.id().0);
+        assert_eq!(state.watches_wanted(inbox::bridge()).len(), 1);
+        assert_eq!(state.address_contracts_to_reread(STORE).len(), 1);
+
+        let state = a_seller_selling(
+            vec![deep(crate::state::WATCH_PAST_ANCHOR_BLOCKS + 1)],
+            gk.id().0,
+        );
+        assert!(state.watches_wanted(inbox::bridge()).is_empty());
+        assert!(state.address_contracts_to_reread(STORE).is_empty());
+    }
+
+    /// **Past the per-key budget, the newest orders are the ones watched**,
+    /// across every store of the key (#154 review round 1). A bridge refuses a
+    /// new script past its cap while renewals keep their places, so without
+    /// the budget a seller with a fortnight of unpaid invoices would have the
+    /// fresh one refused. Red with the truncation removed, with the
+    /// cross-store sort removed (the second store's newest would be cut), and
+    /// with the de-duplication removed (a reused address spends two places),
+    /// and with the kept entry's anchor left at the newer order's.
+    #[test]
+    fn past_the_per_key_budget_the_newest_orders_are_watched() {
+        use crate::state::WATCHES_PER_GHOSTKEY;
+        let gk = inbox::authority().mint();
+        // One more than the budget, oldest first so the store's own order is
+        // not what puts the newest in front.
+        // Each on its own address, so the budget counts scripts, as the
+        // bridge does (the fixture's orders otherwise share one).
+        let on_its_own_address = |age: u32| {
+            let mut order = an_order_naming_the_test_bridge(age);
+            let mut script = vec![0x00, 0x14];
+            script.extend_from_slice(&[0u8; 16]);
+            script.extend_from_slice(&age.to_be_bytes());
+            order.order.payment_script_pubkey = script;
+            resigned(order, &seller_signing_key())
+        };
+        let mut orders: Vec<AuthorizedOrder> = (0..=WATCHES_PER_GHOSTKEY as u32)
+            .rev()
+            .map(|age| on_its_own_address(age + 10))
+            .collect();
+        // And one address reused by a second order: one place, not two.
+        let mut reused = on_its_own_address(11);
+        reused.order.anchor = Some(anchor(TIP_HEIGHT - 12));
+        orders.push(resigned(reused, &seller_signing_key()));
+        let mut state = a_seller_selling(orders, gk.id().0);
+        // A second store of the same key, holding the newest order of all.
+        let second: Vec<u8> = vec![0x5e; 32];
+        state
+            .my_stores
+            .get_mut("seller-fp")
+            .expect("the seller")
+            .push(StoreRegistration {
+                store_contract_id: second.clone(),
+                reputation_contract_id: vec![12u8; 32],
+                mailbox_contract_id: vec![13u8; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
+            });
+        state.begin_browsing(second.clone());
+        let newest = on_its_own_address(1);
+        {
+            let store = state.browsing_stores.get_mut(&second).expect("the store");
+            store.seller_verifying_key = Some(gk.id().0);
+            store.store_verifying_key = Some(gk.id().0);
+            store.orders = vec![newest];
+        }
+
+        let wanted = state.watches_wanted(inbox::bridge());
+        assert_eq!(wanted.len(), 1, "one key, one group");
+        let heights: Vec<Option<u32>> = wanted[0].2.iter().map(|w| w.anchor_height).collect();
+        assert_eq!(heights.len(), WATCHES_PER_GHOSTKEY, "held to the budget");
+        assert_eq!(
+            heights[0],
+            Some(TIP_HEIGHT - 1),
+            "the other store's newest order comes first"
+        );
+        let scripts: std::collections::HashSet<&Vec<u8>> =
+            wanted[0].2.iter().map(|w| &w.script).collect();
+        assert_eq!(
+            scripts.len(),
+            WATCHES_PER_GHOSTKEY,
+            "every place is a distinct script: the reused address took one"
+        );
+        let reused_script = on_its_own_address(11).order.payment_script_pubkey;
+        let reused_entry = wanted[0]
+            .2
+            .iter()
+            .find(|w| w.script == reused_script)
+            .expect("the reused address is watched");
+        assert_eq!(
+            reused_entry.anchor_height,
+            Some(TIP_HEIGHT - 12),
+            "a reused address is scanned from its EARLIER order's anchor"
+        );
+        assert!(
+            !heights.contains(&Some(TIP_HEIGHT - (WATCHES_PER_GHOSTKEY as u32 + 10))),
+            "the oldest is the one dropped"
+        );
+    }
+
+    /// The bound covers the deepest confirmation count any order may ask
+    /// for, measured from the last block a payment may confirm in. Checked
+    /// against the two contract constants rather than restated, so narrowing
+    /// either side without the other fails here.
+    #[test]
+    fn the_watch_bound_covers_the_window_and_the_deepest_confirmation_count() {
+        use harvest_common::payment::{MAX_REQUIRED_CONFIRMATIONS, PAYMENT_WINDOW_BLOCKS};
+        const {
+            assert!(
+                crate::state::WATCH_PAST_ANCHOR_BLOCKS
+                    >= PAYMENT_WINDOW_BLOCKS + MAX_REQUIRED_CONFIRMATIONS - 1
+            )
+        };
     }
 
     /// **Registering the same inbox again changes nothing; a new generation
