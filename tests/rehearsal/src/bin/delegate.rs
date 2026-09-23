@@ -30,7 +30,13 @@
 //!      carries the registration but never the key, harvest#138 F1)
 //!   delegate recover-store <ws-url-with-authToken> <delegate.wasm> <seeded-store.json>
 //!     (what custody's Recover does: unwrap the seeded copy with the stand-in
-//!      backer's wrap signature, then check the successor signs again)
+//!      backer's wrap signature, then check the successor signs again,
+//!      including a `Despatch`, harvest#53 Phase B)
+//!   delegate seed-store-state <seeded-store.json> <out-dir>
+//!     (no node: write the seeded seller's store -- owner and custody copy --
+//!      as `store.parameters` / `store.state` / `store.code` for `fdev
+//!      publish` at an earlier store generation, so a store re-key has a
+//!      real state to carry; harvest#53 Phase B)
 //!   delegate seed-convo <ws-url-with-authToken> <delegate.wasm> <store-code-hash-hex> <out-dir>
 //!     (keep a buyer conversation under the store's id at an EARLIER store
 //!      generation, and write the store code plus the current generation's
@@ -492,7 +498,32 @@ async fn recover_store(url: &str, wasm: &[u8], seeded: &str) {
     }
     let (registered, subkeys, signed) = store_key_report(&mut node, &key, store).await;
     println!("after recovery: registered={registered} subkeys={subkeys:?} sign={signed:?}");
-    if subkeys.is_ok() && signed.is_ok() {
+    // harvest#53 Phase B: the seller's despatch is the payload a recovered key
+    // must sign after the Phase B re-key; the closure above proves only that
+    // the key is held.
+    let despatch = harvest_common::fulfilment::Despatch {
+        order_id: harvest_common::payment::OrderId([0x71; 32]),
+        anchor: freenet_bitcoin_common::BlockAnchor {
+            height: 900_000,
+            hash: freenet_bitcoin_common::BlockHash([0x72; 32]),
+        },
+    };
+    let despatch_signed = match node
+        .harvest(
+            &key,
+            HarvestDelegateRequest::SignStoreUpdate {
+                request_id: 45,
+                store_verifying_key: store,
+                payload: harvest_common::to_cbor(&despatch).unwrap(),
+            },
+        )
+        .await
+    {
+        HarvestDelegateResponse::StoreUpdateSigned { result, .. } => result.map(|_| ()),
+        other => panic!("SignStoreUpdate(Despatch): {other:?}"),
+    };
+    println!("after recovery: sign despatch={despatch_signed:?}");
+    if subkeys.is_ok() && signed.is_ok() && despatch_signed.is_ok() {
         println!("RECOVERED: the successor signs for the store again");
     } else {
         println!("NOT RECOVERED");
@@ -543,6 +574,24 @@ async fn seed_convo(url: &str, wasm: &[u8], earlier_code_hash_hex: &str, out_dir
     );
 }
 
+/// The seeded seller's store as a publishable state: its owner and the custody
+/// copy `seed-store` made (a store-key-signed record, so the state verifies
+/// without asking the delegate to sign anything else). Published at an EARLIER
+/// store code, it is what a store re-key must carry forward.
+fn seed_store_state(seeded: &str, out_dir: &str) {
+    use harvest_common::backing::SignedRecord;
+    let seeded: SeededStore = serde_json::from_slice(&std::fs::read(seeded).unwrap()).unwrap();
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&seeded.store_verifying_key).unwrap();
+    let params = harvest_common::store::StoreParameters::new(vk);
+    let mut state = harvest_common::store::StoreStateV1 { owner: Some(vk), ..Default::default() };
+    state.copies.records.insert(seeded.copy.slot(), seeded.copy.clone());
+    std::fs::create_dir_all(out_dir).unwrap();
+    std::fs::write(format!("{out_dir}/store.parameters"), harvest_common::to_cbor(&params).unwrap()).unwrap();
+    std::fs::write(format!("{out_dir}/store.state"), harvest_common::to_cbor(&state).unwrap()).unwrap();
+    std::fs::write(format!("{out_dir}/store.code"), params.code()).unwrap();
+    println!("seller store {} with 1 custody copy written to {out_dir}", params.code());
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -553,6 +602,7 @@ async fn main() {
         Some("seed-store") => seed_store(&args[2], &std::fs::read(&args[3]).unwrap(), &args[4]).await,
         Some("check-store") => check_store(&args[2], &std::fs::read(&args[3]).unwrap(), &args[4]).await,
         Some("recover-store") => recover_store(&args[2], &std::fs::read(&args[3]).unwrap(), &args[4]).await,
+        Some("seed-store-state") => seed_store_state(&args[2], &args[3]),
         Some("seed-convo") => seed_convo(&args[2], &std::fs::read(&args[3]).unwrap(), &args[4], &args[5]).await,
         _ => {
             eprintln!("usage: delegate seed|touch|check ... (see the module docs)");

@@ -389,15 +389,35 @@ pub struct AppState {
     /// them, in order.
     pub stores_from_my_indexes: Vec<Vec<u8>>,
 
-    /// Cancellations signed, checked and sent, by order id, so the seller's
-    /// control does not reappear on an invoice whose cancellation is on its
-    /// way to the store. Session-only: a reload shows the store's own answer.
-    pub cancellations_sent: HashSet<harvest_common::payment::OrderId>,
+    /// Cancellations signed, checked and sent, by store and order id, so the
+    /// seller's control does not reappear on an invoice whose cancellation is
+    /// on its way to the store. Session-only: a reload shows the store's own
+    /// answer. Keyed by the store too because an order id is a hash of the
+    /// terms alone, which two stores can both hold ([`OrderAt`]).
+    pub cancellations_sent: HashSet<OrderAt>,
 
     /// Off-target only: cancelled invoices recorded instead of published, so
-    /// the cancel flow can be followed in a test (harvest#53).
+    /// the cancel flow can be followed in a test (harvest#53). Holds the
+    /// buyer's cancellations too (Phase B), which are published keyless.
     #[cfg(not(target_arch = "wasm32"))]
     pub published_cancellations: Vec<harvest_common::payment::AuthorizedOrder>,
+
+    /// Despatches signed, checked and sent, by store and order id, so the
+    /// seller's control does not come back while the despatch is on its way
+    /// to the store (harvest#53 Phase B). Session-only, like
+    /// `cancellations_sent`.
+    pub despatches_sent: HashSet<OrderAt>,
+
+    /// The buyer's own cancellations sent, by store and order id (harvest#53
+    /// Phase B).
+    pub buyer_cancellations_sent: HashSet<OrderAt>,
+
+    /// Off-target only: despatches recorded instead of published.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub published_despatches: Vec<(
+        harvest_common::payment::AuthorizedOrder,
+        harvest_common::fulfilment::AuthorizedDespatch,
+    )>,
 
     /// Off-target only: index entries recorded instead of published.
     #[cfg(not(target_arch = "wasm32"))]
@@ -850,6 +870,13 @@ pub(crate) const PAYMENT_ON_ITS_WAY: &str =
      counting. Check your wallet: if it settles the invoice, the order is paid and the goods \
      are owed.";
 
+/// What a BUYER is told when they try to cancel a purchase whose payment is
+/// already in sight (harvest#53 Phase B): the same fact as
+/// [`PAYMENT_ON_ITS_WAY`], from the other side.
+pub(crate) const PAYMENT_ON_ITS_WAY_BUYER: &str =
+    "a payment for this order has been seen at its address, and cancelling would not stop it \
+     counting. If it settles the order, the order is paid and the seller owes you the goods.";
+
 /// What a seller is told when they try to publish to a store this device has
 /// no store key for (harvest#93).
 pub(crate) const NO_STORE_KEY_MESSAGE: &str =
@@ -857,6 +884,25 @@ pub(crate) const NO_STORE_KEY_MESSAGE: &str =
      keys has to be moved to one first (My Store offers it); for a store created on another \
      device, open its link here with the Ghost Key that backs it connected, and Harvest \
      recovers the key from the store.";
+
+/// What a seller is told when their store's key is registered on this device
+/// but the delegate does not hold it (harvest#138): after a delegate re-key,
+/// until custody recovers it from the copy wrapped to a backing Ghost Key.
+/// Said in place of a control whose signature the delegate would refuse.
+pub(crate) const STORE_KEY_NOT_HELD_MESSAGE: &str =
+    "this device does not hold your store's key yet. Harvest recovers it from the copy wrapped \
+     to a Ghost Key that backs the store, once that Ghost Key is connected here.";
+
+/// One order in one store: the key of the session markers for records on
+/// their way to a store. An [`harvest_common::payment::OrderId`] is a hash of
+/// the order's terms alone, which name no store, so two stores can hold an
+/// order with the same id, and a marker keyed by the id alone would refuse
+/// the second store's control for the session (#136 review, round 5).
+pub type OrderAt = (Vec<u8>, harvest_common::payment::OrderId);
+
+fn order_at(store_contract_id: &[u8], order_id: &harvest_common::payment::OrderId) -> OrderAt {
+    (store_contract_id.to_vec(), order_id.clone())
+}
 
 /// Wrap a freshly-signed invoice as the record the store contract stores.
 ///
@@ -1140,6 +1186,9 @@ pub enum PendingSignature {
     Order(Box<PendingOrder>),
     /// A seller cancelling one of their own unpaid invoices (harvest#53).
     Cancellation(Box<PendingCancellation>),
+    /// A seller recording the despatch of one of their paid orders
+    /// (harvest#53 Phase B).
+    Despatch(Box<PendingDespatch>),
     /// A request asking the bridge to watch a seller's payment addresses.
     InboxEntry(Box<crate::bitcoin_inbox::PendingInboxEntry>),
     /// A Ghost Key's statement that it backs a new store, from the vault.
@@ -1168,6 +1217,7 @@ impl PendingSignature {
             PendingSignature::StoreInfo(pending) => harvest_common::to_cbor(&pending.info),
             PendingSignature::Order(pending) => harvest_common::to_cbor(&pending.order),
             PendingSignature::Cancellation(pending) => pending.signed_bytes(),
+            PendingSignature::Despatch(pending) => harvest_common::to_cbor(&pending.despatch),
             PendingSignature::InboxEntry(pending) => Ok(pending.signing_payload.clone()),
             PendingSignature::BackingStatement(pending) => {
                 harvest_common::to_cbor(&pending.statement)
@@ -1194,6 +1244,7 @@ impl PendingSignature {
             | PendingSignature::StoreInfo(_)
             | PendingSignature::Order(_)
             | PendingSignature::Cancellation(_)
+            | PendingSignature::Despatch(_)
             | PendingSignature::BackingAcceptance(_) => Signer::StoreKey,
             PendingSignature::InboxEntry(_) | PendingSignature::BackingStatement(_) => {
                 Signer::GhostKey
@@ -1270,6 +1321,12 @@ pub struct PendingInvoice {
     /// it checks against what their OWN node derives rather than against
     /// anything in a message.
     pub order_binding: Option<[u8; 32]>,
+    /// The buyer's receipt key from their request (harvest#53 Phase B),
+    /// signed into the commitment so the buyer can cancel it unpaid or
+    /// complain about it paid. Same provenance and the same reasoning as
+    /// `order_binding`: `None` for an unprompted invoice, which no buyer will
+    /// pay through the buy flow ([`PaymentBlocker::CommitmentLacksBuyerKey`]).
+    pub buyer_receipt_key: Option<[u8; 32]>,
 }
 
 /// A fully-formed invoice awaiting the seller's signature.
@@ -1326,6 +1383,18 @@ impl PendingCancellation {
             ..self.order
         }
     }
+}
+
+/// A seller's despatch of one of their paid orders, waiting on the store
+/// key's signature (harvest#53 Phase B).
+#[derive(Clone, Debug)]
+pub struct PendingDespatch {
+    pub store_contract_id: Vec<u8>,
+    /// The published order, as it stood when the seller asked. Sent with the
+    /// despatch so a replica that lacks it keeps the despatch.
+    pub order: harvest_common::payment::AuthorizedOrder,
+    /// What the store key is asked to sign.
+    pub despatch: harvest_common::fulfilment::Despatch,
 }
 
 /// Build the invoice an address has just completed.
@@ -1416,6 +1485,8 @@ pub fn order_for_invoice(
         // none, and no buyer will pay one through the buy flow.
         order_binding: pending.order_binding,
         listing_tag,
+        // Copied from the request verbatim too (harvest#53 Phase B).
+        buyer_receipt_key: pending.buyer_receipt_key,
         created_at,
     }
     .with_derived_id())
@@ -1688,6 +1759,19 @@ pub enum PaymentBlocker {
     ///
     /// All four mean the same thing to the buyer, and none is safe.
     CommitmentNotForThisBuyer,
+    /// The commitment does not carry this buyer's receipt key (harvest#53
+    /// Phase B), so after paying the buyer could not file a complaint the
+    /// store's reputation would accept, and before paying could not cancel.
+    ///
+    /// Checked against what this node derives
+    /// ([`crate::messaging::BuyerConversation::buyer_receipt_key`]), never the
+    /// key in the request, for the reason [`Self::CommitmentNotForThisBuyer`]
+    /// gives. Not a walk-away, but not the seller's to fix alone either: the
+    /// seller copies the key from the REQUEST, so an order answering an
+    /// unkeyed request (an earlier build's) is reissued just as unkeyed. The
+    /// buyer sends the request again, and the new one carries the key
+    /// ([`crate::components::buy_view::Remedy::AskAgain`]).
+    CommitmentLacksBuyerKey,
     /// The commitment names no Bitcoin bridge, so no payment to it could ever
     /// be proven.
     ///
@@ -1809,6 +1893,11 @@ impl PaymentBlocker {
                  bill -- and the seller would still owe only the one order they published. \
                  Do not pay it."
                 .to_string(),
+            PaymentBlocker::CommitmentLacksBuyerKey => "The published order does not carry your \
+                 key for this order, so you could not cancel it yourself or, later, file a \
+                 complaint about it. Send your request again: the seller copies the key from \
+                 the request, and a new one carries it."
+                .to_string(),
             PaymentBlocker::NoTrustedBridge => "The published order names no Bitcoin bridge, \
                  so no payment to it could ever be proven -- not by you, not by anyone. Ask \
                  the seller to reissue it."
@@ -1893,6 +1982,64 @@ pub struct BuyerPurchase {
 }
 
 impl BuyerPurchase {
+    /// Whether the order was issued to the conversation this purchase is
+    /// filed under: its binding matched this conversation's. The binding is
+    /// derived from the conversation's own secret, so only the conversation
+    /// the seller answered can pass it; every later check (listing tag,
+    /// receipt key, status) is made only once it has, so a blocker from one
+    /// of those still proves the order is this conversation's (round 4 of
+    /// harvest#136: counting `CommitmentLacksBuyerKey` as "not issued here"
+    /// filed an unkeyed order under a stray thread, with the walk-away text
+    /// in place of "send your request again"). Used only to choose between
+    /// conversations that both name the order (`AppState::buyer_purchases`).
+    fn issued_here(&self) -> bool {
+        !self
+            .blockers
+            .contains(&PaymentBlocker::CommitmentNotForThisBuyer)
+    }
+
+    /// Whether the buyer may cancel this purchase (harvest#53 Phase B): it is
+    /// published, still awaiting payment, and every check that makes it THIS
+    /// buyer's held -- including that it carries this conversation's receipt
+    /// key, without which the contract would refuse the buyer's signature.
+    ///
+    /// Blockers about paying it NOW (a stale anchor, an unknown bridge, the
+    /// chain not loaded) do not stop a cancel: an order a buyer will not pay
+    /// is exactly one they may want to withdraw in public.
+    ///
+    /// Exhaustive on purpose, like `AuthorizedOrder::fields_used`: a new
+    /// blocker does not compile until somebody decides whether it makes an
+    /// order not the buyer's to cancel.
+    pub fn cancellable(&self) -> bool {
+        let Some(commitment) = self.commitment.as_ref() else {
+            return false;
+        };
+        if commitment.status != harvest_common::payment::OrderStatus::AwaitingPayment {
+            return false;
+        }
+        self.blockers.iter().all(|blocker| match blocker {
+            PaymentBlocker::CommitmentNotPublished
+            | PaymentBlocker::SellerIdentityUnknown
+            | PaymentBlocker::StoreClosed
+            | PaymentBlocker::CommitmentNotTheSellers(_)
+            | PaymentBlocker::CommitmentNotForThisBuyer
+            | PaymentBlocker::CommitmentLacksBuyerKey
+            | PaymentBlocker::CommitmentNotRequested
+            | PaymentBlocker::NotAwaitingPayment(_) => false,
+            PaymentBlocker::NoTrustedBridge
+            | PaymentBlocker::BridgeNotRecognised(_)
+            | PaymentBlocker::DestinationDisagrees
+            | PaymentBlocker::DestinationUnreadable
+            | PaymentBlocker::AnchorMissing
+            | PaymentBlocker::ChainUnknown
+            | PaymentBlocker::AnchorOffChain
+            | PaymentBlocker::AnchorUnverifiable
+            | PaymentBlocker::AnchorAheadOfTip { .. }
+            | PaymentBlocker::AnchorStale { .. }
+            | PaymentBlocker::ConversationNotKept => true,
+        })
+    }
+
     /// The published order, when it is genuinely this buyer's and has moved
     /// past awaiting payment -- paid, cancelled or reversed -- so the card
     /// shows where it stands rather than a reason not to pay (harvest#53).
@@ -1998,6 +2145,14 @@ pub struct BrowsingStore {
     /// Orders placed against this store (buyer or seller side -- the store
     /// contract carries both). Payments-first UI groups these by status.
     pub orders: Vec<AuthorizedOrder>,
+    /// The seller's despatch of each order that has one, by order id
+    /// (harvest#53 Phase B), as the store contract accepted them: signed by
+    /// the store key, and only for an order the store holds. Readers ignore
+    /// one on an order that is not paid (`fulfilment::order_stage`).
+    pub despatches: std::collections::BTreeMap<
+        harvest_common::payment::OrderId,
+        harvest_common::fulfilment::AuthorizedDespatch,
+    >,
     /// Reputation contract ID (extracted from StoreInfoV1 on first load).
     pub reputation_contract_id: Option<Vec<u8>>,
     /// Mailbox contract ID (will be set when we know it).
@@ -3454,6 +3609,12 @@ impl AppState {
                     store.info = Some(store_state.info.info);
                     store.listings = store_state.listings.listings;
                     store.orders = store_state.orders.orders.into_values().collect();
+                    store.despatches = store_state
+                        .fulfilment
+                        .records
+                        .into_values()
+                        .map(|d| (d.despatch.order_id.clone(), d))
+                        .collect();
                     store.reputation_contract_id = Some(reputation_id.clone());
 
                     // The Ghost Key behind this store may also back another
@@ -4727,25 +4888,37 @@ impl AppState {
                 if message.addressing != Addressing::ToBuyer {
                     continue;
                 }
-                if purchases
-                    .iter()
-                    .any(|purchase| purchase.order_id == order_id)
-                {
-                    // The seller may repeat an acceptance; it is still one
-                    // purchase, and showing it twice would read as two debts.
-                    continue;
-                }
                 let commitment = store
                     .orders
                     .iter()
                     .find(|order| order.order.id == order_id)
                     .cloned();
-                purchases.push(BuyerPurchase {
+                let candidate = BuyerPurchase {
                     blockers: self.payment_blockers(store, conversation, commitment.as_ref()),
                     order_id,
                     conversation: conversation.buyer_public_key,
                     commitment,
-                });
+                };
+                // The seller may repeat an acceptance, or send one into more
+                // than one of this buyer's conversations; it is still one
+                // purchase, and showing it twice would read as two debts. The
+                // conversation it is filed under decides the key a cancel
+                // signs with and whose binding it is checked against, so it
+                // is the one the order was actually issued to wherever there
+                // is one -- not merely the first to name it. First-wins let
+                // a seller's acceptance sent into the wrong thread, earlier,
+                // leave the real buyer unable to pay or cancel (round-3
+                // review of harvest#136).
+                match purchases
+                    .iter_mut()
+                    .find(|purchase| purchase.order_id == candidate.order_id)
+                {
+                    Some(held) if candidate.issued_here() && !held.issued_here() => {
+                        *held = candidate
+                    }
+                    Some(_) => {}
+                    None => purchases.push(candidate),
+                }
             }
         }
         purchases
@@ -5983,6 +6156,15 @@ impl AppState {
         }
 
         let mut blockers = Vec::new();
+        // The key this buyer will sign with to cancel the order unpaid or to
+        // complain about it paid (harvest#53 Phase B). Compared against what
+        // THIS node derives, never against the request in the mailbox, for
+        // the reason the binding above is. A conversation with no usable key
+        // (all-zeros from an older delegate) matches nothing.
+        match conversation.buyer_receipt_key() {
+            Some(expected) if commitment.order.buyer_receipt_key == Some(expected) => {}
+            _ => blockers.push(PaymentBlocker::CommitmentLacksBuyerKey),
+        }
         match commitment.order.anchor {
             None => blockers.push(PaymentBlocker::AnchorMissing),
             Some(anchor) => match self.bitcoin.tips.get(&commitment.order.network) {
@@ -6929,13 +7111,13 @@ impl AppState {
     /// or the buyer's complaint; calling either "cancel" would promise
     /// something the system cannot do.
     ///
-    /// # Why the buyer cannot cancel here yet
+    /// # The seller's half only
     ///
-    /// The harvest#53 design makes cancel symmetric before payment, but a
-    /// buyer has no key the store contract recognises until the order
-    /// carries one (`buyer_receipt_key`, the next phase). Until then a buyer
-    /// who changes their mind simply does not pay, and the order lapses by
-    /// reading (`fulfilment::OrderStage::Lapsed`), which writes nothing.
+    /// Cancel is symmetric before payment (harvest#53): the buyer's half is
+    /// [`Self::buyer_cancel_order`], signed by the order's
+    /// `buyer_receipt_key` rather than the store key. A buyer who simply does
+    /// not pay needs neither: the order lapses by reading
+    /// (`fulfilment::OrderStage::Lapsed`), which writes nothing.
     ///
     /// Refused unless the order is in one of this device's own stores, is
     /// still awaiting payment as this node last read it, and is not already
@@ -6947,9 +7129,7 @@ impl AppState {
     ) -> Result<(), String> {
         use harvest_common::payment::OrderStatus;
 
-        let store_key = self
-            .store_owner_key(store_contract_id)
-            .ok_or_else(|| NO_STORE_KEY_MESSAGE.to_string())?;
+        let store_key = self.signing_store_key(store_contract_id)?;
         let order = self
             .browsing_stores
             .get(store_contract_id)
@@ -6974,7 +7154,9 @@ impl AppState {
         if self.payment_on_its_way(&order) {
             return Err(PAYMENT_ON_ITS_WAY.to_string());
         }
-        if self.cancellation_pending(order_id) || self.cancellations_sent.contains(order_id) {
+        if self.cancellation_pending(store_contract_id, order_id)
+            || self.cancellation_sent(store_contract_id, order_id)
+        {
             return Err("this invoice is already being cancelled".to_string());
         }
         info!("Cancelling invoice {}", order_id.short());
@@ -7039,10 +7221,458 @@ impl AppState {
         sight
     }
 
-    /// Whether a cancellation of `order_id` is waiting on its signature.
-    pub fn cancellation_pending(&self, order_id: &harvest_common::payment::OrderId) -> bool {
+    /// What `despatch_order` would refuse with, if anything, and what it
+    /// signs with otherwise. One function for both, so the seller's control
+    /// is shown exactly when pressing it could work (round-3 review of
+    /// harvest#136: it used to show and then refuse).
+    fn despatch_preconditions(
+        &self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Result<
+        (
+            ed25519_dalek::VerifyingKey,
+            harvest_common::payment::AuthorizedOrder,
+            freenet_bitcoin_common::BlockAnchor,
+        ),
+        String,
+    > {
+        use harvest_common::payment::OrderStatus;
+
+        let store_key = self.signing_store_key(store_contract_id)?;
+        let store = self
+            .browsing_stores
+            .get(store_contract_id)
+            .ok_or("this order is not in the store as this device last read it")?;
+        let order = store
+            .orders
+            .iter()
+            .find(|o| &o.order.id == order_id)
+            .cloned()
+            .ok_or("this order is not in the store as this device last read it")?;
+        if order.status != OrderStatus::Paid {
+            return Err(format!(
+                "only a paid order can be marked despatched, and this one is {}",
+                match order.status {
+                    OrderStatus::AwaitingPayment => "not paid yet",
+                    OrderStatus::Cancelled => "cancelled",
+                    OrderStatus::PaymentReversed => "paid and then reversed",
+                    OrderStatus::Paid => "paid",
+                }
+            ));
+        }
+        if store.despatches.contains_key(order_id) {
+            return Err("this order is already marked despatched".to_string());
+        }
+        if self.despatch_pending(store_contract_id, order_id)
+            || self.despatch_sent(store_contract_id, order_id)
+        {
+            return Err("this order's despatch is already on its way".to_string());
+        }
+        let anchor = self
+            .bitcoin
+            .tips
+            .get(&order.order.network)
+            .and_then(|tip| tip.current_anchor())
+            .ok_or(
+                "your node has not seen a recent Bitcoin block yet, and a despatch has to name \
+                 one to say when it was made. Wait for the chain data to load and try again.",
+            )?;
+        Ok((store_key, order, anchor))
+    }
+
+    /// Why the seller cannot record a despatch of this order right now, or
+    /// `None` when they can. The control shows this in place of its button.
+    pub fn despatch_refusal(
+        &self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Option<String> {
+        self.despatch_preconditions(store_contract_id, order_id)
+            .err()
+    }
+
+    /// Record that one of this seller's PAID orders has been despatched
+    /// (harvest#53 Phase B).
+    ///
+    /// The store key signs `Despatch { order id, anchor }`, the anchor being
+    /// the newest block this seller's node has seen: a despatch says when
+    /// only by naming a recent block, since a contract has no clock. Readers
+    /// never let it shorten the buyer's complaint window
+    /// (`fulfilment::order_stage`), so the anchor is information, not
+    /// leverage.
+    ///
+    /// Refused unless the order is in one of this device's own stores, is
+    /// PAID as this node last read it, has no despatch recorded, and none is
+    /// on its way. A late despatch -- after the despatch window -- is allowed:
+    /// it is still true, and it moves the buyer's window later, not earlier.
+    pub fn despatch_order(
+        &mut self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Result<(), String> {
+        let (store_key, order, anchor) =
+            self.despatch_preconditions(store_contract_id, order_id)?;
+        info!("Recording the despatch of order {}", order_id.short());
+        let despatch = harvest_common::fulfilment::Despatch {
+            order_id: order_id.clone(),
+            anchor,
+        };
+        self.request_store_key_signature(
+            PendingSignature::Despatch(Box::new(PendingDespatch {
+                store_contract_id: store_contract_id.to_vec(),
+                order,
+                despatch,
+            })),
+            store_key.to_bytes(),
+        )
+    }
+
+    /// A despatch was signed and checked but never reached the node: release
+    /// the marker so the seller's control comes back, and say so. Off the
+    /// wasm-gated send so the release is testable (the optimistic-marker
+    /// class in `docs/untested-invariants.md`).
+    pub(crate) fn on_despatch_send_failed(
+        &mut self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+        reason: &str,
+    ) {
+        self.despatches_sent
+            .remove(&order_at(store_contract_id, order_id));
+        self.notifications.push(format!(
+            "Could not record the despatch of order {}: {reason}",
+            order_id.short()
+        ));
+    }
+
+    /// The buyer's cancellation never reached the node: release the marker
+    /// so the control comes back, and say so. See
+    /// [`Self::on_despatch_send_failed`].
+    pub(crate) fn on_buyer_cancellation_send_failed(
+        &mut self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+        reason: &str,
+    ) {
+        self.buyer_cancellations_sent
+            .remove(&order_at(store_contract_id, order_id));
+        self.notifications.push(format!(
+            "Could not cancel order {}: {reason}",
+            order_id.short()
+        ));
+    }
+
+    /// Whether a despatch of `order_id` in this store is waiting on its
+    /// signature.
+    pub fn despatch_pending(
+        &self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> bool {
         self.pending_signatures.iter().any(|pending| {
-            matches!(pending, PendingSignature::Cancellation(c) if &c.order.order.id == order_id)
+            matches!(pending, PendingSignature::Despatch(d)
+                if &d.despatch.order_id == order_id && d.store_contract_id == store_contract_id)
+        })
+    }
+
+    /// Whether a despatch of `order_id` in this store was sent this session.
+    pub fn despatch_sent(
+        &self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> bool {
+        self.despatches_sent
+            .contains(&order_at(store_contract_id, order_id))
+    }
+
+    /// Whether a seller's cancellation of `order_id` in this store was sent
+    /// this session.
+    pub fn cancellation_sent(
+        &self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> bool {
+        self.cancellations_sent
+            .contains(&order_at(store_contract_id, order_id))
+    }
+
+    /// Whether the buyer's cancellation of `order_id` in this store was sent
+    /// this session.
+    pub fn buyer_cancellation_sent(
+        &self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> bool {
+        self.buyer_cancellations_sent
+            .contains(&order_at(store_contract_id, order_id))
+    }
+
+    /// Why this device cannot sign for `store_contract_id` right now, or
+    /// `None` when it can. For a control that signs, shown in place of its
+    /// button.
+    pub fn store_key_refusal(&self, store_contract_id: &[u8]) -> Option<String> {
+        self.signing_store_key(store_contract_id).err()
+    }
+
+    /// The store key this device can SIGN for `store_contract_id` with: the
+    /// registration names it AND the delegate holds it (harvest#138). A
+    /// control that signs is refused here rather than shown and then refused
+    /// by the delegate, which after a delegate re-key is every seller until
+    /// custody recovers the key (#136 review, round 5).
+    fn signing_store_key(
+        &self,
+        store_contract_id: &[u8],
+    ) -> Result<ed25519_dalek::VerifyingKey, String> {
+        let key = self
+            .store_owner_key(store_contract_id)
+            .ok_or_else(|| NO_STORE_KEY_MESSAGE.to_string())?;
+        if !self.holds_store_key(&key.to_bytes()) {
+            return Err(STORE_KEY_NOT_HELD_MESSAGE.to_string());
+        }
+        Ok(key)
+    }
+
+    /// The store key signed a despatch: verify it and publish it, with its
+    /// order.
+    ///
+    /// Verified BEFORE sending, for the reason `on_cancellation_signed` gives:
+    /// a record the contract refuses is refused in silence.
+    fn on_despatch_signed(
+        &mut self,
+        pending: PendingDespatch,
+        scoped_payload: Vec<u8>,
+        signature: Vec<u8>,
+    ) {
+        let short = pending.despatch.order_id.short();
+        let despatch = harvest_common::fulfilment::AuthorizedDespatch {
+            despatch: pending.despatch,
+            scoped_payload,
+            signature,
+        };
+        let verdict = self
+            .store_owner_key(&pending.store_contract_id)
+            .ok_or_else(|| NO_STORE_KEY_MESSAGE.to_string())
+            .and_then(|key| despatch.verify(&key));
+        if let Err(why) = verdict {
+            self.notifications.push(format!(
+                "Could not record the despatch of order {short}: {why}"
+            ));
+            return;
+        }
+        self.despatches_sent.insert(order_at(
+            &pending.store_contract_id,
+            &despatch.despatch.order_id,
+        ));
+        #[cfg(target_arch = "wasm32")]
+        {
+            let store_contract_id = pending.store_contract_id;
+            let order = pending.order;
+            wasm_bindgen_futures::spawn_local(async move {
+                let id = despatch.despatch.order_id.clone();
+                if let Err(e) = crate::gateway::store_ops::submit_despatch_by_id(
+                    &store_contract_id,
+                    order,
+                    despatch,
+                )
+                .await
+                {
+                    dioxus::logger::tracing::error!("Failed to publish the despatch: {}", e);
+                    crate::gateway::APP_STATE.write().on_despatch_send_failed(
+                        &store_contract_id,
+                        &id,
+                        &e,
+                    );
+                }
+            });
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.published_despatches.push((pending.order, despatch));
+    }
+
+    /// What `buyer_cancel_order` would refuse with, if anything, and what it
+    /// signs with otherwise. One function for both, so the buyer's control is
+    /// shown exactly when pressing it could work (round-3 review of
+    /// harvest#136: it used to show and then refuse while a payment was on
+    /// its way).
+    fn buyer_cancel_preconditions(
+        &self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Result<
+        (
+            harvest_common::payment::AuthorizedOrder,
+            ed25519_dalek::SigningKey,
+            ed25519_dalek::VerifyingKey,
+        ),
+        String,
+    > {
+        let purchase = self
+            .buyer_purchases(store_contract_id)
+            .into_iter()
+            .find(|p| &p.order_id == order_id)
+            .ok_or("this order is not one of your purchases at this store")?;
+        self.buyer_cancel_checks(store_contract_id, purchase)
+    }
+
+    /// [`Self::buyer_cancel_preconditions`] for a purchase the caller already
+    /// holds, so a card rendering its control does not recompute every
+    /// purchase at the store (round 4 of harvest#136).
+    fn buyer_cancel_checks(
+        &self,
+        store_contract_id: &[u8],
+        purchase: BuyerPurchase,
+    ) -> Result<
+        (
+            harvest_common::payment::AuthorizedOrder,
+            ed25519_dalek::SigningKey,
+            ed25519_dalek::VerifyingKey,
+        ),
+        String,
+    > {
+        let order_id = &purchase.order_id.clone();
+        if !purchase.cancellable() {
+            return Err("only an unpaid order that is yours can be cancelled".to_string());
+        }
+        let order = purchase
+            .commitment
+            .ok_or("this order has not been published")?;
+        let store = self
+            .browsing_stores
+            .get(store_contract_id)
+            .ok_or("this store is not loaded")?;
+        let key = store
+            .conversations
+            .iter()
+            .find(|c| c.buyer_public_key == purchase.conversation)
+            .and_then(|c| c.receipt_signing_key())
+            .filter(|key| order.order.buyer_receipt_key == Some(key.verifying_key().to_bytes()))
+            .ok_or("this node does not hold the key this order names for its buyer")?;
+        let store_key = store
+            .store_verifying_key
+            .and_then(|k| ed25519_dalek::VerifyingKey::from_bytes(&k).ok())
+            .ok_or("this store's key is not known here")?;
+        if self.payment_on_its_way(&order) {
+            return Err(PAYMENT_ON_ITS_WAY_BUYER.to_string());
+        }
+        if self.buyer_cancellation_sent(store_contract_id, order_id) {
+            return Err("this order is already being cancelled".to_string());
+        }
+        Ok((order, key, store_key))
+    }
+
+    /// Why the buyer cannot cancel this purchase right now, or `None` when
+    /// they can. The control shows this in place of its button.
+    pub fn buyer_cancel_refusal(
+        &self,
+        store_contract_id: &[u8],
+        purchase: &BuyerPurchase,
+    ) -> Option<String> {
+        self.buyer_cancel_checks(store_contract_id, purchase.clone())
+            .err()
+    }
+
+    /// The BUYER cancels one of their own unpaid purchases (harvest#53
+    /// Phase B): the conversation's receipt key signs `(order id,
+    /// Cancelled)`, the key the seller signed into the order's terms, and the
+    /// record is published without the store key.
+    ///
+    /// Symmetric with the seller's cancel, and refused on the same grounds: a
+    /// payment already on its way still settles the order (`Paid` outranks
+    /// `Cancelled`), so cancelling then would put a public record out that
+    /// says the opposite of what is about to happen. After payment there is
+    /// no cancel; see [`Self::cancel_invoice`].
+    ///
+    /// Refused unless the purchase is genuinely this buyer's
+    /// ([`BuyerPurchase::cancellable`]) and this conversation holds the key
+    /// the order names.
+    pub fn buyer_cancel_order(
+        &mut self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Result<(), String> {
+        use ed25519_dalek::Signer as _;
+        use harvest_common::payment::OrderStatus;
+
+        let (order, key, store_key) =
+            self.buyer_cancel_preconditions(store_contract_id, order_id)?;
+        let message = harvest_common::to_cbor(&(order.order.id.clone(), OrderStatus::Cancelled))?;
+        let envelope = harvest_common::backing::store_key_envelope(message)?;
+        let signature = key.sign(&envelope).to_bytes().to_vec();
+        let cancelled = harvest_common::payment::AuthorizedOrder {
+            status: OrderStatus::Cancelled,
+            payment_proof: None,
+            status_scoped_payload: Some(envelope),
+            status_signature: Some(signature),
+            ..order
+        };
+        // Checked before sending, against the store key the contract will
+        // check the terms with: refused in silence otherwise.
+        cancelled
+            .verify(&store_key)
+            .map_err(|e| format!("the cancellation would be refused: {e}"))?;
+        info!("Cancelling purchase {}", order_id.short());
+        self.buyer_cancellations_sent
+            .insert(order_at(store_contract_id, order_id));
+        #[cfg(target_arch = "wasm32")]
+        {
+            let store_contract_id = store_contract_id.to_vec();
+            wasm_bindgen_futures::spawn_local(async move {
+                let id = cancelled.order.id.clone();
+                if let Err(e) = crate::gateway::store_ops::submit_settled_order_by_id(
+                    &store_contract_id,
+                    cancelled,
+                )
+                .await
+                {
+                    dioxus::logger::tracing::error!("Failed to publish the cancellation: {}", e);
+                    crate::gateway::APP_STATE
+                        .write()
+                        .on_buyer_cancellation_send_failed(&store_contract_id, &id, &e);
+                }
+            });
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.published_cancellations.push(cancelled);
+        Ok(())
+    }
+
+    /// The seller's despatch of `order`, from the store that holds this very
+    /// record (harvest#53 Phase B).
+    ///
+    /// Matched on the terms SIGNATURE and not on the id alone. An order id is
+    /// a hash of terms, so another store's owner could re-sign the same terms
+    /// into their own store alongside a despatch of their own, and a lookup
+    /// by id across every loaded store could then show this order as
+    /// despatched on the word of somebody who is not its seller.
+    pub fn despatch_of(
+        &self,
+        order: &harvest_common::payment::AuthorizedOrder,
+    ) -> Option<harvest_common::fulfilment::AuthorizedDespatch> {
+        self.browsing_stores.values().find_map(|store| {
+            store
+                .orders
+                .iter()
+                .any(|held| {
+                    held.order.id == order.order.id
+                        && held.signature == order.signature
+                        && held.scoped_payload == order.scoped_payload
+                })
+                .then(|| store.despatches.get(&order.order.id).cloned())
+                .flatten()
+        })
+    }
+
+    /// Whether a cancellation of `order_id` in this store is waiting on its
+    /// signature.
+    pub fn cancellation_pending(
+        &self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> bool {
+        self.pending_signatures.iter().any(|pending| {
+            matches!(pending, PendingSignature::Cancellation(c)
+                if &c.order.order.id == order_id && c.store_contract_id == store_contract_id)
         })
     }
 
@@ -7081,7 +7711,8 @@ impl AppState {
         // Held until the store shows the cancellation or the send fails, so
         // the control does not come back on an invoice whose cancellation is
         // on its way.
-        self.cancellations_sent.insert(cancelled.order.id.clone());
+        self.cancellations_sent
+            .insert(order_at(&store_contract_id, &cancelled.order.id));
         #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
             let id = cancelled.order.id.clone();
@@ -7090,7 +7721,9 @@ impl AppState {
             {
                 dioxus::logger::tracing::error!("Failed to publish the cancellation: {}", e);
                 let mut state = crate::gateway::APP_STATE.write();
-                state.cancellations_sent.remove(&id);
+                state
+                    .cancellations_sent
+                    .remove(&order_at(&store_contract_id, &id));
                 state
                     .notifications
                     .push(format!("Could not cancel invoice {short}: {e}"));
@@ -7148,6 +7781,7 @@ impl AppState {
             Some(PendingSignature::StoreInfo(_)) => "your store's details",
             Some(PendingSignature::Order(_)) => "the invoice",
             Some(PendingSignature::Cancellation(_)) => "the cancellation",
+            Some(PendingSignature::Despatch(_)) => "the despatch",
             Some(PendingSignature::BackingAcceptance(_)) => "your new store",
             _ => "your store",
         };
@@ -8251,6 +8885,9 @@ impl AppState {
             }
             Some(PendingSignature::Cancellation(pending)) => {
                 self.on_cancellation_signed(*pending, scoped_payload, signature);
+            }
+            Some(PendingSignature::Despatch(pending)) => {
+                self.on_despatch_signed(*pending, scoped_payload, signature);
             }
             Some(PendingSignature::InboxEntry(pending)) => {
                 let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
@@ -11328,6 +11965,7 @@ mod tests {
                 PendingSignature::Listing(_)
                 | PendingSignature::Order(_)
                 | PendingSignature::Cancellation(_)
+                | PendingSignature::Despatch(_)
                 | PendingSignature::InboxEntry(_)
                 | PendingSignature::BackingStatement(_)
                 | PendingSignature::BackingAcceptance(_) => None,
@@ -12055,6 +12693,7 @@ mod tests {
                 PendingSignature::Listing(_)
                 | PendingSignature::Order(_)
                 | PendingSignature::Cancellation(_)
+                | PendingSignature::Despatch(_)
                 | PendingSignature::InboxEntry(_)
                 | PendingSignature::BackingStatement(_)
                 | PendingSignature::BackingAcceptance(_) => None,
@@ -12895,6 +13534,7 @@ mod invoice_tests {
             order_binding: None,
             amount_sats: 50_000,
             required_confirmations: 1,
+            buyer_receipt_key: None,
         }
     }
 
@@ -13177,6 +13817,7 @@ mod invoice_tests {
             anchor: Some(anchor(TIP_HEIGHT)),
             order_binding: None,
             listing_tag: None,
+            buyer_receipt_key: None,
             created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("time"),
         }
         .with_derived_id();
@@ -14384,6 +15025,7 @@ mod authorized_order_tests {
             anchor: None,
             order_binding: None,
             listing_tag: None,
+            buyer_receipt_key: None,
             created_at,
         }
         .with_derived_id()
@@ -15616,6 +16258,9 @@ mod buyer_persistence_tests {
             buyer_to_seller: conversation_key_from_dh(&shared, MessageDirection::BuyerToSeller),
             seller_to_buyer: conversation_key_from_dh(&shared, MessageDirection::SellerToBuyer),
             order_binding: harvest_common::mailbox::order_binding_from_secret(&secret.to_bytes()),
+            buyer_receipt_seed: harvest_common::mailbox::buyer_receipt_seed_from_secret(
+                &secret.to_bytes(),
+            ),
             created_at,
             // A conversation just handed to the delegate has not been saved
             // anywhere by the buyer, and was opened here rather than
@@ -16363,6 +17008,9 @@ mod buyer_backup_tests {
             buyer_to_seller: [seed; 32],
             seller_to_buyer: [seed; 32],
             order_binding: harvest_common::mailbox::order_binding_from_secret(&[seed; 32]),
+            buyer_receipt_seed: harvest_common::mailbox::buyer_receipt_seed_from_secret(
+                &[seed; 32],
+            ),
             created_at: 1_700_000_000 + seed as i64,
             imported: false,
             backed_up,
@@ -17355,6 +18003,29 @@ mod buy_flow_tests {
         status: OrderStatus,
         order_binding: Option<[u8; 32]>,
     ) -> AuthorizedOrder {
+        // The buyer's receipt key (harvest#53 Phase B): the key the fixtures'
+        // buyer derives, when the order is bound to anyone.
+        let buyer_receipt_key =
+            order_binding.and_then(|_| the_buyers_conversation().buyer_receipt_key());
+        commitment_with_buyer_key(
+            what,
+            signing_key,
+            anchor_at,
+            status,
+            order_binding,
+            buyer_receipt_key,
+        )
+    }
+
+    /// [`commitment_for`] naming a buyer receipt key of the caller's choosing.
+    fn commitment_with_buyer_key(
+        what: &str,
+        signing_key: &SigningKey,
+        anchor_at: Option<freenet_bitcoin_common::BlockAnchor>,
+        status: OrderStatus,
+        order_binding: Option<[u8; 32]>,
+        buyer_receipt_key: Option<[u8; 32]>,
+    ) -> AuthorizedOrder {
         use freenet_stdlib::prelude::ContractInstanceId;
 
         // `what` used to vary the listing; orders no longer carry one
@@ -17387,6 +18058,7 @@ mod buy_flow_tests {
             // The tag this conversation would expect for the fixtures'
             // listing, when the order is bound to it.
             listing_tag: order_binding.map(|_| the_buyers_conversation().listing_tag(&widget())),
+            buyer_receipt_key,
             created_at,
         }
         .with_derived_id();
@@ -17618,6 +18290,7 @@ mod buy_flow_tests {
             required_confirmations: 1,
             reply_to: Some(tag),
             order_binding: Some(the_buyers_conversation().order_binding()),
+            buyer_receipt_key: the_buyers_conversation().buyer_receipt_key(),
         }
     }
 
@@ -17712,6 +18385,13 @@ mod buy_flow_tests {
             Some(tag),
             "the invoice must remember which request it answers"
         );
+        // harvest#53 Phase B: the buyer's receipt key rides into the signed
+        // terms, or the buyer can neither cancel nor complain.
+        assert_eq!(
+            queued.order.buyer_receipt_key,
+            the_buyers_conversation().buyer_receipt_key()
+        );
+        assert!(queued.order.buyer_receipt_key.is_some());
 
         state.on_delegate_response(order_sign_result(&queued));
 
@@ -17925,11 +18605,13 @@ mod buy_flow_tests {
     #[test]
     fn one_commitment_is_payable_by_exactly_one_buyer() {
         let (alice, alice_conversation) = buyer_conversation();
-        let published = commitment_bound_to(
+        let published = commitment_with_buyer_key(
+            "one-buyer",
             &seller_signing_key(),
             Some(anchor(TIP_HEIGHT)),
             OrderStatus::AwaitingPayment,
             Some(alice_conversation.order_binding()),
+            alice_conversation.buyer_receipt_key(),
         );
 
         let alice = buyer_holding(alice, alice_conversation, &published);
@@ -18007,6 +18689,7 @@ mod buy_flow_tests {
                 shipping: "anywhere".into(),
                 note: String::new(),
                 order_binding: other_conversation.order_binding(),
+                buyer_receipt_key: None,
             },
         )
         .expect("seal");
@@ -18063,6 +18746,7 @@ mod buy_flow_tests {
                 buyer_to_seller: [7u8; 32],
                 seller_to_buyer: [8u8; 32],
                 order_binding: [9u8; 32],
+                buyer_receipt_seed: [0u8; 32],
                 created_at: 1,
                 imported: false,
                 backed_up: false,
@@ -18083,6 +18767,7 @@ mod buy_flow_tests {
                 buyer_to_seller: [7u8; 32],
                 seller_to_buyer: [8u8; 32],
                 order_binding: [9u8; 32],
+                buyer_receipt_seed: [0u8; 32],
                 created_at: 1,
                 imported: false,
                 backed_up: false,
@@ -20530,6 +21215,7 @@ mod buy_flow_tests {
                 buyer_to_seller: keys.to_seller,
                 seller_to_buyer: keys.from_seller,
                 order_binding: [0u8; 32],
+                buyer_receipt_seed: [0u8; 32],
                 created_at: 0,
                 imported: false,
                 backed_up: false,
@@ -21173,6 +21859,7 @@ mod buy_flow_tests {
             buyer_to_seller: [7u8; 32],
             seller_to_buyer: [8u8; 32],
             order_binding: [9u8; 32],
+            buyer_receipt_seed: [0u8; 32],
             created_at: 1,
             imported: false,
             backed_up: false,
@@ -22747,7 +23434,7 @@ mod buy_flow_tests {
         state
             .cancel_invoice(STORE, &order.order.id)
             .expect("an unpaid invoice in our own store can be cancelled");
-        assert!(state.cancellation_pending(&order.order.id));
+        assert!(state.cancellation_pending(STORE, &order.order.id));
         assert!(
             state.published_cancellations.is_empty(),
             "not before it is signed"
@@ -22755,9 +23442,9 @@ mod buy_flow_tests {
 
         answer_the_store_key_request(&mut state, &seller_signing_key());
 
-        assert!(!state.cancellation_pending(&order.order.id));
+        assert!(!state.cancellation_pending(STORE, &order.order.id));
         assert!(
-            state.cancellations_sent.contains(&order.order.id),
+            state.cancellation_sent(STORE, &order.order.id),
             "the control stays down until the store shows the cancellation"
         );
         assert!(state.cancel_invoice(STORE, &order.order.id).is_err());
@@ -22842,7 +23529,7 @@ mod buy_flow_tests {
             .next()
             .expect("queued");
         state.store_key_signature_failed(request_id, "the delegate said no");
-        assert!(!state.cancellation_pending(&order.order.id));
+        assert!(!state.cancellation_pending(STORE, &order.order.id));
         state
             .cancel_invoice(STORE, &order.order.id)
             .expect("a withdrawn cancellation can be asked for again");
@@ -22974,7 +23661,7 @@ mod buy_flow_tests {
         show_a_payment_row(&mut state, &order, order.order.amount_sats);
         answer_the_store_key_request(&mut state, &seller_signing_key());
         assert!(state.published_cancellations.is_empty());
-        assert!(!state.cancellations_sent.contains(&order.order.id));
+        assert!(!state.cancellation_sent(STORE, &order.order.id));
         assert!(
             state
                 .notifications
@@ -23004,7 +23691,7 @@ mod buy_flow_tests {
         // however far the tip has moved.
         assert!(sight.ambiguous);
         assert!(!matches!(
-            crate::fulfilment::order_stage(&order, Some(TIP_HEIGHT + 100_000), sight),
+            crate::fulfilment::order_stage(&order, None, Some(TIP_HEIGHT + 100_000), sight),
             crate::fulfilment::OrderStage::Lapsed { .. }
         ));
         // And one sat of mempool dust over the twin's payment does not bring
@@ -23065,7 +23752,7 @@ mod buy_flow_tests {
         );
         assert_eq!(purchase.settled(), Some(&paid));
         assert!(matches!(
-            crate::fulfilment::order_stage(&paid, Some(TIP_HEIGHT), Default::default()),
+            crate::fulfilment::order_stage(&paid, None, Some(TIP_HEIGHT), Default::default()),
             crate::fulfilment::OrderStage::AwaitingDespatch { .. }
         ));
     }
@@ -23094,6 +23781,749 @@ mod buy_flow_tests {
             vec![PaymentBlocker::CommitmentNotForThisBuyer]
         );
         assert_eq!(purchase.settled(), None);
+    }
+
+    // ------------------------------------------------------------------
+    // harvest#53 Phase B: the buyer's receipt key, the buyer's cancel, and
+    // the seller's despatch.
+    // ------------------------------------------------------------------
+
+    /// A commitment bound to this buyer but carrying no receipt key, or
+    /// somebody else's, is not payable: after paying, the buyer could not
+    /// complain. The buyer is told to send the request again, since a
+    /// seller's reissue would copy the same request's missing key.
+    #[test]
+    fn a_commitment_without_this_buyers_receipt_key_is_not_payable() {
+        let binding = Some(the_buyers_conversation().order_binding());
+        for (label, key) in [("no key", None), ("another buyer's key", Some([0x42; 32]))] {
+            let published = commitment_with_buyer_key(
+                "Widget",
+                &seller_signing_key(),
+                Some(anchor(TIP_HEIGHT)),
+                OrderStatus::AwaitingPayment,
+                binding,
+                key,
+            );
+            let (state, _) = buyer_after_acceptance(&published);
+            let purchase = purchases(&state).pop().expect("one purchase");
+            assert_eq!(
+                purchase.blockers,
+                vec![PaymentBlocker::CommitmentLacksBuyerKey],
+                "{label}"
+            );
+            assert_eq!(
+                crate::components::buy_view::remedy(&PaymentBlocker::CommitmentLacksBuyerKey),
+                crate::components::buy_view::Remedy::AskAgain
+            );
+            assert!(!purchase.cancellable(), "{label}: the buyer could not sign");
+        }
+    }
+
+    /// A recalled conversation whose delegate answered no seed (all-zeros)
+    /// holds no key, and does not match a seller who signed the all-zeros
+    /// key's public half: that seed is one anyone can derive.
+    #[test]
+    fn an_all_zero_receipt_seed_is_no_key() {
+        let recalled =
+            crate::messaging::BuyerConversation::recalled(&harvest_common::RecalledConversation {
+                buyer_public_key: [5u8; 32],
+                conversation_id: [6u8; 32],
+                buyer_to_seller: [7u8; 32],
+                seller_to_buyer: [8u8; 32],
+                order_binding: [9u8; 32],
+                buyer_receipt_seed: [0u8; 32],
+                created_at: 1_700_000_000,
+                imported: false,
+                backed_up: false,
+            });
+        assert_eq!(recalled.buyer_receipt_key(), None);
+        assert!(recalled.receipt_signing_key().is_none());
+
+        let seeded =
+            crate::messaging::BuyerConversation::recalled(&harvest_common::RecalledConversation {
+                buyer_public_key: [5u8; 32],
+                conversation_id: [6u8; 32],
+                buyer_to_seller: [7u8; 32],
+                seller_to_buyer: [8u8; 32],
+                order_binding: [9u8; 32],
+                buyer_receipt_seed: [3u8; 32],
+                created_at: 1_700_000_000,
+                imported: false,
+                backed_up: false,
+            });
+        assert_eq!(
+            seeded.buyer_receipt_key(),
+            Some(
+                SigningKey::from_bytes(&[3u8; 32])
+                    .verifying_key()
+                    .to_bytes()
+            ),
+            "the delegate's seed is the key the recalled conversation signs with"
+        );
+    }
+
+    /// The same, for an order answering an unkeyed request (round 4 of
+    /// harvest#136): its real buyer's blocker is `CommitmentLacksBuyerKey`,
+    /// which is only reached once the binding matched, so it is still filed
+    /// under the real thread -- and the buyer is told to send the request
+    /// again, not to walk away.
+    #[test]
+    fn a_misdirected_acceptance_does_not_take_an_unkeyed_purchase_either() {
+        let order = commitment_with_buyer_key(
+            "Widget",
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 2)),
+            OrderStatus::AwaitingPayment,
+            Some(the_buyers_conversation().order_binding()),
+            None,
+        );
+        let (mut state, real) = buyer_after_acceptance(&order);
+        let mut stray =
+            BuyerConversation::opened_from_secret_for_test(&[42u8; 32], &seller_encryption_key())
+                .expect("open");
+        stray.mark_kept();
+        let stray_tag = stray.buyer_public_key;
+        let misdirected = crate::messaging::seal_order_accepted(
+            &seller_keys_for(&stray_tag),
+            &stray_tag,
+            &stray.conversation_id,
+            &order.order.id,
+        )
+        .expect("seal");
+        let store = state.browsing_stores.get_mut(STORE).expect("store");
+        store.conversations.insert(0, stray);
+        store.mailbox_messages.push(misdirected);
+
+        let held = purchases(&state);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].conversation, real);
+        assert_eq!(
+            held[0].blockers,
+            vec![PaymentBlocker::CommitmentLacksBuyerKey]
+        );
+    }
+
+    /// **A purchase is filed under the conversation it was issued to**
+    /// (round-3 review of harvest#136). A seller's acceptance for the same
+    /// order sent into another of this buyer's threads -- earlier, so it is
+    /// read first -- used to win, and the real buyer was then told the order
+    /// was not theirs and could neither pay nor cancel it.
+    #[test]
+    fn a_misdirected_acceptance_does_not_take_the_purchase_from_its_buyer() {
+        let order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 2)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut state, real) = buyer_after_acceptance(&order);
+        let mut stray =
+            BuyerConversation::opened_from_secret_for_test(&[42u8; 32], &seller_encryption_key())
+                .expect("open");
+        stray.mark_kept();
+        let stray_tag = stray.buyer_public_key;
+        let misdirected = crate::messaging::seal_order_accepted(
+            &seller_keys_for(&stray_tag),
+            &stray_tag,
+            &stray.conversation_id,
+            &order.order.id,
+        )
+        .expect("seal");
+        let store = state.browsing_stores.get_mut(STORE).expect("store");
+        store.conversations.insert(0, stray);
+        store.mailbox_messages.push(misdirected);
+
+        let held = purchases(&state);
+        assert_eq!(held.len(), 1, "still one purchase");
+        assert_eq!(
+            held[0].conversation, real,
+            "filed under its own buyer's thread"
+        );
+        assert!(held[0].blockers.is_empty(), "{:?}", held[0].blockers);
+        assert!(held[0].cancellable());
+        state
+            .buyer_cancel_order(STORE, &order.order.id)
+            .expect("the real buyer can still cancel");
+
+        // With no conversation it was issued to, the first still stands,
+        // blocked as before.
+        let store = state.browsing_stores.get_mut(STORE).expect("store");
+        store.conversations.retain(|c| c.buyer_public_key != real);
+        let held = purchases(&state);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].conversation, stray_tag);
+        assert_eq!(
+            held[0].blockers,
+            vec![PaymentBlocker::CommitmentNotForThisBuyer]
+        );
+    }
+
+    /// The buyer's cancel: signed with the conversation's receipt key, it
+    /// verifies under the store's own rules and applies to the store.
+    #[test]
+    fn a_buyer_cancels_an_unpaid_purchase_with_a_record_the_contract_accepts() {
+        use freenet_scaffold::ComposableState;
+        let order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 2)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut state, _) = buyer_after_acceptance(&order);
+        assert!(purchases(&state)[0].cancellable());
+        state
+            .buyer_cancel_order(STORE, &order.order.id)
+            .expect("the buyer may cancel their own unpaid order");
+        assert!(state.buyer_cancellation_sent(STORE, &order.order.id));
+        assert!(
+            state.buyer_cancel_order(STORE, &order.order.id).is_err(),
+            "once is enough"
+        );
+        let cancelled = state.published_cancellations.pop().expect("published");
+        assert_eq!(cancelled.status, OrderStatus::Cancelled);
+        assert_eq!(cancelled.order, order.order, "the terms travel unchanged");
+        let store_key = seller_signing_key().verifying_key();
+        cancelled
+            .verify(&store_key)
+            .expect("verifies under the store's rules");
+        crate::gateway::store_ops::keyless_publishable(&cancelled, &store_key)
+            .expect("and may be published without the store key");
+
+        // Applied to a store holding the open order, it moves to Cancelled.
+        let params = crate::migrate::store_params(&store_key);
+        let mut store = harvest_common::store::StoreStateV1::default();
+        let delta = |o: AuthorizedOrder| harvest_common::store::StoreStateV1Delta {
+            owner: Some(store_key),
+            orders: Some(vec![o]),
+            ..Default::default()
+        };
+        store
+            .apply_delta(&store.clone(), &params, &Some(delta(order.clone())))
+            .expect("the open order");
+        store
+            .apply_delta(&store.clone(), &params, &Some(delta(cancelled)))
+            .expect("the buyer's cancel");
+        assert_eq!(
+            store.orders.orders[&order.order.id].status,
+            OrderStatus::Cancelled
+        );
+    }
+
+    /// The buyer cannot cancel once the order is paid, while a payment is on
+    /// its way, or an order that is not theirs.
+    #[test]
+    fn a_buyer_cannot_cancel_a_paid_order_one_being_paid_or_one_not_theirs() {
+        // Paid.
+        let (paid, claims, tip) = a_paid_order();
+        let mut settled = paid.clone();
+        settled.status = OrderStatus::Paid;
+        settled.payment_proof = Some(harvest_common::payment::OrderPaymentProof::on_chain(
+            claims.clone(),
+            tip.clone(),
+        ));
+        let (mut state, _) = buyer_after_acceptance(&settled);
+        assert!(!purchases(&state)[0].cancellable());
+        assert!(state.buyer_cancel_order(STORE, &settled.order.id).is_err());
+
+        // Unpaid, but the payment is visible at the address.
+        let (mut state, _) = buyer_after_acceptance(&paid);
+        give_the_node_the_chain(&mut state, &paid, claims, tip);
+        show_a_payment_row(&mut state, &paid, paid.order.amount_sats);
+        let refused = state
+            .buyer_cancel_order(STORE, &paid.order.id)
+            .expect_err("a payment on its way still counts");
+        assert!(
+            refused.contains("still counts") || refused.contains("would not stop"),
+            "{refused}"
+        );
+        assert!(state.published_cancellations.is_empty());
+
+        // Somebody else's order.
+        let mut theirs = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 2)),
+            OrderStatus::AwaitingPayment,
+        );
+        theirs.order.order_binding = Some([0x77; 32]);
+        let theirs = resigned(theirs, &seller_signing_key());
+        let (mut state, _) = buyer_after_acceptance(&theirs);
+        assert!(!purchases(&state)[0].cancellable());
+        assert!(state.buyer_cancel_order(STORE, &theirs.order.id).is_err());
+        assert!(state.published_cancellations.is_empty());
+    }
+
+    /// `cancellable` does not rest on the blockers alone for the status: a
+    /// purchase whose record is past payment is never cancellable, whatever
+    /// list of blockers came with it.
+    #[test]
+    fn a_purchase_past_payment_is_never_cancellable() {
+        let (paid, _, _) = a_paid_order();
+        for status in [
+            OrderStatus::Paid,
+            OrderStatus::Cancelled,
+            OrderStatus::PaymentReversed,
+        ] {
+            let mut commitment = paid.clone();
+            commitment.status = status;
+            let purchase = BuyerPurchase {
+                order_id: commitment.order.id.clone(),
+                conversation: [0u8; 32],
+                commitment: Some(commitment),
+                blockers: Vec::new(),
+            };
+            assert!(!purchase.cancellable(), "{status:?}");
+        }
+    }
+
+    /// A stale anchor stops a payment, not a cancel: an order the buyer will
+    /// not pay is exactly one they may want to withdraw.
+    #[test]
+    fn a_purchase_blocked_only_on_paying_now_can_still_be_cancelled() {
+        let stale = commitment(
+            &seller_signing_key(),
+            Some(anchor(
+                TIP_HEIGHT - harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS - 10,
+            )),
+            OrderStatus::AwaitingPayment,
+        );
+        let (state, _) = buyer_after_acceptance(&stale);
+        let purchase = purchases(&state).pop().expect("one purchase");
+        assert!(matches!(
+            purchase.blockers.as_slice(),
+            [PaymentBlocker::AnchorStale { .. }]
+        ));
+        assert!(purchase.cancellable());
+    }
+
+    /// A registered store whose key the delegate says it does not hold
+    /// (harvest#138: every seller, right after a delegate re-key, until
+    /// custody recovers the key) gets no despatch control: the delegate
+    /// would refuse the signature every time (#136 review, round 5).
+    #[test]
+    fn a_seller_whose_delegate_lacks_the_store_key_is_not_offered_a_despatch() {
+        let (mut state, order) = seller_holding_a_despatchable_order();
+        let stores = state.my_stores["seller-fp"].clone();
+        state.note_held_store_keys(&stores, Some(&[]));
+
+        assert_eq!(
+            state.despatch_refusal(STORE, &order.order.id).as_deref(),
+            Some(STORE_KEY_NOT_HELD_MESSAGE)
+        );
+        assert!(state.despatch_order(STORE, &order.order.id).is_err());
+        assert!(
+            state.pending_store_key_requests.is_empty(),
+            "nothing is asked of a delegate that would refuse it"
+        );
+
+        // Once custody recovers the key, the control comes back.
+        let held = [seller_signing_key().verifying_key().to_bytes()];
+        state.note_held_store_keys(&stores, Some(&held));
+        assert_eq!(state.despatch_refusal(STORE, &order.order.id), None);
+    }
+
+    /// The seller's cancel is refused the same way, before the delegate is
+    /// asked.
+    #[test]
+    fn a_seller_whose_delegate_lacks_the_store_key_cannot_start_a_cancel() {
+        let (mut state, order) = seller_holding_an_unpaid_invoice();
+        let stores = state
+            .my_stores
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        state.note_held_store_keys(&stores, Some(&[]));
+
+        assert_eq!(
+            state.store_key_refusal(STORE).as_deref(),
+            Some(STORE_KEY_NOT_HELD_MESSAGE),
+            "the cancel control says why instead of showing its button"
+        );
+        assert_eq!(
+            state.cancel_invoice(STORE, &order.order.id),
+            Err(STORE_KEY_NOT_HELD_MESSAGE.to_string())
+        );
+        assert!(state.pending_store_key_requests.is_empty());
+    }
+
+    /// An order id is a hash of the terms alone, which name no store, so two
+    /// of this seller's stores can hold an order with the same id. A despatch
+    /// on its way to one must not refuse the other's (codex, #136 review
+    /// round 5).
+    #[test]
+    fn a_despatch_on_its_way_to_one_store_does_not_refuse_the_same_order_in_another() {
+        const OTHER: &[u8] = &[77u8; 32];
+        let (mut state, order) = seller_holding_a_despatchable_order();
+        with_a_twin_store(&mut state, OTHER);
+
+        state
+            .despatch_order(STORE, &order.order.id)
+            .expect("queued");
+        assert_eq!(
+            state.despatch_refusal(OTHER, &order.order.id),
+            None,
+            "a despatch waiting on its signature in one store"
+        );
+        answer_the_store_key_request(&mut state, &seller_signing_key());
+        assert!(state.despatch_sent(STORE, &order.order.id));
+        assert!(!state.despatch_sent(OTHER, &order.order.id));
+        assert_eq!(
+            state.despatch_refusal(OTHER, &order.order.id),
+            None,
+            "a despatch sent to one store"
+        );
+    }
+
+    /// Put a copy of `STORE`, and of its registration where there is one,
+    /// under `other`: a second store holding an order with the same id.
+    fn with_a_twin_store(state: &mut AppState, other: &[u8]) {
+        let copy = state.browsing_stores[STORE].clone();
+        state.browsing_stores.insert(other.to_vec(), copy);
+        for stores in state.my_stores.values_mut() {
+            if let Some(mut twin) = stores
+                .iter()
+                .find(|s| s.store_contract_id == STORE)
+                .cloned()
+            {
+                twin.store_contract_id = other.to_vec();
+                stores.push(twin);
+            }
+        }
+    }
+
+    /// The seller's cancel markers are per store too (#136 review, round 5).
+    #[test]
+    fn a_cancel_on_its_way_to_one_store_does_not_refuse_the_same_order_in_another() {
+        const OTHER: &[u8] = &[78u8; 32];
+        let (mut state, order) = seller_holding_an_unpaid_invoice();
+        with_a_twin_store(&mut state, OTHER);
+        state
+            .cancel_invoice(STORE, &order.order.id)
+            .expect("queued");
+        assert!(!state.cancellation_pending(OTHER, &order.order.id));
+        answer_the_store_key_request(&mut state, &seller_signing_key());
+        assert!(state.cancellation_sent(STORE, &order.order.id));
+        assert!(!state.cancellation_sent(OTHER, &order.order.id));
+        state
+            .cancel_invoice(OTHER, &order.order.id)
+            .expect("the other store's invoice is not already being cancelled");
+    }
+
+    /// And the buyer's.
+    #[test]
+    fn a_buyers_cancel_sent_to_one_store_does_not_refuse_the_same_order_in_another() {
+        const OTHER: &[u8] = &[79u8; 32];
+        let order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 2)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut state, _) = buyer_after_acceptance(&order);
+        with_a_twin_store(&mut state, OTHER);
+        state
+            .buyer_cancel_order(STORE, &order.order.id)
+            .expect("sent");
+        assert!(!state.buyer_cancellation_sent(OTHER, &order.order.id));
+        state
+            .buyer_cancel_order(OTHER, &order.order.id)
+            .expect("the other store's order is not already being cancelled");
+    }
+
+    /// A seller who owns `STORE`, holding one PAID order of theirs.
+    fn seller_holding_a_despatchable_order() -> (AppState, AuthorizedOrder) {
+        let (paid, claims, tip) = a_paid_order();
+        let mut settled = paid;
+        settled.status = OrderStatus::Paid;
+        settled.payment_proof = Some(harvest_common::payment::OrderPaymentProof::on_chain(
+            claims, tip,
+        ));
+        let (mut state, _) = buyer_after_acceptance(&settled);
+        state.my_stores.insert(
+            "seller-fp".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(seller_signing_key().verifying_key().to_bytes()),
+            }],
+        );
+        (state, settled)
+    }
+
+    /// The seller's despatch: the store key signs it through the delegate's
+    /// own signing function (so a message kind the delegate refuses fails
+    /// here too), it verifies, and it lands in the store with its order.
+    #[test]
+    fn a_seller_despatches_a_paid_order_with_a_record_the_contract_accepts() {
+        use freenet_scaffold::ComposableState;
+        let (mut state, order) = seller_holding_a_despatchable_order();
+        state
+            .despatch_order(STORE, &order.order.id)
+            .expect("a paid order in our own store can be despatched");
+        assert!(state.despatch_pending(STORE, &order.order.id));
+        assert!(
+            state.despatch_order(STORE, &order.order.id).is_err(),
+            "one at a time"
+        );
+
+        answer_the_store_key_request(&mut state, &seller_signing_key());
+
+        assert!(!state.despatch_pending(STORE, &order.order.id));
+        assert!(state.despatch_sent(STORE, &order.order.id));
+        assert!(state.despatch_order(STORE, &order.order.id).is_err());
+        let (sent_order, despatch) = state.published_despatches.pop().expect("published");
+        assert_eq!(sent_order, order, "the order rides along");
+        assert_eq!(despatch.despatch.order_id, order.order.id);
+        assert_eq!(
+            Some(despatch.despatch.anchor),
+            state.bitcoin.tips[&BitcoinNetwork::Signet].current_anchor(),
+            "anchored to the newest block this seller has seen"
+        );
+        let store_key = seller_signing_key().verifying_key();
+        despatch
+            .verify(&store_key)
+            .expect("verifies under the store key");
+
+        let params = crate::migrate::store_params(&store_key);
+        let mut store = harvest_common::store::StoreStateV1::default();
+        store
+            .apply_delta(
+                &store.clone(),
+                &params,
+                &Some(harvest_common::store::StoreStateV1Delta {
+                    owner: Some(store_key),
+                    orders: Some(vec![sent_order]),
+                    fulfilment: Some(vec![despatch]),
+                    ..Default::default()
+                }),
+            )
+            .expect("the store accepts it");
+        assert_eq!(store.fulfilment.records.len(), 1);
+    }
+
+    #[test]
+    fn only_a_paid_undespatched_order_in_our_own_store_can_be_despatched() {
+        // Unpaid.
+        let (mut state, order) = seller_holding_an_unpaid_invoice();
+        let refused = state
+            .despatch_order(STORE, &order.order.id)
+            .expect_err("unpaid");
+        assert!(refused.contains("not paid"), "{refused}");
+
+        // Already despatched.
+        let (mut state, order) = seller_holding_a_despatchable_order();
+        let anchor = state.bitcoin.tips[&BitcoinNetwork::Signet]
+            .current_anchor()
+            .expect("tip");
+        let despatch = harvest_common::fulfilment::Despatch {
+            order_id: order.order.id.clone(),
+            anchor,
+        };
+        let (scoped_payload, signature) = harvest_common::backing::sign_with_store_key(
+            &seller_signing_key(),
+            harvest_common::to_cbor(&despatch).unwrap(),
+        )
+        .unwrap();
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .despatches
+            .insert(
+                order.order.id.clone(),
+                harvest_common::fulfilment::AuthorizedDespatch {
+                    despatch,
+                    scoped_payload,
+                    signature,
+                },
+            );
+        assert!(state.despatch_order(STORE, &order.order.id).is_err());
+
+        // Not our store.
+        let (mut state, order) = seller_holding_a_despatchable_order();
+        state.my_stores.clear();
+        assert!(state.despatch_order(STORE, &order.order.id).is_err());
+
+        // No chain tip to anchor to.
+        let (mut state, order) = seller_holding_a_despatchable_order();
+        state.bitcoin.tips.clear();
+        let refused = state
+            .despatch_order(STORE, &order.order.id)
+            .expect_err("no tip");
+        assert!(refused.contains("recent Bitcoin block"), "{refused}");
+        assert!(state.pending_signatures.is_empty());
+    }
+
+    /// The seller's control shows its button exactly when pressing it could
+    /// work (round-3 review of harvest#136): the refusal it shows instead is
+    /// the one `despatch_order` would give.
+    #[test]
+    fn the_despatch_control_says_why_instead_of_refusing() {
+        let (mut state, order) = seller_holding_a_despatchable_order();
+        assert_eq!(state.despatch_refusal(STORE, &order.order.id), None);
+        state.bitcoin.tips.clear();
+        let shown = state
+            .despatch_refusal(STORE, &order.order.id)
+            .expect("no tip");
+        assert_eq!(
+            Err(shown),
+            state.despatch_order(STORE, &order.order.id),
+            "the same reason pressing it would give"
+        );
+        let (mut state, order) = seller_holding_a_despatchable_order();
+        state.my_stores.clear();
+        assert_eq!(
+            state.despatch_refusal(STORE, &order.order.id).as_deref(),
+            Some(NO_STORE_KEY_MESSAGE)
+        );
+    }
+
+    /// Likewise the buyer's cancel: with a payment on its way the card says
+    /// so rather than offering a button that refuses.
+    #[test]
+    fn the_cancel_control_says_why_instead_of_refusing() {
+        let (paid, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&paid);
+        give_the_node_the_chain(&mut state, &paid, claims, tip);
+        assert!(purchases(&state)[0].cancellable());
+        assert_eq!(
+            state.buyer_cancel_refusal(STORE, &purchases(&state)[0]),
+            None
+        );
+        show_a_payment_row(&mut state, &paid, paid.order.amount_sats);
+        assert_eq!(
+            state
+                .buyer_cancel_refusal(STORE, &purchases(&state)[0])
+                .as_deref(),
+            Some(PAYMENT_ON_ITS_WAY_BUYER)
+        );
+    }
+
+    #[test]
+    fn a_despatch_signed_by_the_wrong_key_is_not_published() {
+        let (mut state, order) = seller_holding_a_despatchable_order();
+        state
+            .despatch_order(STORE, &order.order.id)
+            .expect("queued");
+        answer_the_store_key_request(&mut state, &SigningKey::from_bytes(&[99u8; 32]));
+        assert!(state.published_despatches.is_empty());
+        assert!(!state.despatch_sent(STORE, &order.order.id));
+        assert!(
+            state
+                .notifications
+                .iter()
+                .any(|n| n.contains("Could not record the despatch")),
+            "{:?}",
+            state.notifications
+        );
+    }
+
+    /// A despatch or a buyer's cancellation that never reached the node
+    /// releases its marker, so the control comes back, and says so (the
+    /// optimistic-marker class).
+    #[test]
+    fn a_send_that_fails_releases_its_marker() {
+        let (mut state, order) = seller_holding_a_despatchable_order();
+        state
+            .despatch_order(STORE, &order.order.id)
+            .expect("queued");
+        answer_the_store_key_request(&mut state, &seller_signing_key());
+        assert!(state.despatch_sent(STORE, &order.order.id));
+        state.on_despatch_send_failed(STORE, &order.order.id, "the node is gone");
+        assert!(!state.despatch_sent(STORE, &order.order.id));
+        assert!(
+            state
+                .notifications
+                .iter()
+                .any(|n| n.contains("Could not record the despatch")
+                    && n.contains("the node is gone"))
+        );
+        // And the seller may try again.
+        state.despatch_order(STORE, &order.order.id).expect("again");
+
+        let unpaid = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 2)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut state, _) = buyer_after_acceptance(&unpaid);
+        state
+            .buyer_cancel_order(STORE, &unpaid.order.id)
+            .expect("sent");
+        state.on_buyer_cancellation_send_failed(STORE, &unpaid.order.id, "the node is gone");
+        assert!(!state.buyer_cancellation_sent(STORE, &unpaid.order.id));
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("Could not cancel order")));
+        state
+            .buyer_cancel_order(STORE, &unpaid.order.id)
+            .expect("the buyer may try again");
+    }
+
+    /// A despatch the delegate refused to sign is withdrawn, so the seller
+    /// can ask again.
+    #[test]
+    fn a_refused_despatch_is_withdrawn_so_the_seller_can_try_again() {
+        let (mut state, order) = seller_holding_a_despatchable_order();
+        state
+            .despatch_order(STORE, &order.order.id)
+            .expect("queued");
+        let request_id = *state
+            .pending_store_key_requests
+            .keys()
+            .next()
+            .expect("a request");
+        state.store_key_signature_failed(request_id, "refused");
+        assert!(!state.despatch_pending(STORE, &order.order.id));
+        assert!(
+            state
+                .notifications
+                .iter()
+                .any(|n| n.contains("the despatch")),
+            "{:?}",
+            state.notifications
+        );
+        state.despatch_order(STORE, &order.order.id).expect("again");
+    }
+
+    /// `despatch_of` reads the despatch from the store holding THIS record,
+    /// matched by its terms signature: another store whose owner re-signed
+    /// the same terms (same id) cannot mark this order despatched.
+    #[test]
+    fn a_despatch_is_read_only_from_the_store_holding_this_record() {
+        let (mut state, order) = seller_holding_a_despatchable_order();
+        let impostor = SigningKey::from_bytes(&[0x66; 32]);
+        let copied = resigned(order.clone(), &impostor);
+        assert_eq!(copied.order.id, order.order.id, "same terms, same id");
+        let despatch = harvest_common::fulfilment::Despatch {
+            order_id: order.order.id.clone(),
+            anchor: anchor(TIP_HEIGHT),
+        };
+        let (scoped_payload, signature) = harvest_common::backing::sign_with_store_key(
+            &impostor,
+            harvest_common::to_cbor(&despatch).unwrap(),
+        )
+        .unwrap();
+        let other = state.browsing_stores.entry(vec![0xee; 32]).or_default();
+        other.orders = vec![copied];
+        other.despatches.insert(
+            order.order.id.clone(),
+            harvest_common::fulfilment::AuthorizedDespatch {
+                despatch,
+                scoped_payload,
+                signature,
+            },
+        );
+        assert_eq!(state.despatch_of(&order), None);
+        // The genuine store's own despatch is read.
+        let genuine = state.browsing_stores[&vec![0xee; 32]].despatches[&order.order.id].clone();
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .despatches
+            .insert(order.order.id.clone(), genuine.clone());
+        assert_eq!(state.despatch_of(&order), Some(genuine));
     }
 }
 
@@ -23124,6 +24554,7 @@ mod payment_blocker_wording_tests {
             PaymentBlocker::StoreClosed,
             PaymentBlocker::CommitmentNotTheSellers("the signature is not theirs".to_string()),
             PaymentBlocker::CommitmentNotForThisBuyer,
+            PaymentBlocker::CommitmentLacksBuyerKey,
             PaymentBlocker::NoTrustedBridge,
             PaymentBlocker::BridgeNotRecognised("7Kf2abcd".to_string()),
             PaymentBlocker::DestinationDisagrees,
@@ -23157,6 +24588,7 @@ mod payment_blocker_wording_tests {
                 | PaymentBlocker::StoreClosed
                 | PaymentBlocker::CommitmentNotTheSellers(_)
                 | PaymentBlocker::CommitmentNotForThisBuyer
+                | PaymentBlocker::CommitmentLacksBuyerKey
                 | PaymentBlocker::NoTrustedBridge
                 | PaymentBlocker::BridgeNotRecognised(_)
                 | PaymentBlocker::DestinationDisagrees
@@ -23187,7 +24619,7 @@ mod payment_blocker_wording_tests {
     /// The one number a future edit has to change by hand, and the assertion
     /// above is what makes forgetting it fail rather than silently narrow the
     /// coverage.
-    const EVERY_BLOCKER: usize = 18;
+    const EVERY_BLOCKER: usize = 19;
 
     /// **Every blocker says something, and says it as prose.**
     ///
@@ -23730,6 +25162,9 @@ mod store_rekey_recall_tests {
             buyer_to_seller: [seed; 32],
             seller_to_buyer: [seed; 32],
             order_binding: harvest_common::mailbox::order_binding_from_secret(&[seed; 32]),
+            buyer_receipt_seed: harvest_common::mailbox::buyer_receipt_seed_from_secret(
+                &[seed; 32],
+            ),
             created_at: 1_700_000_000 + seed as i64,
             imported: false,
             backed_up: false,
