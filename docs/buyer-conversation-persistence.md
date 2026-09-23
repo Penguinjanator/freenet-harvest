@@ -448,10 +448,21 @@ is why "forget this conversation" exists and why it had to be a real deletion.
 Also recorded in `messaging-privacy.md`.
 
 **The migration export grows.** These records sit under `harvest:`, so a
-delegate re-key carries them — which is necessary, since otherwise a re-key
+delegate re-key CAN carry them -- which is necessary, since otherwise a re-key
 destroys every buyer's recourse. It means export size now scales with
 conversations rather than being roughly constant. Pinned by
 `buyer_conversations_are_under_the_exported_prefix`.
+
+(Correction, harvest#123: this paragraph said a re-key "carries them" when
+nothing yet asked a predecessor to export, so every re-key until then dropped
+every conversation. The prefix made them exportable; `ui/src/delegate_migrate.rs`
+is what now exports them, on the first load after a delegate re-key, from any
+earlier generation from V5 on that the buyer's node still has registered. It
+cannot reach a conversation kept only under V1 to V4, or under a generation
+this node never ran. And a conversation is keyed by the store's CONTRACT id:
+it is carried whatever that id is, but it is only shown while the store still
+lives at that id, so one kept under a store generation that has since re-keyed
+is carried and not shown -- the store re-key's gap, not this one's.)
 
 ## The shape of the change, as built
 

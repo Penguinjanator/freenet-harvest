@@ -10,7 +10,8 @@
 //! to recover from. Only the OLD delegate can hand them over, and only if it
 //! shipped with the code to do so.
 //!
-//! So this handler does nothing for anyone today. Generations V1 to V4 in
+//! Since harvest#123 a successor asks (`ui/src/delegate_migrate.rs`), and
+//! [`crate::import`] is the half that takes what this answers. Generations V1 to V4 in
 //! `legacy/harvest_delegate.toml` do not have it, and no change made now can
 //! give it to them: their WASM is already deployed and its `handle_request`
 //! rejects anything that is neither a `HarvestDelegateRequest` nor a
@@ -55,11 +56,10 @@ impl SecretStore for CtxStore<'_> {
     }
 
     fn set_secret(&mut self, _key: &[u8], _value: &[u8]) -> bool {
-        // Export is read-only. A successor imports through this delegate's own
-        // request handlers, not by having its bytes written in behind them --
-        // those handlers derive fingerprints, maintain the transaction index,
-        // and check what they are given, none of which a raw key/value copy
-        // would do.
+        // Export is read-only. A successor imports through its own per-family
+        // rules (`crate::import`), not by having these bytes written in
+        // behind them: a list must be merged, a keypair kept a pair, a cap
+        // respected, none of which a raw key/value copy would do.
         false
     }
 }
@@ -384,6 +384,7 @@ mod tests {
         // reach the code that exports this delegate's private keys.
         let init_encryption_key = to_cbor(&HarvestDelegateRequest::InitEncryptionKey {
             ghostkey_fingerprint: "fp".into(),
+            recall_only: false,
         })
         .expect("cbor");
         let derive_keys = to_cbor(&HarvestDelegateRequest::DeriveConversationKeys {

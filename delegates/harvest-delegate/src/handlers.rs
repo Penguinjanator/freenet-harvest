@@ -24,7 +24,7 @@ fn tx_key(tx_id: &str) -> Vec<u8> {
 fn stores_key(fp: &str) -> Vec<u8> {
     format!("harvest:stores:{fp}").into_bytes()
 }
-const TX_INDEX_KEY: &[u8] = b"harvest:tx_index";
+pub(crate) const TX_INDEX_KEY: &[u8] = b"harvest:tx_index";
 
 /// Every shape of secret key this delegate writes, for a sample fingerprint
 /// and transaction id.
@@ -56,6 +56,7 @@ pub(crate) fn all_secret_key_shapes(fp: &str, tx_id: &str) -> Vec<Vec<u8>> {
             &ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]).verifying_key(),
         ),
         crate::store_keys::creation_secret(fp),
+        crate::import::folded_key(&[7u8; 32]),
     ]
 }
 
@@ -173,7 +174,8 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
         // another web app.
         HarvestDelegateRequest::InitEncryptionKey {
             ghostkey_fingerprint,
-        } => crate::messaging::init_encryption_key(store, &ghostkey_fingerprint),
+            recall_only,
+        } => crate::messaging::init_encryption_key(store, &ghostkey_fingerprint, recall_only),
 
         HarvestDelegateRequest::DeriveConversationKeys {
             request_id,
@@ -304,6 +306,24 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
         HarvestDelegateRequest::SetMigrationMarker { marker, note } => {
             crate::markers::set_marker(store, &marker, &note)
         }
+
+        // Importing a predecessor delegate's secrets (harvest#123). Gated like
+        // everything else, and it matters most here: an import writes
+        // secrets, private keys included. `import` owns the per-family rules.
+        HarvestDelegateRequest::GetPredecessorMarker { predecessor } => {
+            crate::import::get_marker(store, predecessor)
+        }
+
+        HarvestDelegateRequest::RecordPredecessorMarker {
+            predecessor,
+            marker,
+        } => crate::import::record_marker(store, predecessor, marker),
+
+        HarvestDelegateRequest::ImportMigratedSecret {
+            predecessor,
+            key,
+            value,
+        } => crate::import::import(store, predecessor, key, &value.0),
 
         // The stores this node has visited. Gated like everything else: the
         // list is a record of which sellers this user has dealt with, which
@@ -997,6 +1017,7 @@ mod origin_gating_tests {
             Some(&a_different_web_app()),
             HarvestDelegateRequest::InitEncryptionKey {
                 ghostkey_fingerprint: FINGERPRINT.to_string(),
+                recall_only: false,
             },
         );
         assert!(
@@ -1012,6 +1033,7 @@ mod origin_gating_tests {
             Some(&harvest()),
             HarvestDelegateRequest::InitEncryptionKey {
                 ghostkey_fingerprint: FINGERPRINT.to_string(),
+                recall_only: false,
             },
         ) {
             HarvestDelegateResponse::EncryptionKeyReady {

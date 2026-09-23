@@ -562,7 +562,10 @@ pub struct PendingStoreCreation {
     /// Filled by the harvest delegate's `ReputationKeysInitialized` response.
     /// `None` until it arrives.
     pub rsa_public_key_der: Option<Vec<u8>>,
-    /// Filled by the harvest delegate's `EncryptionKeyReady` response.
+    /// Filled from the store key's inbox key (`custody_flow`'s
+    /// `fill_creation_from_subkeys`, harvest#93 phase 1b); the per-Ghost-Key
+    /// key `EncryptionKeyReady` answers is only for stores made before store
+    /// keys.
     ///
     /// **Not** part of the readiness gate, unlike the two above. Creation
     /// waits on the certificate and the RSA key because a store without
@@ -572,9 +575,6 @@ pub struct PendingStoreCreation {
     /// thing to wait on would add a third way for a creation to hang
     /// forever, and this one has a recovery path that those do not.
     ///
-    /// In practice it is nearly always present: `InitEncryptionKey` goes out
-    /// alongside `InitReputationKeys`, and generating a 2048-bit RSA key
-    /// takes far longer than 32 random bytes. Nothing here relies on that.
     pub encryption_public_key: Option<[u8; 32]>,
     /// The new store's own key (harvest#93), filled by the harvest delegate's
     /// `StoreKeyCreated`. `None` until it arrives; creation waits on it,
@@ -4053,6 +4053,24 @@ impl AppState {
         );
     }
 
+    /// Forget which stores' conversations were already asked for, so the next
+    /// recall asks again. Used once the delegate migration has imported a
+    /// predecessor's secrets (harvest#123): the first answer came from a
+    /// delegate that did not hold them yet.
+    ///
+    /// A store whose recall is still in flight keeps its claim: its answer is
+    /// on the way, and a second chain beside it would only race it (see
+    /// `buyer_conversations_to_recall`).
+    pub fn forget_recalled_conversations(&mut self) {
+        let in_flight: HashSet<Vec<u8>> = self
+            .pending_conversation_recalls
+            .values()
+            .cloned()
+            .collect();
+        self.buyer_conversations_recalled
+            .retain(|store| in_flight.contains(store));
+    }
+
     /// Ask for the kept conversations of every store already on screen.
     ///
     /// The other half of the ordering above: a store whose state arrived
@@ -7500,6 +7518,17 @@ impl AppState {
                 self.start_reputation_migration(&ghostkey_fingerprint);
             }
 
+            // The connect path's recall found no key. Mint one, but only once
+            // the delegate migration has had its chance to import the key an
+            // earlier generation held (harvest#123). `mint_encryption_key`
+            // only defers and spawns, so nothing here re-enters `APP_STATE`.
+            HarvestDelegateResponse::EncryptionKeyAbsent {
+                ghostkey_fingerprint,
+            } => {
+                info!("No encryption key yet for {ghostkey_fingerprint}; minting after the delegate migration");
+                crate::components::mint_encryption_key(ghostkey_fingerprint);
+            }
+
             HarvestDelegateResponse::EncryptionKeyReady {
                 ghostkey_fingerprint,
                 x25519_public_key,
@@ -8221,6 +8250,10 @@ impl AppState {
                         crate::gateway::migrate_ops::start_reputation_migration(&fingerprint, &vk);
                     }
 
+                    // A RECALL, which never mints: safe before the delegate
+                    // migration has run. A recall that finds nothing answers
+                    // `EncryptionKeyAbsent`, and only then is a mint sent,
+                    // after the migration (harvest#123).
                     for fingerprint in needs_encryption_key {
                         crate::components::ensure_encryption_key(fingerprint);
                     }
@@ -23385,5 +23418,25 @@ mod store_code_tests {
         assert_eq!(rows[1].code, plain, "archived after the rest");
         assert_eq!(rows[1].label, format!("Store {plain}"), "labelled by code");
         assert!(rows[1].archived);
+    }
+}
+
+#[cfg(test)]
+mod delegate_migration_refresh_tests {
+    use super::*;
+
+    /// After the delegate migration imports secrets, conversations are asked
+    /// for again -- except where an ask is still in flight, which would only
+    /// race its own answer. Mutated red by clearing everything, and by
+    /// clearing nothing.
+    #[test]
+    fn a_refresh_forgets_answered_recalls_and_keeps_in_flight_ones() {
+        let mut state = AppState::default();
+        state.buyer_conversations_recalled.insert(vec![1; 32]);
+        state.buyer_conversations_recalled.insert(vec![2; 32]);
+        state.pending_conversation_recalls.insert(7, vec![2; 32]);
+        state.forget_recalled_conversations();
+        assert!(!state.buyer_conversations_recalled.contains(&vec![1; 32]));
+        assert!(state.buyer_conversations_recalled.contains(&vec![2; 32]));
     }
 }

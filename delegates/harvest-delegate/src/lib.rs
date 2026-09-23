@@ -3,6 +3,7 @@
 mod bip32;
 mod bitcoin;
 mod handlers;
+mod import;
 mod known_stores;
 mod markers;
 mod messaging;
@@ -408,6 +409,7 @@ mod boundary_tests {
             // which is to say, a read of their private correspondence.
             to_cbor(&HarvestDelegateRequest::InitEncryptionKey {
                 ghostkey_fingerprint: "fp".into(),
+                recall_only: false,
             })
             .expect("cbor"),
             to_cbor(&HarvestDelegateRequest::DeriveConversationKeys {
