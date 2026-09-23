@@ -511,6 +511,15 @@ fn handle_delegate_response(
     key: freenet_stdlib::prelude::DelegateKey,
     values: Vec<freenet_stdlib::prelude::OutboundDelegateMsg>,
 ) {
+    // An answer with no messages at all is how a `freenet network` node says
+    // the delegate is not registered (harvest#150). If the migration walk is
+    // waiting on that delegate, it is the walk's answer; otherwise there is
+    // nothing in it to act on anyway.
+    #[cfg(target_arch = "wasm32")]
+    if values.is_empty() && super::delegate_migrate_ops::offer_empty(&key) {
+        return;
+    }
+
     // Read the registered keys and drop the guard before any write below --
     // APP_STATE is a RefCell underneath and holding both at once panics.
     let sender = {

@@ -65,9 +65,10 @@
 //!
 //! * V1 to V4 have no export handler and are not walked at all (they would
 //!   answer every export with an error, which is a timeout here).
-//! * A generation the node never registered answers `Missing`, is recorded
-//!   `Unresponsive`, and is asked again on the next load at the cost of two
-//!   node-local round trips.
+//! * A generation the node never registered answers `Missing` (an error
+//!   from `freenet local`, an EMPTY answer from `freenet network`: see
+//!   [`Expect::reply_to_empty_answer`]), is recorded `Unresponsive`, and is
+//!   asked again on the next load at the cost of one node-local round trip.
 //! * Store keys are never exported; custody recovers them. The store
 //!   REGISTRATIONS are carried, so a device comes out of a re-key registered
 //!   for a store it holds no key for; the delegate's `StoreList` answer says
@@ -83,6 +84,13 @@
 //!   whole-key generation (V1 to V16, before the store code) is not.
 //! * A family at its cap answers `Retryable`, so its predecessor is not
 //!   sealed and is walked again each load until there is room.
+//! * On a node older than freenet-core 0.2.134, a registered generation that
+//!   fails to run answers the probe as if it were not registered
+//!   ([`Expect::reply_to_empty_answer`]), so it is walked past rather than
+//!   stopping the walk: an older generation's value can then land first and
+//!   stand, and the walk completes, so a mint can run ahead of that
+//!   generation's encryption key. It needs both an out-of-date node and a
+//!   generation that no longer runs on it.
 //! * A generation that is registered here but NEVER answers -- a module the
 //!   node can no longer run, an export over the host's 4096-key enumeration
 //!   cap -- stops every walk at that point, so nothing older is carried
@@ -164,8 +172,10 @@ pub fn exporting_predecessors() -> Vec<DelegateLineageEntry> {
 pub enum Reply {
     /// The delegate answered with these application-message payloads.
     Payloads(Vec<Vec<u8>>),
-    /// The node answered that no delegate is registered under the key
-    /// (`DelegateError::Missing`): a generation this node never ran.
+    /// The node answered that no delegate is registered under the key: a
+    /// generation this node never ran. `freenet local` says so with
+    /// `DelegateError::Missing`, `freenet network` with an empty answer to a
+    /// predecessor call ([`Expect::reply_to_empty_answer`]).
     Missing,
 }
 
@@ -246,8 +256,53 @@ impl Expect {
         matches!(self, Expect::AnyFrom | Expect::Export)
     }
 
+    /// What an answer with NO messages in it, from the delegate being waited
+    /// on, means: `Missing` for a predecessor, nothing for the current
+    /// delegate.
+    ///
+    /// A `freenet network` node answers a message to a delegate it never
+    /// registered with an empty `DelegateResponse` rather than
+    /// `DelegateError::Missing`, which only `freenet local` sends (freenet-core
+    /// `contract.rs`, "Delegate not found in store (expected for migration
+    /// probes)"). Waiting for the error alone cost every real walk a timeout
+    /// at the first generation its node never ran, and a timeout stops the
+    /// walk ([`Walk`]): nothing older was imported and the walk never
+    /// completed (harvest#150). Every generation from V5 answers both
+    /// predecessor calls with a message when it runs (checked live by
+    /// `tests/rehearsal/delegate-rehearsal.sh`, "every exporting generation
+    /// answers", on an empty delegate for each; with data for the two
+    /// newest), so an empty answer is the node's.
+    ///
+    /// That holds on freenet-core 0.2.134 and later. Before it (#5287) a
+    /// network node also answered a registered delegate that FAILED to run
+    /// with an empty answer, and the UI cannot see the node's version. On
+    /// such a node, a newer generation that fails the probe is walked past,
+    /// an older one's values can land first, and the walk completes, so the
+    /// gated mint can run. Before harvest#150 the same node stopped every
+    /// walk at the first generation it never ran, which lost more for every
+    /// user than this loses for the few; see the residuals in the module
+    /// docs.
+    ///
+    /// The current delegate is registered by this app and always answers with
+    /// a message, so nothing is read into an empty answer from it; its call
+    /// times out and is retried as before.
+    pub fn reply_to_empty_answer(&self) -> Option<Reply> {
+        self.is_predecessor_call().then_some(Reply::Missing)
+    }
+
+    /// The whole decision the transport makes on an empty answer: the
+    /// reply for the call waiting on `waiting_on` with this expectation, if
+    /// an answer with no messages arrived from `from`. `None` leaves the call
+    /// waiting. Kept here, off the wasm-only transport, so it is tested.
+    pub fn take_empty_answer(&self, waiting_on: &DelegateKey, from: &DelegateKey) -> Option<Reply> {
+        if waiting_on != from {
+            return None;
+        }
+        self.reply_to_empty_answer()
+    }
+
     /// Whether a raw application-message payload from the delegate being
-    /// waited on is this call's answer. The one decision the transport makes.
+    /// waited on is this call's answer.
     pub fn accepts_payload(&self, payload: &[u8]) -> bool {
         match self {
             Expect::AnyFrom => true,
