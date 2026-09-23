@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Harvest delegate: RSA blind signing for feedback tokens, listing management, transaction state"
+description = "Harvest delegate: store keys, conversation keys, payment keys and registries"
 
 [features]
 default = ["freenet-main-delegate"]
@@ -56,6 +56,11 @@ bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
 [dev-dependencies]
 # The custody tests sign as the Ghost Key vault does.
 ghostkey-common = { workspace = true }
+# Enables `freenet_bitcoin_common::spv::testing`, so `paid_purchases` tests
+# build a genuinely signed, genuinely paid order (harvest#53 Phase C) rather
+# than stubbing out payment verification -- same reasoning as
+# `common/Cargo.toml` and `contracts/store-contract/Cargo.toml`.
+freenet-bitcoin-common = { workspace = true, features = ["test-support"] }
 
 [lib]
 crate-type = ["cdylib", "rlib"]

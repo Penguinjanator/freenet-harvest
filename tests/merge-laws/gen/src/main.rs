@@ -3,8 +3,8 @@
 //! Every state is built with the repo's own `harvest-common` types and merged
 //! with the contracts' own `apply_delta` / `merge` code, and every state is
 //! checked natively with the same `verify` the contract's `validate_state`
-//! calls before it is written. Keys are fixed throwaway seeds (ed25519) or a
-//! fresh throwaway RSA key; nothing here touches a real key.
+//! calls before it is written. Keys are fixed throwaway ed25519 seeds;
+//! nothing here touches a real key.
 //!
 //! Output layout, one directory per corpus under the output root:
 //!   <corpus>/params.bin
@@ -37,19 +37,27 @@ use freenet_bitcoin_common::{
     SignedTipEntry, TipEntryBody,
 };
 use freenet_scaffold::ComposableState;
-use harvest_common::feedback::{FeedbackCategory, FeedbackToken};
+use harvest_common::feedback::FeedbackCategory;
 use harvest_common::listing::{AuthorizedListing, Listing, ListingId, ListingKind, PriceInfo};
 use harvest_common::mailbox::{
     ConversationId, EncryptedMessage, MailboxParameters, MailboxStateV1, MAX_MESSAGE_BYTES,
     MAX_MAILBOX_BYTES,
 };
 use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderPaymentProof, OrderStatus};
-use harvest_common::reputation::{FeedbackEntry, ReputationParameters, ReputationStateV1};
+use harvest_common::reputation::{
+    Complaint, ComplaintTag, ComplaintTerms, ReputationParameters, ReputationStateV1,
+    MAX_COMPLAINTS,
+};
 use harvest_common::store::{
     AuthorizedStoreInfoV1, ListingsV1, OrdersV1, StoreInfoV1, StoreParameters, StoreStateV1,
     StoreStateV1Delta, MAX_ORDERS,
 };
 use serde::Serialize;
+
+
+/// The E2E test Ghost Key's public certificate, genuine under Freenet's
+/// master key (`tests/fixtures/ghostkey-certificate.pem`).
+const OWNER_CERT: &str = include_str!("../../../fixtures/ghostkey-certificate.pem");
 
 fn cbor<T: Serialize>(v: &T) -> Vec<u8> {
     harvest_common::to_cbor(v).expect("encode")
@@ -465,22 +473,6 @@ impl StoreFx {
     }
 }
 
-trait SellerKey {
-    fn seller_verifying_key(&self) -> ed25519_dalek::VerifyingKey;
-}
-impl SellerKey for StoreParameters {
-    fn seller_verifying_key(&self) -> ed25519_dalek::VerifyingKey {
-        // `seller_verifying_key` is pub(crate); recover it through CBOR,
-        // where the struct is a one-field map.
-        #[derive(serde::Deserialize)]
-        struct P {
-            seller_verifying_key: ed25519_dalek::VerifyingKey,
-        }
-        let p: P = harvest_common::from_cbor(&cbor(self)).unwrap();
-        p.seller_verifying_key
-    }
-}
-
 fn gen_store(root: &Path) {
     let fx = StoreFx::new();
     let params = cbor(&fx.params);
@@ -640,65 +632,85 @@ fn gen_store(root: &Path) {
 // Reputation
 // ---------------------------------------------------------------------------
 
-fn gen_reputation(root: &Path) {
-    use rsa::pkcs1::EncodeRsaPublicKey;
-    use rsa::pss::BlindedSigningKey;
-    use rsa::signature::{RandomizedSigner, SignatureEncoding};
+/// harvest#53 Phase C: the buyer's receipt key for the store fixture's order
+/// numbered `n`.
+fn complaint_buyer(n: u8) -> SigningKey {
+    SigningKey::from_bytes(&[n.wrapping_add(100); 32])
+}
 
-    let mut rng = rand_core::OsRng;
-    let private = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
-    let der = rsa::RsaPublicKey::from(&private)
-        .to_pkcs1_der()
-        .unwrap()
-        .as_bytes()
-        .to_vec();
-    let owner = SigningKey::from_bytes(&[0xC3; 32]).verifying_key();
-    let params = ReputationParameters::new(der, owner);
-    let pbytes = cbor(&params);
-    let signer = BlindedSigningKey::<sha2::Sha256>::new(private);
+impl StoreFx {
+    /// Order `n` naming `complaint_buyer(n)` as its receipt key: the only
+    /// kind of order a complaint can be made about.
+    fn receipted_order(&self, n: u8) -> Order {
+        let mut o = self.order(&format!("complainer-{n}"), 1_700_000_000 + i64::from(n));
+        o.buyer_receipt_key = Some(complaint_buyer(n).verifying_key().to_bytes());
+        o.with_derived_id()
+    }
+}
 
-    // PR #82 (#22): the token carries a per-token Ed25519 key that signs the
-    // whole entry.
-    let entry_key = |n: u8| SigningKey::from_bytes(&[n.wrapping_add(1); 32]);
-    let entry = |n: u8, cat: FeedbackCategory, comment: &str| {
-        // PR #82 review Must Fix 1: the nonce is derived from the key.
-        let token = FeedbackToken::new([5u8; 32], entry_key(n).verifying_key().to_bytes());
-        let signature = signer.sign_with_rng(&mut rand_core::OsRng, &cbor(&token)).to_vec();
-        FeedbackEntry::sign(
-            token,
-            signature,
-            cat,
-            comment.into(),
-            ts(1_700_000_000 + n as i64 * 100),
-            &entry_key(n),
-        )
+/// A complaint about `order`, signed by `buyer` over the terms exactly as
+/// the UI builds them (`ComplaintTerms` in a Harvest `ScopedPayload`).
+fn complaint_by(
+    buyer: &SigningKey,
+    order: AuthorizedOrder,
+    category: FeedbackCategory,
+    height: u32,
+) -> Complaint {
+    // The height the complaint's own proof shows it paid at, which the
+    // contract checks the signed value against; 0 for an unpaid order, whose
+    // complaint is refused before that is looked at.
+    let paid_height = harvest_common::payment::paid_height(&order).unwrap_or(0);
+    let terms = ComplaintTerms {
+        tag: ComplaintTag::HarvestComplaintV1,
+        order_id: order.order.id.clone(),
+        category: category.clone(),
+        block_height: height,
+        paid_height,
     };
-    let f: Vec<FeedbackEntry> = (1u8..=6)
-        .map(|n| {
-            entry(
-                n * 17,
-                match n % 3 {
-                    0 => FeedbackCategory::NonDelivery,
-                    1 => FeedbackCategory::Misrepresented,
-                    _ => FeedbackCategory::Other(format!("reason {n}")),
-                },
-                &format!("comment {n}"),
-            )
-        })
-        .collect();
+    let (scoped_payload, buyer_signature) = sign_scoped(buyer, &terms);
+    Complaint { order, category, block_height: height, paid_height, scoped_payload, buyer_signature }
+}
 
-    let build = |cert: &str, entries: Vec<FeedbackEntry>| {
-        let mut s = ReputationStateV1 {
-            owner_certificate_pem: cert.into(),
-            ..Default::default()
-        };
-        if !entries.is_empty() {
-            s.apply_delta(&params, &Some(entries)).unwrap();
+/// The terms a complaint's buyer signs, from the complaint's own fields.
+fn moved_terms(c: &Complaint) -> ComplaintTerms {
+    ComplaintTerms {
+        tag: ComplaintTag::HarvestComplaintV1,
+        order_id: c.order.order.id.clone(),
+        category: c.category.clone(),
+        block_height: c.block_height,
+        paid_height: c.paid_height,
+    }
+}
+
+/// The genuine complaint about the fixture store's paid order `n`.
+fn complaint_fx(fx: &StoreFx, n: u8, category: FeedbackCategory) -> Complaint {
+    let order = fx.authorized(&fx.receipted_order(n), OrderStatus::Paid, 1);
+    complaint_by(&complaint_buyer(n), order, category, 200 + u32::from(n))
+}
+
+fn gen_reputation(root: &Path) {
+    let fx = StoreFx::new();
+    let params = ReputationParameters::new(fx.seller.verifying_key());
+    let pbytes = cbor(&params);
+
+    let f: Vec<Complaint> = (1u8..=6)
+        .map(|n| complaint_fx(&fx, n * 17, FeedbackCategory::ALL[usize::from(n % 3)].clone()))
+        .collect();
+    for c in &f {
+        c.verify(params.store_key()).expect("fixture complaint verifies");
+    }
+
+    let build = |cert: &str, complaints: Vec<Complaint>| {
+        let mut s = ReputationStateV1 { owner_certificate_pem: cert.into(), ..Default::default() };
+        if !complaints.is_empty() {
+            s.apply_delta(&params, &Some(complaints)).unwrap();
         }
         s.verify(&params).unwrap();
         s
     };
-    let cert = "-----BEGIN THROWAWAY OWNER CERT-----";
+    // A genuine Ghost Key certificate: the contract refuses anything else
+    // in this field since #143 review round 1 (P1-4).
+    let cert = OWNER_CERT;
     let merged = |base: &ReputationStateV1, other: &ReputationStateV1| {
         // Mirror of update_state's State arm.
         let mut s = base.clone();
@@ -710,17 +722,21 @@ fn gen_reputation(root: &Path) {
     let mut honest: Vec<(&str, ReputationStateV1)> = vec![
         ("default", ReputationStateV1::default()),
         ("cert_only", build(cert, vec![])),
-        ("F1", build(cert, vec![f[0].clone()])),
-        ("F12", build(cert, vec![f[0].clone(), f[1].clone()])),
-        ("F23", build(cert, vec![f[1].clone(), f[2].clone()])),
-        ("F345", build(cert, vec![f[2].clone(), f[3].clone(), f[4].clone()])),
-        ("F16_nocert", build("", vec![f[0].clone(), f[5].clone()])),
-        ("F123456", build(cert, f.clone())),
+        ("C1", build(cert, vec![f[0].clone()])),
+        ("C12", build(cert, vec![f[0].clone(), f[1].clone()])),
+        ("C23", build(cert, vec![f[1].clone(), f[2].clone()])),
+        ("C345", build(cert, vec![f[2].clone(), f[3].clone(), f[4].clone()])),
+        ("C16_nocert", build("", vec![f[0].clone(), f[5].clone()])),
+        ("C123456", build(cert, f.clone())),
+        // A complaint PUT by a buyer onto a record nobody has created yet
+        // (`store_ops::submit_complaint` sends an empty certificate).
+        ("C4_buyer_created", build("", vec![f[3].clone()])),
     ];
     let trans = vec![
-        ("F1", "t_F1_plus_F2", build("", vec![f[1].clone()])),
-        ("cert_only", "t_cert_plus_F3", build("", vec![f[2].clone()])),
-        ("F16_nocert", "t_F16_gets_cert_and_F4", build(cert, vec![f[3].clone()])),
+        ("C1", "t_C1_plus_C2", build("", vec![f[1].clone()])),
+        ("cert_only", "t_cert_plus_C3", build("", vec![f[2].clone()])),
+        ("C16_nocert", "t_C16_gets_cert_and_C4", build(cert, vec![f[3].clone()])),
+        ("C4_buyer_created", "t_C4_gets_cert", build(cert, vec![])),
     ];
     let mut c = Corpus::new(root, "reputation", &pbytes);
     let mut extra = vec![];
@@ -734,7 +750,7 @@ fn gen_reputation(root: &Path) {
         c.state(n, &cbor(s));
     }
     let find = |n: &str| honest.iter().find(|(m, _)| *m == n).unwrap().1.clone();
-    for (base, targets) in [("F1", vec!["F12", "F23", "F345"]), ("default", vec!["F1", "F23"])] {
+    for (base, targets) in [("C1", vec!["C12", "C23", "C345"]), ("default", vec!["C1", "C23"])] {
         let b = find(base);
         let summ = b.summarize();
         for t in targets {
@@ -755,48 +771,249 @@ fn gen_reputation(root: &Path) {
     c.finish();
 
     let mut c = Corpus::new(root, "reputation-adv", &pbytes);
-    for n in ["default", "F1", "F12", "F23"] {
+    for n in ["default", "C1", "C12", "C23"] {
         c.state(n, &cbor(&honest.iter().find(|(m, _)| *m == n).unwrap().1));
     }
-    // #22: same token + signature, different category/comment. A THIRD
-    // PARTY's variant (entry signature not redone) no longer verifies, so it
-    // is stored raw: the contract must refuse it.
-    let mut f1v = f[0].clone();
-    f1v.category = FeedbackCategory::Other("no complaint".into());
-    f1v.comment = "actually it was fine".into();
-    let raw = ReputationStateV1 {
+    let raw = |complaints: Vec<Complaint>| ReputationStateV1 {
         owner_certificate_pem: cert.into(),
-        used_nonces: [f1v.token.nonce].into_iter().collect(),
-        feedback: vec![f1v],
+        complaints,
     };
-    assert!(raw.verify(&params).is_err());
-    c.state("adv_F1_variant", &cbor(&raw));
-    // The BUYER's own second entry for the same token (validly signed).
-    let f1b = entry(17, FeedbackCategory::Other("second thoughts".into()), "changed my mind");
-    c.state("adv_F1_buyer_variant", &cbor(&build(cert, vec![f1b])));
-    // PR #82 review Must Fix 1: the RSA key holder (the seller) mints a token
-    // for the buyer's PUBLISHED slot with a key of its own. Refused now.
-    let seller_key = SigningKey::from_bytes(&[0x77; 32]);
-    let minted = FeedbackToken {
-        target_reputation_contract: [5u8; 32],
-        nonce: f[0].token.nonce,
-        entry_key: seller_key.verifying_key().to_bytes(),
-    };
-    let minted_sig = signer.sign_with_rng(&mut rand_core::OsRng, &cbor(&minted)).to_vec();
-    let minted = FeedbackEntry::sign(minted, minted_sig, FeedbackCategory::Other("fine".into()), "all good".into(), ts(1_700_000_050), &seller_key);
-    let raw = ReputationStateV1 {
-        owner_certificate_pem: cert.into(),
-        used_nonces: [minted.token.nonce].into_iter().collect(),
-        feedback: vec![minted],
-    };
-    assert!(raw.verify(&params).is_err());
-    c.state("adv_seller_minted_slot", &cbor(&raw));
-    // A different non-empty owner certificate (not covered by anything).
-    c.state("adv_other_cert_F2", &cbor(&build("-----BEGIN OTHER CERT-----", vec![f[1].clone()])));
-    // Unsorted feedback: verify does not require order.
+    // A THIRD PARTY's variant of C1: category changed, buyer signature not
+    // redone. Refused: stored raw.
+    let mut c1v = f[0].clone();
+    c1v.category = FeedbackCategory::Counterfeit;
+    let s = raw(vec![c1v]);
+    assert!(s.verify(&params).is_err());
+    c.state("adv_C1_third_party_variant", &cbor(&s));
+    // The BUYER's own second complaint for the same order (validly signed):
+    // one slot, the smaller encoding wins.
+    let c1b = complaint_by(
+        &complaint_buyer(17),
+        f[0].order.clone(),
+        FeedbackCategory::Counterfeit,
+        999,
+    );
+    c.state("adv_C1_buyer_variant", &cbor(&build(cert, vec![c1b])));
+    // Anyone: the same buyer-signed terms with DIFFERENT valid payment
+    // evidence for the same order (evidence is signed by nobody).
+    let mut c1e = f[0].clone();
+    c1e.order = fx.authorized(&f[0].order.order, OrderStatus::Paid, 2);
+    assert_ne!(cbor(&c1e), cbor(&f[0]));
+    c.state("adv_C1_other_evidence", &cbor(&build(cert, vec![c1e])));
+    // The SELLER signs a complaint about its own order with its own key.
+    let forged = complaint_by(&fx.seller, f[1].order.clone(), FeedbackCategory::NonDelivery, 300);
+    let s = raw(vec![forged]);
+    assert!(s.verify(&params).is_err());
+    c.state("adv_seller_signed_complaint", &cbor(&s));
+    // A genuine buyer signature about an UNPAID order.
+    let unpaid = fx.authorized(&fx.receipted_order(90), OrderStatus::AwaitingPayment, 0);
+    let s = raw(vec![complaint_by(&complaint_buyer(90), unpaid, FeedbackCategory::NonDelivery, 300)]);
+    assert!(s.verify(&params).is_err());
+    c.state("adv_unpaid_order", &cbor(&s));
+    // Free text in the certificate field: refused by the contract since #143
+    // review round 1 (P1-4), where it used to be #81's first-writer-wins
+    // violation. (A second GENUINE certificate would still exercise #81;
+    // the corpus has only one, the E2E test Ghost Key's.)
+    c.state("adv_other_cert_C2", &cbor(&build("-----BEGIN OTHER CERT-----", vec![f[1].clone()])));
+    // #143 round 2 / threat model: the same buyer statement with the ORDER
+    // re-signed by the seller in another envelope (bytes after the CBOR
+    // item). Accepted since R2-1, and it takes C1's one slot: the survivor
+    // is decided by the total order, whichever arrives first.
+    let mut c1r = f[0].clone();
+    let mut envelope = c1r.order.scoped_payload.clone();
+    envelope.extend_from_slice(&[0u8; 8]);
+    c1r.order.signature = fx.seller.sign(&envelope).to_bytes().to_vec();
+    c1r.order.scoped_payload = envelope;
+    c.state("adv_C1_resigned_order_envelope", &cbor(&build(cert, vec![c1r])));
+    // Padded evidence: C1 with its one claim repeated. The verifier alone
+    // accepts it; a complaint must carry the minimal proof (TM-E). Refused.
+    let mut c1p = f[0].clone();
+    if let Some(harvest_common::payment::OrderPaymentProof::OnChain(proof)) =
+        c1p.order.payment_proof.as_mut()
+    {
+        let first = proof.claims[0].clone();
+        proof.claims.push(first);
+    }
+    let s = raw(vec![c1p]);
+    assert!(s.verify(&params).is_err());
+    c.state("adv_C1_padded_evidence", &cbor(&s));
+    // A paid height the evidence does not give (TM-D), validly signed by
+    // the buyer. Refused.
+    let mut moved = complaint_by(
+        &complaint_buyer(17),
+        f[0].order.clone(),
+        FeedbackCategory::NonDelivery,
+        300,
+    );
+    moved.paid_height += 1;
+    let (scoped_payload, buyer_signature) = sign_scoped(&complaint_buyer(17), &moved_terms(&moved));
+    moved.scoped_payload = scoped_payload;
+    moved.buyer_signature = buyer_signature;
+    let s = raw(vec![moved]);
+    assert!(s.verify(&params).is_err());
+    c.state("adv_C1_moved_paid_height", &cbor(&s));
+    // Unsorted complaints: refused by verify (strictly ascending).
     let mut s = build(cert, vec![f[0].clone(), f[1].clone(), f[2].clone()]);
-    s.feedback.reverse();
-    c.state("adv_unsorted_F123", &cbor(&s));
+    s.complaints.reverse();
+    assert!(s.verify(&params).is_err());
+    c.state("adv_unsorted_C123", &cbor(&s));
+    c.finish();
+
+    // #143 R5-C: the cap binds. A full record of the seller's own late
+    // complaints (A), honest complaints dated near their payments (B), a
+    // second, far-dated statement by one of those buyers whose terms encode
+    // smaller (C), and the full record once the honest ones have arrived (D).
+    // The honest complaints must survive every grouping, and the far
+    // statement must never cost its order its slot.
+    let dated = |n: u8, after: u32, category: FeedbackCategory| {
+        let order = fx.authorized(&fx.receipted_order(n), OrderStatus::Paid, 1);
+        let paid_at = harvest_common::payment::paid_height(&order).expect("paid");
+        complaint_by(&complaint_buyer(n), order, category, paid_at + after)
+    };
+    let seller_late: Vec<Complaint> = (0..MAX_COMPLAINTS)
+        .map(|i| dated(100 + i as u8, 5_000 + i as u32, FeedbackCategory::NonDelivery))
+        .collect();
+    let honest: Vec<Complaint> =
+        (1u8..=3).map(|n| dated(n, 150 + u32::from(n), FeedbackCategory::NonDelivery)).collect();
+    let far = dated(1, 9_000, FeedbackCategory::Counterfeit);
+    assert!(
+        cbor(&moved_terms(&far)) < cbor(&moved_terms(&honest[0])),
+        "the far statement's terms encode smaller, so only the distance ranks the near one first"
+    );
+    let a = build(cert, seller_late);
+    assert_eq!(a.complaints.len(), MAX_COMPLAINTS);
+    let b = build(cert, honest.clone());
+    let cc = build("", vec![far]);
+    let d = merged(&a, &b);
+    assert_eq!(d.complaints.len(), MAX_COMPLAINTS);
+    for h in &honest {
+        assert!(d.complaints.contains(h), "an honest complaint was dropped for a late one");
+    }
+    let ab_c = merged(&merged(&a, &b), &cc);
+    let a_bc = merged(&a, &merged(&b, &cc));
+    assert_eq!(cbor(&ab_c), cbor(&a_bc), "reputation-cap: the merge is not associative");
+    assert!(honest.iter().all(|h| ab_c.complaints.contains(h)), "an honest complaint was dropped");
+    println!("reputation-cap native: (A+B)+C == A+(B+C), honest all kept");
+    let mut c = Corpus::new(root, "reputation-cap", &pbytes);
+    c.state("cap_A_full_late", &cbor(&a));
+    c.state("cap_B_honest_near", &cbor(&b));
+    c.state("cap_C_order1_far_statement", &cbor(&cc));
+    c.state("cap_D_full_with_honest", &cbor(&d));
+    c.transition("cap_A_full_late", "cap_D_full_with_honest");
+    // B + C is B itself: the far statement loses its order's slot to the
+    // near one. Not a state of its own (fdev would dedup it, and the pair
+    // would read as a reversed transition).
+    assert_eq!(cbor(&merged(&b, &cc)), cbor(&b), "the near statement keeps the slot");
+    let summ = a.summarize();
+    let delta = b.delta(&summ).expect("non-empty delta");
+    let mut r = a.clone();
+    r.apply_delta(&params, &Some(delta.clone())).unwrap();
+    r.verify(&params).unwrap();
+    assert_eq!(cbor(&r.complaints), cbor(&d.complaints));
+    c.delta_step(&cbor(&a), &cbor(&summ), &cbor(&delta), &cbor(&r));
+    c.finish();
+}
+
+/// The reputation half of the round-robin (`rr`) family: encodings the
+/// canonical-bytes check must refuse, weak buyer keys, a reversed payment,
+/// and the RSA generations' state shape.
+fn gen_reputation_rr(root: &Path) {
+    let fx = StoreFx::new();
+    let params = ReputationParameters::new(fx.seller.verifying_key());
+    let pbytes = cbor(&params);
+    // A genuine Ghost Key certificate: the contract refuses anything else
+    // in this field since #143 review round 1 (P1-4).
+    let cert = OWNER_CERT;
+    let honest = |complaints: Vec<Complaint>| {
+        let mut s = ReputationStateV1 { owner_certificate_pem: cert.into(), ..Default::default() };
+        if !complaints.is_empty() {
+            s.apply_delta(&params, &Some(complaints)).unwrap();
+        }
+        s.verify(&params).unwrap();
+        s
+    };
+    let f1 = complaint_fx(&fx, 0x42, FeedbackCategory::NonDelivery);
+    let f2 = complaint_fx(&fx, 0x43, FeedbackCategory::Misrepresented);
+
+    let mut c = Corpus::new(root, "reputation-rr", &pbytes);
+    c.state("zero_bytes", &[]);
+    let def = cbor(&ReputationStateV1::default());
+    c.state("default", &def);
+    // encoded default, map header non-minimal (0xA2 -> 0xB8 0x02)
+    assert_eq!(def[0], 0xA2);
+    let mut d2 = vec![0xB8, 0x02];
+    d2.extend(&def[1..]);
+    c.state("adv_default_nonminimal_map", &d2);
+    let st1 = honest(vec![f1.clone()]);
+    c.state("C1", &cbor(&st1));
+    c.state("C2", &cbor(&honest(vec![f2.clone()])));
+    // C1 with its complaints array header non-minimal (0x81 -> 0x98 0x01)
+    let nm = nonminimal_after(&cbor(&st1), "complaints", &[0x81], &[0x98, 0x01]);
+    assert_eq!(harvest_common::from_cbor::<ReputationStateV1>(&nm).unwrap(), st1);
+    c.state("adv_C1_nonminimal_array", &nm);
+    // The RSA generations' state shape (certificate, no complaints key): it
+    // decodes, which the migration relies on, but is not canonical here.
+    #[derive(Serialize)]
+    struct RsaGenerationState {
+        owner_certificate_pem: String,
+        feedback: Vec<()>,
+        used_nonces: Vec<()>,
+    }
+    let legacy = cbor(&RsaGenerationState {
+        owner_certificate_pem: cert.into(),
+        feedback: vec![],
+        used_nonces: vec![],
+    });
+    let decoded: ReputationStateV1 = harvest_common::from_cbor(&legacy).unwrap();
+    assert_eq!(decoded.owner_certificate_pem, cert);
+    c.state("adv_rsa_generation_state", &legacy);
+    // Weak / non-canonical buyer receipt keys with a forged (R = identity,
+    // s = 0) signature, on a genuinely paid order the seller signed.
+    let mut ident_r = [0u8; 64];
+    ident_r[0] = 1; // R = identity (y = 1), s = 0
+    let weak_keys: [(&str, [u8; 32]); 3] = [
+        ("identity", { let mut k = [0u8; 32]; k[0] = 1; k }),
+        ("identity_y_plus_p", { let mut k = [0xFFu8; 32]; k[0] = 0xEE; k[31] = 0x7F; k }),
+        ("identity_signbit", { let mut k = [0u8; 32]; k[0] = 1; k[31] = 0x80; k }),
+    ];
+    for (i, (name, k)) in weak_keys.into_iter().enumerate() {
+        let mut o = fx.receipted_order(0x50 + i as u8);
+        o.buyer_receipt_key = Some(k);
+        let o = o.with_derived_id();
+        let mut e = complaint_by(&complaint_buyer(0), fx.authorized(&o, OrderStatus::Paid, 1), FeedbackCategory::NonDelivery, 300);
+        e.buyer_signature = ident_r.to_vec();
+        let nonstrict = ed25519_dalek::VerifyingKey::from_bytes(&k).map(|vk| {
+            use ed25519_dalek::Verifier;
+            vk.verify(&e.scoped_payload, &ed25519_dalek::Signature::from_bytes(&ident_r)).is_ok()
+        });
+        let raw = ReputationStateV1 { owner_certificate_pem: cert.into(), complaints: vec![e] };
+        let r = raw.verify(&params);
+        println!(
+            "reputation-rr weak key {name}: decompress={:?} nonstrict_forgery_ok={:?} contract verify={:?}",
+            ed25519_dalek::VerifyingKey::from_bytes(&k).is_ok(),
+            nonstrict.ok(),
+            r
+        );
+        assert!(r.is_err(), "a weak-key forgery must not verify");
+        c.state(&format!("adv_weak_{name}"), &cbor(&raw));
+    }
+    // A buyer-signed complaint whose order carries a REVERSED payment: the
+    // contract accepts only Paid (readers decide what a later reversal means).
+    let rev = fx.authorized(&fx.receipted_order(0x60), OrderStatus::PaymentReversed, 0);
+    let raw = ReputationStateV1 {
+        owner_certificate_pem: cert.into(),
+        complaints: vec![complaint_by(&complaint_buyer(0x60), rev, FeedbackCategory::NonDelivery, 300)],
+    };
+    assert!(raw.verify(&params).is_err());
+    c.state("adv_reversed_payment", &cbor(&raw));
+    // Delta steps: default <- C1, C1 <- C2
+    for (b, t) in [(ReputationStateV1::default(), st1.clone()), (st1.clone(), honest(vec![f2.clone()]))] {
+        let summ = b.summarize();
+        let d = t.delta(&summ).unwrap();
+        let mut r = b.clone();
+        r.apply_delta(&params, &Some(d.clone())).unwrap();
+        c.delta_step(&cbor(&b), &cbor(&summ), &cbor(&d), &cbor(&r));
+    }
     c.finish();
 }
 
@@ -1567,84 +1784,7 @@ fn nonminimal_after(bytes: &[u8], key: &str, hdr: &[u8], rep: &[u8]) -> Vec<u8> 
 }
 
 fn gen_rr(root: &Path) {
-    use rsa::pkcs1::EncodeRsaPublicKey;
-    use rsa::pss::BlindedSigningKey;
-    use rsa::signature::{RandomizedSigner, SignatureEncoding};
-
-    // ---- reputation
-    let mut rng = rand_core::OsRng;
-    let private = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
-    let der = rsa::RsaPublicKey::from(&private).to_pkcs1_der().unwrap().as_bytes().to_vec();
-    let owner = SigningKey::from_bytes(&[0xC3; 32]).verifying_key();
-    let params = ReputationParameters::new(der, owner);
-    let pbytes = cbor(&params);
-    let signer = BlindedSigningKey::<sha2::Sha256>::new(private);
-    let rsa_sign = |t: &FeedbackToken| signer.sign_with_rng(&mut rand_core::OsRng, &cbor(t)).to_vec();
-    let cert = "-----BEGIN THROWAWAY OWNER CERT-----";
-    let honest = |entries: Vec<FeedbackEntry>| {
-        let mut s = ReputationStateV1 { owner_certificate_pem: cert.into(), ..Default::default() };
-        if !entries.is_empty() { s.apply_delta(&params, &Some(entries)).unwrap(); }
-        s.verify(&params).unwrap();
-        s
-    };
-    let buyer = SigningKey::from_bytes(&[0x42; 32]);
-    let t1 = FeedbackToken::new([5u8; 32], buyer.verifying_key().to_bytes());
-    let s1 = rsa_sign(&t1);
-    let f1 = FeedbackEntry::sign(t1, s1, FeedbackCategory::NonDelivery, "never arrived".into(), ts(1_700_000_100), &buyer);
-    let buyer2 = SigningKey::from_bytes(&[0x43; 32]);
-    let t2 = FeedbackToken::new([5u8; 32], buyer2.verifying_key().to_bytes());
-    let s2 = rsa_sign(&t2);
-    let f2 = FeedbackEntry::sign(t2, s2, FeedbackCategory::Misrepresented, "not as shown".into(), ts(1_700_000_200), &buyer2);
-
-    let mut c = Corpus::new(root, "reputation-rr", &pbytes);
-    c.state("zero_bytes", &[]);
-    let def = cbor(&ReputationStateV1::default());
-    c.state("default", &def);
-    // encoded default, map header non-minimal (0xA3 -> 0xB8 0x03)
-    assert_eq!(def[0], 0xA3);
-    let mut d2 = vec![0xB8, 0x03]; d2.extend(&def[1..]);
-    c.state("adv_default_nonminimal_map", &d2);
-    let st1 = honest(vec![f1.clone()]);
-    c.state("F1", &cbor(&st1));
-    c.state("F2", &cbor(&honest(vec![f2.clone()])));
-    // F1 with its feedback array header non-minimal (0x81 -> 0x98 0x01)
-    let nm = nonminimal_after(&cbor(&st1), "feedback", &[0x81], &[0x98, 0x01]);
-    assert_eq!(harvest_common::from_cbor::<ReputationStateV1>(&nm).unwrap(), st1);
-    c.state("adv_F1_nonminimal_array", &nm);
-    // Weak / non-canonical entry keys with a forged (R = identity, s = 0) sig,
-    // nonce correctly derived, token genuinely RSA-signed (a seller-minted slot).
-    let mut ident_r = [0u8; 64]; ident_r[0] = 1; // R = identity (y = 1), s = 0
-    let weak_keys: [(&str, [u8; 32]); 3] = [
-        ("identity", { let mut k = [0u8; 32]; k[0] = 1; k }),
-        ("identity_y_plus_p", { let mut k = [0xFFu8; 32]; k[0] = 0xEE; k[31] = 0x7F; k }),
-        ("identity_signbit", { let mut k = [0u8; 32]; k[0] = 1; k[31] = 0x80; k }),
-    ];
-    for (name, k) in weak_keys {
-        let tok = FeedbackToken::new([5u8; 32], k);
-        let sig = rsa_sign(&tok);
-        let e = FeedbackEntry { token: tok, signature: sig, category: FeedbackCategory::Other("forged".into()),
-            comment: format!("third party via {name}"), submitted_at: ts(1_700_000_300), entry_signature: ident_r.to_vec() };
-        // Also check: does NON-strict verify accept the forged signature? (would show verify_strict is load-bearing)
-        let nonstrict = ed25519_dalek::VerifyingKey::from_bytes(&k).map(|vk| {
-            use ed25519_dalek::Verifier;
-            vk.verify(&e.signing_bytes(), &ed25519_dalek::Signature::from_bytes(&ident_r)).is_ok()
-        });
-        let probe = ReputationStateV1 { owner_certificate_pem: cert.into(), used_nonces: [e.token.nonce].into_iter().collect(), feedback: vec![e.clone()] };
-        let r = probe.verify(&params);
-        println!("reputation-rr weak key {name}: decompress={:?} nonstrict_forgery_ok={:?} contract verify={:?}",
-            ed25519_dalek::VerifyingKey::from_bytes(&k).is_ok(), nonstrict.ok(), r);
-        let raw = ReputationStateV1 { owner_certificate_pem: cert.into(), used_nonces: [e.token.nonce].into_iter().collect(), feedback: vec![e] };
-        c.state(&format!("adv_weak_{name}"), &cbor(&raw));
-    }
-    // Delta steps: default <- F1, F1 <- F2
-    for (b, t) in [(ReputationStateV1::default(), st1.clone()), (st1.clone(), honest(vec![f2.clone()]))] {
-        let summ = b.summarize();
-        let d = t.delta(&summ).unwrap();
-        let mut r = b.clone();
-        r.apply_delta(&params, &Some(d.clone())).unwrap();
-        c.delta_step(&cbor(&b), &cbor(&summ), &cbor(&d), &cbor(&r));
-    }
-    c.finish();
+    gen_reputation_rr(root);
 
     // ---- store: FULL cap, boundary (lowest-ranked) order Paid with differing proofs
     let fx = StoreFx::new();

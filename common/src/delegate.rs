@@ -1,7 +1,5 @@
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::feedback::FeedbackToken;
 use crate::listing::{AuthorizedListing, Listing};
 
 pub type RequestId = u64;
@@ -22,20 +20,17 @@ pub const DELEGATE_PARAMETERS: &[u8] = &[];
 #[non_exhaustive]
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub enum HarvestDelegateRequest {
-    // === RSA Key Management (for feedback token blind signing) ===
-    /// Generate and store an RSA-PSS keypair for a ghostkey identity's reputation.
-    InitReputationKeys { ghostkey_fingerprint: String },
-
-    /// Get the RSA public key (PKCS#1 DER) for a reputation identity.
+    // === Legacy reputation addressing ===
+    /// Get the per-device RSA public key (PKCS#1 DER) a Ghost Key's
+    /// reputation record was addressed by before harvest#93 phase 1b, if this
+    /// device ever made one.
+    ///
+    /// Read-only, and kept ONLY so the reputation migration can derive the
+    /// addresses of records published under it (harvest#53 Phase C, Option
+    /// A). Nothing signs with the private half any more, and nothing mints a
+    /// new pair: the request that did (`InitReputationKeys`) is gone with the
+    /// blind-signature machinery.
     GetRsaPublicKey { ghostkey_fingerprint: String },
-
-    // === Blind Signing (seller signs buyer's feedback token) ===
-    /// Blind-sign a buyer's feedback token.
-    BlindSignFeedbackToken {
-        request_id: RequestId,
-        ghostkey_fingerprint: String,
-        blinded_token: Vec<u8>,
-    },
 
     // === Buyer-to-seller messaging ===
     /// Mint (or return) this identity's long-term X25519 public key.
@@ -259,28 +254,6 @@ pub enum HarvestDelegateRequest {
         listing: Listing,
     },
 
-    // === Transaction State ===
-    /// Record that a feedback token exchange has started with a buyer.
-    BeginTransaction {
-        request_id: RequestId,
-        /// Identifier for this transaction (e.g. listing ID + buyer ephemeral key).
-        transaction_id: String,
-        /// Our unblinded feedback token (held locally, never sent to counterparty).
-        our_token: FeedbackToken,
-        /// The blinded version we sent to the counterparty for signing.
-        our_blinded_token: Vec<u8>,
-    },
-
-    /// Record receipt of a blind signature on our feedback token.
-    RecordBlindSignature {
-        request_id: RequestId,
-        transaction_id: String,
-        blind_signature: Vec<u8>,
-    },
-
-    /// Get stored transaction history.
-    ListTransactions,
-
     // === Store Registry ===
     /// Register a store's contracts with a ghostkey identity so the delegate
     /// knows which contracts to subscribe to for notifications.
@@ -390,6 +363,47 @@ pub enum HarvestDelegateRequest {
     /// with none): the records are keyed by store code alone.
     ListRememberedStores,
 
+    // === The buyer's kept purchases (harvest#53 Phase C) ===
+    /// Keep, upgrade, or add the filed complaint to the buyer's copy of one
+    /// of their orders (`docs/complaint-threat-model.md` section 3).
+    ///
+    /// # Why the buyer keeps a copy, and from when
+    ///
+    /// A complaint carries the order as its evidence, and the seller
+    /// controls every copy the store holds: it can evict an order by
+    /// flooding the store, re-sign it, or replace it in a new generation.
+    /// So the buyer keeps the seller-signed order BEFORE paying: the UI asks
+    /// for this when the buyer presses to pay, and shows no payment details
+    /// until the delegate's list holds the copy. Only that press consumes a
+    /// slot, so orders the seller mints into the buyer's conversation never
+    /// take one (review round 2 of #143, R2-2 and R2-3).
+    ///
+    /// # The rules, per order id
+    ///
+    /// * A new copy must be `AwaitingPayment` or `Paid`, verify under
+    ///   `store_key`, meet `payment::complaint_preconditions`, and name the
+    ///   receipt key of `conversation`, which this delegate must hold. The
+    ///   delegate derives the receipt seed from that conversation and keeps
+    ///   it in the record, so losing the conversation later does not lose
+    ///   the complaint (R2-5).
+    /// * A kept `AwaitingPayment` copy is replaced by a verifying `Paid` copy.
+    /// * A kept `Paid` copy is never replaced, but it may gain the filed
+    ///   complaint, once, and only one that verifies against it.
+    /// * A held record that no longer decodes or verifies is overwritten.
+    ///
+    /// Answered with [`HarvestDelegateResponse::KeptPurchases`], or with
+    /// [`HarvestDelegateResponse::KeepPurchaseRefused`] naming the order, so
+    /// the UI can release its marker and say why.
+    ///
+    /// Boxed because an `AuthorizedOrder` is large next to every other
+    /// request (`clippy::large_enum_variant`); a `Box` encodes exactly as
+    /// its contents.
+    KeepPurchase { keep: Box<PurchaseToKeep> },
+
+    /// Every purchase this node keeps. Answered with
+    /// [`HarvestDelegateResponse::KeptPurchases`].
+    ListKeptPurchases,
+
     // === Store keys (harvest#93, revision 2) ===
     /// Mint a new store key: a fresh Ed25519 key, from the host's RNG, kept in
     /// this delegate on this device. Answered with
@@ -486,6 +500,139 @@ pub enum HarvestDelegateRequest {
     },
 }
 
+/// What the UI asks the delegate to keep (harvest#53 Phase C). See
+/// [`HarvestDelegateRequest::KeepPurchase`].
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct PurchaseToKeep {
+    /// The store key the order's terms are signed by: the store's identity,
+    /// which outlives any one store contract generation, and the key its
+    /// reputation record is addressed by.
+    pub store_key: [u8; 32],
+    /// The buyer conversation the order was issued to (its public key),
+    /// whose receipt key the order must name.
+    pub conversation: [u8; 32],
+    /// The seller-signed order, `AwaitingPayment` or `Paid`.
+    pub order: crate::payment::AuthorizedOrder,
+    /// The complaint the buyer filed about it, if any. Only on a `Paid`
+    /// order, and only once.
+    #[serde(default)]
+    pub complaint: Option<KeptComplaint>,
+}
+
+/// A buyer's kept copy of one of their orders, as the delegate holds and
+/// returns it (harvest#53 Phase C). See
+/// [`HarvestDelegateRequest::KeepPurchase`].
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct KeptPurchase {
+    /// See [`PurchaseToKeep::store_key`].
+    pub store_key: [u8; 32],
+    /// See [`PurchaseToKeep::conversation`].
+    pub conversation: [u8; 32],
+    /// The seed of the order's receipt key, derived by the delegate from
+    /// the conversation when the copy was first kept
+    /// ([`crate::mailbox::buyer_receipt_seed_from_secret`]). Kept here so
+    /// the complaint does not depend on the conversation surviving: 256
+    /// conversations are kept, oldest out, and a buyer may forget one
+    /// (review round 2 of #143, R2-5). Secret.
+    pub receipt_seed: [u8; 32],
+    /// The order, `AwaitingPayment` until the buyer's node sees it paid.
+    pub order: crate::payment::AuthorizedOrder,
+    /// The complaint the buyer filed, kept so the UI can put it back on the
+    /// record whenever the record lacks it (`docs/complaint-threat-model.md`
+    /// section 3.4).
+    #[serde(default)]
+    pub complaint: Option<KeptComplaint>,
+}
+
+impl KeptPurchase {
+    /// The filed complaint, as the reputation record holds it.
+    pub fn filed_complaint(&self) -> Option<crate::reputation::Complaint> {
+        self.complaint.as_ref().map(|kept| kept.about(&self.order))
+    }
+}
+
+impl core::fmt::Debug for KeptPurchase {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Field by field, for the reason `RecalledConversation`'s gives.
+        f.debug_struct("KeptPurchase")
+            .field("store_key", &self.store_key)
+            .field("conversation", &self.conversation)
+            .field("receipt_seed", &Redacted)
+            .field("order", &self.order)
+            .field("complaint", &self.complaint)
+            .finish()
+    }
+}
+
+/// The buyer's half of a complaint: everything but the order it is about,
+/// which the kept record already holds.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct KeptComplaint {
+    pub category: crate::feedback::FeedbackCategory,
+    pub block_height: u32,
+    pub paid_height: u32,
+    pub scoped_payload: Vec<u8>,
+    pub buyer_signature: Vec<u8>,
+}
+
+impl KeptComplaint {
+    /// The buyer's half of `complaint`.
+    pub fn of(complaint: &crate::reputation::Complaint) -> Self {
+        Self {
+            category: complaint.category.clone(),
+            block_height: complaint.block_height,
+            paid_height: complaint.paid_height,
+            scoped_payload: complaint.scoped_payload.clone(),
+            buyer_signature: complaint.buyer_signature.clone(),
+        }
+    }
+
+    /// The whole complaint, about `order`.
+    pub fn about(&self, order: &crate::payment::AuthorizedOrder) -> crate::reputation::Complaint {
+        crate::reputation::Complaint {
+            order: order.clone(),
+            category: self.category.clone(),
+            block_height: self.block_height,
+            paid_height: self.paid_height,
+            scoped_payload: self.scoped_payload.clone(),
+            buyer_signature: self.buyer_signature.clone(),
+        }
+    }
+}
+
+/// How many purchases one node keeps. Past it a new one is refused out
+/// loud, and the buyer is not shown payment details: refusing to pay is the
+/// safe failure. Only the buyer's own press takes a slot (*Pay this order*,
+/// or *File a complaint* about a paid copy never kept), so nothing a seller
+/// mints, fabricates or pays for can fill it (`docs/complaint-threat-model.md`
+/// section 5.1). A press never paid holds its slot: bounded by the buyer's
+/// own presses.
+pub const MAX_KEPT_PURCHASES: usize = 1024;
+
+/// The largest kept purchase, in bytes of its CBOR encoding.
+///
+/// # Derived from what verifies, so a genuine copy always fits
+///
+/// Review round 2 of #143 (R2-4) found a fixed 64 KiB bound below a genuine
+/// proof. Every part of a kept record is bounded by something the record
+/// must pass anyway:
+///
+/// * the order's envelope and its terms, `MAX_ORDER_ENVELOPE_BYTES` each
+///   (`payment::complaint_preconditions`);
+/// * the proof's claims, `MAX_PROOF_CLAIM_BYTES` (the verifier refuses
+///   more);
+/// * the rest -- the tip, the seller's signature, the keys, the seed, the
+///   complaint's terms, envelope and signature, and CBOR framing -- a few
+///   hundred bytes, given 16 KiB.
+///
+/// So a copy that verifies fits. The UI keeps the minimal proof
+/// (`payment::minimal_on_chain_proof`), which is far smaller; this bound
+/// does not rely on it. Pinned by
+/// `a_maximal_verifying_purchase_fits_the_bound`.
+pub const MAX_KEPT_PURCHASE_BYTES: usize = 2 * crate::payment::MAX_ORDER_ENVELOPE_BYTES
+    + crate::payment::MAX_PROOF_CLAIM_BYTES
+    + 16 * 1024;
+
 /// A store this node remembers visiting.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct RememberedStore {
@@ -499,11 +646,6 @@ pub struct RememberedStore {
 #[non_exhaustive]
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub enum HarvestDelegateResponse {
-    ReputationKeysInitialized {
-        ghostkey_fingerprint: String,
-        rsa_public_key_der: Vec<u8>,
-    },
-
     RsaPublicKey {
         ghostkey_fingerprint: String,
         rsa_public_key_der: Vec<u8>,
@@ -619,28 +761,9 @@ pub enum HarvestDelegateResponse {
         result: Result<Vec<ConversationKey>, String>,
     },
 
-    BlindSignatureResult {
-        request_id: RequestId,
-        result: Result<Vec<u8>, String>,
-    },
-
     ListingCreated {
         request_id: RequestId,
         result: Result<AuthorizedListing, String>,
-    },
-
-    TransactionRecorded {
-        request_id: RequestId,
-        result: Result<(), String>,
-    },
-
-    BlindSignatureRecorded {
-        request_id: RequestId,
-        result: Result<(), String>,
-    },
-
-    TransactionList {
-        transactions: Vec<TransactionRecord>,
     },
 
     /// A subscribed contract's state changed (new mailbox message, feedback, etc.).
@@ -719,6 +842,23 @@ pub enum HarvestDelegateResponse {
     /// it believes it asked for.
     RememberedStores {
         stores: Vec<RememberedStore>,
+    },
+
+    /// Every purchase this node keeps, after whichever `KeepPurchase` or
+    /// `ListKeptPurchases` asked. The whole list, for the reason
+    /// [`Self::RememberedStores`] gives. Carries each purchase's receipt
+    /// seed.
+    KeptPurchases {
+        purchases: Vec<KeptPurchase>,
+    },
+
+    /// A `KeepPurchase` was refused. Names the order, unlike
+    /// [`Self::Error`], so the UI releases that order's marker and shows the
+    /// reason where the payment details would have been (review round 2 of
+    /// #143, R2-4).
+    KeepPurchaseRefused {
+        order_id: crate::payment::OrderId,
+        reason: String,
     },
 
     /// Whether the migration named by `marker` is already recorded as done.
@@ -1069,30 +1209,6 @@ impl core::fmt::Debug for ConversationKey {
     }
 }
 
-impl core::fmt::Debug for TransactionRecord {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // Destructured, so a new field does not compile until somebody
-        // decides whether it may print.
-        let Self {
-            transaction_id,
-            our_token,
-            our_blinded_token: _,
-            blind_signature,
-            created_at,
-        } = self;
-        f.debug_struct("TransactionRecord")
-            .field("transaction_id", transaction_id)
-            .field("our_token", our_token)
-            .field("our_blinded_token", &Redacted)
-            .field(
-                "blind_signature",
-                &blind_signature.as_ref().map(|_| Redacted),
-            )
-            .field("created_at", created_at)
-            .finish()
-    }
-}
-
 impl core::fmt::Debug for RecalledConversation {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // Listed field by field rather than derived so a field added later is
@@ -1166,24 +1282,6 @@ pub struct StoreSubkeyInfo {
 pub struct StoreKeySignature {
     pub scoped_payload: Vec<u8>,
     pub signature: Vec<u8>,
-}
-
-/// A record of a feedback token exchange, stored locally by the delegate.
-///
-/// `Debug` redacts the blinded token and the blind signature: printed beside
-/// the unblinded token they are exactly the link blind signing exists to
-/// break (which buyer holds which feedback slot). The token itself redacts
-/// its own key and nonce; see [`FeedbackToken`].
-#[derive(Serialize, Deserialize, Clone, PartialEq)]
-pub struct TransactionRecord {
-    pub transaction_id: String,
-    /// Our unblinded feedback token (can be submitted to counterparty's reputation contract).
-    pub our_token: FeedbackToken,
-    /// The blinded version we sent for signing.
-    pub our_blinded_token: Vec<u8>,
-    /// The blind signature we received (None until counterparty signs).
-    pub blind_signature: Option<Vec<u8>>,
-    pub created_at: DateTime<Utc>,
 }
 
 #[cfg(test)]
@@ -1324,110 +1422,91 @@ mod tests {
     fn classify_response(r: &HarvestDelegateResponse) -> (usize, bool) {
         use HarvestDelegateResponse as R;
         match r {
-            R::ReputationKeysInitialized { .. } => (0, false),
-            R::RsaPublicKey { .. } => (1, false),
-            R::EncryptionKeyReady { .. } => (2, false),
-            R::BuyerConversationStored { .. } => (3, false),
+            R::RsaPublicKey { .. } => (0, false),
+            R::EncryptionKeyReady { .. } => (1, false),
+            R::BuyerConversationStored { .. } => (2, false),
             // Both direction keys of every recalled conversation.
-            R::BuyerConversationList { .. } => (4, true),
+            R::BuyerConversationList { .. } => (3, true),
             // The backup string, which contains the X25519 secret.
-            R::BuyerConversationExported { .. } => (5, true),
-            R::BuyerConversationImported { .. } => (6, false),
-            R::BuyerConversationMarkedBackedUp { .. } => (7, false),
-            R::BuyerConversationForgotten { .. } => (8, false),
+            R::BuyerConversationExported { .. } => (4, true),
+            R::BuyerConversationImported { .. } => (5, false),
+            R::BuyerConversationMarkedBackedUp { .. } => (6, false),
+            R::BuyerConversationForgotten { .. } => (7, false),
             // Both direction keys for every buyer asked about.
-            R::ConversationKeys { .. } => (9, true),
-            R::BlindSignatureResult { .. } => (10, false),
-            R::ListingCreated { .. } => (11, false),
-            R::TransactionRecorded { .. } => (12, false),
-            R::BlindSignatureRecorded { .. } => (13, false),
-            // Our unblinded token (nonce, entry key) beside the blinded one:
-            // together they link the buyer to their feedback slot.
-            R::TransactionList { .. } => (14, true),
-            R::ContractUpdate { .. } => (15, false),
-            R::ContractState { .. } => (16, false),
-            R::StoreRegistered { .. } => (17, false),
-            R::StoreList { .. } => (18, false),
-            R::RememberedStores { .. } => (19, false),
-            R::MigrationMarker { .. } => (20, false),
-            R::MigrationMarkerRecorded { .. } => (21, false),
-            R::Error { .. } => (22, false),
+            R::ConversationKeys { .. } => (8, true),
+            R::ListingCreated { .. } => (9, false),
+            R::ContractUpdate { .. } => (10, false),
+            R::ContractState { .. } => (11, false),
+            R::StoreRegistered { .. } => (12, false),
+            R::StoreList { .. } => (13, false),
+            R::RememberedStores { .. } => (14, false),
+            R::MigrationMarker { .. } => (15, false),
+            R::MigrationMarkerRecorded { .. } => (16, false),
+            R::Error { .. } => (17, false),
             // The store key's public half only; the seed never leaves.
-            R::StoreKeyCreated { .. } => (23, false),
+            R::StoreKeyCreated { .. } => (18, false),
             // A signature over a store record, published as it is.
-            R::StoreUpdateSigned { .. } => (24, false),
+            R::StoreUpdateSigned { .. } => (19, false),
             // A wrapped copy: ciphertext meant for store state, published.
-            R::StoreKeyWrapped { .. } => (25, false),
-            R::StoreKeyRecovered { .. } => (26, false),
+            R::StoreKeyWrapped { .. } => (20, false),
+            R::StoreKeyRecovered { .. } => (21, false),
             // The derived keys' PUBLIC halves.
-            R::StoreSubkeys { .. } => (27, false),
-            R::PredecessorMarker { .. } => (28, false),
-            R::PredecessorMarkerRecorded { .. } => (29, false),
-            R::MigratedSecretImported { .. } => (30, false),
-            R::EncryptionKeyAbsent { .. } => (31, false),
+            R::StoreSubkeys { .. } => (22, false),
+            R::PredecessorMarker { .. } => (23, false),
+            R::PredecessorMarkerRecorded { .. } => (24, false),
+            R::MigratedSecretImported { .. } => (25, false),
+            R::EncryptionKeyAbsent { .. } => (26, false),
+            // Public orders the buyer already read out of store state.
+            // Each kept purchase's receipt seed.
+            R::KeptPurchases { .. } => (27, true),
+            R::KeepPurchaseRefused { .. } => (28, false),
         }
     }
-    const RESPONSE_VARIANTS: usize = 32;
+    const RESPONSE_VARIANTS: usize = 29;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
         use HarvestDelegateRequest as Q;
         match r {
-            Q::InitReputationKeys { .. } => (0, false),
-            Q::GetRsaPublicKey { .. } => (1, false),
-            Q::BlindSignFeedbackToken { .. } => (2, false),
-            Q::InitEncryptionKey { .. } => (3, false),
-            Q::DeriveConversationKeys { .. } => (4, false),
+            Q::GetRsaPublicKey { .. } => (0, false),
+            Q::InitEncryptionKey { .. } => (1, false),
+            Q::DeriveConversationKeys { .. } => (2, false),
             // The buyer's ephemeral X25519 secret.
-            Q::StoreBuyerConversation { .. } => (5, true),
-            Q::ListBuyerConversations { .. } => (6, false),
-            Q::ForgetBuyerConversation { .. } => (7, false),
-            Q::ExportBuyerConversation { .. } => (8, false),
+            Q::StoreBuyerConversation { .. } => (3, true),
+            Q::ListBuyerConversations { .. } => (4, false),
+            Q::ForgetBuyerConversation { .. } => (5, false),
+            Q::ExportBuyerConversation { .. } => (6, false),
             // The pasted backup string.
-            Q::ImportBuyerConversation { .. } => (9, true),
-            Q::MarkConversationBackedUp { .. } => (10, false),
-            Q::CreateListing { .. } => (11, false),
-            // The unblinded token (nonce, entry key); see `TransactionList`.
-            Q::BeginTransaction { .. } => (12, true),
-            Q::RecordBlindSignature { .. } => (13, false),
-            Q::ListTransactions => (14, false),
-            Q::RegisterStore { .. } => (15, false),
-            Q::ListStores { .. } => (16, false),
-            Q::GetMigrationMarker { .. } => (17, false),
-            Q::SetMigrationMarker { .. } => (18, false),
-            Q::RememberStore { .. } => (19, false),
-            Q::SetStoreArchived { .. } => (20, false),
-            Q::ListRememberedStores => (21, false),
-            Q::CreateStoreKey { .. } => (22, false),
+            Q::ImportBuyerConversation { .. } => (7, true),
+            Q::MarkConversationBackedUp { .. } => (8, false),
+            Q::CreateListing { .. } => (9, false),
+            Q::RegisterStore { .. } => (10, false),
+            Q::ListStores { .. } => (11, false),
+            Q::GetMigrationMarker { .. } => (12, false),
+            Q::SetMigrationMarker { .. } => (13, false),
+            Q::RememberStore { .. } => (14, false),
+            Q::SetStoreArchived { .. } => (15, false),
+            Q::ListRememberedStores => (16, false),
+            Q::CreateStoreKey { .. } => (17, false),
             // A store record to be signed and published.
-            Q::SignStoreUpdate { .. } => (23, false),
+            Q::SignStoreUpdate { .. } => (18, false),
             // The vault's wrap signature, which opens the wrapped copy.
-            Q::WrapStoreKeyFor { .. } => (24, true),
-            Q::UnwrapStoreKey { .. } => (25, true),
-            Q::GetStoreSubkeys { .. } => (26, false),
-            Q::GetPredecessorMarker { .. } => (27, false),
-            Q::RecordPredecessorMarker { .. } => (28, false),
+            Q::WrapStoreKeyFor { .. } => (19, true),
+            Q::UnwrapStoreKey { .. } => (20, true),
+            Q::GetStoreSubkeys { .. } => (21, false),
+            Q::GetPredecessorMarker { .. } => (22, false),
+            Q::RecordPredecessorMarker { .. } => (23, false),
             // Any secret this delegate holds, private keys included.
-            Q::ImportMigratedSecret { .. } => (29, true),
+            Q::ImportMigratedSecret { .. } => (24, true),
+            Q::KeepPurchase { .. } => (25, false),
+            Q::ListKeptPurchases => (26, false),
         }
     }
-    const REQUEST_VARIANTS: usize = 30;
+    const REQUEST_VARIANTS: usize = 27;
 
     /// A valid Ed25519 verifying key for samples that need one.
     fn sample_key() -> ed25519_dalek::VerifyingKey {
         ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key()
-    }
-
-    /// A feedback token whose private parts are the sentinel. Built
-    /// directly rather than with `FeedbackToken::new`, which would derive
-    /// the nonce and so put a hash, not the sentinel, where it must not
-    /// print.
-    fn private_token() -> FeedbackToken {
-        FeedbackToken {
-            target_reputation_contract: [9u8; 32],
-            nonce: SECRET,
-            entry_key: SECRET,
-        }
     }
 
     fn recalled() -> RecalledConversation {
@@ -1449,10 +1528,6 @@ mod tests {
         let fp = || "fp-one".to_string();
         let store = || vec![3u8; 32];
         vec![
-            R::ReputationKeysInitialized {
-                ghostkey_fingerprint: fp(),
-                rsa_public_key_der: vec![5u8; 8],
-            },
             R::RsaPublicKey {
                 ghostkey_fingerprint: fp(),
                 rsa_public_key_der: vec![5u8; 8],
@@ -1506,31 +1581,9 @@ mod tests {
                     seller_to_buyer: SECRET,
                 }]),
             },
-            R::BlindSignatureResult {
-                request_id: 42,
-                result: Ok(vec![8u8; 16]),
-            },
             R::ListingCreated {
                 request_id: 42,
                 result: Err("not signed".into()),
-            },
-            R::TransactionRecorded {
-                request_id: 42,
-                result: Ok(()),
-            },
-            R::BlindSignatureRecorded {
-                request_id: 42,
-                result: Ok(()),
-            },
-            R::TransactionList {
-                transactions: vec![TransactionRecord {
-                    transaction_id: "tx-one".into(),
-                    our_token: private_token(),
-                    our_blinded_token: SECRET.to_vec(),
-                    blind_signature: Some(SECRET.to_vec()),
-                    created_at: DateTime::<Utc>::from_timestamp(1_700_000_000, 0)
-                        .expect("timestamp"),
-                }],
             },
             R::ContractUpdate {
                 contract_key: store(),
@@ -1644,7 +1697,29 @@ mod tests {
                     record_public_key: vec![21u8; 8],
                 }),
             },
+            R::KeptPurchases {
+                purchases: vec![KeptPurchase {
+                    store_key: [17u8; 32],
+                    conversation: [1u8; 32],
+                    receipt_seed: SECRET,
+                    order: crate::test_orders::paid(1),
+                    complaint: None,
+                }],
+            },
+            R::KeepPurchaseRefused {
+                order_id: crate::payment::OrderId([3u8; 32]),
+                reason: "refused".into(),
+            },
         ]
+    }
+
+    fn purchase_to_keep() -> PurchaseToKeep {
+        PurchaseToKeep {
+            store_key: [17u8; 32],
+            conversation: [1u8; 32],
+            order: crate::test_orders::paid(1),
+            complaint: None,
+        }
     }
 
     fn request_samples() -> Vec<HarvestDelegateRequest> {
@@ -1652,16 +1727,8 @@ mod tests {
         let fp = || "fp-one".to_string();
         let store = || vec![3u8; 32];
         vec![
-            Q::InitReputationKeys {
-                ghostkey_fingerprint: fp(),
-            },
             Q::GetRsaPublicKey {
                 ghostkey_fingerprint: fp(),
-            },
-            Q::BlindSignFeedbackToken {
-                request_id: 42,
-                ghostkey_fingerprint: fp(),
-                blinded_token: vec![11u8; 16],
             },
             Q::InitEncryptionKey {
                 ghostkey_fingerprint: fp(),
@@ -1713,25 +1780,10 @@ mod tests {
                     description: "blue".into(),
                     kind: crate::listing::ListingKind::Sale,
                     price: None,
-                    created_at: DateTime::<Utc>::from_timestamp(1_700_000_000, 0)
+                    created_at: chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
                         .expect("timestamp"),
                 },
             },
-            Q::BeginTransaction {
-                request_id: 42,
-                transaction_id: "tx-one".into(),
-                our_token: private_token(),
-                // Not the sentinel: the seller holds the blinded token
-                // already, and with the token's own key and nonce redacted
-                // it links nothing on its own.
-                our_blinded_token: vec![11u8; 16],
-            },
-            Q::RecordBlindSignature {
-                request_id: 42,
-                transaction_id: "tx-one".into(),
-                blind_signature: vec![12u8; 16],
-            },
-            Q::ListTransactions,
             Q::RegisterStore {
                 ghostkey_fingerprint: fp(),
                 store_contract_id: store(),
@@ -1801,7 +1853,98 @@ mod tests {
                 request_id: 47,
                 store_verifying_key: [17u8; 32],
             },
+            Q::KeepPurchase {
+                keep: Box::new(purchase_to_keep()),
+            },
+            Q::ListKeptPurchases,
         ]
+    }
+
+    /// **A genuine purchase always fits what the delegate keeps**
+    /// (`MAX_KEPT_PURCHASE_BYTES`, review round 2 of #143, R2-4). The
+    /// largest record that still passes every check: an order whose terms
+    /// and whose signed envelope are each at `MAX_ORDER_ENVELOPE_BYTES`, a
+    /// proof whose claims fill `MAX_PROOF_CLAIM_BYTES` (one genuine claim,
+    /// repeated: the verifier deduplicates before checking and budgets before
+    /// deduplicating), and a complaint's parts. Red if the bound is set below
+    /// what verifies, as the fixed 64 KiB one was.
+    #[test]
+    fn a_maximal_verifying_purchase_fits_the_bound() {
+        use crate::payment::{
+            complaint_preconditions, OrderPaymentProof, OrderStatus, MAX_ORDER_ENVELOPE_BYTES,
+            MAX_PROOF_CLAIM_BYTES,
+        };
+        use crate::test_orders::{buyer_key, compact_envelope, order, proof, store_key};
+        use ed25519_dalek::Signer as _;
+
+        // Terms as large as the bound allows, with room for the envelope's
+        // own framing around them once compacted.
+        let mut terms = order(1);
+        terms.seller_fingerprint = String::new();
+        let base = crate::to_cbor(&terms.clone().with_derived_id())
+            .expect("encodes")
+            .len();
+        terms.seller_fingerprint = "s".repeat(MAX_ORDER_ENVELOPE_BYTES - base - 128);
+        let terms = terms.with_derived_id();
+        let terms_len = crate::to_cbor(&terms).expect("encodes").len();
+        assert!(
+            terms_len > MAX_ORDER_ENVELOPE_BYTES - 256 && terms_len <= MAX_ORDER_ENVELOPE_BYTES
+        );
+
+        let mut paid =
+            crate::test_orders::authorized(&store_key(), terms.clone(), OrderStatus::Paid);
+        let mut envelope = compact_envelope(&paid.scoped_payload);
+        assert!(
+            envelope.len() <= MAX_ORDER_ENVELOPE_BYTES,
+            "{}",
+            envelope.len()
+        );
+        envelope.resize(MAX_ORDER_ENVELOPE_BYTES, 0);
+        paid.signature = store_key().sign(&envelope).to_bytes().to_vec();
+        paid.scoped_payload = envelope;
+
+        let OrderPaymentProof::OnChain(mut on_chain) = proof(&terms, 1) else {
+            panic!("an on-chain fixture");
+        };
+        let claim = on_chain.claims[0].clone();
+        let cost = crate::to_cbor(&claim).expect("encodes").len();
+        on_chain.claims = vec![claim; MAX_PROOF_CLAIM_BYTES / cost];
+        paid.payment_proof = Some(OrderPaymentProof::OnChain(on_chain));
+
+        complaint_preconditions(&paid).expect("at the bound, not past it");
+        paid.verify(&store_key().verifying_key())
+            .expect("the maximal order verifies");
+        // Padded with repeats, this proof is not the minimal one a kept copy
+        // or a complaint must carry, so the delegate would refuse it: it is
+        // an upper bound on any proof that verifies, which is what the bound
+        // is derived from. The complaint's own parts are fixed-size.
+        let complaint = crate::test_orders::complaint_by(
+            &buyer_key(1),
+            paid.clone(),
+            crate::feedback::FeedbackCategory::NonDelivery,
+            u32::MAX,
+        );
+        // The same parts bound a complaint on the record (R5-C: what makes
+        // `MAX_COMPLAINTS` a byte bound).
+        let complaint_len = crate::to_cbor(&complaint).expect("encodes").len();
+        assert!(
+            complaint_len <= crate::reputation::MAX_COMPLAINT_BYTES,
+            "a maximal verifying complaint is {complaint_len} bytes, over the {} a record \
+             budgets for one",
+            crate::reputation::MAX_COMPLAINT_BYTES
+        );
+        let kept = KeptPurchase {
+            store_key: [0xff; 32],
+            conversation: [0xff; 32],
+            receipt_seed: [0xff; 32],
+            order: paid,
+            complaint: Some(KeptComplaint::of(&complaint)),
+        };
+        let len = crate::to_cbor(&kept).expect("encodes").len();
+        assert!(
+            len <= MAX_KEPT_PURCHASE_BYTES,
+            "a maximal verifying purchase is {len} bytes, over the {MAX_KEPT_PURCHASE_BYTES} kept"
+        );
     }
 
     /// Check one sample: classified correctly, and nothing printed from it
@@ -2055,7 +2198,6 @@ mod tests {
         );
         check_sample("BackupString", &BackupString(SECRET_TEXT.into()), true);
         check_sample("ConversationSecret", &ConversationSecret(SECRET), true);
-        check_sample("FeedbackToken", &private_token(), true);
         check_sample("PaymentXpubStatus", &xpub_status(), true);
     }
 

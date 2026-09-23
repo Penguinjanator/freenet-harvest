@@ -186,6 +186,11 @@ fn StoreList() -> Element {
 #[component]
 fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Element {
     let info = store.info.as_ref().unwrap();
+    // Counted the way the Reputation page counts them
+    // (`BrowsingStore::complaint_standings`), so the badge and the record
+    // agree, and neither reads the store's status.
+    let counted_complaints = store.counted_complaints();
+    let (record_class, record_text) = store.record.badge(counted_complaints);
     let mut show_messages = use_signal(|| false);
     // Read once, here, rather than inside the per-listing helper: this
     // component re-renders on every keystroke in the boxes below it, and the
@@ -207,13 +212,9 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                         }
                     }
                     div { class: "store-meta",
-                        if store.feedback.is_empty() {
-                            span { class: "reputation-clean", "Clean record" }
-                        } else {
-                            span { class: "reputation-negative",
-                                "{store.feedback.len()} negative"
-                            }
-                        }
+                        // "Clean record" only once the record has been read
+                        // (review round 1 of #143, P1-5).
+                        span { class: "{record_class}", "{record_text}" }
                         p { class: "seller-id",
                             "Seller: {truncate_fingerprint(&info.seller_fingerprint)}"
                         }
@@ -237,6 +238,16 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                 // Said first and plainly: a closed store's key may be in
                 // someone else's hands, so nothing on this page can be
                 // bought, and the record stays visible (harvest#93, 6.4).
+                // Round 6 of #143: past the cap the count is a floor.
+                if store.record_full() {
+                    p { class: "text-warning",
+                        "This seller's record is full: it holds {harvest_common::reputation::MAX_COMPLAINTS} \
+                         complaints, the most a record can. A new complaint is kept only in place of \
+                         one dated farther from its payment, so the count here may be less than \
+                         every complaint ever made."
+                    }
+                }
+
                 if store.closed {
                     p { class: "text-warning",
                         "This store has closed. Its seller closed it because its key may be \
@@ -294,21 +305,35 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
 
             super::buy_view::Purchases { store_contract_id: contract_id.clone() }
 
-            // No payment address on a store buyers must not pay: closed, or
-            // backed by nothing a reader can believe in (Must Fix 2).
-            if store.payable() {
-                StoreInvoices { orders: store.orders.clone() }
-            } else if !store.orders.is_empty() {
+            // The seller's own invoices on their own store; on anyone
+            // else's, only the settled ones, which carry no address. A
+            // buyer's unpaid orders show on the purchase card above, which
+            // reveals an address only once the buyer's node keeps the order
+            // (review round 3 of #143, P1-A): listing every order here put
+            // any of the seller's addresses in front of a buyer who kept
+            // nothing. No payment address on a store nobody should pay:
+            // closed, or backed by nothing a reader can believe in (Must
+            // Fix 2).
+            StoreInvoices {
+                orders: APP_STATE.read().invoices_shown(&contract_id),
+                owned,
+            }
+            if owned && !store.payable()
+                && store
+                    .orders
+                    .iter()
+                    .any(|o| o.status == harvest_common::payment::OrderStatus::AwaitingPayment)
+            {
                 p { class: "text-muted",
-                    "This store's invoices are not shown: it has closed, or nothing vouches \
-                     for the key that signs them, so none of them should be paid."
+                    "This store's unpaid invoices are not shown: it has closed, or nothing \
+                     vouches for the key that signs them, so none of them should be paid."
                 }
             }
         }
     }
 }
 
-/// The invoices a store has issued, as a buyer sees them.
+/// The invoices the viewer's own store has issued (`AppState::invoices_shown`).
 ///
 /// They are on the store contract and public, which is not an oversight:
 /// decentralized payment verification is impossible unless everyone can see
@@ -325,7 +350,7 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
 /// whose "Paid" verdict would rest on a stranger's signature has to say so
 /// before the buyer sends anything.
 #[component]
-fn StoreInvoices(orders: Vec<harvest_common::payment::AuthorizedOrder>) -> Element {
+fn StoreInvoices(orders: Vec<harvest_common::payment::AuthorizedOrder>, owned: bool) -> Element {
     if orders.is_empty() {
         return rsx! {};
     }
@@ -336,12 +361,21 @@ fn StoreInvoices(orders: Vec<harvest_common::payment::AuthorizedOrder>) -> Eleme
     rsx! {
         div { style: "margin-top: 24px;",
             h4 { "Invoices" }
-            p { class: "text-muted",
-                "Pay the address shown on an invoice for the exact amount. Anyone can "
-                "check the evidence that settles it, so neither you nor the seller has to "
-                "be taken at their word about the payment."
+            // The paying instructions only where an invoice can carry an
+            // address: on the viewer's own store. Anyone else's list holds
+            // settled invoices only (review round 5, P3).
+            if owned {
+                p { class: "text-muted",
+                    "Pay the address shown on an invoice for the exact amount. Anyone can "
+                    "check the evidence that settles it, so neither you nor the seller has to "
+                    "be taken at their word about the payment."
+                }
+                super::invoice_form::PaymentWatchNote {}
+            } else {
+                p { class: "text-muted",
+                    "Settled invoices. Anyone can check the evidence that settled each one."
+                }
             }
-            super::invoice_form::PaymentWatchNote {}
             for order in sorted.iter() {
                 super::bitcoin_view::OrderCard {
                     key: "{order.order.id}",

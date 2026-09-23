@@ -7,7 +7,7 @@ use dioxus::logger::tracing::{debug, info, warn};
 use harvest_common::listing::AuthorizedListing;
 use harvest_common::mailbox::EncryptedMessage;
 use harvest_common::payment::AuthorizedOrder;
-use harvest_common::reputation::FeedbackEntry;
+use harvest_common::reputation::Complaint;
 use harvest_common::store::{StoreInfoV1, StoreParameters};
 use harvest_common::{
     BitcoinDelegateResponse, BridgeEndpoint, HarvestDelegateResponse, StoreRegistration,
@@ -130,7 +130,12 @@ pub struct AppState {
     /// (GhostKeyList success, AccessDenied, NoIdentityAvailable, Error).
     pub request_any_access_in_flight: bool,
 
-    /// RSA public keys for our identities (fingerprint -> DER bytes).
+    /// The per-device RSA public keys our identities' reputation records were
+    /// addressed by before harvest#93 phase 1b (fingerprint -> DER bytes),
+    /// as the delegate's `RsaPublicKey` reports them.
+    ///
+    /// Used ONLY to locate those records for the reputation migration
+    /// (harvest#53 Phase C, Option A): nothing verifies or signs with them.
     pub rsa_public_keys: HashMap<String, Vec<u8>>,
 
     /// Long-term X25519 public keys the harvest delegate holds for our own
@@ -287,9 +292,9 @@ pub struct AppState {
     /// correlation that does not exist.
     pub next_messaging_request_id: u64,
 
-    /// Store creation pending RSA key response. When InitReputationKeys
-    /// is sent, the store details are stored here. When ReputationKeysInitialized
-    /// arrives, the response handler picks this up and creates the contracts.
+    /// A store creation waiting on its inputs (the certificate, the store key
+    /// and its subkeys); `start_store_creation_if_ready` proceeds once all
+    /// have arrived.
     pub pending_store_creation: Option<PendingStoreCreation>,
 
     /// Signature requests sent to the ghostkey delegate and not yet
@@ -411,6 +416,93 @@ pub struct AppState {
     /// The buyer's own cancellations sent, by store and order id (harvest#53
     /// Phase B).
     pub buyer_cancellations_sent: HashSet<OrderAt>,
+
+    /// The buyer's kept purchases, as the Harvest delegate holds them
+    /// (harvest#53 Phase C, `docs/complaint-threat-model.md` section 3): the
+    /// seller-signed order, kept from before payment, upgraded to `Paid`, and
+    /// the complaint filed about it, each with the receipt seed it is signed
+    /// with.
+    ///
+    /// What a buyer's recourse rests on, instead of anything the seller
+    /// controls: the store's order list (the seller can evict), the store
+    /// copy's rank (a new generation can replace it), the mailbox (bounded,
+    /// and anyone may write to it), and the conversation (256 are kept,
+    /// oldest out). See [`Self::buyer_purchases`].
+    pub kept_purchases: Vec<harvest_common::delegate::KeptPurchase>,
+
+    /// Whether the delegate's list has arrived this session. Until it has,
+    /// `ListKeptPurchases` is asked again on the watch timer (review round 2
+    /// of #143, P3): a lost first answer would otherwise leave every
+    /// purchase unkept, and the payment details hidden, for the session.
+    pub kept_purchases_loaded: bool,
+
+    /// `KeepPurchase` requests on their way to the delegate, by order id and
+    /// what each asks for, so each is sent once. Released when the list
+    /// shows it done, when the delegate refuses, when the send fails, or
+    /// after [`KEEP_TIMEOUT_MS`] with no answer (review round 3, P3): an
+    /// answer lost, or an error naming no order, must not hold the pay
+    /// button or the complaint for the whole session.
+    pub keeps_sent: HashMap<(harvest_common::payment::OrderId, KeepStep), KeepInFlight>,
+
+    /// Steps the delegate refused this session, with the digest of the copy
+    /// that was offered ([`order_digest`]). A `Paid` copy is rebuilt against
+    /// each new tip, so a refused upgrade is offered again once a block:
+    /// that is the retry for a refusal that clears on its own (review round
+    /// 5), and [`Self::refusals_notified`] keeps it from being said again. The same copy is not offered
+    /// again by an automatic trigger, so a refusal is not re-sent, and
+    /// re-notified, on every arrival (review round 3, P3); a different copy,
+    /// or the buyer's own press, is.
+    pub keeps_refused: HashMap<(harvest_common::payment::OrderId, KeepStep), u64>,
+
+    /// Why the delegate refused to keep an order, by order id (model section
+    /// 5.1). The purchase card shows it where the payment details would have
+    /// been.
+    pub keep_refusals: HashMap<harvest_common::payment::OrderId, String>,
+
+    /// Refusals already notified this session, by order id and reason, so
+    /// an upgrade retried once a block is not re-announced each time.
+    pub refusals_notified: HashSet<(harvest_common::payment::OrderId, String)>,
+
+    /// The kept complaints put back on their records this session, by order
+    /// id (model section 3.4). Per complaint rather than once per session,
+    /// because the first list of a session can come from a freshly re-keyed
+    /// delegate before the migration imports its predecessor's records
+    /// (review round 3). Released when a PUT fails, so the next list
+    /// arrival tries it again. See [`complaints_to_reassert`].
+    pub complaints_reasserted: HashSet<harvest_common::payment::OrderId>,
+
+    /// Kept complaints whose PUT failed this session: how many times, and
+    /// the earliest ms at which it is tried again (review round 5, P2). The
+    /// wait doubles from a minute up to an hour, so a record that keeps
+    /// refusing (one the seller has bloated past the size limit, say) is not
+    /// sent a PUT every minute for as long as the tab is open.
+    pub reassert_backoff: HashMap<harvest_common::payment::OrderId, (u32, u64)>,
+
+    /// `Complaint::verify` answers for the complaint control, by order id and
+    /// [`order_digest`] of the copy, so a card does not run a full proof
+    /// verification on every render (review round 3, P2-D). Interior
+    /// mutability because it is filled while rendering, under a read.
+    pub complaint_verdicts:
+        std::cell::RefCell<HashMap<(harvest_common::payment::OrderId, u64), Result<(), String>>>,
+
+    /// Test only: guards a fixture took (a bridge recognised for the test),
+    /// released when every copy of this state is dropped.
+    #[cfg(test)]
+    pub test_guards: Vec<std::rc::Rc<crate::components::bitcoin_view::RecognisedForTest>>,
+
+    /// Off-target only: `KeepPurchase` requests that would have been sent.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub keep_requests: Vec<harvest_common::delegate::PurchaseToKeep>,
+
+    /// Off-target only: how many times `ListKeptPurchases` would have been
+    /// sent.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub kept_list_requests: usize,
+
+    /// Off-target only: kept complaints that would have been put back on
+    /// their records, with the store key whose record each goes to.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub reasserted_complaints: Vec<(ed25519_dalek::VerifyingKey, Complaint)>,
 
     /// Off-target only: despatches recorded instead of published.
     #[cfg(not(target_arch = "wasm32"))]
@@ -611,8 +703,10 @@ pub struct PendingStoreCreation {
     pub certificate_pem: String,
     pub store_name: String,
     pub description: String,
-    /// Filled by the harvest delegate's `ReputationKeysInitialized` response.
-    /// `None` until it arrives.
+    /// The store's record public key, from `StoreSubkeys` (harvest#93 phase
+    /// 1b), published in `StoreInfoV1::record_public_key` so another device
+    /// can check its own derivation. No longer a reputation parameter
+    /// (harvest#53 Phase C). `None` until it arrives.
     pub rsa_public_key_der: Option<Vec<u8>>,
     /// Filled from the store key's inbox key (`custody_flow`'s
     /// `fill_creation_from_subkeys`, harvest#93 phase 1b); the per-Ghost-Key
@@ -986,14 +1080,16 @@ pub struct StoreDetails {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StoreDetailsGap {
     /// Still at version 0, the uninitialized state -- nothing has ever been
-    /// published, so the store has no name, no description, and no link to
-    /// the seller's reputation.
+    /// published, so the store has no name and no description.
+    ///
+    /// Not "and no reputation link": since harvest#53 Phase C a reader
+    /// derives a store's record from the store key, and the details'
+    /// `reputation_contract_id` is not followed, so the record is reachable
+    /// whatever the details say. A `NoReputationLink` gap existed for that
+    /// field and is gone with it (review round 1 of #143, P1-6).
     NeverPublished,
     /// Published, but with no name a buyer can read.
     NoName,
-    /// Published, but naming no reputation contract, so the seller's
-    /// feedback history cannot be reached from the store.
-    NoReputationLink,
     /// Published, but carrying no encryption key, so no buyer can send this
     /// seller a message.
     ///
@@ -1010,16 +1106,12 @@ impl StoreDetailsGap {
         match self {
             StoreDetailsGap::NeverPublished => {
                 "This store's details were never published. Buyers who open your link see a \
-                 storefront with no name and no description, and your reputation record \
-                 cannot be reached from it. Publishing the details below fixes all three."
+                 storefront with no name and no description. Publishing the details below \
+                 fixes both."
             }
             StoreDetailsGap::NoName => {
                 "This store has no name. Buyers who open your link see an unnamed storefront. \
                  Publishing the details below fixes it."
-            }
-            StoreDetailsGap::NoReputationLink => {
-                "This store does not name your reputation contract, so buyers cannot reach your \
-                 feedback history from it. Publishing the details below restores the link."
             }
             StoreDetailsGap::NoEncryptionKey => {
                 "This store publishes no encryption key, so buyers who open it are told they \
@@ -1053,10 +1145,10 @@ pub fn store_details_gap(
     if info.store_name.trim().is_empty() {
         return Some(StoreDetailsGap::NoName);
     }
-    if info.reputation_contract_id == [0u8; 32] {
-        return Some(StoreDetailsGap::NoReputationLink);
-    }
-    // Last of the four: a store nobody can find the name of is worse than one
+    // A zero `reputation_contract_id` is not a gap: readers derive the
+    // record from the store key (harvest#53 Phase C).
+    //
+    // Last of the three: a store nobody can find the name of is worse than one
     // nobody can message, and only one prompt is shown at a time.
     if info.encryption_public_key.is_none() && encryption_key_ready {
         return Some(StoreDetailsGap::NoEncryptionKey);
@@ -1099,6 +1191,47 @@ fn unverified_listings(
 }
 
 impl BrowsingStore {
+    /// How a reader counts each complaint on this store's record, beside the
+    /// complaint: the ONE place both the store badge and the Reputation page
+    /// read it from, so they cannot disagree.
+    ///
+    /// Reads the complaint, the store's record of that one order and its
+    /// despatch, and nothing about the store's status: closure, retirement
+    /// and backing are never consulted (`docs/complaint-threat-model.md`
+    /// section 6). A seller can backdate a closure, so no "discount after
+    /// closure" rule is safe.
+    pub fn complaint_standings(
+        &self,
+    ) -> impl Iterator<Item = (&Complaint, crate::fulfilment::ComplaintStanding)> {
+        self.complaints.iter().map(|complaint| {
+            let standing = crate::fulfilment::complaint_standing(
+                complaint,
+                self.orders
+                    .iter()
+                    .find(|order| order.order.id == *complaint.order_id()),
+                self.despatches.get(complaint.order_id()),
+            );
+            (complaint, standing)
+        })
+    }
+
+    /// Whether this store's record, read, holds as many complaints as a
+    /// record can (`reputation::MAX_COMPLAINTS`, review round 6 of #143):
+    /// from then on a new complaint is kept only in place of one dated
+    /// farther from its payment, so the count shown is a floor, not the
+    /// store's whole history. Readers are told.
+    pub fn record_full(&self) -> bool {
+        self.record == RecordLoad::Loaded
+            && self.complaints.len() >= harvest_common::reputation::MAX_COMPLAINTS
+    }
+
+    /// How many complaints on this store's record count against it.
+    pub fn counted_complaints(&self) -> usize {
+        self.complaint_standings()
+            .filter(|(_, standing)| standing.counts())
+            .count()
+    }
+
     /// Whether anything on this store may be offered to a buyer as payable
     /// (harvest#93 review, Must Fix 2): the store is backed by a Ghost Key a
     /// reader can believe in, and it has not closed. An unbacked store's
@@ -1151,7 +1284,7 @@ impl PendingStoreEdit {
     /// one and left `None` when it has not. Unlike the certificate, it does
     /// NOT gate publication: a store with no key is a store buyers cannot
     /// message, which is bad, whereas a store whose details never publish at
-    /// all has no name, no description and no reputation link, which is
+    /// all has no name and no description, which is
     /// worse. `store_details_gap` reports the missing key afterwards so the
     /// seller has a route back to it.
     fn store_info(
@@ -1860,6 +1993,29 @@ pub enum PaymentBlocker {
     /// are about to stop counting as open exposure, so paying it buys the
     /// buyer a declaration that is going quiet either way.
     AnchorStale { anchor_height: u32, tip_height: u32 },
+    /// The order fails the complaint preconditions
+    /// (`harvest_common::payment::complaint_preconditions`): it is for
+    /// nothing, needs no confirmation or more than
+    /// [`harvest_common::payment::MAX_REQUIRED_CONFIRMATIONS`], is not on
+    /// chain, or is too large for a complaint to carry.
+    ///
+    /// The same predicate the reputation contract checks, so a buyer never
+    /// pays an order a complaint about it would be refused for
+    /// (`docs/complaint-threat-model.md` section 4). Carries the predicate's
+    /// own words.
+    UnfitForComplaint(String),
+    /// The order names an address contract other than the one the recognised
+    /// bridges' signed generation pointer names
+    /// (`docs/complaint-threat-model.md` section 3.1, TM-A).
+    ///
+    /// The seller chooses `bitcoin_address_code_hash`, so an order could point
+    /// its buyer at a contract nobody writes to, and a payment to it would
+    /// never be seen proven. An honest order is issued from the same pointer
+    /// (`order_for_invoice`), so it always matches.
+    ///
+    /// `generation_known` is false while this node has not resolved the
+    /// pointer, which is a wait rather than a fault in the order.
+    AddressContractNotCurrent { generation_known: bool },
     /// This node has not confirmed it is keeping the key that reads this
     /// conversation.
     ///
@@ -1868,6 +2024,22 @@ pub enum PaymentBlocker {
     /// buyer's only capability to complain. See
     /// `docs/buyer-conversation-persistence.md`.
     ConversationNotKept,
+    /// A kept purchase whose conversation this node no longer holds: the
+    /// buyer forgot it, or it was evicted (256 are kept). The kept record
+    /// still carries the receipt seed, so a paid purchase keeps its
+    /// complaint (R2-5); what is gone is the thread the order was agreed in,
+    /// so no payment details are shown for an unpaid one.
+    ConversationForgotten,
+    /// This node's delegate does not yet hold its own copy of this order for
+    /// this conversation (`docs/complaint-threat-model.md` section 3.1).
+    ///
+    /// Last, because it is the one the buyer clears themselves: when it is the
+    /// only blocker, the card offers "Pay this order", which asks the
+    /// delegate to keep the seller-signed terms, and the payment details
+    /// appear only once the delegate's list holds them. So before any money
+    /// moves the buyer holds what a complaint will verify against, whatever
+    /// the seller does to the store afterwards.
+    PurchaseNotKept,
 }
 
 impl PaymentBlocker {
@@ -1954,9 +2126,34 @@ impl PaymentBlocker {
                  Ask the seller to issue it again.",
                 tip_height.saturating_sub(*anchor_height)
             ),
+            PaymentBlocker::UnfitForComplaint(why) => format!(
+                "If this order went wrong you could not complain about it on the seller's \
+                 record ({why}). Ask the seller to issue it again."
+            ),
+            PaymentBlocker::AddressContractNotCurrent {
+                generation_known: true,
+            } => "The published order watches for your payment somewhere the Bitcoin bridges \
+                 do not report to, so your payment could never be shown to have arrived. Ask \
+                 the seller to issue it again."
+                .to_string(),
+            PaymentBlocker::AddressContractNotCurrent {
+                generation_known: false,
+            } => "Your node has not yet found out where the Bitcoin bridges report payments, \
+                 so it cannot check where this order watches for yours. Wait a moment and look \
+                 again."
+                .to_string(),
             PaymentBlocker::ConversationNotKept => "Your node has not confirmed it is keeping \
                  the key that reads this conversation. Pay now and you may not be able to read \
                  what the seller sends afterwards. Send the seller a message to try again."
+                .to_string(),
+            PaymentBlocker::ConversationForgotten => "The conversation this order came from is no \
+                 longer on this node, so no payment details are shown. Your node still keeps \
+                 its copy of the order: if you have paid, it is still your purchase once the \
+                 payment is seen."
+                .to_string(),
+            PaymentBlocker::PurchaseNotKept => "Your node has not yet kept its own copy of this \
+                 order, which is what a complaint about it would rest on. Pay this order to \
+                 keep it; the payment details appear once it is kept."
                 .to_string(),
         }
     }
@@ -1979,6 +2176,22 @@ pub struct BuyerPurchase {
     pub commitment: Option<harvest_common::payment::AuthorizedOrder>,
     /// Empty when there is nothing standing between the buyer and paying.
     pub blockers: Vec<PaymentBlocker>,
+    /// The order, when it is PAID and this buyer's, as the copy a complaint
+    /// about it carries (a `Paid` record with the canonical minimal proof),
+    /// judged only on what the seller cannot change after payment
+    /// (`docs/complaint-threat-model.md` section 3). See
+    /// [`AppState::paid_copy`] for the order of preference: the kept `Paid`
+    /// copy, then the kept unpaid copy shown paid by claims this node holds,
+    /// then a store `Paid` copy that passes every check a buyer's own copy
+    /// would have.
+    ///
+    /// NOT derived from [`Self::blockers`]. Those are about whether to PAY,
+    /// and several are the seller's to cause at will -- closing the store
+    /// (`StoreClosed`), or retiring the backing so no key reads as the
+    /// seller's (`SellerIdentityUnknown`) -- and every one of them returns
+    /// before the status is looked at. Deciding the complaint from them let
+    /// a seller who had been paid take the buyer's complaint away.
+    pub paid: Option<harvest_common::payment::AuthorizedOrder>,
 }
 
 impl BuyerPurchase {
@@ -2025,7 +2238,9 @@ impl BuyerPurchase {
             | PaymentBlocker::CommitmentNotForThisBuyer
             | PaymentBlocker::CommitmentLacksBuyerKey
             | PaymentBlocker::CommitmentNotRequested
-            | PaymentBlocker::NotAwaitingPayment(_) => false,
+            | PaymentBlocker::NotAwaitingPayment(_)
+            // The cancel is signed with the conversation's key, which is gone.
+            | PaymentBlocker::ConversationForgotten => false,
             PaymentBlocker::NoTrustedBridge
             | PaymentBlocker::BridgeNotRecognised(_)
             | PaymentBlocker::DestinationDisagrees
@@ -2036,8 +2251,19 @@ impl BuyerPurchase {
             | PaymentBlocker::AnchorUnverifiable
             | PaymentBlocker::AnchorAheadOfTip { .. }
             | PaymentBlocker::AnchorStale { .. }
-            | PaymentBlocker::ConversationNotKept => true,
+            | PaymentBlocker::UnfitForComplaint(_)
+            | PaymentBlocker::AddressContractNotCurrent { .. }
+            | PaymentBlocker::ConversationNotKept
+            | PaymentBlocker::PurchaseNotKept => true,
         })
+    }
+
+    /// Whether the only thing between the buyer and the payment details is
+    /// this node keeping its own copy of the order, which the buyer asks for
+    /// by pressing "Pay this order" (`docs/complaint-threat-model.md`
+    /// section 3.1).
+    pub fn ready_to_keep(&self) -> bool {
+        self.blockers.as_slice() == [PaymentBlocker::PurchaseNotKept]
     }
 
     /// The published order, when it is genuinely this buyer's and has moved
@@ -2048,10 +2274,224 @@ impl BuyerPurchase {
     /// checks the status after the signature, the buyer binding and the
     /// listing tag, and stops at the first failure of each, so reaching the
     /// status check at all means every one of those held.
+    ///
+    /// Not for a `Paid` record this app cannot confirm as the buyer's own
+    /// paid purchase ([`Self::paid`] is `None`): a seller can publish `Paid`
+    /// for an order naming the buyer's key through a bridge it runs, and the
+    /// card would otherwise show it as paid, awaiting despatch (review round
+    /// 3, P2-C). See [`Self::unconfirmed_paid`].
     pub fn settled(&self) -> Option<&harvest_common::payment::AuthorizedOrder> {
         match self.blockers.as_slice() {
-            [PaymentBlocker::NotAwaitingPayment(_)] => self.commitment.as_ref(),
+            [PaymentBlocker::NotAwaitingPayment(_)] => self
+                .commitment
+                .as_ref()
+                .filter(|order| !self.is_unconfirmed_paid(order)),
             _ => None,
+        }
+    }
+
+    /// Whether the store says this order is `Paid` in a way this app cannot
+    /// confirm as the buyer's own paid purchase, which the card says in so
+    /// many words instead of showing it settled.
+    pub fn unconfirmed_paid(&self) -> bool {
+        matches!(
+            self.blockers.as_slice(),
+            [PaymentBlocker::NotAwaitingPayment(_)]
+        ) && self
+            .commitment
+            .as_ref()
+            .is_some_and(|order| self.is_unconfirmed_paid(order))
+    }
+
+    fn is_unconfirmed_paid(&self, order: &harvest_common::payment::AuthorizedOrder) -> bool {
+        order.status == harvest_common::payment::OrderStatus::Paid && self.paid.is_none()
+    }
+}
+
+/// Everything a complaint about one purchase is built from, bar the category
+/// the buyer picks (`AppState::complaint_checks`).
+struct ComplaintParts {
+    /// The paid copy the complaint carries: `Paid`, with the minimal proof.
+    order: AuthorizedOrder,
+    /// The order's receipt key.
+    key: ed25519_dalek::SigningKey,
+    /// The store key, which addresses the record.
+    store_key: ed25519_dalek::VerifyingKey,
+    /// When the buyer says the complaint was made: the tip, or the base
+    /// window's close if that is sooner (`complaint_parts`).
+    block_height: u32,
+    /// `payment::paid_height` over `order`.
+    paid_height: u32,
+    /// The conversation the delegate keeps (or will keep) the purchase under.
+    conversation: [u8; 32],
+}
+
+impl ComplaintParts {
+    /// The complaint, signed, about `category`.
+    fn sign(
+        &self,
+        category: harvest_common::feedback::FeedbackCategory,
+    ) -> Result<Complaint, String> {
+        use ed25519_dalek::Signer as _;
+        let terms = harvest_common::reputation::ComplaintTerms {
+            tag: harvest_common::reputation::ComplaintTag::HarvestComplaintV1,
+            order_id: self.order.order.id.clone(),
+            category: category.clone(),
+            block_height: self.block_height,
+            paid_height: self.paid_height,
+        };
+        let envelope =
+            harvest_common::backing::store_key_envelope(harvest_common::to_cbor(&terms)?)?;
+        let buyer_signature = self.key.sign(&envelope).to_bytes().to_vec();
+        Ok(Complaint {
+            order: self.order.clone(),
+            category,
+            block_height: self.block_height,
+            paid_height: self.paid_height,
+            scoped_payload: envelope,
+            buyer_signature,
+        })
+    }
+}
+
+/// What one `KeepPurchase` asks the delegate for, so each is sent once and
+/// released when the delegate's list shows it done
+/// (`docs/complaint-threat-model.md` section 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeepStep {
+    /// Keep the unpaid copy: the buyer pressed "Pay this order" (3.1).
+    Keep,
+    /// Keep the `Paid` copy with its minimal proof: the upgrade of a kept
+    /// unpaid copy (3.2).
+    Paid,
+    /// Add the complaint the buyer filed (3.4), with the paid copy it is
+    /// about. For a paid order the node never kept (3.3) this is the press
+    /// that keeps it.
+    Complaint,
+}
+
+impl KeepStep {
+    /// Whether `kept` shows this step done.
+    fn done_in(self, kept: &harvest_common::delegate::KeptPurchase) -> bool {
+        match self {
+            KeepStep::Keep => true,
+            KeepStep::Paid => kept.order.status == harvest_common::payment::OrderStatus::Paid,
+            KeepStep::Complaint => kept.complaint.is_some(),
+        }
+    }
+}
+
+/// One `KeepPurchase` on its way to the delegate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeepInFlight {
+    /// [`order_digest`] of the copy offered, so a refusal can be tied to it.
+    pub digest: u64,
+    /// When it was sent, in ms since the epoch.
+    pub since_ms: u64,
+}
+
+/// How long a `KeepPurchase` waits for the delegate's answer before its
+/// marker is let go: the length [`LISTING_CERTIFICATE_TIMEOUT_MS`] gives a
+/// delegate round trip, which needs no prompt.
+pub(crate) const KEEP_TIMEOUT_MS: u64 = 2 * 60 * 1000;
+
+/// A digest of `order`'s encoding, to tell one copy of an order from another
+/// within a session: the same terms under other evidence, or re-signed.
+/// Not a commitment to anything; nothing outside this session reads it.
+pub(crate) fn order_digest(order: &AuthorizedOrder) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    harvest_common::to_cbor(order)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The complaints to put back on their records, as `(store key, complaint)`:
+/// every complaint the delegate keeps that `done` does not name, so each is
+/// put back once per session, on whichever arrival of the kept list first
+/// holds it (`docs/complaint-threat-model.md` section 3.4, TM-H, R3).
+///
+/// Whether or not the store is being viewed: the buyer's node is the durable
+/// copy and the public record a replica of it, so a lost first PUT, a record
+/// nobody hosts, a stale replica, and a reputation re-key the seller never
+/// migrated are all repaired by putting it back. A PUT to an existing record
+/// is merged by the contract's `update_state`, which keeps one complaint per
+/// order under a total order, so doing it again changes nothing.
+///
+/// `done` is the session's per-order marker. A record whose store key is not
+/// a usable Ed25519 key has no record to go to, and is skipped.
+pub fn complaints_to_reassert(
+    kept: &[harvest_common::delegate::KeptPurchase],
+    done: &HashSet<harvest_common::payment::OrderId>,
+) -> Vec<(ed25519_dalek::VerifyingKey, Complaint)> {
+    kept.iter()
+        .filter(|purchase| !done.contains(&purchase.order.order.id))
+        .filter_map(|purchase| {
+            let complaint = purchase.filed_complaint()?;
+            let store_key = ed25519_dalek::VerifyingKey::from_bytes(&purchase.store_key).ok()?;
+            Some((store_key, complaint))
+        })
+        .collect()
+}
+
+/// Whether `ListKeptPurchases` should be sent (again): the delegate is
+/// registered and its list has not arrived this session (review round 2 of
+/// #143, P3).
+pub fn kept_list_due(loaded: bool, registered: bool) -> bool {
+    registered && !loaded
+}
+
+/// `order` as `Paid` on `proof`: the copy a complaint carries and the
+/// delegate keeps.
+fn paid_on(
+    order: &AuthorizedOrder,
+    proof: harvest_common::payment::OrderPaymentProof,
+) -> AuthorizedOrder {
+    AuthorizedOrder {
+        status: harvest_common::payment::OrderStatus::Paid,
+        payment_proof: Some(proof),
+        // A `Paid` record carries no status signature, and one carrying a
+        // field its status does not use is refused
+        // (`AuthorizedOrder::verify_unused_fields_absent`).
+        status_scoped_payload: None,
+        status_signature: None,
+        ..order.clone()
+    }
+}
+
+/// How far a store's reputation record has loaded (harvest#53 Phase C,
+/// review round 1 of #143, P1-5).
+///
+/// An empty complaint list reads as "Clean record" only once the record
+/// itself has been read. Before that, and when the node said it holds
+/// nothing or the fetch failed, an empty list is an absence of information,
+/// and a badge that turned it into praise would be the one thing on the page
+/// a seller could arrange by making their record hard to fetch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecordLoad {
+    /// Asked for, nothing back yet.
+    #[default]
+    Loading,
+    /// Read: the complaints are the record's.
+    Loaded,
+    /// The node answered that it holds no such record. Not proof there is
+    /// none -- a dead-ended GET answers the same -- and not a clean record.
+    NotFound,
+    /// The fetch failed.
+    Unavailable,
+}
+
+impl RecordLoad {
+    /// The badge for a store whose record is in this state, holding
+    /// `counted` complaints that count: `(css class, text)`.
+    pub fn badge(self, counted: usize) -> (&'static str, String) {
+        match self {
+            RecordLoad::Loaded if counted == 0 => ("reputation-clean", "Clean record".into()),
+            RecordLoad::Loaded => ("reputation-negative", format!("{counted} complaint(s)")),
+            RecordLoad::Loading => ("text-muted", "Record loading".into()),
+            RecordLoad::NotFound => ("text-muted", "No record found".into()),
+            RecordLoad::Unavailable => ("text-muted", "Record unavailable".into()),
         }
     }
 }
@@ -2157,8 +2597,12 @@ pub struct BrowsingStore {
     pub reputation_contract_id: Option<Vec<u8>>,
     /// Mailbox contract ID (will be set when we know it).
     pub mailbox_contract_id: Option<Vec<u8>>,
-    /// Negative feedback entries from the reputation contract.
-    pub feedback: Vec<FeedbackEntry>,
+    /// Buyers' complaints from the store's reputation record (harvest#53
+    /// Phase C). Every one the contract accepted names a paid order of this
+    /// store; whether it COUNTS is `fulfilment::complaint_standing`'s call.
+    pub complaints: Vec<Complaint>,
+    /// Whether [`Self::complaints`] is the record, or just nothing yet.
+    pub record: RecordLoad,
     /// Encrypted messages from the mailbox contract.
     pub mailbox_messages: Vec<EncryptedMessage>,
     /// The buyer's conversations with this store, oldest first.
@@ -2529,6 +2973,44 @@ fn send_buyer_conversations_recall(
     }
     #[cfg(not(target_arch = "wasm32"))]
     let _ = (store_contract_id, request_id, delegate_key, request);
+}
+
+/// Send a kept-purchase request to the Harvest delegate (harvest#53 Phase
+/// C). On a failure to send, a `KeepPurchase` releases its session marker,
+/// so the next arrival sends it again.
+#[cfg(target_arch = "wasm32")]
+fn send_kept_purchase_request(
+    delegate_key: Option<freenet_stdlib::prelude::DelegateKey>,
+    request: harvest_common::HarvestDelegateRequest,
+    keeping: Option<(harvest_common::payment::OrderId, KeepStep)>,
+) {
+    use dioxus::prelude::WritableExt;
+    let fail = move |why: String| {
+        dioxus::logger::tracing::warn!("A kept-purchase request to the delegate failed: {why}");
+        if let Some((id, step)) = keeping.as_ref() {
+            crate::gateway::APP_STATE
+                .write()
+                .on_keep_send_failed(id, *step);
+        }
+    };
+    let Some(delegate_key) = delegate_key else {
+        // Not registered yet: `components::app` lists them once it is, and
+        // the store's next arrival sends the copy.
+        wasm_bindgen_futures::spawn_local(async move { fail("delegate not registered".into()) });
+        return;
+    };
+    let payload = match harvest_common::to_cbor(&request) {
+        Ok(payload) => payload,
+        Err(e) => {
+            wasm_bindgen_futures::spawn_local(async move { fail(e) });
+            return;
+        }
+    };
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
+            fail(e.to_string());
+        }
+    });
 }
 
 /// Send a `RememberStore` request, releasing its `stores_remembered` claim
@@ -3464,6 +3946,11 @@ impl AppState {
                         {
                             self.publish_settled_orders(&store_contract_id);
                         }
+                        // And a kept unpaid copy whose claims were only
+                        // waiting for depth (codex round 4, P1): for an order
+                        // the store has evicted, the tip may be the last
+                        // event that ever arrives for it.
+                        self.upgrade_kept_purchases();
                     }
                     return;
                 }
@@ -3500,6 +3987,10 @@ impl AppState {
                     {
                         self.publish_settled_orders(&store_contract_id);
                     }
+                    // And the buyer's kept unpaid copy of an order these
+                    // claims prove paid is upgraded, whether or not its store
+                    // still holds it (`docs/complaint-threat-model.md` 3.2).
+                    self.upgrade_kept_purchases();
                     return;
                 }
                 Err(e) => warn!(
@@ -3542,7 +4033,18 @@ impl AppState {
                         "Received store state for {:?}",
                         &contract_id[..8.min(contract_id.len())]
                     );
-                    let reputation_id = store_state.info.info.reputation_contract_id.to_vec();
+                    // The record the store KEY addresses under this build
+                    // (harvest#53 Phase C), not the id the details name: the
+                    // details of every store published before Phase C name
+                    // an RSA generation's record, and the store key is
+                    // authenticated by the store's own address, so this
+                    // needs no signature to be believed. `None` for a store
+                    // with no owner key, which predates store keys.
+                    let reputation_id = store_state.owner.and_then(|owner| {
+                        crate::gateway::store_ops::reputation_instance_id(&owner)
+                            .ok()
+                            .map(|id| id.as_bytes().to_vec())
+                    });
 
                     // A store the seller just created, or one they own, arrives
                     // without anyone having followed a link. Show it, unless a link
@@ -3615,7 +4117,7 @@ impl AppState {
                         .into_values()
                         .map(|d| (d.despatch.order_id.clone(), d))
                         .collect();
-                    store.reputation_contract_id = Some(reputation_id.clone());
+                    store.reputation_contract_id = reputation_id.clone();
 
                     // The Ghost Key behind this store may also back another
                     // store this reader has loaded, and the reverse: re-apply
@@ -3647,8 +4149,13 @@ impl AppState {
 
                     // Register the reverse mapping so incoming reputation state
                     // can be matched to this store
-                    self.reputation_to_store
-                        .insert(reputation_id, contract_id.clone());
+                    if let Some(reputation_id) = reputation_id {
+                        self.reputation_to_store
+                            .insert(reputation_id, contract_id.clone());
+                    }
+                    // One of ours: its details carry the record key that
+                    // locates its pre-Phase-C reputation record.
+                    self.start_reputation_migration(&contract_id);
 
                     // Ask the delegate for whatever conversations this node
                     // has had with this store. Here rather than on the
@@ -3674,6 +4181,10 @@ impl AppState {
                     self.refresh_same_address_orders();
                     self.publish_settled_orders(&contract_id);
                     self.republish_withheld();
+                    // And keep this buyer's own paid copy of any order of
+                    // theirs now paid, before the seller can push it out
+                    // (`docs/complaint-threat-model.md` sections 3.2, 3.3).
+                    self.upgrade_kept_purchases();
 
                     // And ask the bridge to watch the payment address of any
                     // new order this seller issued. Nothing else tells the
@@ -3691,20 +4202,22 @@ impl AppState {
             Err(e) => e,
             Ok(reputation_state) => {
                 info!(
-                    "Received reputation state ({} entries)",
-                    reputation_state.feedback.len()
+                    "Received reputation state ({} complaints)",
+                    reputation_state.complaints.len()
                 );
 
                 // Look up which store this reputation belongs to
                 if let Some(store_id) = self.reputation_to_store.get(&contract_id).cloned() {
                     if let Some(store) = self.browsing_stores.get_mut(&store_id) {
-                        store.feedback = reputation_state.feedback;
+                        store.complaints = reputation_state.complaints;
+                        store.record = RecordLoad::Loaded;
                     }
                 } else {
                     info!("Reputation state for unknown store -- caching by contract ID");
                     // Cache it; will be linked when the store state arrives
                     let store = self.browsing_stores.entry(contract_id).or_default();
-                    store.feedback = reputation_state.feedback;
+                    store.complaints = reputation_state.complaints;
+                    store.record = RecordLoad::Loaded;
                 }
                 return;
             }
@@ -4851,25 +5364,27 @@ impl AppState {
         }
     }
 
-    /// The buyer's thread with this store, oldest first.
-    ///
-    /// Empty for a store this browser has never written to -- there is no
-    /// conversation, so there is nothing in the mailbox that could be theirs.
     /// Every purchase this node is party to at `store_contract_id`, judged.
     ///
     /// One per acceptance the buyer can read in their own conversations,
     /// judged individually: a buyer can buy twice from one store, and
     /// collapsing to the newest would hide an order they still owe money on.
+    /// Then every purchase the delegate keeps for this store's key that no
+    /// acceptance names any more (`docs/complaint-threat-model.md` section
+    /// 3.4, R2-5): the mailbox is bounded and anyone may write to it, and a
+    /// conversation can be forgotten, so neither may decide whether a buyer
+    /// still has their purchase.
     ///
     /// # Why the acceptance message decides WHICH order, and nothing else
     ///
-    /// The order id cannot be derived by the buyer -- `OrderId::from_terms` hashes
-    /// terms the seller chooses, including a `created_at` they stamp -- so the seller has to name it. But
-    /// both parties hold both conversation direction keys, so the message
-    /// carrying that name proves nothing about who wrote it. Everything that
-    /// matters is therefore re-derived from the PUBLISHED commitment and this
-    /// node's own view of the chain; the message is a pointer and is treated
-    /// as one.
+    /// The order id cannot be derived by the buyer -- `OrderId::from_terms`
+    /// hashes terms the seller chooses, including a `created_at` they stamp
+    /// -- so the seller has to name it. But both parties hold both
+    /// conversation direction keys, so the message carrying that name proves
+    /// nothing about who wrote it. Everything that matters is therefore
+    /// re-derived from the PUBLISHED commitment, this node's kept copy and
+    /// this node's own view of the chain; the message is a pointer and is
+    /// treated as one.
     pub fn buyer_purchases(&self, store_contract_id: &[u8]) -> Vec<BuyerPurchase> {
         use crate::messaging::{Addressing, MessageContent};
 
@@ -4888,17 +5403,21 @@ impl AppState {
                 if message.addressing != Addressing::ToBuyer {
                     continue;
                 }
-                let commitment = store
-                    .orders
-                    .iter()
-                    .find(|order| order.order.id == order_id)
-                    .cloned();
-                let candidate = BuyerPurchase {
-                    blockers: self.payment_blockers(store, conversation, commitment.as_ref()),
+                // A kept purchase is filed under the conversation the delegate
+                // kept it for, whichever thread an acceptance names it in: the
+                // loop below adds it there (review round 3, P3).
+                if store.owner.is_some_and(|owner| {
+                    self.kept_copy(&owner, &order_id)
+                        .is_some_and(|kept| kept.conversation != conversation.buyer_public_key)
+                }) {
+                    continue;
+                }
+                let candidate = self.judge_purchase(
+                    store,
+                    Some(conversation),
                     order_id,
-                    conversation: conversation.buyer_public_key,
-                    commitment,
-                };
+                    conversation.buyer_public_key,
+                );
                 // The seller may repeat an acceptance, or send one into more
                 // than one of this buyer's conversations; it is still one
                 // purchase, and showing it twice would read as two debts. The
@@ -4921,7 +5440,563 @@ impl AppState {
                 }
             }
         }
+        // A kept purchase whose acceptance the mailbox no longer holds, or
+        // whose conversation this node no longer keeps: still the buyer's
+        // (R2-5). Filed under the conversation the delegate kept it for.
+        if let Some(owner) = store.owner {
+            for kept in self.kept_purchases.iter().filter(|k| k.store_key == owner) {
+                if purchases.iter().any(|p| p.order_id == kept.order.order.id) {
+                    continue;
+                }
+                let conversation = store
+                    .conversations
+                    .iter()
+                    .find(|c| c.buyer_public_key == kept.conversation);
+                purchases.push(self.judge_purchase(
+                    store,
+                    conversation,
+                    kept.order.order.id.clone(),
+                    kept.conversation,
+                ));
+            }
+        }
         purchases
+    }
+
+    /// One purchase of `store`, filed under the conversation with public key
+    /// `filed_under` (`conversation`, when this node still holds it).
+    fn judge_purchase(
+        &self,
+        store: &BrowsingStore,
+        conversation: Option<&crate::messaging::BuyerConversation>,
+        order_id: harvest_common::payment::OrderId,
+        filed_under: [u8; 32],
+    ) -> BuyerPurchase {
+        let held = store.orders.iter().find(|order| order.order.id == order_id);
+        let kept = store
+            .owner
+            .and_then(|owner| self.kept_copy(&owner, &order_id));
+        let paid = self.paid_copy(store, conversation, held, kept);
+        // What the card shows and the payment checks judge: the paid copy
+        // when there is one, so a lower-ranked store copy in a new
+        // generation cannot put a paid order back to "awaiting payment"
+        // (R2-6); else the store's copy; else the kept copy, which is what
+        // lets a buyer still pay an order the seller evicted before the
+        // payment was seen (R2-2).
+        let commitment = paid
+            .clone()
+            .or_else(|| held.cloned())
+            .or_else(|| kept.map(|kept| kept.order.clone()));
+        let blockers = match conversation {
+            Some(conversation) => self.payment_blockers(store, conversation, commitment.as_ref()),
+            // The conversation is gone (only a kept purchase is listed without
+            // one). Not `ConversationNotKept`, whose remedy is to send a
+            // message (review round 3, P3). A paid purchase is still shown
+            // paid, from `paid`, whatever this says.
+            None => vec![PaymentBlocker::ConversationForgotten],
+        };
+        BuyerPurchase {
+            order_id,
+            conversation: filed_under,
+            commitment,
+            blockers,
+            paid,
+        }
+    }
+
+    /// The delegate's copy of order `order_id` of the store with key
+    /// `store_key`, if it keeps one.
+    fn kept_copy(
+        &self,
+        store_key: &[u8; 32],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Option<&harvest_common::delegate::KeptPurchase> {
+        self.kept_purchases
+            .iter()
+            .find(|kept| &kept.store_key == store_key && &kept.order.order.id == order_id)
+    }
+
+    /// The copy a complaint about this purchase would carry, when it is paid
+    /// and this buyer's (`docs/complaint-threat-model.md` section 3), in this
+    /// order of preference:
+    ///
+    /// 1. **The kept `Paid` copy**, whatever the store holds. A new store
+    ///    generation can replace the store's copy with a lower-ranked one,
+    ///    so the store copy never outranks the buyer's own (R2-6).
+    /// 2. **The kept unpaid copy, shown paid** by claims this node holds:
+    ///    the store's `Paid` copy's claims, or the address contract's
+    ///    ([`Self::proven_paid_copy`]). This is what survives the seller
+    ///    evicting the order before this node saw it paid (R2-2).
+    /// 3. **Nothing kept: a store `Paid` copy** that passes every check a
+    ///    kept copy would have ([`Self::fallback_paid_copy`], model 3.3),
+    ///    its proof rebuilt over the same union of claims an upgrade uses
+    ///    ([`Self::proven_paid_copy`]) when that proves it: the store copy's
+    ///    own claims are the ones the seller chose, and the complaint press
+    ///    freezes whatever this returns (review round 4, P2).
+    ///
+    /// Nothing here reads the payment blockers, `store_verifying_key`, the
+    /// backing, or whether the store is closed (P1-1): those are the
+    /// seller's to change after payment. Only the fallback reads the store's
+    /// order list, which is why it comes last.
+    pub(crate) fn paid_copy(
+        &self,
+        store: &BrowsingStore,
+        conversation: Option<&crate::messaging::BuyerConversation>,
+        held: Option<&AuthorizedOrder>,
+        kept: Option<&harvest_common::delegate::KeptPurchase>,
+    ) -> Option<AuthorizedOrder> {
+        use harvest_common::payment::OrderStatus;
+        match kept {
+            Some(kept) if kept.order.status == OrderStatus::Paid => Some(kept.order.clone()),
+            Some(kept) => self.proven_paid_copy(&kept.order, &kept.store_key),
+            None => {
+                let fallback = Self::fallback_paid_copy(store, conversation?, held?)?;
+                Some(
+                    store
+                        .owner
+                        .and_then(|owner| self.proven_paid_copy(&fallback, &owner))
+                        .unwrap_or(fallback),
+                )
+            }
+        }
+    }
+
+    /// The kept copy `order` of the store with key `store_key`, as a `Paid`
+    /// copy carrying the minimal proof, when claims this node holds show it
+    /// paid (`docs/complaint-threat-model.md` section 3.2).
+    ///
+    /// ONE minimal proof over the union of every claim this node holds for
+    /// the order, deduplicated by digest: the claims in any store `Paid` copy
+    /// of the same id, and those of the address contracts it watches for it
+    /// ([`Self::kept_order_address_instances`]). Not the store copy's claims
+    /// first: those are the ones the seller chose, and a store copy carrying
+    /// only a payment the seller made to its own address earlier would put
+    /// the paid height, and every window, before the buyer's own payment
+    /// (review round 3, TM-D). Measured against the highest tip available
+    /// that verifies for the order.
+    ///
+    /// The terms are the kept copy's, the bytes the seller signed before
+    /// payment, whatever the store now holds.
+    fn proven_paid_copy(
+        &self,
+        order: &AuthorizedOrder,
+        store_key: &[u8; 32],
+    ) -> Option<AuthorizedOrder> {
+        use harvest_common::payment::{minimal_on_chain_proof, OrderPaymentProof, OrderStatus};
+        let mut seen = HashSet::new();
+        let mut claims: Vec<freenet_bitcoin_common::SignedClaim> = Vec::new();
+        let mut tips: Vec<freenet_bitcoin_common::SignedTipEntry> = Vec::new();
+        for store in self
+            .browsing_stores
+            .values()
+            .filter(|store| store.owner.as_ref() == Some(store_key))
+        {
+            for held in store
+                .orders
+                .iter()
+                .filter(|held| held.order.id == order.order.id && held.status == OrderStatus::Paid)
+            {
+                if let Some(OrderPaymentProof::OnChain(proof)) = held.payment_proof.as_ref() {
+                    claims.extend(proof.claims.iter().cloned());
+                    tips.push(proof.tip.clone());
+                }
+            }
+        }
+        for id in self.kept_order_address_instances(&order.order) {
+            if let Some(view) = self.bitcoin.addresses.get(id.as_slice()) {
+                claims.extend(view.claims.iter().cloned());
+            }
+        }
+        claims.retain(|claim| seen.insert(claim.digest()));
+        if claims.is_empty() {
+            return None;
+        }
+        if let Some(tip) = self
+            .bitcoin
+            .tips
+            .get(&order.order.network)
+            .and_then(|tip| tip.signed_tip.as_ref())
+        {
+            tips.push(tip.clone());
+        }
+        // Highest first; a tip that does not verify for this order's bridges
+        // is passed over for the next.
+        tips.sort_by_key(|tip| std::cmp::Reverse(tip.body().map_or(0, |b| b.anchor.height)));
+        tips.iter()
+            .find_map(|tip| minimal_on_chain_proof(&order.order, &claims, tip).ok())
+            .map(|minimal| paid_on(order, minimal))
+    }
+
+    /// A store `Paid` copy of an order this node never kept, when it is
+    /// this buyer's paid purchase all the same (`docs/complaint-threat-model.md`
+    /// section 3.3, TM-F): it names `conversation`'s receipt key, verifies
+    /// under the store's OWNER key, names only recognised bridges, and meets
+    /// the complaint preconditions. Returned in the form a complaint carries,
+    /// with the minimal proof.
+    ///
+    /// Each check closes a way a seller could fabricate a purchase (R2-3):
+    /// the seller can mint `Paid` orders naming the buyer's receipt key (it
+    /// copies the key from the request), backed by a bridge it runs, or at 0
+    /// sats. Such an order is never shown as this buyer's paid purchase,
+    /// never kept, and never offered the complaint.
+    ///
+    /// The owner key is `StoreStateV1::owner`: the key the store contract
+    /// verified every record against, and the one the reputation record is
+    /// addressed by. NOT `store_verifying_key`, which is `None` unless a live
+    /// backing vouches for the store, and a seller can end that by retiring
+    /// their backing (P1-1).
+    pub(crate) fn fallback_paid_copy(
+        store: &BrowsingStore,
+        conversation: &crate::messaging::BuyerConversation,
+        held: &AuthorizedOrder,
+    ) -> Option<AuthorizedOrder> {
+        use harvest_common::payment::{minimal_on_chain_proof, OrderPaymentProof, OrderStatus};
+        if held.status != OrderStatus::Paid {
+            return None;
+        }
+        let receipt = conversation.buyer_receipt_key()?;
+        if held.order.buyer_receipt_key != Some(receipt) {
+            return None;
+        }
+        let owner = ed25519_dalek::VerifyingKey::from_bytes(&store.owner?).ok()?;
+        held.verify(&owner).ok()?;
+        // The same check `PaymentBlocker::BridgeNotRecognised` makes.
+        if held.order.trusted_bridges.is_empty()
+            || !crate::components::bitcoin_view::unrecognised_bridges(&held.order).is_empty()
+        {
+            return None;
+        }
+        harvest_common::payment::complaint_preconditions(held).ok()?;
+        let Some(OrderPaymentProof::OnChain(proof)) = held.payment_proof.as_ref() else {
+            return None;
+        };
+        let minimal = minimal_on_chain_proof(&held.order, &proof.claims, &proof.tip).ok()?;
+        Some(paid_on(held, minimal))
+    }
+
+    /// Send the delegate every `Paid` copy it should keep and does not yet
+    /// (`docs/complaint-threat-model.md` section 3.2): the upgrade of every
+    /// kept unpaid copy that claims now show paid, whether or not the store
+    /// is loaded or still holds the order. A kept `Paid` copy is never
+    /// replaced (revision 4 removed the fresher-evidence rule; model 7.2).
+    ///
+    /// Nothing that was never kept is kept here (revision 3, 3.3): a seller
+    /// could otherwise fill every slot on the node with one payment to a
+    /// reused address. Called once per event that can change it: a store's
+    /// state, an address's claims, the chain tip, the kept list.
+    pub fn upgrade_kept_purchases(&mut self) {
+        for (step, keep) in self.upgrades_due() {
+            self.send_keep(step, keep);
+        }
+    }
+
+    /// What [`Self::upgrade_kept_purchases`] sends.
+    fn upgrades_due(&self) -> Vec<(KeepStep, harvest_common::delegate::PurchaseToKeep)> {
+        use harvest_common::payment::OrderStatus;
+        self.kept_purchases
+            .iter()
+            .filter(|kept| kept.order.status == OrderStatus::AwaitingPayment)
+            .filter_map(|kept| {
+                let order = self.proven_paid_copy(&kept.order, &kept.store_key)?;
+                Some((
+                    KeepStep::Paid,
+                    harvest_common::delegate::PurchaseToKeep {
+                        store_key: kept.store_key,
+                        conversation: kept.conversation,
+                        order,
+                        complaint: None,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// The buyer pressed "Pay this order" (`docs/complaint-threat-model.md`
+    /// section 3.1): ask the delegate to keep the store's unpaid copy. The
+    /// payment details appear once the delegate's list holds it.
+    ///
+    /// Refused unless keeping it is the only thing between the buyer and
+    /// paying ([`BuyerPurchase::ready_to_keep`]), so the control cannot
+    /// reveal the details of an order any other check refuses.
+    pub fn keep_purchase(
+        &mut self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Result<(), String> {
+        let purchase = self
+            .buyer_purchases(store_contract_id)
+            .into_iter()
+            .find(|p| &p.order_id == order_id)
+            .ok_or("this order is not one of your purchases at this store")?;
+        if !purchase.ready_to_keep() {
+            return Err("this order is not ready to pay".into());
+        }
+        let order = purchase
+            .commitment
+            .filter(|order| order.status == harvest_common::payment::OrderStatus::AwaitingPayment)
+            .ok_or("only an order awaiting payment is kept to be paid")?;
+        let owner = self
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|store| store.owner)
+            .ok_or("this store's key is not known here")?;
+        // The buyer's own press: a refusal earlier this session does not
+        // stop it being asked again ("Try again").
+        self.keeps_refused
+            .remove(&(order_id.clone(), KeepStep::Keep));
+        self.send_keep(
+            KeepStep::Keep,
+            harvest_common::delegate::PurchaseToKeep {
+                store_key: owner,
+                conversation: purchase.conversation,
+                order,
+                complaint: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Whether this buyer's press to pay order `order_id` is on its way to
+    /// the delegate.
+    pub fn keep_sent(&self, order_id: &harvest_common::payment::OrderId) -> bool {
+        self.keep_in_flight(order_id, KeepStep::Keep, now_ms())
+    }
+
+    /// Whether `step` for `order_id` is on its way to the delegate at
+    /// `now_ms`: sent, not answered, and not older than [`KEEP_TIMEOUT_MS`].
+    fn keep_in_flight(
+        &self,
+        order_id: &harvest_common::payment::OrderId,
+        step: KeepStep,
+        now_ms: u64,
+    ) -> bool {
+        self.keeps_sent
+            .get(&(order_id.clone(), step))
+            .is_some_and(|sent| now_ms.saturating_sub(sent.since_ms) < KEEP_TIMEOUT_MS)
+    }
+
+    /// Why the delegate refused to keep order `order_id`, if it did.
+    pub fn keep_refusal(&self, order_id: &harvest_common::payment::OrderId) -> Option<&str> {
+        self.keep_refusals.get(order_id).map(String::as_str)
+    }
+
+    /// Send one `KeepPurchase`, once: nothing is sent while the same step for
+    /// the same order is on its way, already done in the kept list, or was
+    /// refused this session for this very copy.
+    fn send_keep(&mut self, step: KeepStep, keep: harvest_common::delegate::PurchaseToKeep) {
+        let now = now_ms();
+        let id = keep.order.order.id.clone();
+        if self
+            .kept_purchases
+            .iter()
+            .any(|kept| kept.order.order.id == id && step.done_in(kept))
+        {
+            return;
+        }
+        let digest = order_digest(&keep.order);
+        if self.keeps_refused.get(&(id.clone(), step)) == Some(&digest) {
+            return;
+        }
+        if self.keep_in_flight(&id, step, now) {
+            return;
+        }
+        self.keeps_sent.insert(
+            (id.clone(), step),
+            KeepInFlight {
+                digest,
+                since_ms: now,
+            },
+        );
+        self.keep_refusals.remove(&id);
+        #[cfg(target_arch = "wasm32")]
+        send_kept_purchase_request(
+            self.harvest_delegate_key.clone(),
+            harvest_common::HarvestDelegateRequest::KeepPurchase {
+                keep: Box::new(keep),
+            },
+            Some((id, step)),
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        self.keep_requests.push(keep);
+    }
+
+    /// Ask the delegate for every purchase it keeps.
+    pub fn sync_kept_purchases(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        send_kept_purchase_request(
+            self.harvest_delegate_key.clone(),
+            harvest_common::HarvestDelegateRequest::ListKeptPurchases,
+            None,
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.kept_list_requests += 1;
+        }
+    }
+
+    /// Whether the watch timer should ask for the kept list again.
+    pub fn kept_list_due(&self) -> bool {
+        kept_list_due(
+            self.kept_purchases_loaded,
+            self.harvest_delegate_key.is_some(),
+        )
+    }
+
+    /// The delegate's list of kept purchases arrived.
+    pub(crate) fn on_kept_purchases(
+        &mut self,
+        purchases: Vec<harvest_common::delegate::KeptPurchase>,
+    ) {
+        self.keeps_sent.retain(|(id, step), _| {
+            !purchases
+                .iter()
+                .any(|kept| &kept.order.order.id == id && step.done_in(kept))
+        });
+        self.kept_purchases = purchases;
+        self.kept_purchases_loaded = true;
+        // Every kept complaint not yet put back this session, on every
+        // arrival (model 3.4, R3). This is also how a newly filed complaint
+        // reaches the record: it is kept first, then PUT.
+        self.reassert_kept_complaints();
+        // Watch every kept unpaid order's address, whether or not its store
+        // is loaded (model 3.2), and upgrade any the claims already prove.
+        self.watch_kept_purchase_addresses();
+        self.upgrade_kept_purchases();
+    }
+
+    /// The delegate refused to keep `order_id` (model section 5.1): release
+    /// every marker for it, so nothing waits on an answer that has come, and
+    /// keep the reason for the card, which shows it where the payment
+    /// details would have been.
+    pub(crate) fn on_keep_refused(
+        &mut self,
+        order_id: &harvest_common::payment::OrderId,
+        reason: String,
+    ) {
+        // The card shows a refused press to pay; a refused upgrade or
+        // complaint has no card of its own to show it on, so it is said.
+        let pressed = self
+            .keeps_sent
+            .contains_key(&(order_id.clone(), KeepStep::Keep));
+        let refused: Vec<((harvest_common::payment::OrderId, KeepStep), u64)> = self
+            .keeps_sent
+            .iter()
+            .filter(|((id, _), _)| id == order_id)
+            .map(|(key, sent)| (key.clone(), sent.digest))
+            .collect();
+        for (key, digest) in refused {
+            self.keeps_sent.remove(&key);
+            self.keeps_refused.insert(key, digest);
+        }
+        if !pressed
+            && self
+                .refusals_notified
+                .insert((order_id.clone(), reason.clone()))
+        {
+            self.notifications.push(format!(
+                "Your node would not keep its copy of order {}: {reason}",
+                order_id.short()
+            ));
+        }
+        self.keep_refusals.insert(order_id.clone(), reason);
+    }
+
+    /// A `KeepPurchase` never reached the delegate: release its marker so the
+    /// next arrival sends it again.
+    pub(crate) fn on_keep_send_failed(
+        &mut self,
+        order_id: &harvest_common::payment::OrderId,
+        step: KeepStep,
+    ) {
+        self.keeps_sent.remove(&(order_id.clone(), step));
+    }
+
+    /// Put every kept complaint back on its record, once per complaint per
+    /// session (`docs/complaint-threat-model.md` section 3.4). See
+    /// [`complaints_to_reassert`], which decides the set.
+    pub(crate) fn reassert_kept_complaints(&mut self) {
+        let now = now_ms();
+        let due: Vec<_> = complaints_to_reassert(&self.kept_purchases, &self.complaints_reasserted)
+            .into_iter()
+            .filter(|(_, complaint)| self.reassert_ready(complaint.order_id(), now))
+            .collect();
+        for (store_key, complaint) in due {
+            self.complaints_reasserted
+                .insert(complaint.order_id().clone());
+            #[cfg(target_arch = "wasm32")]
+            wasm_bindgen_futures::spawn_local(async move {
+                let id = complaint.order_id().clone();
+                // Not followed: a record for a store this tab is not showing
+                // has nowhere to be shown, and following it would file its
+                // state as a store of its own. The store page follows its own.
+                if let Err(e) =
+                    crate::gateway::store_ops::submit_complaint(store_key, complaint, false).await
+                {
+                    dioxus::logger::tracing::warn!(
+                        "Could not put the complaint about order {} on its record: {e}",
+                        id.short()
+                    );
+                    crate::gateway::APP_STATE.write().on_reassert_failed(&id);
+                }
+            });
+            #[cfg(not(target_arch = "wasm32"))]
+            self.reasserted_complaints.push((store_key, complaint));
+        }
+    }
+
+    /// Whether a kept complaint is waiting to be put back: its PUT failed
+    /// this session (review round 4, P2-6). The watch timer asks, so a
+    /// failed PUT is tried again once a minute rather than only on the next
+    /// arrival of the kept list, which may not come this session: a
+    /// complaint that never reaches the record counts for no reader.
+    pub fn reasserts_due(&self) -> bool {
+        let now = now_ms();
+        self.kept_purchases_loaded
+            && complaints_to_reassert(&self.kept_purchases, &self.complaints_reasserted)
+                .iter()
+                .any(|(_, complaint)| self.reassert_ready(complaint.order_id(), now))
+    }
+
+    /// Whether the kept complaint about `order_id` may be PUT at `now_ms`:
+    /// never failed this session, or its backoff has run out.
+    fn reassert_ready(&self, order_id: &harvest_common::payment::OrderId, now_ms: u64) -> bool {
+        self.reassert_backoff
+            .get(order_id)
+            .is_none_or(|(_, not_before)| now_ms >= *not_before)
+    }
+
+    /// Whether a buyer's press to pay has outlived [`KEEP_TIMEOUT_MS`] at
+    /// `now_ms` and its marker is still held: the card still reads it as on
+    /// its way until something repaints (review round 4, P3). Only the
+    /// press: it is the one marker a card reads, and the others are kept so a
+    /// late answer is still tied to what was sent (review round 5, P3).
+    pub fn keeps_timed_out(&self, now_ms: u64) -> bool {
+        self.keeps_sent.iter().any(|((_, step), sent)| {
+            *step == KeepStep::Keep && now_ms.saturating_sub(sent.since_ms) >= KEEP_TIMEOUT_MS
+        })
+    }
+
+    /// Let go of every marker [`Self::keeps_timed_out`] finds, which is also
+    /// what repaints the card.
+    pub fn drop_timed_out_keeps(&mut self, now_ms: u64) {
+        self.keeps_sent.retain(|(_, step), sent| {
+            *step != KeepStep::Keep || now_ms.saturating_sub(sent.since_ms) < KEEP_TIMEOUT_MS
+        });
+    }
+
+    /// Putting the kept complaint about `order_id` on its record failed:
+    /// release its marker, so the watch timer, or the next arrival of the
+    /// kept list, tries again.
+    pub(crate) fn on_reassert_failed(&mut self, order_id: &harvest_common::payment::OrderId) {
+        self.complaints_reasserted.remove(order_id);
+        let failures = self
+            .reassert_backoff
+            .get(order_id)
+            .map_or(0, |(failures, _)| *failures)
+            .saturating_add(1);
+        let wait = (60_000u64 << failures.min(6)).min(60 * 60_000);
+        self.reassert_backoff
+            .insert(order_id.clone(), (failures, now_ms().saturating_add(wait)));
     }
 
     /// Every listing this conversation has asked about.
@@ -5513,8 +6588,87 @@ impl AppState {
     /// Returns the ids rather than subscribing, so what is asked for is
     /// decidable without a browser. [`Self::watch_purchase_addresses`] is the
     /// half that needs one.
+    ///
+    /// Plus the address contracts of every unpaid order the delegate keeps for
+    /// this store's key, whether or not the store still holds it
+    /// ([`Self::kept_order_address_instances`]).
     pub fn address_contracts_to_watch(&self, store_contract_id: &[u8]) -> Vec<[u8; 32]> {
-        self.our_order_addresses(store_contract_id, |_| true)
+        let mut ids = self.our_order_addresses(store_contract_id, |_| true);
+        let Some(owner) = self
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|store| store.owner)
+        else {
+            return ids;
+        };
+        for kept in self.kept_purchases.iter().filter(|kept| {
+            kept.store_key == owner
+                && kept.order.status == harvest_common::payment::OrderStatus::AwaitingPayment
+                && self.kept_order_could_still_count(kept)
+        }) {
+            for id in self.kept_order_address_instances(&kept.order.order) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    }
+
+    /// The address contracts that observe a kept order's payment address
+    /// (`docs/complaint-threat-model.md` section 3.2, TM-A): the build the
+    /// order names, and the build the recognised bridges' signed generation
+    /// pointer names now, when this node has resolved it.
+    ///
+    /// Both, because the order's hash is the seller's choice, fixed at issue,
+    /// while the bridges write to their current build. Claims for the
+    /// upgrade to `Paid` come from whichever of the two this node holds.
+    pub fn kept_order_address_instances(
+        &self,
+        order: &harvest_common::payment::Order,
+    ) -> Vec<[u8; 32]> {
+        let mut ids: Vec<[u8; 32]> = order.bitcoin_address_instance_id().into_iter().collect();
+        if let Some(current) = self.bitcoin.address_generation.code_hash() {
+            let id = order.bitcoin_address_instance_id_under(current);
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// The address contracts of every unpaid order the delegate keeps, with
+    /// each order's network, across every store: what
+    /// [`Self::watch_kept_purchase_addresses`] subscribes.
+    pub fn kept_address_contracts_to_watch(&self) -> Vec<([u8; 32], BitcoinNetwork)> {
+        use harvest_common::payment::OrderStatus;
+        let mut ids: Vec<([u8; 32], BitcoinNetwork)> = Vec::new();
+        // Every one, for as long as it is unpaid: never judged lapsed from
+        // what this node has not seen (review round 4, P1). An empty or
+        // stale address view is not evidence of non-payment, and a keep
+        // judged lapsed on one was never watched again, so a buyer who paid
+        // and came back after the last settling block lost the purchase.
+        // Bounded by the buyer's own presses (model 5.1), and in time by the
+        // tip alone ([`Self::kept_order_could_still_count`]).
+        for kept in self.kept_purchases.iter().filter(|kept| {
+            kept.order.status == OrderStatus::AwaitingPayment
+                && self.kept_order_could_still_count(kept)
+        }) {
+            for id in self.kept_order_address_instances(&kept.order.order) {
+                if !ids.iter().any(|(held, _)| *held == id) {
+                    ids.push((id, kept.order.order.network));
+                }
+            }
+        }
+        ids
+    }
+
+    /// [`Self::kept_address_contracts_to_watch`], subscribed. Called when the
+    /// kept list arrives and when the generation pointer resolves.
+    pub fn watch_kept_purchase_addresses(&mut self) {
+        for (id, network) in self.kept_address_contracts_to_watch() {
+            self.watch_address_contract(id, network);
+        }
     }
 
     /// The address contracts of orders that are ours and still unsettled, so
@@ -5730,24 +6884,27 @@ impl AppState {
     /// notification per order.
     pub fn watch_purchase_addresses(&mut self, store_contract_id: &[u8]) {
         for id in self.address_contracts_to_watch(store_contract_id) {
-            let bytes = id.to_vec();
-            self.bitcoin
-                .address_contract_network
-                .entry(bytes.clone())
-                .or_insert_with(|| {
-                    // Recorded so an incoming state routes to the right view
-                    // without guessing from the bytes -- the same reason
-                    // `register_watch_contract` records it.
-                    crate::gateway::bitcoin_config::default_network()
-                });
-            if !self.bitcoin.subscribed.insert(bytes.clone()) {
-                continue;
-            }
-            // A fresh claim gets its own full retry budget -- see
-            // `register_watch_contract`'s identical reset for why.
-            self.bitcoin.address_subscribe_failures.remove(&bytes);
-            subscribe_to_address_contract(bytes);
+            self.watch_address_contract(id, crate::gateway::bitcoin_config::default_network());
         }
+    }
+
+    /// Subscribe to address contract `id`, once per tab.
+    fn watch_address_contract(&mut self, id: [u8; 32], network: BitcoinNetwork) {
+        let bytes = id.to_vec();
+        // Recorded so an incoming state routes to the right view without
+        // guessing from the bytes -- the same reason `register_watch_contract`
+        // records it.
+        self.bitcoin
+            .address_contract_network
+            .entry(bytes.clone())
+            .or_insert(network);
+        if !self.bitcoin.subscribed.insert(bytes.clone()) {
+            return;
+        }
+        // A fresh claim gets its own full retry budget -- see
+        // `register_watch_contract`'s identical reset for why.
+        self.bitcoin.address_subscribe_failures.remove(&bytes);
+        subscribe_to_address_contract(bytes);
     }
 
     /// Every address contract worth asking about again, across every store
@@ -5772,6 +6929,14 @@ impl AppState {
                 if !wanted.contains(&id) {
                     wanted.push(id);
                 }
+            }
+        }
+        // And every kept unpaid order's, whether or not its store is loaded
+        // (review round 3, P3): a stale first answer hides the payment the
+        // upgrade needs as surely as it hides a store order's.
+        for (id, _) in self.kept_address_contracts_to_watch() {
+            if !wanted.contains(&id) {
+                wanted.push(id);
             }
         }
         let due = self.bitcoin.address_rereads.due(&wanted, now_ms);
@@ -5983,18 +7148,39 @@ impl AppState {
         &self,
         contract_id: &[u8],
     ) -> Option<freenet_bitcoin_common::BitcoinAddressParameters> {
-        self.browsing_stores.values().find_map(|store| {
-            store
-                .orders
-                .iter()
-                .find(|order| {
-                    order
-                        .order
-                        .bitcoin_address_instance_id()
-                        .is_some_and(|id| id.as_slice() == contract_id)
-                })
-                .map(|order| order.order.bitcoin_params())
-        })
+        self.order_naming_address(contract_id)
+            .map(|order| order.bitcoin_params())
+    }
+
+    /// An order this node holds whose payment address contract `contract_id`
+    /// is: a store order under the build it names, or a kept order under
+    /// either build it is watched under ([`Self::kept_order_address_instances`]).
+    ///
+    /// Kept orders too (codex round 4, P2): they are watched whether or not
+    /// their store is loaded, and under the current generation's build as
+    /// well as their own. Without them an answer for such a watch found no
+    /// parameters, so it replaced the held view instead of being unioned
+    /// with it, and a stale answer could erase claims the upgrade needs. The
+    /// parameters are the order's in both builds: only the code differs.
+    fn order_naming_address(&self, contract_id: &[u8]) -> Option<&harvest_common::payment::Order> {
+        self.browsing_stores
+            .values()
+            .flat_map(|store| store.orders.iter().map(|order| &order.order))
+            .find(|order| {
+                order
+                    .bitcoin_address_instance_id()
+                    .is_some_and(|id| id.as_slice() == contract_id)
+            })
+            .or_else(|| {
+                self.kept_purchases
+                    .iter()
+                    .map(|kept| &kept.order.order)
+                    .find(|order| {
+                        self.kept_order_address_instances(order)
+                            .iter()
+                            .any(|id| id.as_slice() == contract_id)
+                    })
+            })
     }
 
     /// The network of an order naming this address contract.
@@ -6005,13 +7191,7 @@ impl AppState {
     /// agree; they stop agreeing the moment a second one is settleable, and
     /// the wrong answer there would be read into a balance.
     fn address_network_for(&self, id: &[u8; 32]) -> Option<BitcoinNetwork> {
-        self.browsing_stores.values().find_map(|store| {
-            store
-                .orders
-                .iter()
-                .find(|order| order.order.bitcoin_address_instance_id().as_ref() == Some(id))
-                .map(|order| order.order.network)
-        })
+        self.order_naming_address(id).map(|order| order.network)
     }
 
     /// Whether one of the SELLER's own orders has stopped being payable and
@@ -6223,15 +7403,93 @@ impl AppState {
             }
         }
 
+        // A complaint about this order must be one the reputation contract
+        // takes: the same predicate, checked before payment
+        // (`docs/complaint-threat-model.md` section 4).
+        if let Err(why) = harvest_common::payment::complaint_preconditions(commitment) {
+            blockers.push(PaymentBlocker::UnfitForComplaint(why));
+        }
+        // The address contract the order names must be the one the bridges
+        // write to, or a payment would never be seen (TM-A). Compared
+        // against the same signed pointer the seller's `order_for_invoice`
+        // issues from.
+        // Not for an order already kept: both builds are watched for it
+        // (model 3.2), and after a redeploy this would read as "ask for it
+        // again", inviting a second payment (review round 3, P3). An order
+        // already paid returned above.
+        let kept = self.holds_kept_copy(store, conversation, &commitment.order.id);
+        match self.bitcoin.address_generation.code_hash() {
+            _ if kept => {}
+            Some(current) if commitment.order.bitcoin_address_code_hash == Some(current) => {}
+            Some(_) => blockers.push(PaymentBlocker::AddressContractNotCurrent {
+                generation_known: true,
+            }),
+            None => blockers.push(PaymentBlocker::AddressContractNotCurrent {
+                generation_known: false,
+            }),
+        }
+
         // Last, and separate from everything above: the others are about the
-        // seller's side of the bargain, this one is about whether this node is
+        // seller's side of the bargain, these are about whether this node is
         // ready. See `PaymentBlocker::ConversationNotKept`.
         if !conversation.is_kept() {
             blockers.push(PaymentBlocker::ConversationNotKept);
         }
+        // And last of all, the one the buyer clears by pressing "Pay this
+        // order" (model section 3.1).
+        if !kept {
+            blockers.push(PaymentBlocker::PurchaseNotKept);
+        }
         blockers
     }
 
+    /// Whether a complaint about `kept` could still count if it turned out
+    /// to be paid: false only once the chain tip is past the latest block any
+    /// complaint window for it could reach (review round 5, P2). A complaint
+    /// counts up to `paid_height + DESPATCH_WINDOW_BLOCKS +
+    /// COMPLAINT_WINDOW_BLOCKS` (model 6), and `paid_height` is at most the
+    /// order's last settling block. Decided from the bridge-signed tip and
+    /// the order's own terms only, never from the address view, so it cannot
+    /// repeat round 4's P1: past this block nothing is lost by not watching.
+    /// True while the tip, or the order's window, is unknown.
+    fn kept_order_could_still_count(&self, kept: &harvest_common::delegate::KeptPurchase) -> bool {
+        let tip = self
+            .bitcoin
+            .tips
+            .get(&kept.order.order.network)
+            .and_then(|tip| tip.tip_height);
+        match (tip, crate::fulfilment::last_settling_block(&kept.order)) {
+            (Some(tip), Some(last)) => {
+                tip <= last
+                    .saturating_add(crate::fulfilment::DESPATCH_WINDOW_BLOCKS)
+                    .saturating_add(crate::fulfilment::COMPLAINT_WINDOW_BLOCKS)
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether this node's delegate keeps a copy of order `order_id` of
+    /// `store`, filed under `conversation`.
+    fn holds_kept_copy(
+        &self,
+        store: &BrowsingStore,
+        conversation: &crate::messaging::BuyerConversation,
+        order_id: &harvest_common::payment::OrderId,
+    ) -> bool {
+        let Some(owner) = store.owner else {
+            return false;
+        };
+        self.kept_purchases.iter().any(|kept| {
+            kept.store_key == owner
+                && kept.conversation == conversation.buyer_public_key
+                && &kept.order.order.id == order_id
+        })
+    }
+
+    /// The buyer's thread with this store, oldest first.
+    ///
+    /// Empty for a store this browser has never written to -- there is no
+    /// conversation, so there is nothing in the mailbox that could be theirs.
     pub fn conversation_thread(
         &self,
         store_contract_id: &[u8],
@@ -6767,6 +8025,42 @@ impl AppState {
         }
         let held = self.browsing_stores.get(store_contract_id)?.owner?;
         ed25519_dalek::VerifyingKey::from_bytes(&held).ok()
+    }
+
+    /// The invoices the store page lists: every order of a store this node
+    /// owns, while the store is payable; for anyone else's store, only the
+    /// orders past `AwaitingPayment` (review round 3 of #143, P1-A; narrowed
+    /// in round 4, P3). A buyer sees a payment address only on their
+    /// purchase card, once their node keeps the order
+    /// (`docs/complaint-threat-model.md` section 3.1). The public record of
+    /// settled invoices stays readable to everyone, and carries no address:
+    /// the card offers one only for an order awaiting payment
+    /// (`fulfilment::offers_payment_address`).
+    pub fn invoices_shown(&self, store_contract_id: &[u8]) -> Vec<AuthorizedOrder> {
+        use harvest_common::payment::OrderStatus;
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return Vec::new();
+        };
+        if self.store_owner_fingerprint(store_contract_id).is_none() {
+            return store
+                .orders
+                .iter()
+                .filter(|order| order.status != OrderStatus::AwaitingPayment)
+                .cloned()
+                .collect();
+        }
+        if store.payable() {
+            store.orders.clone()
+        } else {
+            // A closed or unbacked store of the viewer's own: its settled
+            // history, as everyone else sees it (review round 5, P3).
+            store
+                .orders
+                .iter()
+                .filter(|order| order.status != OrderStatus::AwaitingPayment)
+                .cloned()
+                .collect()
+        }
     }
 
     pub fn store_owner_fingerprint(&self, store_contract_id: &[u8]) -> Option<String> {
@@ -7637,29 +8931,444 @@ impl AppState {
         Ok(())
     }
 
+    /// What `file_complaint` would refuse with, if anything, and what it
+    /// builds otherwise. One function for both, so the buyer's control is
+    /// shown exactly when pressing it could work: it ends by verifying a
+    /// complaint exactly as the reputation contract will (review round 2 of
+    /// #143, P3), so the control is never offered for one the record would
+    /// refuse.
+    ///
+    /// A purchase this node keeps is judged from the kept record alone
+    /// ([`Self::kept_complaint_checks`]), exactly as it is where no store is
+    /// loaded at all (review round 5, R5-B). Only a paid copy this node never
+    /// kept (model 3.3) needs the store: its owner key and the conversation's
+    /// receipt key come from there.
+    fn complaint_checks(
+        &self,
+        store_contract_id: &[u8],
+        purchase: &BuyerPurchase,
+    ) -> Result<ComplaintParts, String> {
+        let order_id = &purchase.order_id;
+        // `purchase.paid`, never `settled()` or the payment blockers: those
+        // are the seller's to change after payment (P1-1). It is the kept
+        // `Paid` copy, the kept unpaid copy shown paid, or a store copy that
+        // passed every check a kept one would (`paid_copy`).
+        let order = purchase
+            .paid
+            .clone()
+            .ok_or("only a paid order of yours can be complained about")?;
+        let store = self
+            .browsing_stores
+            .get(store_contract_id)
+            .ok_or("this store is not loaded")?;
+        let owner = store.owner.ok_or("this store's key is not known here")?;
+        if let Some(kept) = self.kept_copy(&owner, order_id) {
+            return self.kept_complaint_checks(kept);
+        }
+        self.refuse_a_second_complaint(&owner, order_id)?;
+        let key = store
+            .conversations
+            .iter()
+            .find(|c| c.buyer_public_key == purchase.conversation)
+            .and_then(|c| c.receipt_signing_key())
+            .filter(|key| order.order.buyer_receipt_key == Some(key.verifying_key().to_bytes()))
+            .ok_or("this node does not hold the key this order names for its buyer")?;
+        // The store's OWNER key: what the record is addressed by. Not
+        // `store_verifying_key`, which the seller can make `None` by
+        // retiring their backing (P1-1).
+        self.complaint_parts(order, key, &owner, purchase.conversation)
+    }
+
+    /// [`Self::complaint_checks`] for a purchase this node keeps, from the
+    /// kept record alone (review round 5 of #143, R5-B).
+    ///
+    /// The record holds everything a complaint is made of: the store key
+    /// (which addresses the reputation record, whatever build of the store
+    /// is current), the receipt seed, and the kept paid copy. So nothing here
+    /// reads `browsing_stores` except to see whether a loaded record already
+    /// holds a complaint, and to find a despatch, and neither is required: a
+    /// store re-keyed while the seller stays away, or one nobody hosts,
+    /// leaves the complaint where it was.
+    fn kept_complaint_checks(
+        &self,
+        kept: &harvest_common::delegate::KeptPurchase,
+    ) -> Result<ComplaintParts, String> {
+        use harvest_common::payment::OrderStatus;
+        let order_id = &kept.order.order.id;
+        if self
+            .complaint_on_record_by_key(&kept.store_key, order_id)
+            .is_some()
+        {
+            return Err("your complaint about this order is already on the seller's record".into());
+        }
+        // A kept copy still awaiting payment means its upgrade to `Paid` is
+        // on its way, if claims this node holds show it paid. The complaint
+        // must be about the copy the delegate will hold: built from a paid
+        // copy computed here, it could name a different paid height from the
+        // upgrade the delegate keeps, which would then refuse to keep the
+        // complaint, and the re-assert would never cover it. So the
+        // complaint waits for the upgrade.
+        if kept.order.status != OrderStatus::Paid {
+            return Err(if self
+                .proven_paid_copy(&kept.order, &kept.store_key)
+                .is_some()
+            {
+                "your node is still keeping its proof of payment; the complaint can be made \
+                     once it has"
+            } else {
+                "only a paid order of yours can be complained about"
+            }
+            .into());
+        }
+        if kept.complaint.is_some() {
+            // A full record drops a complaint dated farther from its payment
+            // than all it holds, and the re-assert is then dropped each time
+            // too; say so rather than imply it is on the record (round 6).
+            let full_without_it = self
+                .browsing_stores
+                .values()
+                .filter(|store| store.owner.as_ref() == Some(&kept.store_key))
+                .any(BrowsingStore::record_full);
+            return Err(if full_without_it {
+                "your complaint about this order is kept on this node, but the seller's record \
+                 is full and does not show it: a full record keeps the complaints dated nearest \
+                 their payments. Your node offers it again each time Harvest opens"
+            } else {
+                "your complaint about this order is kept on this node, which puts it on the \
+                 seller's record each time Harvest opens"
+            }
+            .into());
+        }
+        if self.complaint_sent(order_id) {
+            return Err("your complaint about this order is on its way".into());
+        }
+        // The kept record's own receipt seed, so forgetting the conversation
+        // does not lose the complaint (R2-5).
+        let key = Some(ed25519_dalek::SigningKey::from_bytes(&kept.receipt_seed))
+            .filter(|key| {
+                kept.order.order.buyer_receipt_key == Some(key.verifying_key().to_bytes())
+            })
+            .ok_or("this node does not hold the key this order names for its buyer")?;
+        self.complaint_parts(kept.order.clone(), key, &kept.store_key, kept.conversation)
+    }
+
+    /// Refused when the record already holds this buyer's complaint about
+    /// `order_id`, or one is on its way.
+    fn refuse_a_second_complaint(
+        &self,
+        store_key: &[u8; 32],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Result<(), String> {
+        if self
+            .complaint_on_record_by_key(store_key, order_id)
+            .is_some()
+        {
+            return Err("your complaint about this order is already on the seller's record".into());
+        }
+        if self.complaint_sent(order_id) {
+            return Err("your complaint about this order is on its way".into());
+        }
+        Ok(())
+    }
+
+    /// The part of the complaint checks that is the same for a kept copy and
+    /// a never-kept one: where the order stands against the chain, and a
+    /// trial complaint verified as the contract will.
+    fn complaint_parts(
+        &self,
+        order: AuthorizedOrder,
+        key: ed25519_dalek::SigningKey,
+        store_key: &[u8; 32],
+        conversation: [u8; 32],
+    ) -> Result<ComplaintParts, String> {
+        let store_key = ed25519_dalek::VerifyingKey::from_bytes(store_key)
+            .map_err(|_| "this store's key is not usable".to_string())?;
+        let tip_height = self
+            .bitcoin
+            .tips
+            .get(&order.order.network)
+            .and_then(|t| t.tip_height);
+        // Optional: read from any loaded store under this owner key. With
+        // none, the deadline decides.
+        let despatch = self.despatch_of(&order);
+        let stage = crate::fulfilment::order_stage(
+            &order,
+            despatch.as_ref(),
+            tip_height,
+            self.payment_sight(&order),
+        );
+        match stage {
+            crate::fulfilment::OrderStage::Despatched { .. }
+            | crate::fulfilment::OrderStage::DespatchWindowClosed { .. } => {}
+            crate::fulfilment::OrderStage::AwaitingDespatch { despatch_by, .. } => {
+                return Err(format!(
+                    "the seller has until block {despatch_by} to despatch, and a complaint can \
+                     be made once they record a despatch or that deadline passes"
+                ))
+            }
+            crate::fulfilment::OrderStage::Closed { closed_at } => {
+                return Err(format!(
+                    "the complaint window closed at block {closed_at}, and the order counts as \
+                     complete"
+                ))
+            }
+            crate::fulfilment::OrderStage::Unknown => {
+                return Err(
+                    "your node cannot place this order against the Bitcoin chain yet".into(),
+                )
+            }
+            _ => return Err("this order cannot be complained about".into()),
+        }
+        let tip_height = tip_height.ok_or(
+            "your node has not seen a recent Bitcoin block yet, and a complaint has to say when \
+             it was made",
+        )?;
+        // Measured over the very copy the complaint carries, which is what
+        // the contract checks the signed value against (model 5.2).
+        let paid_height = harvest_common::payment::paid_height(&order)
+            .ok_or("your node cannot read when this order was paid")?;
+        // Dated no later than the base window's close (review round 6): a
+        // complaint made in a window a despatch extended would otherwise be
+        // farther from its payment than a late complaint, which no reader
+        // counts, and a full record keeps the nearest (model 5.3). Every
+        // reader counts it at this height, with or without the despatch.
+        let block_height = tip_height.min(paid_height.saturating_add(
+            crate::fulfilment::DESPATCH_WINDOW_BLOCKS + crate::fulfilment::COMPLAINT_WINDOW_BLOCKS,
+        ));
+        let parts = ComplaintParts {
+            order,
+            key,
+            store_key,
+            block_height,
+            paid_height,
+            conversation,
+        };
+        // The category is the buyer's choice and no part of what the
+        // contract checks beyond its being signed, so any one stands in.
+        // Memoised by the copy the complaint carries: a card renders often,
+        // and this is a full proof verification (review round 3, P2-D).
+        // Nothing else the verdict depends on can change under one copy: the
+        // key is filtered to the order's receipt key above, the paid height is
+        // read from the copy, and the contract does not read the block height.
+        let memo = (parts.order.order.id.clone(), order_digest(&parts.order));
+        let cached = self.complaint_verdicts.borrow().get(&memo).cloned();
+        let verdict = match cached {
+            Some(verdict) => verdict,
+            None => {
+                let trial = parts.sign(harvest_common::feedback::FeedbackCategory::NonDelivery)?;
+                let verdict = trial.verify(&store_key);
+                let mut verdicts = self.complaint_verdicts.borrow_mut();
+                // Small: a handful of paid cards. Cleared rather than evicted
+                // one by one if it ever grows.
+                if verdicts.len() >= 256 {
+                    verdicts.clear();
+                }
+                verdicts.insert(memo, verdict.clone());
+                verdict
+            }
+        };
+        verdict.map_err(|e| format!("the seller's record would refuse it: {e}"))?;
+        Ok(parts)
+    }
+
+    /// Why the buyer cannot complain about this purchase right now, or
+    /// `None` when they can. The control shows this in place of its form.
+    pub fn complaint_refusal(
+        &self,
+        store_contract_id: &[u8],
+        purchase: &BuyerPurchase,
+    ) -> Option<String> {
+        self.complaint_checks(store_contract_id, purchase).err()
+    }
+
+    /// Whether claims this node holds show the kept unpaid copy `kept` paid,
+    /// so its upgrade to `Paid` is on its way (the Payments-tab list).
+    pub fn kept_seen_paid(&self, kept: &harvest_common::delegate::KeptPurchase) -> bool {
+        kept.order.status != harvest_common::payment::OrderStatus::Paid
+            && self
+                .proven_paid_copy(&kept.order, &kept.store_key)
+                .is_some()
+    }
+
+    /// Why the buyer cannot complain about the purchase this node keeps
+    /// under `store_key` and `order_id`, or `None` when they can: the
+    /// store-independent list of kept purchases (R5-B).
+    pub fn kept_complaint_refusal(
+        &self,
+        store_key: &[u8; 32],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Option<String> {
+        match self.kept_copy(store_key, order_id) {
+            Some(kept) => self.kept_complaint_checks(kept).err(),
+            None => Some("this node keeps no such purchase".into()),
+        }
+    }
+
+    /// Whether the buyer's complaint about `order_id` is on its way to the
+    /// delegate, which keeps it before it is put on the record.
+    pub fn complaint_sent(&self, order_id: &harvest_common::payment::OrderId) -> bool {
+        self.keep_in_flight(order_id, KeepStep::Complaint, now_ms())
+    }
+
+    /// The buyer's complaint about this order, if the store's record holds
+    /// one.
+    pub fn complaint_on_record(
+        &self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Option<Complaint> {
+        let owner = self.browsing_stores.get(store_contract_id)?.owner?;
+        self.complaint_on_record_by_key(&owner, order_id)
+    }
+
+    /// The buyer's complaint about `order_id`, if a loaded record of the
+    /// store with key `store_key` holds one. The record is addressed by the
+    /// store key alone, so every build of the store shares it; any loaded
+    /// store under that owner key carries it (R5-B).
+    pub fn complaint_on_record_by_key(
+        &self,
+        store_key: &[u8; 32],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Option<Complaint> {
+        self.browsing_stores
+            .values()
+            .filter(|store| store.owner.as_ref() == Some(store_key))
+            .flat_map(|store| store.complaints.iter())
+            .find(|c| c.order_id() == order_id)
+            .cloned()
+    }
+
+    /// The BUYER complains about one of their PAID purchases (harvest#53
+    /// Phase C, `docs/complaint-threat-model.md` sections 3.4, 3.5): the
+    /// order's receipt key -- the key the seller signed into the order's
+    /// terms, held in the kept record -- signs `ComplaintTerms { order id,
+    /// category, the date (see `complaint_parts`), the paid height }`, about the paid
+    /// copy with its minimal proof.
+    ///
+    /// **Kept first, then PUT.** The complaint goes to the delegate in a
+    /// `KeepPurchase` with the copy it is about, and is PUT to the record the
+    /// store key addresses once the delegate's list holds it
+    /// ([`Self::reassert_kept_complaints`]). So a lost PUT, or a tab closed
+    /// mid-PUT, is covered by the re-assert, and no complaint is on the
+    /// record without being kept. For a paid order this node never kept
+    /// (3.3), this is the press that keeps it.
+    ///
+    /// Offered once the seller has recorded a despatch or the despatch
+    /// deadline has passed, and until the complaint window closes
+    /// (`fulfilment::order_stage`). One complaint per order: the record keeps
+    /// one per order id, so there is no second complaint to make.
+    pub fn file_complaint(
+        &mut self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+        category: harvest_common::feedback::FeedbackCategory,
+    ) -> Result<(), String> {
+        let purchase = self
+            .buyer_purchases(store_contract_id)
+            .into_iter()
+            .find(|p| &p.order_id == order_id)
+            .ok_or("this order is not one of your purchases at this store")?;
+        let parts = self.complaint_checks(store_contract_id, &purchase)?;
+        self.send_complaint(parts, category)
+    }
+
+    /// [`Self::file_complaint`] for a purchase this node keeps, from the
+    /// kept record alone, with no store loaded (review round 5 of #143,
+    /// R5-B): the control in the store-independent list of kept purchases.
+    pub fn file_kept_complaint(
+        &mut self,
+        store_key: &[u8; 32],
+        order_id: &harvest_common::payment::OrderId,
+        category: harvest_common::feedback::FeedbackCategory,
+    ) -> Result<(), String> {
+        let kept = self
+            .kept_copy(store_key, order_id)
+            .ok_or("this node keeps no such purchase")?
+            .clone();
+        let parts = self.kept_complaint_checks(&kept)?;
+        self.send_complaint(parts, category)
+    }
+
+    /// Sign the complaint `parts` describe and send it to the delegate to
+    /// keep; the re-assert puts it on the record once it is kept.
+    fn send_complaint(
+        &mut self,
+        parts: ComplaintParts,
+        category: harvest_common::feedback::FeedbackCategory,
+    ) -> Result<(), String> {
+        let order_id = parts.order.order.id.clone();
+        let complaint = parts.sign(category)?;
+        // Checked before sending, against the key the record is addressed
+        // by: the contract refuses in silence otherwise.
+        complaint
+            .verify(&parts.store_key)
+            .map_err(|e| format!("the complaint would be refused: {e}"))?;
+        info!("Complaining about order {}", order_id.short());
+        // The buyer's own press: a refusal earlier this session does not stop
+        // it being asked again.
+        self.keeps_refused
+            .remove(&(order_id.clone(), KeepStep::Complaint));
+        self.send_keep(
+            KeepStep::Complaint,
+            harvest_common::delegate::PurchaseToKeep {
+                store_key: parts.store_key.to_bytes(),
+                conversation: parts.conversation,
+                order: complaint.order.clone(),
+                complaint: Some(harvest_common::delegate::KeptComplaint::of(&complaint)),
+            },
+        );
+        Ok(())
+    }
+
+    /// The node answered NotFound for `contract_id`: if it is a store's
+    /// reputation record not yet read, say so rather than leave it loading
+    /// (P1-5). A record already read stays read: NotFound is unauthenticated
+    /// and a dead-ended GET answers it for a record that exists.
+    pub fn on_record_absent(&mut self, contract_id: &[u8]) {
+        self.set_record_unless_loaded(contract_id, RecordLoad::NotFound);
+    }
+
+    /// Fetching a store's reputation record failed (P1-5).
+    pub fn on_record_unavailable(&mut self, contract_id: &[u8]) {
+        self.set_record_unless_loaded(contract_id, RecordLoad::Unavailable);
+    }
+
+    fn set_record_unless_loaded(&mut self, contract_id: &[u8], to: RecordLoad) {
+        let Some(store_id) = self.reputation_to_store.get(contract_id).cloned() else {
+            return;
+        };
+        if let Some(store) = self.browsing_stores.get_mut(&store_id) {
+            if store.record != RecordLoad::Loaded {
+                store.record = to;
+            }
+        }
+    }
+
     /// The seller's despatch of `order`, from the store that holds this very
     /// record (harvest#53 Phase B).
     ///
-    /// Matched on the terms SIGNATURE and not on the id alone. An order id is
-    /// a hash of terms, so another store's owner could re-sign the same terms
-    /// into their own store alongside a despatch of their own, and a lookup
-    /// by id across every loaded store could then show this order as
-    /// despatched on the word of somebody who is not its seller.
+    /// Read from a store whose OWNER key signed this order's terms, by order
+    /// id. Not by id alone across every store: an order id is a hash of
+    /// terms, so another store's owner could re-sign the same terms into
+    /// their own store alongside a despatch of their own. And not by the
+    /// envelope's bytes (review round 3, P3): the seller can re-sign the same
+    /// terms in another encoding at will (R2-1), which hid the despatch from
+    /// a buyer holding the earlier copy. The store contract verifies a
+    /// despatch under the same owner key.
+    ///
+    /// Stores are tried in contract-id order, so which of two generations'
+    /// despatches is read does not depend on the hasher (review round 4, P3).
     pub fn despatch_of(
         &self,
         order: &harvest_common::payment::AuthorizedOrder,
     ) -> Option<harvest_common::fulfilment::AuthorizedDespatch> {
-        self.browsing_stores.values().find_map(|store| {
-            store
-                .orders
-                .iter()
-                .any(|held| {
-                    held.order.id == order.order.id
-                        && held.signature == order.signature
-                        && held.scoped_payload == order.scoped_payload
-                })
-                .then(|| store.despatches.get(&order.order.id).cloned())
-                .flatten()
+        let mut stores: Vec<(&Vec<u8>, &BrowsingStore)> = self.browsing_stores.iter().collect();
+        stores.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        stores.into_iter().find_map(|(_, store)| {
+            let despatch = store.despatches.get(&order.order.id)?;
+            let owner = ed25519_dalek::VerifyingKey::from_bytes(&store.owner?).ok()?;
+            order.verify_terms(&owner).ok()?;
+            Some(despatch.clone())
         })
     }
 
@@ -7825,6 +9534,16 @@ impl AppState {
                  settled while it is still only in the mempool"
                     .to_string(),
             );
+        }
+        // Past the cap a buyer's software refuses to pay the order
+        // (`PaymentBlocker::UnfitForComplaint`), so issuing it would publish
+        // a debt nobody will settle. The forms refuse it first.
+        if invoice.required_confirmations > harvest_common::payment::MAX_REQUIRED_CONFIRMATIONS {
+            return Err(format!(
+                "an invoice may require at most {} confirmations, or buyers could not complain \
+                 about it in time and will not pay it",
+                harvest_common::payment::MAX_REQUIRED_CONFIRMATIONS
+            ));
         }
         // The store has to be one of ours, and the fingerprint that signs has
         // to be the one that owns it -- the store contract verifies every
@@ -8293,14 +10012,14 @@ impl AppState {
     /// Publish a new store's contracts, once every input creation needs has
     /// arrived.
     ///
-    /// `initiate_store_creation` fires two requests together -- `GetCertificate`
-    /// to the ghostkey delegate and `InitReputationKeys` to the harvest
-    /// delegate -- and the two answer independently, in whichever order they
-    /// happen to. So neither response can assume it is the last one, and the
-    /// decision to proceed belongs here rather than in either handler.
+    /// Creation's inputs -- the certificate from the ghostkey delegate, the
+    /// store key and its subkeys from the harvest delegate -- answer
+    /// independently, in whichever order they happen to. So no response can
+    /// assume it is the last one, and the decision to proceed belongs here
+    /// rather than in any handler.
     ///
-    /// Before this gate, `ReputationKeysInitialized` took the pending creation
-    /// and went ahead on its own. A certificate arriving second was then
+    /// Before this gate, the RSA key's response (since retired) took the
+    /// pending creation and went ahead on its own. A certificate arriving second was then
     /// written into a slot already emptied, and silently discarded: the store
     /// published with an empty `certificate_pem`, leaving a buyer no trust
     /// chain to check the seller against. That was already wrong for the
@@ -8352,28 +10071,26 @@ impl AppState {
     /// Handle a response from the harvest delegate.
     pub fn on_delegate_response(&mut self, response: HarvestDelegateResponse) {
         match response {
-            HarvestDelegateResponse::ReputationKeysInitialized {
-                ghostkey_fingerprint,
-                rsa_public_key_der,
-            } => {
-                info!("RSA keys initialized for {}", ghostkey_fingerprint);
-                self.rsa_public_keys
-                    .insert(ghostkey_fingerprint.clone(), rsa_public_key_der.clone());
-                self.start_reputation_migration(&ghostkey_fingerprint);
-
-                // A store's record key now derives from its store key
-                // (harvest#93 phase 1b): creation takes it from
-                // `StoreSubkeys`, not from this per-device key.
-                let _ = rsa_public_key_der;
-            }
-
+            // A per-device RSA key from before harvest#93 phase 1b: it only
+            // LOCATES this identity's old reputation records (harvest#53
+            // Phase C, Option A), so it goes to the reputation migration --
+            // which has usually started already, making this a no-op; the
+            // registration's id is what reliably finds such a record (see
+            // `migrate_ops::start_reputation_migration`).
             HarvestDelegateResponse::RsaPublicKey {
                 ghostkey_fingerprint,
                 rsa_public_key_der,
             } => {
                 self.rsa_public_keys
                     .insert(ghostkey_fingerprint.clone(), rsa_public_key_der);
-                self.start_reputation_migration(&ghostkey_fingerprint);
+                let stores: Vec<Vec<u8>> = self
+                    .my_stores
+                    .get(&ghostkey_fingerprint)
+                    .map(|regs| regs.iter().map(|r| r.store_contract_id.clone()).collect())
+                    .unwrap_or_default();
+                for store in stores {
+                    self.start_reputation_migration(&store);
+                }
             }
 
             // The connect path's recall found no key. Mint one, but only once
@@ -8425,7 +10142,21 @@ impl AppState {
                 request_id,
                 store_contract_id,
                 conversations,
-            } => self.on_buyer_conversations(request_id, &store_contract_id, conversations),
+            } => {
+                self.on_buyer_conversations(request_id, &store_contract_id, conversations);
+            }
+
+            HarvestDelegateResponse::KeptPurchases { purchases } => {
+                self.on_kept_purchases(purchases)
+            }
+
+            HarvestDelegateResponse::KeepPurchaseRefused { order_id, reason } => {
+                warn!(
+                    "The delegate refused to keep order {}: {reason}",
+                    order_id.short()
+                );
+                self.on_keep_refused(&order_id, reason)
+            }
 
             // A conversation the delegate did not keep dies with the tab, and
             // the buyer has already been told their message was sent -- so
@@ -8651,28 +10382,25 @@ impl AppState {
         }
     }
 
-    /// Start this identity's reputation migration, now that the delegate has
-    /// produced its RSA public key.
+    /// Start the reputation migration for one of OUR stores (harvest#53
+    /// Phase C, Option A): carry the RSA generations' record, which holds the
+    /// seller's certificate, forward to the record the store key addresses.
     ///
-    /// **This is the ordering constraint the migration doctrine names.**
-    /// `ReputationParameters::rsa_public_key_der` IS that key, so it is an
-    /// input to the reputation contract's address. Until the key is in hand
-    /// there is no way to derive a predecessor reputation instance -- or the
-    /// current one -- so probing earlier would walk ids belonging to nobody,
-    /// find nothing, and risk sealing that verdict over a recoverable
-    /// instance. The store and mailbox contracts have no such dependency and
-    /// start as soon as the ghostkey is known.
+    /// Called when the store's state arrives (its details carry the record
+    /// key) and when the delegate reports a per-device RSA key. Starting
+    /// twice is a no-op: `migrate_ops` keys walks by their successor, so a
+    /// per-device key helps only if it arrives before the store's state,
+    /// which is rare. Nothing here waits on the RSA keys: the successor is
+    /// the store key's alone, the registration's id reaches the seller's own
+    /// old record whatever key addressed it, and a walk with fewer locators
+    /// is still correct, just less thorough.
     ///
-    /// Called from both delegate responses that can carry the key, because
-    /// which one arrives depends on whether the identity already had keys.
-    /// Starting twice is a no-op: `migrate_ops` keys in-flight probes by their
-    /// marker.
     /// SAFE TO CALL FROM A RESPONSE HANDLER, and it has to be.
     ///
     /// Every caller of this is inside
     /// `apply_delegate_response(&mut APP_STATE.write(), ..)`, so a write guard
-    /// is held. `migrate_ops::start_reputation_migration` opens with an
-    /// `APP_STATE.read()` (migrate_ops.rs:257), and taking that second borrow
+    /// is held. `migrate_ops`'s walks take their own `APP_STATE` borrows
+    /// (`local_snapshot`), and taking that second borrow
     /// panics -- which, under this workspace's `panic = "abort"`, never drops
     /// the guard and leaves APP_STATE borrowed for the rest of the page's life.
     /// One such call bricks the whole app, not just itself.
@@ -8681,27 +10409,67 @@ impl AppState {
     /// only the call that needs its own borrow is deferred. `spawn_local`
     /// queues onto a `queueMicrotask`-drained queue, which cannot run until
     /// this synchronous statement has returned and the guard has dropped.
-    pub fn start_reputation_migration(&self, _ghostkey_fingerprint: &str) {
+    pub fn start_reputation_migration(&self, _store_contract_id: &[u8]) {
         #[cfg(target_arch = "wasm32")]
         {
-            let Some(vk) = self
-                .ghostkeys
-                .iter()
-                .find(|k| k.fingerprint == _ghostkey_fingerprint)
-                .and_then(|k| k.verifying_key_bytes.clone())
-            else {
-                // The vault has not shared this identity's verifying key, so
-                // the owner half of the parameters is missing too. Nothing to
-                // do until it does; `GhostKeyList` starts the other two
-                // migrations at that point and this one retries on the next
-                // key response.
+            let Some(locators) = self.reputation_locators(_store_contract_id) else {
                 return;
             };
-            let fingerprint = _ghostkey_fingerprint.to_string();
             wasm_bindgen_futures::spawn_local(async move {
-                crate::gateway::migrate_ops::start_reputation_migration(&fingerprint, &vk);
+                crate::gateway::migrate_ops::start_reputation_migration(locators);
             });
         }
+    }
+
+    /// What locates one of OUR stores' superseded reputation records
+    /// (`migrate::ReputationLocators`), or `None` until the store key and
+    /// the backing Ghost Key's verifying key are both known here.
+    ///
+    /// The RSA keys are whichever this device can see: the record key the
+    /// store's published details carry, and the Ghost Key's per-device key
+    /// if the delegate reported one.
+    pub(crate) fn reputation_locators(
+        &self,
+        store_contract_id: &[u8],
+    ) -> Option<crate::migrate::ReputationLocators> {
+        let store_key = self.store_owner_key(store_contract_id)?;
+        let (fingerprint, registration) = self.my_stores.iter().find_map(|(fp, regs)| {
+            regs.iter()
+                .find(|r| r.store_contract_id == store_contract_id)
+                .map(|r| (fp, r))
+        })?;
+        let ghost_key = self
+            .ghostkeys
+            .iter()
+            .find(|k| &k.fingerprint == fingerprint)
+            .and_then(|k| k.verifying_key_bytes.as_ref())
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok())?;
+        let mut rsa_public_keys = Vec::new();
+        if let Some(der) = self
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|s| s.info.as_ref())
+            .and_then(|i| i.record_public_key.clone())
+        {
+            rsa_public_keys.push(der);
+        }
+        if let Some(der) = self.rsa_public_keys.get(fingerprint) {
+            if !rsa_public_keys.contains(der) {
+                rsa_public_keys.push(der.clone());
+            }
+        }
+        let registered_id = <[u8; 32]>::try_from(registration.reputation_contract_id.as_slice())
+            .ok()
+            .map(freenet_stdlib::prelude::ContractInstanceId::new);
+        let current_id = crate::gateway::store_ops::reputation_instance_id(&store_key).ok()?;
+        Some(crate::migrate::ReputationLocators {
+            store_key,
+            ghost_key,
+            rsa_public_keys,
+            registered_id,
+            current_id,
+        })
     }
 
     /// A signature has arrived, from the Ghost Key vault or from the store
@@ -9040,20 +10808,18 @@ impl AppState {
                     }
                 }
 
-                // Reputation migration retries for EVERY identity we know a
-                // verifying key for, not just the ones just shared: both halves
-                // of `ReputationParameters` must be present at once and they
-                // arrive from DIFFERENT delegates in no fixed order, so whichever
-                // lands second has to start the probe. Collected after the merge
-                // so a key shared in this very response is included.
-                let all_identities: Vec<(String, Vec<u8>)> = self
-                    .ghostkeys
-                    .iter()
-                    .filter_map(|k| {
-                        k.verifying_key_bytes
-                            .clone()
-                            .map(|vk| (k.fingerprint.clone(), vk))
-                    })
+                // Reputation migration retries for EVERY store of ours whose
+                // locators are now complete, not just the ones just shared: a
+                // store's locators need the store key, its details and the
+                // backing Ghost Key's verifying key, which arrive from
+                // different places in no fixed order, so whichever lands last
+                // has to start the walk (harvest#53 Phase C). Collected after
+                // the merge so a key shared in this very response is included.
+                let all_identities: Vec<crate::migrate::ReputationLocators> = self
+                    .my_stores
+                    .values()
+                    .flatten()
+                    .filter_map(|r| self.reputation_locators(&r.store_contract_id))
                     .collect();
 
                 // EVERYTHING BELOW RUNS OUTSIDE THIS BORROW, AND MUST.
@@ -9109,8 +10875,8 @@ impl AppState {
                         }
                     }
 
-                    for (fingerprint, vk) in all_identities {
-                        crate::gateway::migrate_ops::start_reputation_migration(&fingerprint, &vk);
+                    for locators in all_identities {
+                        crate::gateway::migrate_ops::start_reputation_migration(locators);
                     }
 
                     // A RECALL, which never mints: safe before the delegate
@@ -12011,7 +13777,7 @@ mod tests {
     }
 
     /// Version 0 is the uninitialized state: nothing was ever signed or
-    /// published, so the store has no name and no reputation link. This is
+    /// published, so the store has no name and no description. This is
     /// every store created before details were published at all, and every
     /// store left behind by a creation interrupted before its signed update.
     #[test]
@@ -12030,14 +13796,15 @@ mod tests {
         );
     }
 
-    /// The half nobody would notice. A store can carry a perfectly good name
-    /// and still name no reputation contract, which leaves the seller's
-    /// feedback history unreachable from it.
+    /// A store naming no reputation contract needs no repair: readers derive
+    /// the record from the store key, and the details' id is not followed
+    /// (review round 1 of #143, P1-6: the prompt told sellers their record
+    /// was unreachable when it was not). Red if the gap comes back.
     #[test]
-    fn a_published_store_without_a_reputation_link_needs_repair() {
+    fn a_published_store_without_a_reputation_link_needs_no_repair() {
         assert_eq!(
             store_details_gap(Some(&published_info(1, "Bean Shop", [0u8; 32])), false),
-            Some(StoreDetailsGap::NoReputationLink)
+            None
         );
     }
 
@@ -14831,6 +16598,11 @@ mod invoice_tests {
         let mut instant = invoice();
         instant.required_confirmations = 0;
         assert!(state.issue_invoice(instant).is_err());
+        // Nor more than a complaint allows (TM-C).
+        let mut slow = invoice();
+        slow.required_confirmations = harvest_common::payment::MAX_REQUIRED_CONFIRMATIONS + 1;
+        let refused = state.issue_invoice(slow).expect_err("over the cap");
+        assert!(refused.contains("at most 144"), "{refused}");
     }
 
     /// "No key configured" and "we have not asked yet" have to stay distinct,
@@ -16000,56 +17772,19 @@ mod delegate_correlation_tests {
         }
     }
 
-    /// **The RSA key decides where the reputation contract LIVES.**
-    ///
-    /// `ReputationParameters` carries the RSA public key, and a contract's
-    /// address is `BLAKE3(code_hash || cbor(parameters))` -- so a key filed
-    /// under the wrong identity puts that identity's reputation contract at an
-    /// address derived from somebody else's key. The store then publishes a
-    /// reputation link pointing at a contract nobody owns, inside a signed
-    /// record, and every buyer follows it to nothing.
-    ///
-    /// Observed red by filing under `pending_store_creation`'s fingerprint.
+    /// A creation never adopts a per-device RSA key, for its own identity or
+    /// another's: `start_store_creation_if_ready` gates on this field, and
+    /// since harvest#93 phase 1b the record key a store publishes derives
+    /// from its store key.
     #[test]
-    fn an_rsa_key_is_filed_under_the_identity_the_delegate_named() {
+    fn a_creation_does_not_adopt_a_per_device_rsa_key() {
         let mut state = with_another_creation_in_flight();
 
-        state.on_delegate_response(HarvestDelegateResponse::ReputationKeysInitialized {
+        state.on_delegate_response(HarvestDelegateResponse::RsaPublicKey {
             ghostkey_fingerprint: OURS.to_string(),
             rsa_public_key_der: vec![7u8; 16],
         });
-
-        assert_eq!(
-            state.rsa_public_keys.get(OURS),
-            Some(&vec![7u8; 16]),
-            "the key must be filed under the identity the delegate answered about"
-        );
-        assert!(
-            !state.rsa_public_keys.contains_key(THEIRS),
-            "a key was filed under an identity the delegate said nothing about"
-        );
-    }
-
-    /// And the creation waiting on a DIFFERENT identity must not adopt it.
-    ///
-    /// This is the sharper half: adopting it would let the creation proceed
-    /// (`start_store_creation_if_ready` gates on this field being `Some`) and
-    /// publish a store whose reputation contract is addressed by another
-    /// seller's key. The guard is the `pending.ghostkey_fingerprint ==
-    /// ghostkey_fingerprint` check.
-    ///
-    /// Observed red by removing that check.
-    #[test]
-    fn a_creation_does_not_adopt_another_identitys_rsa_key() {
-        let mut state = with_another_creation_in_flight();
-
-        state.on_delegate_response(HarvestDelegateResponse::ReputationKeysInitialized {
-            ghostkey_fingerprint: OURS.to_string(),
-            rsa_public_key_der: vec![7u8; 16],
-        });
-        // Nor, since harvest#93 phase 1b, the matching identity's per-device
-        // key: a store's record key derives from its store key.
-        state.on_delegate_response(HarvestDelegateResponse::ReputationKeysInitialized {
+        state.on_delegate_response(HarvestDelegateResponse::RsaPublicKey {
             ghostkey_fingerprint: THEIRS.to_string(),
             rsa_public_key_der: vec![7u8; 16],
         });
@@ -18128,6 +19863,10 @@ mod buy_flow_tests {
             .bitcoin
             .tips
             .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
+        // The bridges' pointer names the build the fixtures' orders name, as
+        // it does for an honest seller (`PaymentBlocker::AddressContractNotCurrent`).
+        state.bitcoin.address_generation =
+            crate::bitcoin_generation::Generation::resolved([4u8; 32]);
         state.begin_browsing(STORE.to_vec());
         (
             state,
@@ -18187,6 +19926,8 @@ mod buy_flow_tests {
             .expect("begin_browsing creates it");
         store.seller_verifying_key = Some(seller_signing_key().verifying_key().to_bytes());
         store.store_verifying_key = Some(seller_signing_key().verifying_key().to_bytes());
+        // The store contract's owner: the store key, which signs the orders.
+        store.owner = Some(seller_signing_key().verifying_key().to_bytes());
         store.orders = vec![published.clone()];
         store.conversations = vec![conversation];
         store.mailbox_messages = vec![acceptance];
@@ -18225,6 +19966,18 @@ mod buy_flow_tests {
 
     fn purchases(state: &AppState) -> Vec<BuyerPurchase> {
         state.buyer_purchases(STORE)
+    }
+
+    /// `blockers` without `UnfitForComplaint`, for a test about another
+    /// blocker on an order the complaint preconditions also refuse (they
+    /// require an anchor, a bridge and a buyer key since round 3); the
+    /// preconditions have their own test.
+    fn without_unfit(blockers: &[PaymentBlocker]) -> Vec<PaymentBlocker> {
+        blockers
+            .iter()
+            .filter(|b| !matches!(b, PaymentBlocker::UnfitForComplaint(_)))
+            .cloned()
+            .collect()
     }
 
     /// The seller's half: a store they own, a buyer's request already in
@@ -18620,7 +20373,7 @@ mod buy_flow_tests {
 
         assert_eq!(
             purchases(&alice)[0].blockers,
-            Vec::new(),
+            vec![PaymentBlocker::PurchaseNotKept],
             "the buyer it was issued to can pay it"
         );
         assert_eq!(
@@ -18801,9 +20554,18 @@ mod buy_flow_tests {
         let order = resigned(order, &seller_signing_key());
         let (state, _) = buyer_after_acceptance(&order);
 
+        // The complaint preconditions refuse it too (round 3, defence in
+        // depth), with their own words.
+        let blockers = purchases(&state)[0].blockers.clone();
+        assert!(blockers
+            .iter()
+            .any(|b| matches!(b, PaymentBlocker::UnfitForComplaint(_))));
         assert_eq!(
-            purchases(&state)[0].blockers,
-            vec![PaymentBlocker::NoTrustedBridge]
+            without_unfit(&blockers),
+            vec![
+                PaymentBlocker::NoTrustedBridge,
+                PaymentBlocker::PurchaseNotKept
+            ]
         );
     }
 
@@ -18825,7 +20587,10 @@ mod buy_flow_tests {
         assert!(
             matches!(
                 purchases(&state)[0].blockers.as_slice(),
-                [PaymentBlocker::BridgeNotRecognised(_)]
+                [
+                    PaymentBlocker::BridgeNotRecognised(_),
+                    PaymentBlocker::PurchaseNotKept
+                ]
             ),
             "got {:?}",
             purchases(&state)[0].blockers
@@ -18858,7 +20623,10 @@ mod buy_flow_tests {
 
         assert_eq!(
             purchases(&state)[0].blockers,
-            vec![PaymentBlocker::DestinationDisagrees]
+            vec![
+                PaymentBlocker::DestinationDisagrees,
+                PaymentBlocker::PurchaseNotKept
+            ]
         );
     }
 
@@ -18878,7 +20646,10 @@ mod buy_flow_tests {
 
         assert_eq!(
             purchases(&state)[0].blockers,
-            vec![PaymentBlocker::DestinationUnreadable]
+            vec![
+                PaymentBlocker::DestinationUnreadable,
+                PaymentBlocker::PurchaseNotKept
+            ]
         );
     }
 
@@ -19098,6 +20869,19 @@ mod buy_flow_tests {
         Vec<freenet_bitcoin_common::SignedClaim>,
         freenet_bitcoin_common::SignedTipEntry,
     ) {
+        a_paid_order_where(|_| {})
+    }
+
+    /// [`a_paid_order`] with its terms edited by `edit` before they are
+    /// signed. The claim pays the edited amount, or 1,000 sats for an order
+    /// for nothing.
+    fn a_paid_order_where(
+        edit: impl FnOnce(&mut Order),
+    ) -> (
+        AuthorizedOrder,
+        Vec<freenet_bitcoin_common::SignedClaim>,
+        freenet_bitcoin_common::SignedTipEntry,
+    ) {
         use freenet_bitcoin_common::spv::testing::payment_proof;
         use freenet_bitcoin_common::{
             BlockHash, ClaimBody, SignedClaim, SignedTipEntry, TipEntryBody,
@@ -19116,15 +20900,17 @@ mod buy_flow_tests {
         order.order.trusted_bridges = vec![freenet_bitcoin_common::BridgeId(
             settling_bridge().verifying_key().to_bytes(),
         )];
+        edit(&mut order.order);
         let order = resigned(order, &seller_signing_key());
+        let paid_sats = if order.order.amount_sats == 0 {
+            1_000
+        } else {
+            order.order.amount_sats
+        };
 
         let confirmed_at = TIP_HEIGHT - 1;
-        let (spv, txid, block_hash) = payment_proof(
-            &order.order.payment_script_pubkey,
-            order.order.amount_sats,
-            1,
-            [7u8; 32],
-        );
+        let (spv, txid, block_hash) =
+            payment_proof(&order.order.payment_script_pubkey, paid_sats, 1, [7u8; 32]);
         let claim = SignedClaim::sign(
             &settling_bridge(),
             &ClaimBody {
@@ -19139,7 +20925,7 @@ mod buy_flow_tests {
                 },
                 claim: freenet_bitcoin_common::Claim::ConfirmedOutput {
                     outpoint: freenet_bitcoin_common::OutPoint { txid, vout: 0 },
-                    value_sats: order.order.amount_sats,
+                    value_sats: paid_sats,
                     anchor: freenet_bitcoin_common::BlockAnchor {
                         height: confirmed_at,
                         hash: block_hash,
@@ -21016,6 +22802,8 @@ mod buy_flow_tests {
         let (order, _, _) = a_paid_order();
         let (mut state, _) = buyer_after_acceptance(&order);
         let seller = seller_signing_key().verifying_key();
+        // The fixture's store names its owner; start from one that does not.
+        state.browsing_stores.get_mut(STORE).unwrap().owner = None;
 
         assert!(
             state.delta_owner_key(STORE).is_none(),
@@ -21263,7 +23051,7 @@ mod buy_flow_tests {
         }
         assert_eq!(
             purchases(&state)[0].blockers,
-            Vec::new(),
+            vec![PaymentBlocker::PurchaseNotKept],
             "signed by the store key, backed by a different Ghost Key: payable"
         );
 
@@ -21309,8 +23097,16 @@ mod buy_flow_tests {
             OrderStatus::AwaitingPayment,
         );
 
+        // A buyer whose node keeps `order` (`docs/complaint-threat-model.md`
+        // section 3.1): the one state in which the payment details show.
+        let kept_buyer = |order: &AuthorizedOrder| {
+            let (mut state, _) = buyer_after_acceptance(order);
+            state.kept_purchases = vec![kept(order)];
+            state
+        };
+
         // The baseline: everything present, nothing standing in the way.
-        let (state, _) = buyer_after_acceptance(&order);
+        let state = kept_buyer(&order);
         assert_eq!(
             purchases(&state)[0].blockers,
             Vec::new(),
@@ -21323,6 +23119,10 @@ mod buy_flow_tests {
         // Each case names an input and takes it away.
         let cases: Vec<MissingInput> = vec![
             (
+                // And the kept copy, which stands in for the published one
+                // once the buyer's node keeps it: a seller evicting a kept
+                // order before its payment is seen must not stop the buyer
+                // paying what they were shown (R2-2).
                 "the published commitment",
                 Box::new(|s: &mut AppState| {
                     s.browsing_stores
@@ -21330,8 +23130,16 @@ mod buy_flow_tests {
                         .expect("store")
                         .orders
                         .clear();
+                    s.kept_purchases.clear();
                 }),
             ),
+            (
+                "the delegate's kept copy",
+                Box::new(|s: &mut AppState| s.kept_purchases.clear()),
+            ),
+            // The bridges' address-contract pointer is not an input once the
+            // order is kept (both builds are watched, review round 3); before
+            // keep it is, see the check after this loop.
             (
                 "the store's identity key",
                 Box::new(|s: &mut AppState| {
@@ -21376,7 +23184,7 @@ mod buy_flow_tests {
         };
 
         for (what, remove) in cases {
-            let (mut state, _) = buyer_after_acceptance(&order);
+            let mut state = kept_buyer(&order);
             remove(&mut state);
             assert!(
                 refuses(&state),
@@ -21389,7 +23197,17 @@ mod buy_flow_tests {
         // out, because a fresh one carries a fresh `conversation_id` and the
         // acceptance then cannot be read at all -- safe, but for the wrong
         // reason, which would make this case prove nothing.
-        let (not_kept, _) = buyer_after_acceptance_with(&order, false);
+        // The bridges' address-contract pointer, for an order not yet kept.
+        let (mut unkept, _) = buyer_after_acceptance(&order);
+        unkept.bitcoin.address_generation = Default::default();
+        assert!(purchases(&unkept)[0].blockers.contains(
+            &PaymentBlocker::AddressContractNotCurrent {
+                generation_known: false
+            }
+        ));
+
+        let (mut not_kept, _) = buyer_after_acceptance_with(&order, false);
+        not_kept.kept_purchases = vec![kept(&order)];
         assert!(
             refuses(&not_kept),
             "without the delegate's confirmation, the buyer is told it is safe to pay"
@@ -21415,7 +23233,7 @@ mod buy_flow_tests {
             let mut stripped = order.clone();
             mutate(&mut stripped);
             let stripped = resigned(stripped, &seller_signing_key());
-            let (state, _) = buyer_after_acceptance(&stripped);
+            let state = kept_buyer(&stripped);
             assert!(
                 refuses(&state),
                 "without {what}, the buyer is told it is safe to pay"
@@ -21556,7 +23374,10 @@ mod buy_flow_tests {
             .mailbox_messages
             .push(request);
 
-        assert_eq!(purchases(&state)[0].blockers, Vec::new());
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            vec![PaymentBlocker::PurchaseNotKept]
+        );
     }
 
     /// **A buyer who has been accepted has a purchase they can pay.**
@@ -21579,7 +23400,7 @@ mod buy_flow_tests {
         assert_eq!(found[0].conversation, tag);
         assert_eq!(
             found[0].blockers,
-            Vec::new(),
+            vec![PaymentBlocker::PurchaseNotKept],
             "nothing should stand between this buyer and paying"
         );
         assert_eq!(
@@ -21660,9 +23481,16 @@ mod buy_flow_tests {
         let order = commitment(&seller_signing_key(), None, OrderStatus::AwaitingPayment);
         let (state, _) = buyer_after_acceptance(&order);
 
+        let blockers = purchases(&state)[0].blockers.clone();
+        assert!(blockers
+            .iter()
+            .any(|b| matches!(b, PaymentBlocker::UnfitForComplaint(_))));
         assert_eq!(
-            purchases(&state)[0].blockers,
-            vec![PaymentBlocker::AnchorMissing]
+            without_unfit(&blockers),
+            vec![
+                PaymentBlocker::AnchorMissing,
+                PaymentBlocker::PurchaseNotKept
+            ]
         );
     }
 
@@ -21690,7 +23518,7 @@ mod buy_flow_tests {
         let (state, _) = buyer_after_acceptance(&order);
         assert_eq!(
             purchases(&state)[0].blockers,
-            Vec::new(),
+            vec![PaymentBlocker::PurchaseNotKept],
             "an anchor exactly at the tolerance is still fresh"
         );
 
@@ -21702,10 +23530,13 @@ mod buy_flow_tests {
         let (state, _) = buyer_after_acceptance(&order);
         assert_eq!(
             purchases(&state)[0].blockers,
-            vec![PaymentBlocker::AnchorStale {
-                anchor_height: oldest_allowed - 1,
-                tip_height: TIP_HEIGHT,
-            }],
+            vec![
+                PaymentBlocker::AnchorStale {
+                    anchor_height: oldest_allowed - 1,
+                    tip_height: TIP_HEIGHT,
+                },
+                PaymentBlocker::PurchaseNotKept
+            ],
             "one block past the tolerance is stale"
         );
     }
@@ -21728,7 +23559,10 @@ mod buy_flow_tests {
 
         assert_eq!(
             purchases(&state)[0].blockers,
-            vec![PaymentBlocker::AnchorOffChain]
+            vec![
+                PaymentBlocker::AnchorOffChain,
+                PaymentBlocker::PurchaseNotKept
+            ]
         );
     }
 
@@ -21750,7 +23584,10 @@ mod buy_flow_tests {
 
         assert_eq!(
             purchases(&state)[0].blockers,
-            vec![PaymentBlocker::ChainUnknown]
+            vec![
+                PaymentBlocker::ChainUnknown,
+                PaymentBlocker::PurchaseNotKept
+            ]
         );
     }
 
@@ -21780,7 +23617,10 @@ mod buy_flow_tests {
 
         assert_eq!(
             purchases(&state)[0].blockers,
-            vec![PaymentBlocker::ConversationNotKept]
+            vec![
+                PaymentBlocker::ConversationNotKept,
+                PaymentBlocker::PurchaseNotKept
+            ]
         );
     }
 
@@ -21979,17 +23819,20 @@ mod buy_flow_tests {
             .iter()
             .find(|purchase| purchase.order_id == fresh.order.id)
             .expect("the fresh purchase");
-        assert_eq!(payable.blockers, Vec::new());
+        assert_eq!(payable.blockers, vec![PaymentBlocker::PurchaseNotKept]);
         let refused = found
             .iter()
             .find(|purchase| purchase.order_id == stale.order.id)
             .expect("the stale purchase");
         assert_eq!(
             refused.blockers,
-            vec![PaymentBlocker::AnchorStale {
-                anchor_height: TIP_HEIGHT - MAX_ANCHOR_AGE_BLOCKS - 1,
-                tip_height: TIP_HEIGHT,
-            }]
+            vec![
+                PaymentBlocker::AnchorStale {
+                    anchor_height: TIP_HEIGHT - MAX_ANCHOR_AGE_BLOCKS - 1,
+                    tip_height: TIP_HEIGHT,
+                },
+                PaymentBlocker::PurchaseNotKept
+            ]
         );
     }
 
@@ -23745,12 +25588,26 @@ mod buy_flow_tests {
             claims, tip,
         ));
         let (state, _) = buyer_after_acceptance(&paid);
+
+        // Paid through a bridge this app does not recognise: the store says
+        // paid, and the card says it cannot confirm that rather than showing
+        // it settled (review round 3, P2-C). Red if `settled` shows a `Paid`
+        // record the fallback checks refuse.
         let purchase = purchases(&state).pop().expect("one purchase");
         assert_eq!(
             purchase.blockers,
             vec![PaymentBlocker::NotAwaitingPayment(OrderStatus::Paid)]
         );
+        assert_eq!(purchase.paid, None);
+        assert_eq!(purchase.settled(), None);
+        assert!(purchase.unconfirmed_paid());
+
+        let _recognised = crate::components::bitcoin_view::recognise_for_test(
+            freenet_bitcoin_common::BridgeId(settling_bridge().verifying_key().to_bytes()),
+        );
+        let purchase = purchases(&state).pop().expect("one purchase");
         assert_eq!(purchase.settled(), Some(&paid));
+        assert!(!purchase.unconfirmed_paid());
         assert!(matches!(
             crate::fulfilment::order_stage(&paid, None, Some(TIP_HEIGHT), Default::default()),
             crate::fulfilment::OrderStage::AwaitingDespatch { .. }
@@ -23807,8 +25664,11 @@ mod buy_flow_tests {
             let (state, _) = buyer_after_acceptance(&published);
             let purchase = purchases(&state).pop().expect("one purchase");
             assert_eq!(
-                purchase.blockers,
-                vec![PaymentBlocker::CommitmentLacksBuyerKey],
+                without_unfit(&purchase.blockers),
+                vec![
+                    PaymentBlocker::CommitmentLacksBuyerKey,
+                    PaymentBlocker::PurchaseNotKept
+                ],
                 "{label}"
             );
             assert_eq!(
@@ -23898,8 +25758,11 @@ mod buy_flow_tests {
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].conversation, real);
         assert_eq!(
-            held[0].blockers,
-            vec![PaymentBlocker::CommitmentLacksBuyerKey]
+            without_unfit(&held[0].blockers),
+            vec![
+                PaymentBlocker::CommitmentLacksBuyerKey,
+                PaymentBlocker::PurchaseNotKept
+            ]
         );
     }
 
@@ -23938,7 +25801,7 @@ mod buy_flow_tests {
             held[0].conversation, real,
             "filed under its own buyer's thread"
         );
-        assert!(held[0].blockers.is_empty(), "{:?}", held[0].blockers);
+        assert!(held[0].ready_to_keep(), "{:?}", held[0].blockers);
         assert!(held[0].cancellable());
         state
             .buyer_cancel_order(STORE, &order.order.id)
@@ -24068,6 +25931,7 @@ mod buy_flow_tests {
                 conversation: [0u8; 32],
                 commitment: Some(commitment),
                 blockers: Vec::new(),
+                paid: None,
             };
             assert!(!purchase.cancellable(), "{status:?}");
         }
@@ -24088,7 +25952,10 @@ mod buy_flow_tests {
         let purchase = purchases(&state).pop().expect("one purchase");
         assert!(matches!(
             purchase.blockers.as_slice(),
-            [PaymentBlocker::AnchorStale { .. }]
+            [
+                PaymentBlocker::AnchorStale { .. },
+                PaymentBlocker::PurchaseNotKept
+            ]
         ));
         assert!(purchase.cancellable());
     }
@@ -24523,7 +26390,1854 @@ mod buy_flow_tests {
             .unwrap()
             .despatches
             .insert(order.order.id.clone(), genuine.clone());
-        assert_eq!(state.despatch_of(&order), Some(genuine));
+        assert_eq!(state.despatch_of(&order), Some(genuine.clone()));
+
+        // The same terms in another envelope encoding, as the seller may
+        // re-sign them at will (R2-1): the despatch is still read (review
+        // round 3, P3). Red if the match goes back to the envelope's bytes.
+        let mut reencoded = order.clone();
+        reencoded.scoped_payload.push(0);
+        reencoded.signature = seller_signing_key()
+            .sign(&reencoded.scoped_payload)
+            .to_bytes()
+            .to_vec();
+        assert!(
+            reencoded
+                .verify_terms(&seller_signing_key().verifying_key())
+                .is_ok(),
+            "precondition: a copy the seller genuinely signed"
+        );
+        assert_ne!(reencoded.scoped_payload, order.scoped_payload);
+        assert_eq!(state.despatch_of(&reencoded), Some(genuine));
+    }
+
+    /// A buyer holding a PAID purchase at `STORE`, with the chain loaded.
+    /// Paid at `TIP_HEIGHT - 1` (`a_paid_order`).
+    ///
+    /// Its bridge is recognised for the test's thread: the paid order is one
+    /// this buyer's node takes as theirs without a kept copy
+    /// (`AppState::fallback_paid_copy`).
+    fn a_paid_purchase() -> (AppState, AuthorizedOrder) {
+        let recognised = recognise_settling_bridge();
+        let (paid, claims, tip) = a_paid_order();
+        let mut settled = paid.clone();
+        settled.status = OrderStatus::Paid;
+        settled.payment_proof = Some(harvest_common::payment::OrderPaymentProof::on_chain(
+            claims.clone(),
+            tip.clone(),
+        ));
+        let (mut state, _) = buyer_after_acceptance(&settled);
+        give_the_node_the_chain(&mut state, &settled, claims, tip);
+        state.test_guards.push(recognised);
+        (state, settled)
+    }
+
+    /// The seller's despatch of `order`, recorded in `STORE`.
+    fn despatched(state: &mut AppState, order: &AuthorizedOrder) {
+        let despatch = harvest_common::fulfilment::Despatch {
+            order_id: order.order.id.clone(),
+            anchor: anchor(TIP_HEIGHT),
+        };
+        let (scoped_payload, signature) = harvest_common::backing::sign_with_store_key(
+            &seller_signing_key(),
+            harvest_common::to_cbor(&despatch).unwrap(),
+        )
+        .unwrap();
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .despatches
+            .insert(
+                order.order.id.clone(),
+                harvest_common::fulfilment::AuthorizedDespatch {
+                    despatch,
+                    scoped_payload,
+                    signature,
+                },
+            );
+    }
+
+    fn move_tip_to(state: &mut AppState, height: u32) {
+        let mut view = tip_at(height);
+        view.signed_tip = state.bitcoin.tips[&BitcoinNetwork::Signet]
+            .signed_tip
+            .clone();
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, view);
+    }
+
+    /// **harvest#53 Phase C: the buyer of a despatched, paid order complains,
+    /// and the record's contract accepts what they publish** -- signed by the
+    /// order's receipt key, about a paid order of this store, applied to the
+    /// record the store key addresses.
+    #[test]
+    fn a_buyer_complains_about_a_paid_order_with_a_complaint_the_record_accepts() {
+        use harvest_common::feedback::FeedbackCategory;
+        let (mut state, order) = a_paid_purchase();
+        despatched(&mut state, &order);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(state.complaint_refusal(STORE, &purchase), None);
+
+        state
+            .file_complaint(STORE, &order.order.id, FeedbackCategory::Counterfeit)
+            .expect("the buyer may complain");
+        assert!(state.complaint_sent(&order.order.id));
+        assert!(
+            state
+                .file_complaint(STORE, &order.order.id, FeedbackCategory::NonDelivery)
+                .is_err(),
+            "one complaint per order"
+        );
+
+        let (store_key, complaint) = filed(&mut state);
+        assert_eq!(store_key, seller_signing_key().verifying_key());
+        assert_eq!(complaint.category, FeedbackCategory::Counterfeit);
+        assert_eq!(complaint.order.order, order.order, "the paid order travels");
+        complaint
+            .verify(&store_key)
+            .expect("verifies under the record's rules");
+
+        // Through the bytes a PUT carries, into the record's own merge.
+        let bytes = crate::gateway::store_ops::complaint_state_bytes(complaint.clone()).unwrap();
+        let published: harvest_common::reputation::ReputationStateV1 =
+            harvest_common::from_cbor(&bytes).unwrap();
+        let params = crate::migrate::reputation_params(&store_key);
+        let mut record = harvest_common::reputation::ReputationStateV1 {
+            owner_certificate_pem: "SELLER-CERT".into(),
+            ..Default::default()
+        };
+        record
+            .merge(&params, &published)
+            .expect("the record accepts it");
+        assert_eq!(record.complaints, vec![complaint.clone()]);
+        assert_eq!(
+            record.owner_certificate_pem, "SELLER-CERT",
+            "the cert survives"
+        );
+
+        // Once the record holds it, the card says so instead of offering
+        // another.
+        state.keeps_sent.clear();
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .complaints
+            .push(complaint);
+        let purchase = purchases(&state).remove(0);
+        let refused = state.complaint_refusal(STORE, &purchase).expect("refused");
+        assert!(
+            refused.contains("already on the seller's record"),
+            "{refused}"
+        );
+        assert!(state.complaint_on_record(STORE, &order.order.id).is_some());
+    }
+
+    /// **A kept paid purchase takes its complaint from the kept record
+    /// alone** (review round 5 of #143, R5-B). The store is re-keyed while
+    /// the seller stays away, so nothing answers at the address this build
+    /// loads, or nobody hosts it: no store is loaded at all, or one is
+    /// loaded with no state (no owner, no orders, no conversations). The
+    /// complaint is still offered, and what is filed verifies under the store
+    /// key the record is addressed by. Red if the kept path reads the store
+    /// again (its owner key, its conversations, its orders).
+    #[test]
+    fn a_kept_paid_purchase_takes_its_complaint_with_no_store() {
+        use crate::fulfilment::DESPATCH_WINDOW_BLOCKS;
+        use harvest_common::feedback::FeedbackCategory;
+        type Away = fn(&mut AppState);
+        let aways: [(&str, Away); 2] = [
+            ("no store loaded", |state| state.browsing_stores.clear()),
+            ("a store with no state", |state| {
+                let store = state.browsing_stores.get_mut(STORE).unwrap();
+                store.owner = None;
+                store.orders.clear();
+                store.conversations.clear();
+                store.mailbox_messages.clear();
+                store.despatches.clear();
+                store.store_verifying_key = None;
+                store.seller_verifying_key = None;
+            }),
+        ];
+        for (what, away) in aways {
+            let (mut state, order) = a_paid_purchase();
+            state.kept_purchases = vec![kept(&order)];
+            state.kept_purchases_loaded = true;
+            // No despatch can be read without the store: the deadline decides.
+            move_tip_to(&mut state, TIP_HEIGHT - 1 + DESPATCH_WINDOW_BLOCKS + 1);
+            away(&mut state);
+            let store_key = seller_signing_key().verifying_key().to_bytes();
+            assert_eq!(
+                state.kept_complaint_refusal(&store_key, &order.order.id),
+                None,
+                "{what}"
+            );
+            state
+                .file_kept_complaint(&store_key, &order.order.id, FeedbackCategory::NonDelivery)
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            let (key, complaint) = filed(&mut state);
+            assert_eq!(key.to_bytes(), store_key, "{what}: the owner's record");
+            assert_eq!(complaint.order, order, "{what}: the kept copy travels");
+            complaint
+                .verify(&key)
+                .unwrap_or_else(|e| panic!("{what}: the record accepts it: {e}"));
+            assert!(
+                state
+                    .file_kept_complaint(&store_key, &order.order.id, FeedbackCategory::Counterfeit)
+                    .is_err(),
+                "{what}: one per order"
+            );
+        }
+        // Nothing kept: nothing offered.
+        let (state, order) = a_paid_purchase();
+        assert!(state
+            .kept_complaint_refusal(
+                &seller_signing_key().verifying_key().to_bytes(),
+                &order.order.id
+            )
+            .is_some());
+    }
+
+    /// **A complaint made in a window a despatch extended is dated at the
+    /// base window's close** (review round 6 of #143). The seller despatches
+    /// late, which extends the window; the buyer complains after the base
+    /// window has closed. Dated at the tip, the complaint would be farther
+    /// from its payment than a late complaint no reader counts, which a full
+    /// record keeps first, and a reader without the despatch would read it as
+    /// late. Dated at `paid + DESPATCH + COMPLAINT`, every reader counts it.
+    /// Red if the date goes back to the tip.
+    #[test]
+    fn a_complaint_in_an_extended_window_is_dated_at_the_base_close() {
+        use crate::fulfilment::{
+            complaint_standing, ComplaintStanding, COMPLAINT_WINDOW_BLOCKS, DESPATCH_WINDOW_BLOCKS,
+        };
+        use harvest_common::feedback::FeedbackCategory;
+        let (mut state, order) = a_paid_purchase();
+        let paid_at = harvest_common::payment::paid_height(&order).expect("paid");
+        let despatch = harvest_common::fulfilment::Despatch {
+            order_id: order.order.id.clone(),
+            anchor: anchor(paid_at + DESPATCH_WINDOW_BLOCKS + 500),
+        };
+        let (scoped_payload, signature) = harvest_common::backing::sign_with_store_key(
+            &seller_signing_key(),
+            harvest_common::to_cbor(&despatch).unwrap(),
+        )
+        .unwrap();
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .despatches
+            .insert(
+                order.order.id.clone(),
+                harvest_common::fulfilment::AuthorizedDespatch {
+                    despatch,
+                    scoped_payload,
+                    signature,
+                },
+            );
+        let base_close = paid_at + DESPATCH_WINDOW_BLOCKS + COMPLAINT_WINDOW_BLOCKS;
+        move_tip_to(&mut state, base_close + 100);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(
+            state.complaint_refusal(STORE, &purchase),
+            None,
+            "inside the extended window"
+        );
+        state
+            .file_complaint(STORE, &order.order.id, FeedbackCategory::NonDelivery)
+            .expect("the buyer may complain");
+        let (key, complaint) = filed(&mut state);
+        complaint.verify(&key).expect("the record accepts it");
+        assert_eq!(complaint.block_height, base_close);
+        assert_eq!(
+            complaint_standing(&complaint, None, None),
+            ComplaintStanding::Counts,
+            "counted by a reader who never saw the despatch"
+        );
+    }
+
+    /// **The record read under another build of the store counts as the
+    /// record** (R5-B): the record is addressed by the store key alone, so a
+    /// complaint on it refuses a second one whichever loaded build of the
+    /// store it arrived under. Red if the on-record check reads only one
+    /// store.
+    #[test]
+    fn a_complaint_on_the_record_under_another_build_refuses_a_second() {
+        use harvest_common::feedback::FeedbackCategory;
+        let (mut state, order) = a_paid_purchase();
+        state.kept_purchases = vec![kept(&order)];
+        move_tip_to(
+            &mut state,
+            TIP_HEIGHT - 1 + crate::fulfilment::DESPATCH_WINDOW_BLOCKS + 1,
+        );
+        let store_key = seller_signing_key().verifying_key().to_bytes();
+        let complaint = sign_for_test(&state, &order, FeedbackCategory::Counterfeit);
+        let mut other_build = state.browsing_stores[STORE].clone();
+        other_build.complaints = vec![complaint];
+        state.browsing_stores.insert(vec![0xab; 32], other_build);
+        let refused = state
+            .kept_complaint_refusal(&store_key, &order.order.id)
+            .expect("refused");
+        assert!(
+            refused.contains("already on the seller's record"),
+            "{refused}"
+        );
+    }
+
+    /// **A kept complaint a full record does not hold is not said to be on
+    /// it** (review round 6). Red if the full-record wording is dropped.
+    #[test]
+    fn a_kept_complaint_a_full_record_drops_is_said_so() {
+        use harvest_common::feedback::FeedbackCategory;
+        let (mut state, order) = a_paid_purchase();
+        let complaint = sign_for_test(&state, &order, FeedbackCategory::Counterfeit);
+        let mut held = kept(&order);
+        held.complaint = Some(harvest_common::delegate::KeptComplaint::of(&complaint));
+        state.kept_purchases = vec![held];
+        let store_key = seller_signing_key().verifying_key().to_bytes();
+        let said = state
+            .kept_complaint_refusal(&store_key, &order.order.id)
+            .expect("refused");
+        assert!(said.contains("puts it on the seller's record"), "{said}");
+        // Full of complaints about other orders.
+        // About another order: only the count and the load state are read.
+        let mut other = complaint.clone();
+        other.order.order.id = harvest_common::payment::OrderId([0x77; 32]);
+        let store = state.browsing_stores.get_mut(STORE).unwrap();
+        store.record = RecordLoad::Loaded;
+        store.complaints = vec![other; harvest_common::reputation::MAX_COMPLAINTS];
+        let said = state
+            .kept_complaint_refusal(&store_key, &order.order.id)
+            .expect("refused");
+        assert!(said.contains("record is full"), "{said}");
+    }
+
+    /// A complaint about `order` signed with the fixture conversation's
+    /// receipt key, dated at the current tip.
+    pub(super) fn sign_for_test(
+        state: &AppState,
+        order: &AuthorizedOrder,
+        category: harvest_common::feedback::FeedbackCategory,
+    ) -> Complaint {
+        let key = the_buyers_conversation()
+            .receipt_signing_key()
+            .expect("a receipt key");
+        let parts = ComplaintParts {
+            order: order.clone(),
+            key,
+            store_key: seller_signing_key().verifying_key(),
+            block_height: state.bitcoin.tips[&BitcoinNetwork::Signet]
+                .tip_height
+                .unwrap_or(0),
+            paid_height: harvest_common::payment::paid_height(order).expect("paid"),
+            conversation: the_buyers_conversation().buyer_public_key,
+        };
+        parts.sign(category).expect("signs")
+    }
+
+    /// **A seller who has been paid cannot take the complaint away** (review
+    /// round 1 of #143, P1-1): closing the store, or retiring its backing so
+    /// no key reads as the seller's, trips the PAYMENT checks, and the
+    /// complaint used to be decided through them. Red if eligibility goes
+    /// back to `settled()` / `store_verifying_key`.
+    #[test]
+    fn a_seller_cannot_take_the_complaint_away_after_payment() {
+        use harvest_common::feedback::FeedbackCategory;
+        type Seller = fn(&mut BrowsingStore);
+        let moves: [(&str, Seller); 3] = [
+            ("closes the store", |store| store.closed = true),
+            ("retires the backing", |store| {
+                store.store_verifying_key = None;
+                store.seller_verifying_key = None;
+            }),
+            ("does both", |store| {
+                store.closed = true;
+                store.store_verifying_key = None;
+                store.seller_verifying_key = None;
+            }),
+        ];
+        for (what, seller) in moves {
+            let (mut state, order) = a_paid_purchase();
+            despatched(&mut state, &order);
+            seller(state.browsing_stores.get_mut(STORE).unwrap());
+            let purchase = purchases(&state).remove(0);
+            assert!(
+                purchase.settled().is_none(),
+                "{what}: precondition, the pay checks trip"
+            );
+            assert_eq!(
+                purchase.paid.as_ref(),
+                Some(&order),
+                "{what}: still paid, still theirs"
+            );
+            assert_eq!(state.complaint_refusal(STORE, &purchase), None, "{what}");
+            state
+                .file_complaint(STORE, &order.order.id, FeedbackCategory::NonDelivery)
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            let (key, complaint) = filed(&mut state);
+            assert_eq!(
+                key,
+                seller_signing_key().verifying_key(),
+                "{what}: the owner's record"
+            );
+            complaint.verify(&key).expect("the record accepts it");
+        }
+    }
+
+    /// **An unread record is never "Clean record"** (review round 1 of
+    /// #143, P1-5): loading, not found and unavailable each say so, and only
+    /// a record that was read with nothing counted is clean. A NotFound or a
+    /// failed fetch after the record was read does not un-read it. Red if
+    /// the badge ignores the load state or the reputation arm stops marking
+    /// the record read.
+    #[test]
+    fn an_unread_record_is_never_a_clean_record() {
+        for (state, text) in [
+            (RecordLoad::Loading, "Record loading"),
+            (RecordLoad::NotFound, "No record found"),
+            (RecordLoad::Unavailable, "Record unavailable"),
+            (RecordLoad::Loaded, "Clean record"),
+        ] {
+            assert_eq!(state.badge(0).1, text);
+        }
+        assert_eq!(RecordLoad::Loaded.badge(2).1, "2 complaint(s)");
+        assert_eq!(RecordLoad::default(), RecordLoad::Loading);
+
+        let (mut state, _) = a_paid_purchase();
+        let record = vec![0x77u8; 32];
+        state
+            .reputation_to_store
+            .insert(record.clone(), STORE.to_vec());
+        assert_eq!(state.browsing_stores[STORE].record, RecordLoad::Loading);
+        state.on_record_unavailable(&record);
+        assert_eq!(state.browsing_stores[STORE].record, RecordLoad::Unavailable);
+        state.on_record_absent(&record);
+        assert_eq!(state.browsing_stores[STORE].record, RecordLoad::NotFound);
+        // The record arrives: read.
+        let bytes =
+            harvest_common::to_cbor(&harvest_common::reputation::ReputationStateV1::default())
+                .unwrap();
+        state.on_contract_state(record.clone(), bytes);
+        assert_eq!(state.browsing_stores[STORE].record, RecordLoad::Loaded);
+        state.on_record_absent(&record);
+        state.on_record_unavailable(&record);
+        assert_eq!(
+            state.browsing_stores[STORE].record,
+            RecordLoad::Loaded,
+            "a later NotFound or failure does not un-read it"
+        );
+    }
+
+    /// **A complaint that never reached the delegate gives the control back**
+    /// (review round 1 of #143, testing #3). Red if the marker is kept.
+    #[test]
+    fn a_failed_complaint_send_releases_the_sent_marker() {
+        use harvest_common::feedback::FeedbackCategory;
+        let (mut state, order) = a_paid_purchase();
+        despatched(&mut state, &order);
+        state
+            .file_complaint(STORE, &order.order.id, FeedbackCategory::NonDelivery)
+            .expect("filed");
+        let purchase = purchases(&state).remove(0);
+        assert!(
+            state.complaint_refusal(STORE, &purchase).is_some(),
+            "on its way"
+        );
+        state.on_keep_send_failed(&order.order.id, KeepStep::Complaint);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(
+            state.complaint_refusal(STORE, &purchase),
+            None,
+            "offered again"
+        );
+    }
+
+    /// What the delegate keeps for `order`, filed under the fixtures'
+    /// conversation, with that conversation's receipt seed.
+    fn kept(order: &AuthorizedOrder) -> harvest_common::delegate::KeptPurchase {
+        let conversation = the_buyers_conversation();
+        harvest_common::delegate::KeptPurchase {
+            store_key: seller_signing_key().verifying_key().to_bytes(),
+            conversation: conversation.buyer_public_key,
+            receipt_seed: conversation
+                .receipt_signing_key()
+                .expect("the fixture's conversation has a receipt key")
+                .to_bytes(),
+            order: order.clone(),
+            complaint: None,
+        }
+    }
+
+    /// `order` as the `Paid` record `claims` and `tip` prove.
+    fn paid_on_claims(
+        order: &AuthorizedOrder,
+        claims: Vec<freenet_bitcoin_common::SignedClaim>,
+        tip: freenet_bitcoin_common::SignedTipEntry,
+    ) -> AuthorizedOrder {
+        let mut paid = order.clone();
+        paid.status = OrderStatus::Paid;
+        paid.payment_proof = Some(harvest_common::payment::OrderPaymentProof::on_chain(
+            claims, tip,
+        ));
+        paid
+    }
+
+    /// A buyer accepted for an unpaid order naming a bridge this test
+    /// recognises, with the chain tip loaded but no claims yet: everything
+    /// checks out but the kept copy.
+    fn an_unkept_purchase() -> (
+        AppState,
+        AuthorizedOrder,
+        Vec<freenet_bitcoin_common::SignedClaim>,
+        freenet_bitcoin_common::SignedTipEntry,
+    ) {
+        let (unpaid, claims, tip) = a_paid_order();
+        let recognised = recognise_settling_bridge();
+        let (mut state, _) = buyer_after_acceptance(&unpaid);
+        state.test_guards.push(recognised);
+        (state, unpaid, claims, tip)
+    }
+
+    /// The settling bridge, recognised for as long as the returned guard (or
+    /// the state holding it) lives.
+    fn recognise_settling_bridge() -> std::rc::Rc<crate::components::bitcoin_view::RecognisedForTest>
+    {
+        std::rc::Rc::new(crate::components::bitcoin_view::recognise_for_test(
+            freenet_bitcoin_common::BridgeId(settling_bridge().verifying_key().to_bytes()),
+        ))
+    }
+
+    /// **Recognition does not leak out of a test** (review round 3, testing
+    /// lens): dropping the fixture's state drops its guard. Red if the
+    /// thread-local is never cleared.
+    #[test]
+    fn a_recognised_bridge_is_forgotten_with_its_state() {
+        assert!(!crate::components::bitcoin_view::any_recognised_for_test());
+        let (state, _, _, _) = an_unkept_purchase();
+        assert!(crate::components::bitcoin_view::any_recognised_for_test());
+        let copy = state.clone();
+        drop(state);
+        assert!(
+            crate::components::bitcoin_view::any_recognised_for_test(),
+            "a copy holds it"
+        );
+        drop(copy);
+        assert!(!crate::components::bitcoin_view::any_recognised_for_test());
+    }
+
+    /// [`an_unkept_purchase`], kept: the buyer pressed "Pay this order" and
+    /// the delegate's list holds the unpaid copy.
+    fn a_kept_unpaid_purchase() -> (
+        AppState,
+        AuthorizedOrder,
+        Vec<freenet_bitcoin_common::SignedClaim>,
+        freenet_bitcoin_common::SignedTipEntry,
+    ) {
+        let (mut state, unpaid, claims, tip) = an_unkept_purchase();
+        state
+            .keep_purchase(STORE, &unpaid.order.id)
+            .expect("ready to keep");
+        let keep = state.keep_requests.pop().expect("sent");
+        state.on_kept_purchases(vec![kept(&keep.order)]);
+        (state, unpaid, claims, tip)
+    }
+
+    /// Every seller move after payment that model section 2 lists against the
+    /// store: evict the order, close the store, retire the backing.
+    fn the_seller_evicts_closes_and_retires(state: &mut AppState) {
+        let store = state.browsing_stores.get_mut(STORE).unwrap();
+        store.orders.clear();
+        store.despatches.clear();
+        store.closed = true;
+        store.store_verifying_key = None;
+        store.seller_verifying_key = None;
+    }
+
+    /// Move the tip past the despatch deadline of an order paid at
+    /// `TIP_HEIGHT - 1`, so the complaint is open without a despatch.
+    fn past_the_despatch_deadline(state: &mut AppState) {
+        move_tip_to(
+            state,
+            TIP_HEIGHT - 1 + crate::fulfilment::DESPATCH_WINDOW_BLOCKS + 1,
+        );
+    }
+
+    /// **Keep, then reveal** (`docs/complaint-threat-model.md` section 3.1):
+    /// an order passing every other check shows "Pay this order" and no
+    /// payment details; the press sends `KeepPurchase` with the store's
+    /// unpaid copy under the store's owner key and this conversation; the
+    /// delegate's list holding it clears the blocker, which is what shows the
+    /// address. Red if the blocker is dropped, the press sends anything else,
+    /// or the list stops clearing it.
+    #[test]
+    fn keep_then_reveal() {
+        let (mut state, unpaid, _, _) = an_unkept_purchase();
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(purchase.blockers, vec![PaymentBlocker::PurchaseNotKept]);
+        assert!(purchase.ready_to_keep());
+        // The card shows the address only when there are no blockers.
+        assert!(!purchase.blockers.is_empty(), "no address while not kept");
+
+        state
+            .keep_purchase(STORE, &unpaid.order.id)
+            .expect("pressed");
+        assert!(state.keep_sent(&unpaid.order.id));
+        assert_eq!(
+            state.keep_requests,
+            vec![harvest_common::delegate::PurchaseToKeep {
+                store_key: seller_signing_key().verifying_key().to_bytes(),
+                conversation: the_buyers_conversation().buyer_public_key,
+                order: unpaid.clone(),
+                complaint: None,
+            }]
+        );
+        state
+            .keep_purchase(STORE, &unpaid.order.id)
+            .expect("pressed again");
+        assert_eq!(state.keep_requests.len(), 1, "sent once");
+
+        state.on_kept_purchases(vec![kept(&unpaid)]);
+        assert!(!state.keep_sent(&unpaid.order.id), "the marker is released");
+        let purchase = purchases(&state).remove(0);
+        assert!(purchase.blockers.is_empty(), "{:?}", purchase.blockers);
+        assert_eq!(purchase.commitment.as_ref(), Some(&unpaid));
+    }
+
+    /// **No view offers a buyer a payment address while `PurchaseNotKept`
+    /// holds** (review round 3 of #143, P1-A): not the store's invoice list,
+    /// and not the Payments tab, even for an order that names one of this
+    /// node's Ghost Keys as its buyer. The seller's own book still shows.
+    /// Red if either view lists orders of a store this node does not own.
+    #[test]
+    fn no_view_shows_an_address_before_the_order_is_kept() {
+        let (mut state, mut unpaid, _, _) = an_unkept_purchase();
+        state.ghostkeys.push(ghostkey_common::GhostKeyInfo {
+            fingerprint: "buyer-fp".into(),
+            label: None,
+            notary_info: String::new(),
+            verifying_key_bytes: None,
+            backed_up: false,
+        });
+        unpaid.order.buyer_fingerprint = "buyer-fp".into();
+        let unpaid = resigned(unpaid, &seller_signing_key());
+        state.browsing_stores.get_mut(STORE).unwrap().orders = vec![unpaid.clone()];
+        assert!(state.browsing_stores[STORE].payable());
+        assert!(!purchases(&state)[0].blockers.is_empty(), "not kept");
+        assert!(state.invoices_shown(STORE).is_empty(), "store page");
+        assert!(
+            crate::components::bitcoin_view::my_orders(&state).is_empty(),
+            "Payments tab"
+        );
+        // Another settled order of the same store is on its public list,
+        // with no address (review round 4, P3), and NOT on the Payments tab,
+        // which lists nothing it cannot check is this buyer's (round 5).
+        let mut other = unpaid.clone();
+        other.order.amount_sats += 1;
+        let mut settled = resigned(other, &seller_signing_key());
+        settled.status = OrderStatus::Cancelled;
+        assert_ne!(settled.order.id, unpaid.order.id);
+        assert!(!crate::fulfilment::offers_payment_address(
+            &settled,
+            Some(TIP_HEIGHT)
+        ));
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .orders
+            .push(settled.clone());
+        assert_eq!(state.invoices_shown(STORE), vec![settled.clone()]);
+        assert!(
+            crate::components::bitcoin_view::my_orders(&state).is_empty(),
+            "Payments tab"
+        );
+        state.browsing_stores.get_mut(STORE).unwrap().orders = vec![unpaid.clone()];
+
+        // The seller's own store lists its own invoices.
+        state.my_stores.insert(
+            "seller-fp".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(seller_signing_key().verifying_key().to_bytes()),
+            }],
+        );
+        assert_eq!(state.invoices_shown(STORE), vec![unpaid.clone()]);
+        assert_eq!(
+            crate::components::bitcoin_view::my_orders(&state),
+            vec![unpaid]
+        );
+    }
+
+    /// **A refused keep releases the marker and says why** (model section
+    /// 5.1): the payment details stay hidden and the card shows the reason
+    /// in place of the control. Red if the refusal is not recorded or the
+    /// marker is kept.
+    #[test]
+    fn a_refused_keep_releases_the_marker_and_shows_the_reason() {
+        let (mut state, unpaid, _, _) = an_unkept_purchase();
+        state
+            .keep_purchase(STORE, &unpaid.order.id)
+            .expect("pressed");
+        state.on_keep_refused(&unpaid.order.id, "this node already keeps 1024".into());
+        assert!(!state.keep_sent(&unpaid.order.id));
+        assert_eq!(
+            state.keep_refusal(&unpaid.order.id),
+            Some("this node already keeps 1024")
+        );
+        assert_eq!(
+            purchases(&state).remove(0).blockers,
+            vec![PaymentBlocker::PurchaseNotKept],
+            "still no payment details"
+        );
+        assert!(state.notifications.is_empty(), "the card says it");
+        // "Try again": the buyer's own press asks again, though the copy is
+        // the one refused (review round 3, P3).
+        state
+            .keep_purchase(STORE, &unpaid.order.id)
+            .expect("pressed again");
+        assert_eq!(state.keep_requests.len(), 2, "asked again");
+        assert_eq!(
+            state.keep_refusal(&unpaid.order.id),
+            None,
+            "the reason clears"
+        );
+        // A refused upgrade, which has no card to say it on, is notified:
+        // `a_refused_upgrade_is_not_resent_until_its_copy_changes`.
+    }
+
+    /// Only an order ready to pay is kept by the press: any other blocker
+    /// refuses it, so the control cannot reveal an order the checks refuse.
+    #[test]
+    fn the_press_keeps_nothing_another_blocker_refuses() {
+        let (unpaid, _, _) = a_paid_order();
+        // The settling bridge is not recognised here.
+        let (mut state, _) = buyer_after_acceptance(&unpaid);
+        let purchase = purchases(&state).remove(0);
+        assert!(!purchase.ready_to_keep(), "{:?}", purchase.blockers);
+        assert!(state.keep_purchase(STORE, &unpaid.order.id).is_err());
+        assert!(state.keep_requests.is_empty());
+    }
+
+    /// **`UnfitForComplaint` and `AddressContractNotCurrent` block payment**
+    /// (model sections 3.1, 4). An order needing more than
+    /// `MAX_REQUIRED_CONFIRMATIONS`, or naming an address contract other than
+    /// the bridges' current one, is not offered for payment; an unresolved
+    /// pointer is a wait, not a walk-away. Red if either check is dropped.
+    #[test]
+    fn unfit_and_off_generation_orders_block_payment() {
+        use crate::components::buy_view::{remedy, Remedy};
+        use harvest_common::payment::MAX_REQUIRED_CONFIRMATIONS;
+
+        let mut greedy = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 2)),
+            OrderStatus::AwaitingPayment,
+        );
+        greedy.order.required_confirmations = MAX_REQUIRED_CONFIRMATIONS + 1;
+        let greedy = resigned(greedy, &seller_signing_key());
+        let (state, _) = buyer_after_acceptance(&greedy);
+        let blockers = purchases(&state).remove(0).blockers;
+        assert!(
+            matches!(blockers.first(), Some(PaymentBlocker::UnfitForComplaint(_))),
+            "{blockers:?}"
+        );
+        assert_eq!(remedy(&blockers[0]), Remedy::AskTheSeller);
+
+        let fine = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 2)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut state, _) = buyer_after_acceptance(&fine);
+        state.bitcoin.address_generation =
+            crate::bitcoin_generation::Generation::resolved([9u8; 32]);
+        let blockers = purchases(&state).remove(0).blockers;
+        let off = PaymentBlocker::AddressContractNotCurrent {
+            generation_known: true,
+        };
+        assert_eq!(blockers, vec![off.clone(), PaymentBlocker::PurchaseNotKept]);
+        assert_eq!(remedy(&off), Remedy::AskTheSeller);
+
+        state.bitcoin.address_generation = Default::default();
+        let blockers = purchases(&state).remove(0).blockers;
+        let unknown = PaymentBlocker::AddressContractNotCurrent {
+            generation_known: false,
+        };
+        assert_eq!(
+            blockers,
+            vec![unknown.clone(), PaymentBlocker::PurchaseNotKept]
+        );
+        assert_eq!(remedy(&unknown), Remedy::Wait);
+    }
+
+    /// **Seller power, after keep** (model sections 2, 3): once the buyer's
+    /// node keeps the order and has seen it paid, the seller evicting it from
+    /// the store, closing the store and retiring the backing change nothing.
+    /// The upgrade is sent with a minimal proof, the purchase stays paid, and
+    /// the complaint is offered and verifies. Red if eligibility reads the
+    /// store's order list, `store_verifying_key` or closure.
+    #[test]
+    fn after_keep_the_seller_cannot_take_the_purchase_or_the_complaint() {
+        use harvest_common::feedback::FeedbackCategory;
+        let (mut state, unpaid, claims, tip) = a_kept_unpaid_purchase();
+        // Paid: the claims arrive, and the store publishes `Paid`.
+        give_the_node_the_chain(&mut state, &unpaid, claims.clone(), tip.clone());
+        let paid = paid_on_claims(&unpaid, claims, tip);
+        state.browsing_stores.get_mut(STORE).unwrap().orders = vec![paid.clone()];
+        state.upgrade_kept_purchases();
+        let upgrade = state.keep_requests.pop().expect("the upgrade is sent");
+        assert_eq!(upgrade.order.status, OrderStatus::Paid);
+        harvest_common::payment::verify_minimal_proof(
+            &upgrade.order.order,
+            upgrade.order.payment_proof.as_ref().unwrap(),
+        )
+        .expect("the upgrade carries the minimal proof");
+        state.on_kept_purchases(vec![kept(&upgrade.order)]);
+
+        the_seller_evicts_closes_and_retires(&mut state);
+        past_the_despatch_deadline(&mut state);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(purchase.paid.as_ref(), Some(&upgrade.order), "still paid");
+        assert_eq!(state.complaint_refusal(STORE, &purchase), None);
+        state
+            .file_complaint(STORE, &unpaid.order.id, FeedbackCategory::NonDelivery)
+            .expect("the complaint is still fileable");
+        let (key, complaint) = filed(&mut state);
+        assert_eq!(key, seller_signing_key().verifying_key());
+        complaint.verify(&key).expect("the record accepts it");
+    }
+
+    /// **Eviction at mempool time, before this node sees `Paid`** (R2-2): the
+    /// seller pushes the order out of the store while the payment is
+    /// unconfirmed, so no store `Paid` copy ever reaches the buyer. The kept
+    /// unpaid copy plus the address claims prove it paid, and the upgrade is
+    /// sent with a minimal proof. Red if the upgrade needs the store's copy.
+    #[test]
+    fn a_kept_order_evicted_before_paid_is_proven_paid_from_the_claims() {
+        let (mut state, unpaid, claims, tip) = a_kept_unpaid_purchase();
+        state.browsing_stores.get_mut(STORE).unwrap().orders.clear();
+        give_the_node_the_chain(&mut state, &unpaid, claims, tip);
+        // What the address arrival does.
+        state.upgrade_kept_purchases();
+        let upgrade = state.keep_requests.pop().expect("the upgrade is sent");
+        assert_eq!(upgrade.order.order, unpaid.order, "the kept terms");
+        assert_eq!(upgrade.order.status, OrderStatus::Paid);
+        harvest_common::payment::verify_minimal_proof(
+            &upgrade.order.order,
+            upgrade.order.payment_proof.as_ref().unwrap(),
+        )
+        .expect("minimal");
+        upgrade
+            .order
+            .verify(&seller_signing_key().verifying_key())
+            .expect("a copy the delegate keeps");
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(purchase.paid.as_ref(), Some(&upgrade.order));
+        state.upgrade_kept_purchases();
+        assert!(state.keep_requests.is_empty(), "sent once");
+    }
+
+    /// **The complaint waits for the upgrade to be kept** (found by the UI
+    /// round's own review). While the kept copy is still awaiting payment,
+    /// the purchase reads paid from the claims, but a complaint built from
+    /// that computed copy could name a different paid height from the
+    /// upgrade the delegate keeps, which would refuse the complaint and the
+    /// re-assert would never cover it. So the control waits, and is offered
+    /// about the kept paid copy once it lands. Red if the complaint is built
+    /// before the upgrade is kept.
+    #[test]
+    fn a_complaint_waits_for_the_upgrade_to_be_kept() {
+        let (mut state, unpaid, claims, tip) = a_kept_unpaid_purchase();
+        give_the_node_the_chain(&mut state, &unpaid, claims, tip);
+        past_the_despatch_deadline(&mut state);
+        let purchase = purchases(&state).remove(0);
+        assert!(
+            purchase.paid.is_some(),
+            "precondition: shown paid from the claims"
+        );
+        let refusal = state
+            .complaint_refusal(STORE, &purchase)
+            .expect("not before the upgrade is kept");
+        assert!(refusal.contains("still keeping its proof"), "{refusal}");
+
+        state.upgrade_kept_purchases();
+        let upgrade = state.keep_requests.pop().expect("the upgrade is sent");
+        state.on_kept_purchases(vec![kept(&upgrade.order)]);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(state.complaint_refusal(STORE, &purchase), None);
+    }
+
+    /// **A new store generation holding only the unpaid copy does not hide
+    /// the kept `Paid` copy** (R2-6). Red if the store's copy is preferred.
+    #[test]
+    fn a_lower_ranked_store_copy_does_not_hide_the_kept_paid_copy() {
+        let (mut state, unpaid, claims, tip) = a_kept_unpaid_purchase();
+        let paid = paid_on_claims(&unpaid, claims, tip);
+        state.on_kept_purchases(vec![kept(&paid)]);
+        state.browsing_stores.get_mut(STORE).unwrap().orders = vec![unpaid.clone()];
+        past_the_despatch_deadline(&mut state);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(purchase.paid.as_ref(), Some(&paid));
+        assert!(!purchase.cancellable(), "a paid order is not cancelled");
+        assert_eq!(state.complaint_refusal(STORE, &purchase), None);
+    }
+
+    /// **Fabricated `Paid` orders naming the buyer's receipt key** (R2-3):
+    /// backed by a bridge this build does not recognise, or for 0 sats, they
+    /// are not shown as paid, not kept, and offered no complaint. Red if the
+    /// fallback drops the bridge check or the preconditions.
+    #[test]
+    fn fabricated_paid_orders_are_not_this_buyers_purchase() {
+        // A bridge the seller runs: genuine claims, a stranger's signature.
+        let (unpaid, claims, tip) = a_paid_order();
+        let fake = paid_on_claims(&unpaid, claims, tip);
+        let (mut state, _) = buyer_after_acceptance(&fake);
+        let store = state.browsing_stores[STORE].clone();
+        assert!(
+            fake.verify(&seller_signing_key().verifying_key()).is_ok(),
+            "precondition: a record the store contract accepts"
+        );
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(purchase.paid, None, "an unrecognised bridge");
+        state.upgrade_kept_purchases();
+        assert!(state.keep_requests.is_empty(), "not kept");
+        assert!(state.complaint_refusal(STORE, &purchase).is_some());
+        assert_eq!(
+            AppState::fallback_paid_copy(&store, &store.conversations[0], &fake),
+            None
+        );
+
+        // For nothing, through a recognised bridge.
+        let (free, claims, tip) = a_paid_order_where(|order| order.amount_sats = 0);
+        let _recognised = recognise_settling_bridge();
+        let free = paid_on_claims(&free, claims, tip);
+        assert!(
+            free.verify(&seller_signing_key().verifying_key()).is_ok(),
+            "precondition: a 0-sat Paid record the store contract accepts"
+        );
+        let (mut state, _) = buyer_after_acceptance(&free);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(purchase.paid, None, "0 sats");
+        state.upgrade_kept_purchases();
+        assert!(state.keep_requests.is_empty(), "not kept");
+        assert!(state.complaint_refusal(STORE, &purchase).is_some());
+
+        // Genuinely paid through a recognised bridge, but padded past what a
+        // complaint may carry (the bridge listed hundreds of times): the
+        // preconditions are the only check that refuses this one.
+        let (padded, claims, tip) = a_paid_order_where(|order| {
+            order.trusted_bridges = vec![order.trusted_bridges[0]; 200];
+        });
+        let padded = paid_on_claims(&padded, claims, tip);
+        assert!(
+            padded.verify(&seller_signing_key().verifying_key()).is_ok(),
+            "precondition: a padded Paid record the store contract accepts"
+        );
+        assert!(harvest_common::payment::complaint_preconditions(&padded).is_err());
+        let (mut state, _) = buyer_after_acceptance(&padded);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(purchase.paid, None, "too large to complain about");
+        state.upgrade_kept_purchases();
+        assert!(state.keep_requests.is_empty(), "not kept");
+        assert!(state.complaint_refusal(STORE, &purchase).is_some());
+    }
+
+    /// **The conversation forgotten** (R2-5): with the conversation and the
+    /// acceptance both gone, the kept purchase is still listed under the
+    /// conversation it was kept for, and its complaint is signed with the
+    /// kept receipt seed and verifies. Red if kept purchases need a
+    /// conversation or an acceptance to be listed.
+    #[test]
+    fn a_forgotten_conversation_does_not_lose_the_purchase_or_the_complaint() {
+        use harvest_common::feedback::FeedbackCategory;
+        let (mut state, unpaid, claims, tip) = a_kept_unpaid_purchase();
+        let paid = paid_on_claims(&unpaid, claims, tip);
+        state.on_kept_purchases(vec![kept(&paid)]);
+        let store = state.browsing_stores.get_mut(STORE).unwrap();
+        store.conversations.clear();
+        store.mailbox_messages.clear();
+        store.orders.clear();
+        past_the_despatch_deadline(&mut state);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(
+            purchase.conversation,
+            the_buyers_conversation().buyer_public_key
+        );
+        assert_eq!(purchase.paid.as_ref(), Some(&paid));
+        assert_eq!(state.complaint_refusal(STORE, &purchase), None);
+        state
+            .file_complaint(STORE, &paid.order.id, FeedbackCategory::Misrepresented)
+            .expect("signable with the kept seed");
+        let keep = state.keep_requests.last().cloned().expect("kept first");
+        assert_eq!(keep.order, paid, "about the kept copy");
+        assert_eq!(
+            keep.conversation,
+            the_buyers_conversation().buyer_public_key
+        );
+        let (key, complaint) = filed(&mut state);
+        complaint.verify(&key).expect("the record accepts it");
+    }
+
+    /// **Nothing is kept without a press** (revision 3, section 3.3): a store
+    /// `Paid` copy naming this buyer's key is shown paid, and not sent to the
+    /// delegate, however often its store arrives. A seller could otherwise
+    /// fill every slot with one payment to a reused address. Red if
+    /// anything keeps the fallback copy on its own.
+    #[test]
+    fn a_paid_order_never_kept_is_not_kept_without_a_press() {
+        let (mut state, order) = a_paid_purchase();
+        assert_eq!(
+            purchases(&state)[0].paid.as_ref(),
+            Some(&order),
+            "shown paid"
+        );
+        // Everything that used to keep it: the store's state, the list, an
+        // address's claims.
+        state.upgrade_kept_purchases();
+        state.on_kept_purchases(Vec::new());
+        state.upgrade_kept_purchases();
+        assert!(state.keep_requests.is_empty(), "{:?}", state.keep_requests);
+    }
+
+    /// **The complaint is the press that keeps a paid order never kept**
+    /// (model 3.3, 3.4): ONE `KeepPurchase` carrying the fallback copy with
+    /// its minimal proof and the complaint, and no PUT until the delegate's
+    /// list holds it; then the PUT, once. Red if the complaint is PUT before
+    /// it is kept, or kept without the paid copy.
+    #[test]
+    fn a_complaint_keeps_first_then_puts() {
+        use harvest_common::feedback::FeedbackCategory;
+        let (mut state, order) = a_paid_purchase();
+        past_the_despatch_deadline(&mut state);
+        state
+            .file_complaint(STORE, &order.order.id, FeedbackCategory::NonDelivery)
+            .expect("filed");
+        assert_eq!(state.keep_requests.len(), 1, "one keep");
+        let keep = state.keep_requests[0].clone();
+        assert_eq!(
+            keep.store_key,
+            seller_signing_key().verifying_key().to_bytes()
+        );
+        assert_eq!(
+            keep.conversation,
+            the_buyers_conversation().buyer_public_key
+        );
+        assert_eq!(keep.order.order, order.order);
+        harvest_common::payment::verify_minimal_proof(
+            &keep.order.order,
+            keep.order.payment_proof.as_ref().unwrap(),
+        )
+        .expect("the minimal proof");
+        let kept_complaint = keep.complaint.clone().expect("with the complaint");
+        assert!(
+            state.reasserted_complaints.is_empty(),
+            "no PUT before it is kept"
+        );
+        assert!(state.complaint_sent(&order.order.id), "on its way");
+
+        // The delegate keeps it: now, and only now, it is PUT.
+        let mut record = kept(&keep.order);
+        record.complaint = Some(kept_complaint.clone());
+        state.on_kept_purchases(vec![record.clone()]);
+        assert_eq!(state.reasserted_complaints.len(), 1);
+        assert_eq!(
+            state.reasserted_complaints[0].1,
+            kept_complaint.about(&keep.order)
+        );
+        state.on_kept_purchases(vec![record]);
+        assert_eq!(state.reasserted_complaints.len(), 1, "once per session");
+        assert!(!state.reasserts_due(), "nothing waiting");
+
+        // The PUT failed, and no further kept list arrives this session:
+        // the watch timer's question says so, and its answer puts it back
+        // (review round 4, P2-6). Red if only a list arrival retries.
+        state.on_reassert_failed(&order.order.id);
+        assert!(!state.reasserts_due(), "not at once: it backs off");
+        state.reassert_kept_complaints();
+        assert_eq!(
+            state.reasserted_complaints.len(),
+            1,
+            "not while backing off"
+        );
+        // The wait doubles with each failure (review round 5, P2).
+        let first = state.reassert_backoff[&order.order.id].1;
+        state.on_reassert_failed(&order.order.id);
+        let (failures, second) = state.reassert_backoff[&order.order.id];
+        assert_eq!(failures, 2);
+        assert!(second > first, "a longer wait");
+        state.reassert_backoff.get_mut(&order.order.id).unwrap().1 = 0;
+        assert!(state.reasserts_due(), "due once the wait has run out");
+        state.reassert_kept_complaints();
+        assert_eq!(state.reasserted_complaints.len(), 2, "put back");
+        assert!(!state.reasserts_due());
+    }
+
+    /// A `KeepPurchase` that never reached the delegate is sent again on the
+    /// next press.
+    #[test]
+    fn a_failed_keep_is_sent_again() {
+        let (mut state, unpaid, _, _) = an_unkept_purchase();
+        state
+            .keep_purchase(STORE, &unpaid.order.id)
+            .expect("pressed");
+        assert_eq!(state.keep_requests.len(), 1);
+        state
+            .keep_purchase(STORE, &unpaid.order.id)
+            .expect("pressed");
+        assert_eq!(state.keep_requests.len(), 1, "not while on its way");
+        state.on_keep_send_failed(&unpaid.order.id, KeepStep::Keep);
+        state
+            .keep_purchase(STORE, &unpaid.order.id)
+            .expect("pressed");
+        assert_eq!(state.keep_requests.len(), 2, "sent again");
+    }
+
+    /// **A keep left unanswered times out** (review round 3, P3): an answer
+    /// lost, or an error naming no order, must not hold the button or the
+    /// complaint for the session. Red if the marker never expires.
+    #[test]
+    fn an_unanswered_keep_times_out() {
+        let (mut state, unpaid, _, _) = an_unkept_purchase();
+        state
+            .keep_purchase(STORE, &unpaid.order.id)
+            .expect("pressed");
+        assert!(state.keep_sent(&unpaid.order.id));
+        let key = (unpaid.order.id.clone(), KeepStep::Keep);
+        state.keeps_sent.get_mut(&key).unwrap().since_ms = now_ms() - KEEP_TIMEOUT_MS + 5_000;
+        assert!(state.keep_sent(&unpaid.order.id), "not yet");
+        assert!(!state.keeps_timed_out(now_ms()));
+        state.keeps_sent.get_mut(&key).unwrap().since_ms = now_ms() - KEEP_TIMEOUT_MS - 1;
+        assert!(!state.keep_sent(&unpaid.order.id), "timed out");
+        // The watch timer sees it and lets it go, which repaints the card
+        // (review round 4, P3).
+        assert!(state.keeps_timed_out(now_ms()));
+        // Only the press is let go: another step's marker stays, so a late
+        // answer is still tied to what was sent (review round 5, P3).
+        let upgrade = (unpaid.order.id.clone(), KeepStep::Paid);
+        state.keeps_sent.insert(
+            upgrade.clone(),
+            KeepInFlight {
+                digest: 7,
+                since_ms: 0,
+            },
+        );
+        state.drop_timed_out_keeps(now_ms());
+        assert!(!state.keeps_sent.contains_key(&key));
+        assert!(state.keeps_sent.contains_key(&upgrade));
+        state
+            .keep_purchase(STORE, &unpaid.order.id)
+            .expect("pressed");
+        assert_eq!(state.keep_requests.len(), 2, "asked again");
+    }
+
+    /// **A refused upgrade is not re-sent on every trigger** (review round 3,
+    /// P3): the same copy is skipped, and notified once; a new block's copy
+    /// is offered again, since a refusal can clear on its own, without a
+    /// second notification (review round 5, P2). Red if a refusal is re-sent
+    /// unchanged, never retried, or re-notified.
+    #[test]
+    fn a_refused_upgrade_is_not_resent_until_its_copy_changes() {
+        let (mut state, unpaid, claims, tip) = a_kept_unpaid_purchase();
+        give_the_node_the_chain(&mut state, &unpaid, claims, tip);
+        state.upgrade_kept_purchases();
+        assert_eq!(state.keep_requests.len(), 1);
+        state.on_keep_refused(&unpaid.order.id, "the node refused to save".into());
+        for _ in 0..3 {
+            state.upgrade_kept_purchases();
+        }
+        assert_eq!(state.keep_requests.len(), 1, "not re-sent");
+        // A new block rebuilds the copy against the new tip: offered again,
+        // and a second identical refusal is not announced again.
+        state.apply_tip_state(BitcoinNetwork::Signet, &a_tip_state(TIP_HEIGHT + 1));
+        state.upgrade_kept_purchases();
+        assert_eq!(state.keep_requests.len(), 2, "retried once a block");
+        state.on_keep_refused(&unpaid.order.id, "the node refused to save".into());
+        assert_eq!(
+            state
+                .notifications
+                .iter()
+                .filter(|n| n.contains("the node refused to save"))
+                .count(),
+            1
+        );
+        // A second payment changes the copy: offered.
+        let view_id = unpaid.order.bitcoin_address_instance_id().unwrap().to_vec();
+        let extra = second_payment(&unpaid);
+        state
+            .bitcoin
+            .addresses
+            .get_mut(&view_id)
+            .unwrap()
+            .claims
+            .extend(extra);
+        state.upgrade_kept_purchases();
+        assert_eq!(state.keep_requests.len(), 3, "a different copy is offered");
+    }
+
+    /// **A kept `Paid` copy is never replaced** (revision 4 removed the
+    /// fresher-evidence rule; model 3.2, 7.2): later claims for the same
+    /// payment, a later tip, or a store copy do not send a second copy.
+    /// Red if anything but the unpaid-to-paid upgrade is offered.
+    #[test]
+    fn a_kept_paid_copy_is_never_replaced() {
+        let (mut state, unpaid, claims, tip) = a_kept_unpaid_purchase();
+        let paid = paid_on_claims(&unpaid, claims.clone(), tip.clone());
+        state.on_kept_purchases(vec![kept(&paid)]);
+        give_the_node_the_chain(&mut state, &unpaid, claims, tip);
+        let view_id = unpaid.order.bitcoin_address_instance_id().unwrap().to_vec();
+        state
+            .bitcoin
+            .addresses
+            .get_mut(&view_id)
+            .unwrap()
+            .claims
+            .push(reconfirmed(&unpaid, TIP_HEIGHT + 3));
+        move_tip_to(&mut state, TIP_HEIGHT + 3);
+        // Nothing is even due (review round 5: `send_keep` would drop a step
+        // already done, so the send alone could not show this).
+        assert!(state.upgrades_due().is_empty());
+        state.upgrade_kept_purchases();
+        assert!(state.keep_requests.is_empty(), "{:?}", state.keep_requests);
+        assert!(
+            state.kept_address_contracts_to_watch().is_empty(),
+            "a kept paid copy has nothing left to watch for"
+        );
+    }
+
+    /// **A kept purchase is filed under the conversation it was kept for**
+    /// (review round 3, P3): with that conversation forgotten and a stray
+    /// thread carrying an acceptance naming the order, the purchase is filed
+    /// under the kept conversation, with the forgotten-conversation blocker
+    /// rather than "send a message" or "not issued to you". Red if the
+    /// acceptance's thread decides, or the blocker is `ConversationNotKept`.
+    #[test]
+    fn a_kept_purchase_is_filed_under_its_kept_conversation() {
+        let (mut state, unpaid, _, _) = a_kept_unpaid_purchase();
+        let real = the_buyers_conversation().buyer_public_key;
+        let mut stray =
+            BuyerConversation::opened_from_secret_for_test(&[42u8; 32], &seller_encryption_key())
+                .expect("open");
+        stray.mark_kept();
+        let stray_tag = stray.buyer_public_key;
+        let misdirected = crate::messaging::seal_order_accepted(
+            &seller_keys_for(&stray_tag),
+            &stray_tag,
+            &stray.conversation_id,
+            &unpaid.order.id,
+        )
+        .expect("seal");
+        let store = state.browsing_stores.get_mut(STORE).expect("store");
+        store.conversations = vec![stray];
+        store.mailbox_messages.push(misdirected);
+
+        let held = purchases(&state);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].conversation, real, "the kept conversation");
+        assert_eq!(
+            held[0].blockers,
+            vec![PaymentBlocker::ConversationForgotten]
+        );
+        assert!(!held[0].cancellable());
+    }
+
+    /// **A kept order is not told its address contract is out of date**
+    /// (review round 3, P3): both builds are watched for it, and "ask for it
+    /// again" after a redeploy would invite a second payment. Red if the
+    /// check applies to kept orders.
+    #[test]
+    fn a_kept_order_is_not_refused_after_a_redeploy() {
+        let (mut state, _, _, _) = a_kept_unpaid_purchase();
+        state.bitcoin.address_generation =
+            crate::bitcoin_generation::Generation::resolved([9u8; 32]);
+        assert!(
+            purchases(&state)[0].blockers.is_empty(),
+            "{:?}",
+            purchases(&state)[0].blockers
+        );
+    }
+
+    /// **Pay, close the tab, come back two weeks later** (review round 4,
+    /// P1; codex round 4, P1s 2 and 3). The buyer pays a kept order and
+    /// closes the tab before it confirms; the seller evicts the order and
+    /// closes the store. The buyer returns after the order's last settling
+    /// block, still inside the complaint window, to a session whose tip
+    /// arrives before the kept list and whose first address answer is empty.
+    /// The purchase is listed, its address watched and re-read; the claims
+    /// then upgrade it, and the complaint is fileable and verifies.
+    ///
+    /// Red with the round-3 lapse check, which read "unpaid" from that empty
+    /// view and stopped watching, re-reading and showing the purchase.
+    #[test]
+    fn a_buyer_who_pays_and_returns_two_weeks_later_keeps_the_purchase() {
+        use harvest_common::feedback::FeedbackCategory;
+        let (mut state, unpaid, claims, tip) = a_kept_unpaid_purchase();
+        let last = crate::fulfilment::last_settling_block(&unpaid).expect("anchored");
+        let back = (TIP_HEIGHT + crate::fulfilment::COMPLAINT_WINDOW_BLOCKS).max(last + 1);
+        assert!(
+            back < TIP_HEIGHT - 1
+                + crate::fulfilment::DESPATCH_WINDOW_BLOCKS
+                + crate::fulfilment::COMPLAINT_WINDOW_BLOCKS,
+            "precondition: still inside the complaint window"
+        );
+
+        // The seller moves while the tab is closed.
+        the_seller_evicts_closes_and_retires(&mut state);
+        let store = state.browsing_stores.get_mut(STORE).unwrap();
+        store.mailbox_messages.clear();
+
+        // The new session: nothing held yet, then the tip, then an empty
+        // first answer from the address contract, then the kept list.
+        state.kept_purchases.clear();
+        state.kept_purchases_loaded = false;
+        state.keeps_sent.clear();
+        state.bitcoin.addresses.clear();
+        give_the_node_the_chain(&mut state, &unpaid, Vec::new(), tip);
+        move_tip_to(&mut state, back);
+        state.on_kept_purchases(vec![kept(&unpaid)]);
+        assert!(state.keep_requests.is_empty(), "nothing proves it paid yet");
+
+        let own = unpaid.order.bitcoin_address_instance_id().unwrap();
+        assert_eq!(purchases(&state).len(), 1, "the purchase is listed");
+        assert!(
+            state
+                .kept_address_contracts_to_watch()
+                .iter()
+                .any(|(id, _)| *id == own),
+            "its address is watched"
+        );
+        assert!(state.due_address_rereads(0).0.contains(&own), "and re-read");
+
+        // The address contract's next answer carries the payment.
+        state
+            .bitcoin
+            .addresses
+            .get_mut(own.as_slice())
+            .unwrap()
+            .claims = claims;
+        state.upgrade_kept_purchases();
+        let upgrade = state.keep_requests.pop().expect("the upgrade is sent");
+        assert_eq!(upgrade.order.status, OrderStatus::Paid);
+        state.on_kept_purchases(vec![kept(&upgrade.order)]);
+
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(purchase.paid.as_ref(), Some(&upgrade.order));
+        assert_eq!(state.complaint_refusal(STORE, &purchase), None);
+        state
+            .file_complaint(STORE, &unpaid.order.id, FeedbackCategory::NonDelivery)
+            .expect("the complaint is fileable");
+        let (key, complaint) = filed(&mut state);
+        complaint.verify(&key).expect("the record accepts it");
+    }
+
+    /// **A never-paid keep stops being watched once no complaint about it
+    /// could count** (review round 5, P2), and not before: at the last block
+    /// a complaint window could reach it is still watched and re-read, one
+    /// block later it is not. Decided from the tip alone. Red if the bound
+    /// is removed (watched forever) or reads the address view.
+    #[test]
+    fn a_never_paid_keep_is_watched_until_no_complaint_could_count() {
+        let (mut state, unpaid, _, _) = a_kept_unpaid_purchase();
+        let own = unpaid.order.bitcoin_address_instance_id().unwrap();
+        let last = crate::fulfilment::last_settling_block(&unpaid).expect("anchored");
+        let end = last
+            + crate::fulfilment::DESPATCH_WINDOW_BLOCKS
+            + crate::fulfilment::COMPLAINT_WINDOW_BLOCKS;
+        move_tip_to(&mut state, end);
+        assert!(
+            state.due_address_rereads(0).0.contains(&own),
+            "still watched"
+        );
+        assert!(!state.kept_address_contracts_to_watch().is_empty());
+        move_tip_to(&mut state, end + 1);
+        assert!(
+            !state.due_address_rereads(0).0.contains(&own),
+            "not re-read"
+        );
+        assert!(state.kept_address_contracts_to_watch().is_empty());
+        assert_eq!(purchases(&state).len(), 1, "still listed");
+    }
+
+    /// **A tip alone upgrades a kept copy** (codex round 4, P1): the claims
+    /// are held but too shallow against the node's tip, and the store has
+    /// evicted the order, so the tip contract's next answer is the only
+    /// event that makes it provable. Red if the tip arm does not run the
+    /// kept upgrade.
+    #[test]
+    fn a_fresher_tip_upgrades_a_kept_copy() {
+        let (mut state, unpaid, claims, tip) = a_kept_unpaid_purchase();
+        state.browsing_stores.get_mut(STORE).unwrap().orders.clear();
+        give_the_node_the_chain(&mut state, &unpaid, claims, tip);
+        let tip_id = a_tip_contract(&mut state, BitcoinNetwork::Signet, [7u8; 32]);
+        state.bitcoin.tips.remove(&BitcoinNetwork::Signet);
+        state.apply_tip_state(BitcoinNetwork::Signet, &a_tip_state(TIP_HEIGHT - 3));
+        state.upgrade_kept_purchases();
+        assert!(
+            state.keep_requests.is_empty(),
+            "precondition: not provable against the old tip"
+        );
+        state.on_contract_state(
+            tip_id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&a_tip_state(TIP_HEIGHT)).expect("cbor"),
+        );
+        let upgrade = state
+            .keep_requests
+            .pop()
+            .expect("the tip sends the upgrade");
+        assert_eq!(upgrade.order.status, OrderStatus::Paid);
+    }
+
+    /// **A watch under the current generation's build is unioned, not
+    /// replaced** (codex round 4, P2): a kept order whose store is not
+    /// loaded, watched under the bridges' current build. An empty answer
+    /// must not erase the claims held for it. Red if the parameters are
+    /// looked up in the store's orders only.
+    #[test]
+    fn an_empty_answer_does_not_erase_a_kept_orders_claims() {
+        let (mut state, unpaid, claims, tip) = a_kept_unpaid_purchase();
+        state.browsing_stores.clear();
+        state.bitcoin.address_generation =
+            crate::bitcoin_generation::Generation::resolved([9u8; 32]);
+        let current = unpaid.order.bitcoin_address_instance_id_under([9u8; 32]);
+        let own = unpaid.order.bitcoin_address_instance_id().unwrap();
+        give_the_node_the_chain(&mut state, &unpaid, claims.clone(), tip);
+        let held = state.bitcoin.addresses[own.as_slice()].clone();
+        state.bitcoin.addresses.insert(current.to_vec(), held);
+        let empty = freenet_bitcoin_common::BitcoinAddressStateV1::from_claims(
+            &unpaid.order.bitcoin_params(),
+            Vec::new(),
+        )
+        .expect("an empty state");
+        for id in [current, own] {
+            state.apply_address_state(id.to_vec(), BitcoinNetwork::Signet, &empty);
+            assert_eq!(
+                state.bitcoin.addresses[id.as_slice()].claims.len(),
+                claims.len(),
+                "the held claims survive an empty answer"
+            );
+        }
+    }
+
+    /// **A never-kept paid copy's proof is built over the union too**
+    /// (review round 4, P2): the store's `Paid` copy carries only a payment
+    /// the seller made to its own address, and the address contract shows
+    /// the buyer's later payment. The copy a complaint would freeze gives
+    /// the later paid height. Red if the store copy's claims are used alone.
+    #[test]
+    fn the_fallback_paid_copy_is_built_over_the_union_of_the_claims() {
+        let (mut state, unpaid, seller_self_payment, tip) = an_unkept_purchase();
+        let seller_copy = paid_on_claims(&unpaid, seller_self_payment, tip.clone());
+        state.browsing_stores.get_mut(STORE).unwrap().orders = vec![seller_copy];
+        let buyer_payment = payment_at(&unpaid, TIP_HEIGHT, 9);
+        give_the_node_the_chain(&mut state, &unpaid, vec![buyer_payment], tip);
+        let paid = purchases(&state)
+            .remove(0)
+            .paid
+            .expect("shown paid from the store's copy");
+        assert_eq!(
+            harvest_common::payment::paid_height(&paid),
+            Some(TIP_HEIGHT),
+            "the buyer's later payment, not the seller's earlier one"
+        );
+    }
+
+    /// **The upgrade's proof is built over the union of the claims** (review
+    /// round 3, TM-D): a store `Paid` copy carrying only a payment the seller
+    /// made to its own address, plus the address claims showing the buyer's
+    /// later payment, gives the buyer's later paid height. Red if the store
+    /// copy's seller-chosen claims are used on their own first.
+    #[test]
+    fn the_upgrade_proof_is_built_over_the_union_of_the_claims() {
+        let (mut state, unpaid, seller_self_payment, tip) = a_kept_unpaid_purchase();
+        // The store's copy: the seller's own earlier payment only (TIP - 1).
+        let seller_copy = paid_on_claims(&unpaid, seller_self_payment, tip.clone());
+        state.browsing_stores.get_mut(STORE).unwrap().orders = vec![seller_copy];
+        // The address contract: the buyer's own payment, one block later.
+        let buyer_payment = payment_at(&unpaid, TIP_HEIGHT, 9);
+        give_the_node_the_chain(&mut state, &unpaid, vec![buyer_payment], tip);
+        state.upgrade_kept_purchases();
+        let upgrade = state.keep_requests.pop().expect("the upgrade is sent");
+        assert_eq!(
+            harvest_common::payment::paid_height(&upgrade.order),
+            Some(TIP_HEIGHT),
+            "the buyer's later payment, not the seller's earlier one"
+        );
+    }
+
+    /// A confirmed payment of the full amount to `order`'s script at
+    /// `height`, as of `height`, in the transaction `seed` makes.
+    fn payment_at(
+        order: &AuthorizedOrder,
+        height: u32,
+        seed: u8,
+    ) -> freenet_bitcoin_common::SignedClaim {
+        use freenet_bitcoin_common::spv::testing::payment_proof;
+        use freenet_bitcoin_common::{BlockHash, ClaimBody, SignedClaim};
+        let (spv, txid, block_hash) = payment_proof(
+            &order.order.payment_script_pubkey,
+            order.order.amount_sats,
+            1,
+            [seed; 32],
+        );
+        SignedClaim::sign(
+            &settling_bridge(),
+            &ClaimBody {
+                script_id: order.order.bitcoin_params().script_id(),
+                network: order.order.network,
+                as_of: freenet_bitcoin_common::BlockAnchor {
+                    height,
+                    hash: BlockHash([5u8; 32]),
+                },
+                claim: freenet_bitcoin_common::Claim::ConfirmedOutput {
+                    outpoint: freenet_bitcoin_common::OutPoint { txid, vout: 0 },
+                    value_sats: order.order.amount_sats,
+                    anchor: freenet_bitcoin_common::BlockAnchor {
+                        height,
+                        hash: block_hash,
+                    },
+                    spv,
+                },
+            },
+        )
+        .expect("sign")
+    }
+
+    /// The fixture payment of [`a_paid_order`] confirmed again, in a block
+    /// at `TIP_HEIGHT` and as of `as_of`: what a bridge signs after a reorg
+    /// re-confirms it.
+    fn reconfirmed(order: &AuthorizedOrder, as_of: u32) -> freenet_bitcoin_common::SignedClaim {
+        use freenet_bitcoin_common::spv::testing::payment_proof;
+        use freenet_bitcoin_common::{BlockHash, ClaimBody, SignedClaim};
+        let (spv, txid, block_hash) = payment_proof(
+            &order.order.payment_script_pubkey,
+            order.order.amount_sats,
+            1,
+            [7u8; 32],
+        );
+        SignedClaim::sign(
+            &settling_bridge(),
+            &ClaimBody {
+                script_id: order.order.bitcoin_params().script_id(),
+                network: order.order.network,
+                as_of: freenet_bitcoin_common::BlockAnchor {
+                    height: as_of,
+                    hash: BlockHash([6u8; 32]),
+                },
+                claim: freenet_bitcoin_common::Claim::ConfirmedOutput {
+                    outpoint: freenet_bitcoin_common::OutPoint { txid, vout: 0 },
+                    value_sats: order.order.amount_sats,
+                    anchor: freenet_bitcoin_common::BlockAnchor {
+                        height: TIP_HEIGHT - 1,
+                        hash: block_hash,
+                    },
+                    spv,
+                },
+            },
+        )
+        .expect("sign")
+    }
+
+    /// `fallback_paid_copy` takes a PAID record verifying under the store's
+    /// owner key, naming this conversation's receipt key, and nothing else.
+    /// Red if any check is dropped.
+    #[test]
+    fn paid_order_requires_paid_and_the_owner_key() {
+        let (state, order) = a_paid_purchase();
+        let store = state.browsing_stores[STORE].clone();
+        let conversation = store.conversations[0].clone();
+        assert_eq!(
+            AppState::fallback_paid_copy(&store, &conversation, &order),
+            Some(order.clone())
+        );
+        let mut unpaid = order.clone();
+        unpaid.status = OrderStatus::AwaitingPayment;
+        unpaid.payment_proof = None;
+        assert_eq!(
+            AppState::fallback_paid_copy(&store, &conversation, &unpaid),
+            None
+        );
+        let mut elsewhere = store.clone();
+        elsewhere.owner = Some(
+            SigningKey::from_bytes(&[0x57; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        assert_eq!(
+            AppState::fallback_paid_copy(&elsewhere, &conversation, &order),
+            None,
+            "an order that does not verify under this store's owner is not theirs here"
+        );
+        let stranger = BuyerConversation::open(&seller_encryption_key()).expect("open");
+        assert_eq!(
+            AppState::fallback_paid_copy(&store, &stranger, &order),
+            None,
+            "an order naming another conversation's receipt key"
+        );
+    }
+
+    /// A kept copy counts only for the store whose key it is kept under.
+    #[test]
+    fn a_kept_copy_is_used_only_for_its_own_store() {
+        let (mut state, order) = a_paid_purchase();
+        let genuine = kept(&order);
+        let store = state.browsing_stores.get_mut(STORE).unwrap();
+        store.orders.clear();
+        store.mailbox_messages.clear();
+        state.kept_purchases = vec![harvest_common::delegate::KeptPurchase {
+            store_key: [0x55; 32],
+            ..genuine.clone()
+        }];
+        assert!(purchases(&state).is_empty(), "another store's key");
+        state.kept_purchases = vec![genuine];
+        assert_eq!(purchases(&state).len(), 1, "the genuine copy is used");
+    }
+
+    /// **The re-assert sweep** (model 3.4): every kept complaint, whatever
+    /// store it is about, once per session and never again; a record with no
+    /// complaint puts nothing back. Red if the sweep skips stores not being
+    /// viewed, or runs twice.
+    #[test]
+    fn the_reassert_sweep_puts_every_kept_complaint_back_once() {
+        use harvest_common::feedback::FeedbackCategory;
+        let (mut state, order) = a_paid_purchase();
+        past_the_despatch_deadline(&mut state);
+        state
+            .file_complaint(STORE, &order.order.id, FeedbackCategory::NonDelivery)
+            .expect("filed");
+        let (_, complaint) = filed(&mut state);
+        let mut with_complaint = kept(&complaint.order);
+        with_complaint.complaint = Some(harvest_common::delegate::KeptComplaint::of(&complaint));
+        // Another store's kept complaint, which this tab is not showing.
+        let mut elsewhere = with_complaint.clone();
+        elsewhere.store_key = SigningKey::from_bytes(&[0x33; 32])
+            .verifying_key()
+            .to_bytes();
+        elsewhere.order.order.id = harvest_common::payment::OrderId([0x44; 32]);
+        let (unpaid, _, _) = a_paid_order();
+        let without = kept(&unpaid);
+        let list = vec![with_complaint, elsewhere.clone(), without];
+
+        let due = complaints_to_reassert(&list, &HashSet::new());
+        assert_eq!(due.len(), 2, "both kept complaints, and nothing else");
+        assert!(due
+            .iter()
+            .any(|(key, _)| key.to_bytes() == elsewhere.store_key));
+        let done: HashSet<_> = [
+            complaint.order_id().clone(),
+            elsewhere.order.order.id.clone(),
+        ]
+        .into_iter()
+        .collect();
+        assert!(complaints_to_reassert(&list, &done).is_empty(), "once each");
+
+        // The first list of the session comes from a freshly re-keyed
+        // delegate, before the migration imports: empty. The next holds them,
+        // and they are still put back (review round 3).
+        state.on_kept_purchases(Vec::new());
+        assert!(state.reasserted_complaints.is_empty());
+        state.on_kept_purchases(list.clone());
+        assert_eq!(state.reasserted_complaints.len(), 2);
+        assert_eq!(state.reasserted_complaints[0].1, complaint);
+        state.on_kept_purchases(list.clone());
+        assert_eq!(state.reasserted_complaints.len(), 2, "once per session");
+
+        // A failed PUT is tried again on the next arrival once its backoff
+        // has run out (review round 5, P2), and not before.
+        state.on_reassert_failed(complaint.order_id());
+        state.on_kept_purchases(list.clone());
+        assert_eq!(state.reasserted_complaints.len(), 2, "backing off");
+        state
+            .reassert_backoff
+            .get_mut(complaint.order_id())
+            .unwrap()
+            .1 = 0;
+        state.on_kept_purchases(list);
+        assert_eq!(state.reasserted_complaints.len(), 3, "retried");
+        assert_eq!(state.reasserted_complaints[2].1, complaint);
+    }
+
+    /// **The kept list is asked for until an answer arrives** (review round
+    /// 2 of #143, P3). Red if the timer stops asking before the answer, or
+    /// keeps asking after it.
+    #[test]
+    fn the_kept_list_is_asked_for_until_it_arrives() {
+        assert!(kept_list_due(false, true));
+        assert!(!kept_list_due(true, true), "answered");
+        assert!(!kept_list_due(false, false), "nothing to ask yet");
+        let (mut state, _, _, _) = an_unkept_purchase();
+        assert!(!state.kept_purchases_loaded);
+        state.on_kept_purchases(Vec::new());
+        assert!(state.kept_purchases_loaded, "an empty list is an answer");
+    }
+
+    /// **A kept unpaid order's payment is watched under its own build and
+    /// the pointer's** (model 3.2, TM-A), whether or not the store still
+    /// holds it. Red if either instance is dropped.
+    #[test]
+    fn a_kept_order_is_watched_under_both_builds() {
+        let (mut state, unpaid, _, _) = a_kept_unpaid_purchase();
+        state.browsing_stores.get_mut(STORE).unwrap().orders.clear();
+        let current = [9u8; 32];
+        state.bitcoin.address_generation = crate::bitcoin_generation::Generation::resolved(current);
+        let own = unpaid.order.bitcoin_address_instance_id().expect("a build");
+        let pointer = unpaid.order.bitcoin_address_instance_id_under(current);
+        assert_ne!(own, pointer);
+        let watched = state.address_contracts_to_watch(STORE);
+        assert!(watched.contains(&own), "the order's own build");
+        assert!(watched.contains(&pointer), "the pointer's build");
+        let everywhere: Vec<[u8; 32]> = state
+            .kept_address_contracts_to_watch()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(everywhere.contains(&own) && everywhere.contains(&pointer));
+        // With the pointer unresolved, the order's own build alone.
+        state.bitcoin.address_generation = Default::default();
+        assert_eq!(state.kept_order_address_instances(&unpaid.order), vec![own]);
+    }
+
+    /// **`complaint_checks` refuses what `Complaint::verify` would** (review
+    /// round 2 of #143, P3): a kept `Paid` copy whose proof is not the
+    /// canonical minimal one passes every other check, and the contract would
+    /// still refuse the complaint, so the control is not offered. Red if the
+    /// trial verification is dropped.
+    #[test]
+    fn the_complaint_control_is_refused_when_the_record_would_refuse_it() {
+        let (mut state, unpaid, mut claims, tip) = a_kept_unpaid_purchase();
+        // A second full payment: genuine, but one the first already covers.
+        claims.extend(second_payment(&unpaid));
+        let padded = paid_on_claims(&unpaid, claims, tip);
+        assert!(padded.verify(&seller_signing_key().verifying_key()).is_ok());
+        assert!(harvest_common::payment::verify_minimal_proof(
+            &padded.order,
+            padded.payment_proof.as_ref().unwrap()
+        )
+        .is_err());
+        state.kept_purchases = vec![kept(&padded)];
+        past_the_despatch_deadline(&mut state);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(purchase.paid.as_ref(), Some(&padded));
+        let refused = state.complaint_refusal(STORE, &purchase).expect("refused");
+        assert!(refused.contains("would refuse"), "{refused}");
+    }
+
+    /// A second confirmed payment of the full amount to `order`'s script, in
+    /// another transaction.
+    fn second_payment(order: &AuthorizedOrder) -> Vec<freenet_bitcoin_common::SignedClaim> {
+        use freenet_bitcoin_common::spv::testing::payment_proof;
+        use freenet_bitcoin_common::{BlockHash, ClaimBody, SignedClaim};
+        let (spv, txid, block_hash) = payment_proof(
+            &order.order.payment_script_pubkey,
+            order.order.amount_sats,
+            1,
+            [9u8; 32],
+        );
+        vec![SignedClaim::sign(
+            &settling_bridge(),
+            &ClaimBody {
+                script_id: order.order.bitcoin_params().script_id(),
+                network: order.order.network,
+                as_of: freenet_bitcoin_common::BlockAnchor {
+                    height: TIP_HEIGHT,
+                    hash: BlockHash([5u8; 32]),
+                },
+                claim: freenet_bitcoin_common::Claim::ConfirmedOutput {
+                    outpoint: freenet_bitcoin_common::OutPoint { txid, vout: 0 },
+                    value_sats: order.order.amount_sats,
+                    anchor: freenet_bitcoin_common::BlockAnchor {
+                        height: TIP_HEIGHT - 1,
+                        hash: block_hash,
+                    },
+                    spv,
+                },
+            },
+        )
+        .expect("sign")]
+    }
+
+    /// **Counting never consults closure, retirement or backing** (model
+    /// section 6): the badge's count, and the Reputation page's, are the
+    /// same whatever the store's status. Red if anything discounts
+    /// complaints by it.
+    #[test]
+    fn complaint_counting_ignores_closure_retirement_and_backing() {
+        use harvest_common::feedback::FeedbackCategory;
+        let (mut state, order) = a_paid_purchase();
+        past_the_despatch_deadline(&mut state);
+        state
+            .file_complaint(STORE, &order.order.id, FeedbackCategory::NonDelivery)
+            .expect("filed");
+        let (_, complaint) = filed(&mut state);
+        let store = state.browsing_stores.get_mut(STORE).unwrap();
+        store.complaints = vec![complaint];
+        assert_eq!(store.counted_complaints(), 1);
+        store.closed = true;
+        store.store_verifying_key = None;
+        store.seller_verifying_key = None;
+        store.orders.clear();
+        assert_eq!(store.counted_complaints(), 1, "whatever the store's status");
+    }
+
+    /// The complaint `file_complaint` just asked the delegate to keep, and the
+    /// store key whose record it goes to: kept first, then PUT (model 3.4).
+    fn filed(state: &mut AppState) -> (ed25519_dalek::VerifyingKey, Complaint) {
+        let keep = state
+            .keep_requests
+            .pop()
+            .expect("the complaint goes to the delegate first");
+        let complaint = keep
+            .complaint
+            .as_ref()
+            .expect("with the complaint")
+            .about(&keep.order);
+        (
+            ed25519_dalek::VerifyingKey::from_bytes(&keep.store_key).expect("a store key"),
+            complaint,
+        )
+    }
+
+    /// The complaint is offered only between "the seller has despatched or
+    /// missed the deadline" and "the window has closed", and only for a paid
+    /// order. Red if `complaint_checks` stops consulting the order's stage.
+    #[test]
+    fn a_complaint_is_offered_only_inside_its_window() {
+        use crate::fulfilment::{COMPLAINT_WINDOW_BLOCKS, DESPATCH_WINDOW_BLOCKS};
+        use harvest_common::feedback::FeedbackCategory;
+        let paid_at = TIP_HEIGHT - 1;
+
+        // Paid, not despatched, deadline not passed: the seller still has time.
+        let (mut state, order) = a_paid_purchase();
+        let purchase = purchases(&state).remove(0);
+        let refused = state
+            .complaint_refusal(STORE, &purchase)
+            .expect("too early");
+        assert!(refused.contains("despatch"), "{refused}");
+        assert!(state
+            .file_complaint(STORE, &order.order.id, FeedbackCategory::NonDelivery)
+            .is_err());
+
+        // The despatch deadline passed with nothing recorded: open.
+        move_tip_to(&mut state, paid_at + DESPATCH_WINDOW_BLOCKS + 1);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(state.complaint_refusal(STORE, &purchase), None);
+
+        // The window closed: the order counts as complete.
+        move_tip_to(
+            &mut state,
+            paid_at + DESPATCH_WINDOW_BLOCKS + COMPLAINT_WINDOW_BLOCKS + 1,
+        );
+        let purchase = purchases(&state).remove(0);
+        let refused = state.complaint_refusal(STORE, &purchase).expect("too late");
+        assert!(refused.contains("closed"), "{refused}");
+
+        // An unpaid order takes no complaint at all.
+        let (unpaid, _, _) = a_paid_order();
+        let (state, _) = buyer_after_acceptance(&unpaid);
+        let purchase = purchases(&state).remove(0);
+        assert!(state.complaint_refusal(STORE, &purchase).is_some());
     }
 }
 
@@ -24573,7 +28287,17 @@ mod payment_blocker_wording_tests {
                 anchor_height: 799_000,
                 tip_height: 800_000,
             },
+            PaymentBlocker::UnfitForComplaint("the order is for nothing".to_string()),
+            PaymentBlocker::AddressContractNotCurrent {
+                generation_known: true,
+            },
+            // Both wordings, which the variant count below still counts once.
+            PaymentBlocker::AddressContractNotCurrent {
+                generation_known: false,
+            },
             PaymentBlocker::ConversationNotKept,
+            PaymentBlocker::ConversationForgotten,
+            PaymentBlocker::PurchaseNotKept,
         ];
 
         // Exhaustive and wildcard-free, over the list itself. Each arm is
@@ -24601,7 +28325,11 @@ mod payment_blocker_wording_tests {
                 | PaymentBlocker::AnchorUnverifiable
                 | PaymentBlocker::AnchorAheadOfTip { .. }
                 | PaymentBlocker::AnchorStale { .. }
-                | PaymentBlocker::ConversationNotKept => {}
+                | PaymentBlocker::UnfitForComplaint(_)
+                | PaymentBlocker::AddressContractNotCurrent { .. }
+                | PaymentBlocker::ConversationNotKept
+                | PaymentBlocker::ConversationForgotten
+                | PaymentBlocker::PurchaseNotKept => {}
             }
             seen.insert(std::mem::discriminant(blocker));
         }
@@ -24619,7 +28347,7 @@ mod payment_blocker_wording_tests {
     /// The one number a future edit has to change by hand, and the assertion
     /// above is what makes forgetting it fail rather than silently narrow the
     /// coverage.
-    const EVERY_BLOCKER: usize = 19;
+    const EVERY_BLOCKER: usize = 23;
 
     /// **Every blocker says something, and says it as prose.**
     ///

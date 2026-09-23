@@ -4,6 +4,7 @@ mod bip32;
 mod bitcoin;
 mod handlers;
 mod import;
+mod kept_purchases;
 mod known_stores;
 mod markers;
 mod messaging;
@@ -23,9 +24,9 @@ use harvest_common::{
     from_cbor, to_cbor, BitcoinDelegateRequest, HarvestDelegateRequest, HarvestDelegateResponse,
 };
 
-// RSA key generation (`InitReputationKeys`) and blind signing
-// (`BlindSignFeedbackToken`) need real randomness, via `rsa::rand_core::OsRng`.
-// `getrandom` (which `OsRng` sits on) has no OS backend on
+// Key generation (store keys, X25519 conversation keys) needs real
+// randomness, via `getrandom`. (It first arrived for the RSA blind-signing
+// keys, retired in harvest#53 Phase C.) `getrandom` has no OS backend on
 // `wasm32-unknown-unknown`, so the workspace enables its "custom" feature --
 // but that feature only *allows* registering a source, it doesn't provide
 // one. Without this registration the crate fails to LINK (missing
@@ -241,7 +242,7 @@ fn payload_shape(payload: &[u8]) -> String {
 /// Handle a contract state change notification.
 ///
 /// The delegate subscribes to mailbox and reputation contracts. When new
-/// messages or feedback entries arrive, this handler processes them.
+/// messages or complaints arrive, this handler processes them.
 fn handle_contract_notification(
     _ctx: &mut DelegateCtx,
     notification: &freenet_stdlib::prelude::ContractNotification,
@@ -251,7 +252,7 @@ fn handle_contract_notification(
     //
     // For now, forward the notification to the UI as an application message
     // so the UI can update its view. The delegate will eventually handle
-    // auto-responses (e.g., auto-signing feedback tokens) here.
+    // auto-responses (none are defined today) here.
 
     let notification_msg = HarvestDelegateResponse::ContractUpdate {
         contract_key: notification.contract_id.as_bytes().to_vec(),
@@ -386,6 +387,44 @@ mod boundary_tests {
         );
     }
 
+    /// A `PurchaseToKeep` that decodes but never verifies -- good enough for a
+    /// test that only exercises the ORIGIN gate, which fires before this
+    /// content is looked at.
+    fn unverified_purchase_to_keep() -> harvest_common::delegate::PurchaseToKeep {
+        use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderStatus};
+        harvest_common::delegate::PurchaseToKeep {
+            complaint: None,
+            store_key: [1u8; 32],
+            conversation: [2u8; 32],
+            order: AuthorizedOrder {
+                order: Order {
+                    id: OrderId([0u8; 32]),
+                    buyer_fingerprint: String::new(),
+                    seller_fingerprint: String::new(),
+                    amount_sats: 0,
+                    network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                    payment_script_pubkey: vec![],
+                    payment_hash: None,
+                    payment_address: String::new(),
+                    required_confirmations: 1,
+                    trusted_bridges: vec![],
+                    bitcoin_address_code_hash: None,
+                    anchor: None,
+                    order_binding: None,
+                    listing_tag: None,
+                    buyer_receipt_key: None,
+                    created_at: chrono::DateTime::from_timestamp(0, 0).expect("epoch"),
+                },
+                scoped_payload: vec![],
+                signature: vec![],
+                status: OrderStatus::AwaitingPayment,
+                payment_proof: None,
+                status_scoped_payload: None,
+                status_signature: None,
+            },
+        }
+    }
+
     /// Every family is refused at the same point, including the migration
     /// export, which is the one that was already checked.
     ///
@@ -401,7 +440,7 @@ mod boundary_tests {
                 source_generation: 4,
             })
             .expect("cbor"),
-            to_cbor(&HarvestDelegateRequest::ListTransactions).expect("cbor"),
+            to_cbor(&HarvestDelegateRequest::ListRememberedStores).expect("cbor"),
             to_cbor(&BtcReq::ListWatched).expect("cbor"),
             // The messaging family. `InitEncryptionKey` decides which key
             // buyers will encrypt to, and `DeriveConversationKeys` is a
@@ -463,6 +502,17 @@ mod boundary_tests {
                 buyer_public_key: [7u8; 32],
             })
             .expect("cbor"),
+            // The buyer's kept purchases (harvest#53 Phase C).
+            // `KeepPurchase` writes one and `ListKeptPurchases` reads
+            // it back; both are which paid orders a buyer holds, which is
+            // exactly the linkage a pseudonymous marketplace withholds. The
+            // gate fires before this content is ever validated, so a
+            // never-verifying placeholder order is enough to exercise it.
+            to_cbor(&HarvestDelegateRequest::KeepPurchase {
+                keep: Box::new(unverified_purchase_to_keep()),
+            })
+            .expect("cbor"),
+            to_cbor(&HarvestDelegateRequest::ListKeptPurchases).expect("cbor"),
         ];
         for payload in payloads {
             assert!(refusal(&payload, Some(&a_different_web_app())).contains("Harvest web app"));

@@ -394,6 +394,16 @@ fn held_conversations<S: SecretStore>(
         .collect()
 }
 
+/// The secret of every buyer conversation this delegate holds, for the
+/// kept-purchase check that a copy names its conversation's receipt key
+/// (`kept_purchases::keep`).
+pub(crate) fn held_conversation_secrets<S: SecretStore>(store: &S) -> Vec<[u8; 32]> {
+    held_conversations(store)
+        .into_iter()
+        .filter_map(|(_, record)| record.map(|record| record.secret.0))
+        .collect()
+}
+
 /// Keep a buyer's conversation, evicting the oldest if every slot is taken.
 ///
 /// The routing tag is derived from the secret, so what is answered and what

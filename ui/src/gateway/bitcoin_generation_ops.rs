@@ -96,6 +96,30 @@ pub fn start() {
                 if could_act {
                     APP_STATE.write().send_due_watch_requests();
                 }
+                // The kept purchases, asked again until the delegate answers
+                // (review round 2 of #143, P3): the payment details wait on
+                // that list, so a lost answer would hide them all session.
+                let kept_list_due = {
+                    use dioxus::prelude::ReadableExt;
+                    APP_STATE.peek().kept_list_due()
+                };
+                if kept_list_due {
+                    APP_STATE.write().sync_kept_purchases();
+                }
+                // A kept complaint whose PUT failed, put back (review round
+                // 4, P2-6); and a keep that timed out, let go so its card
+                // repaints (P3). Both decided under a read.
+                let now = crate::state::now_ms();
+                let (reasserts_due, keeps_timed_out) = {
+                    use dioxus::prelude::ReadableExt;
+                    let state = APP_STATE.peek();
+                    (state.reasserts_due(), state.keeps_timed_out(now))
+                };
+                if reasserts_due || keeps_timed_out {
+                    let mut state = APP_STATE.write();
+                    state.reassert_kept_complaints();
+                    state.drop_timed_out_keeps(now);
+                }
             })
         });
     });
@@ -338,6 +362,13 @@ fn mirror() {
         return;
     };
     let mut app = APP_STATE.write();
+    let resolved_now = address.code_hash().is_some() && address != app.bitcoin.address_generation;
     app.bitcoin.address_generation = address;
     app.bitcoin.inbox_generation = inbox;
+    // A kept order's payment is watched under the pointer's build as well as
+    // its own (`docs/complaint-threat-model.md` section 3.2), and the pointer
+    // has just named one.
+    if resolved_now {
+        app.watch_kept_purchase_addresses();
+    }
 }

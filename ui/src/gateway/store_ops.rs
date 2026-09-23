@@ -42,6 +42,34 @@ pub(crate) fn store_code_hash() -> [u8; 32] {
     *HASH
 }
 
+/// The code hash of the reputation contract this build bundles. Cached for
+/// the reason [`store_code_hash`] gives.
+pub(crate) fn reputation_code_hash() -> [u8; 32] {
+    static HASH: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+        let hash = *ContractCode::from(REPUTATION_CONTRACT_WASM.to_vec()).hash();
+        let bytes: &[u8] = hash.as_ref();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes[..32]);
+        out
+    });
+    *HASH
+}
+
+/// The reputation record a store key addresses under this build (harvest#53
+/// Phase C).
+///
+/// A function of the store key alone, so a reader derives it from the store
+/// it is looking at with no lookup, and a buyer can publish a complaint to a
+/// store whose seller never opened Harvest after the upgrade. Through
+/// `crate::migrate`'s derivation, the one store creation and the migration
+/// use, so the three cannot disagree about where a record lives.
+pub fn reputation_instance_id(
+    store_key: &ed25519_dalek::VerifyingKey,
+) -> Result<ContractInstanceId, String> {
+    let bytes = crate::migrate::encode_params(&crate::migrate::reputation_params(store_key))?;
+    Ok(crate::migrate::current_id(&reputation_code_hash(), &bytes))
+}
+
 /// The address a store code opens under this build (harvest#52).
 ///
 /// Everything a client needs is local: the code is the store contract's only
@@ -245,7 +273,7 @@ pub async fn create_store_contracts(
         carried_listings,
     } = creation;
     let rsa_public_key_der =
-        rsa_public_key_der.ok_or("the reputation key had not arrived; nothing was created")?;
+        rsa_public_key_der.ok_or("the store's record key had not arrived; nothing was created")?;
     use dioxus::logger::tracing::{info, warn};
     use dioxus::prelude::{ReadableExt, WritableExt};
     use freenet_stdlib::prelude::*;
@@ -254,9 +282,9 @@ pub async fn create_store_contracts(
     let seller_vk = ed25519_dalek::VerifyingKey::from_bytes(&seller_verifying_key_bytes)
         .map_err(|e| format!("invalid verifying key: {e}"))?;
     // The store's own key (harvest#93): it owns the store, its code is the
-    // store's address, and it signs everything the store holds. The Ghost Key
-    // above still addresses the mailbox and the reputation contract, which
-    // later phases of #93 move onto the store key.
+    // store's address, and it signs everything the store holds -- and since
+    // harvest#53 Phase C it alone addresses the store's reputation record.
+    // The Ghost Key above still addresses the mailbox.
     let store_vk = backing.statement.store;
 
     // Helper to create a ContractContainer from WASM bytes and parameters
@@ -282,13 +310,15 @@ pub async fn create_store_contracts(
     // contracts live -- silently, in the direction that reports a clean
     // "nothing to migrate". This file used to hold that second copy for all
     // three contracts; see `migrate::store_params`.
-    let reputation_params =
-        crate::migrate::reputation_params(rsa_public_key_der.clone(), &seller_vk);
+    let reputation_params = crate::migrate::reputation_params(&store_vk);
     let reputation_params_bytes = harvest_common::to_cbor(&reputation_params)
         .map_err(|e| format!("serialize reputation params: {e}"))?;
 
+    // Only what the contract accepts: a genuine certificate in canonical
+    // armour, or none (`ghostkey_cert::record_certificate`). Anything else
+    // would make this PUT, and with it the store's creation, fail.
     let reputation_state = harvest_common::reputation::ReputationStateV1 {
-        owner_certificate_pem: certificate_pem.clone(),
+        owner_certificate_pem: crate::ghostkey_cert::record_certificate(&certificate_pem),
         ..Default::default()
     };
     let reputation_state_bytes = harvest_common::to_cbor(&reputation_state)
@@ -804,6 +834,73 @@ pub async fn submit_despatch_by_id(
         "Published the despatch of order {} to its store contract",
         id
     );
+    Ok(())
+}
+
+/// The state a buyer publishes to put one complaint on a store's record:
+/// the complaint alone, with no certificate (the seller's is back-filled by
+/// the contract's merge from whichever side has one).
+pub(crate) fn complaint_state_bytes(
+    complaint: harvest_common::reputation::Complaint,
+) -> Result<Vec<u8>, String> {
+    harvest_common::to_cbor(&harvest_common::reputation::ReputationStateV1 {
+        owner_certificate_pem: String::new(),
+        complaints: vec![complaint],
+    })
+}
+
+/// Publish a buyer's complaint to the store's reputation record (harvest#53
+/// Phase C).
+///
+/// A PUT of the record's contract with a state holding just this complaint,
+/// not an UPDATE: the record is addressed by the store key alone, and for a
+/// store whose seller has not opened Harvest since the upgrade the instance
+/// may not exist yet. A PUT creates it if absent and is merged by the
+/// contract if present, which keeps the complaint independent of anything
+/// the seller does, the receipted design's point.
+///
+/// `follow` subscribes to the record afterwards, for a store this tab shows.
+/// The re-assert sweep (`AppState::reassert_kept_complaints`) passes `false`:
+/// a record for a store not shown has nowhere to be shown.
+#[cfg(target_arch = "wasm32")]
+pub async fn submit_complaint(
+    store_key: ed25519_dalek::VerifyingKey,
+    complaint: harvest_common::reputation::Complaint,
+    follow: bool,
+) -> Result<(), String> {
+    use dioxus::logger::tracing::info;
+    use freenet_stdlib::prelude::*;
+    use std::sync::Arc;
+
+    let id = complaint.order_id().short();
+    let params = crate::migrate::encode_params(&crate::migrate::reputation_params(&store_key))?;
+    let code = ContractCode::from(REPUTATION_CONTRACT_WASM.to_vec());
+    let wrapped = WrappedContract::new(Arc::new(code), params);
+    let instance_id = *wrapped.key().id();
+    let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(wrapped));
+    super::put_contract(
+        container,
+        WrappedState::new(complaint_state_bytes(complaint)?),
+    )
+    .await?;
+    info!("Published a complaint about order {id} to the store's reputation record");
+    if !follow {
+        return Ok(());
+    }
+    // Follow the record, so the complaint shows here once the network has it
+    // -- the store page's own subscription may have found nothing, if this
+    // PUT is what created the record.
+    //
+    // The complaint is published once the PUT succeeded, so a failure here
+    // is not the complaint's: reporting it as one released the sent marker
+    // and invited a second complaint about an order already complained
+    // about (review round 1 of #143, P2-8). Logged, and the store page's own
+    // subscription still brings the record in.
+    if let Err(e) = super::get_contract(&instance_id, true).await {
+        dioxus::logger::tracing::warn!(
+            "The complaint about order {id} was published, but following the record failed: {e}"
+        );
+    }
     Ok(())
 }
 

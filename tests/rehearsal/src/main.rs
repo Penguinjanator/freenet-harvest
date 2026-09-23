@@ -7,6 +7,11 @@
 
 #[path = "../../../ui/src/migrate.rs"]
 mod migrate;
+// `migrate::ReputationOps::decode` reduces a certificate to what the
+// reputation contract accepts, through the UI's own certificate check.
+#[path = "../../../ui/src/ghostkey_cert.rs"]
+#[allow(dead_code)]
+mod ghostkey_cert;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,12 +25,24 @@ use freenet_stdlib::client_api::{
     ClientRequest, ContractRequest, ContractResponse, DelegateRequest, HostResponse, WebApi,
 };
 use freenet_stdlib::prelude::{
-    ApplicationMessage, ContractCode, ContractContainer, ContractInstanceId,
+    ApplicationMessage, ContractCode, ContractContainer, ContractInstanceId, ContractKey, State,
+    UpdateData,
     ContractWasmAPIVersion, Delegate, DelegateCode, DelegateContainer, DelegateKey,
     DelegateWasmAPIVersion, InboundDelegateMsg, OutboundDelegateMsg, Parameters, RelatedContracts,
     WrappedContract, WrappedState,
 };
 use harvest_common::listing::{AuthorizedListing, Listing, ListingId, ListingKind, PriceInfo};
+use freenet_bitcoin_common::spv::testing::payment_proof;
+use freenet_bitcoin_common::{
+    BitcoinNetwork, BlockAnchor, BlockHash, BridgeId, Claim, ClaimBody, OutPoint, SignedClaim,
+    SignedTipEntry, TipEntryBody,
+};
+use harvest_common::feedback::FeedbackCategory;
+use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderPaymentProof, OrderStatus};
+use harvest_common::reputation::{
+    Complaint, ComplaintTag, ComplaintTerms, ReputationParameters, ReputationStateV1,
+    MAX_COMPLAINTS,
+};
 use harvest_common::store::{AuthorizedStoreInfoV1, StoreInfoV1, StoreParameters, StoreStateV1};
 
 use migrate::{Artifact, ProbeSession, Seal, StoreOps};
@@ -227,6 +244,548 @@ fn fingerprint_of(vk: &VerifyingKey) -> String {
     bs58::encode(blake3::hash(vk.as_bytes()).as_bytes()).into_string()
 }
 
+// --- harvest#53 Phase C: the reputation record's re-addressing ------------
+
+/// A throwaway RSA public key (PKCS#1 DER) standing in for a store's record
+/// key. The RSA generations' contract parses it in `validate_state`, so it
+/// has to be a real key; nothing ever signed with its private half.
+const THROWAWAY_RSA_DER_HEX: &str = "3082010a0282010100b27faa28bf26a8ca2b29176d45f8bbd501eceaea7fa8bc9d5c56411194fd3bf68ee21e6576a8035e3786b418fd747d78fac7ba13c561f1f1bffe38749887d98b98be0ff960e9333decfe41f6402354bbaa0dbb8254b8770c426966b54b3752f03b1fb22e133ac076f9434a953540fe668fa71f12b4372e7115c9956f2383db314860e6096563b77d4afd7989e9aa0b13f71fa375eb4e35ce9f682f68cda8e28922a165734366d42446b02dc1d794a09b4d09ebcca455f31451736b54f88a735b62a13d182a7f333a56728a8abadd14360a03fb3411a6f8e6a6b35716cdd3c476b357adc0f184c661ea4e4ab8fd002b01ade77037e0fc9a2440da88a19918e40b0203010001";
+
+/// The last generation addressed by the RSA key and the Ghost Key, and the
+/// hash the registry must give it.
+const REPUTATION_PLANT_AT: (u32, &str) = (
+    15,
+    "78ae80d2bcb3e80299a977da3a437a44cced8b74367f53d24e407c2b171d362e",
+);
+
+/// The RSA generations' parameters, written out independently of
+/// `migrate.rs`'s copy for the reason `LegacyStoreParameters` gives.
+#[derive(serde::Serialize)]
+struct RsaReputationParameters {
+    rsa_public_key_der: Vec<u8>,
+    owner_verifying_key: VerifyingKey,
+}
+
+/// The RSA generations' state, as every live record holds it: the seller's
+/// certificate and no feedback (no producer of a feedback entry ever
+/// shipped).
+#[derive(serde::Serialize)]
+struct RsaGenerationReputationState {
+    owner_certificate_pem: String,
+    feedback: Vec<()>,
+    used_nonces: Vec<[u8; 32]>,
+}
+
+/// Scenario 4: a V15 reputation record holding the seller's certificate is
+/// found through `migrate::reputation_candidates` (Option A: the RSA key as
+/// a legacy address input only), folded by `ReputationOps`, and the
+/// certificate lands at the record the store key addresses under this
+/// build.
+async fn scenario_reputation(node: &mut Node, repo: &Path) {
+    println!("\n== scenario 4: a V15 reputation record's certificate is carried to the store-key record ==");
+    let (generation, want) = REPUTATION_PLANT_AT;
+    let row = migrate::reputation_lineage()
+        .iter()
+        .find(|e| e.generation == generation)
+        .expect("the registry declares V15");
+    assert_eq!(hex::encode(row.code_hash), want, "V15 no longer has the hash planted at");
+    assert_eq!(
+        migrate::LAST_RSA_REPUTATION_PARAM_GENERATION, generation,
+        "V15 is the last RSA-addressed generation"
+    );
+    let v15 = legacy_wasm_from_git(repo, "reputation_contract", want);
+    let current = read_wasm(&repo.join("ui/public/contracts/reputation_contract.wasm"));
+
+    let store = SigningKey::from_bytes(&[0x5C; 32]).verifying_key();
+    let ghost = SigningKey::from_bytes(&[0x6D; 32]).verifying_key();
+    let record_der = hex::decode(THROWAWAY_RSA_DER_HEX).unwrap();
+    // A second key that addressed nothing here: a Ghost Key's per-device
+    // key, which addressed the records of stores made BEFORE harvest#93 1b
+    // (this store, made after, used its record key). The walk tries it too
+    // when it is known.
+    let mut per_device_der = record_der.clone();
+    let last = per_device_der.len() - 1;
+    per_device_der[last] ^= 1;
+
+    let rsa_params = Parameters::from(
+        harvest_common::to_cbor(&RsaReputationParameters {
+            rsa_public_key_der: record_der.clone(),
+            owner_verifying_key: ghost,
+        })
+        .unwrap(),
+    );
+    let (v15_container, v15_id) = container(&v15, rsa_params);
+    let current_params =
+        migrate::encode_params(&migrate::reputation_params(&store)).expect("encode");
+    let (curr_container, curr_id) = container(&current, current_params.clone());
+    assert_eq!(migrate::current_id(&code_hash(&current), &current_params), curr_id);
+    println!("  V15 record (stdlib key derivation): {v15_id}");
+    println!("  store-key record under this build:  {curr_id}");
+
+    // The walk reaches the node's own address for V15, from the record key,
+    // and does not list the registration's id a second time when it is the
+    // same record.
+    let locators = || migrate::ReputationLocators {
+        store_key: store,
+        ghost_key: ghost,
+        rsa_public_keys: vec![per_device_der.clone(), record_der.clone()],
+        registered_id: Some(v15_id),
+        current_id: curr_id,
+    };
+    let ids = migrate::reputation_candidate_ids(&locators()).expect("derive");
+    assert!(ids.contains(&v15_id), "the walk must reach the V15 record");
+    assert_eq!(ids.iter().filter(|i| **i == v15_id).count(), 1, "no duplicate");
+    assert!(!ids.contains(&curr_id), "the successor is not its own predecessor");
+    println!("  {} candidates, V15 record at position {}", ids.len(), ids.iter().position(|i| *i == v15_id).unwrap());
+
+    // A genuine Ghost Key certificate: since #143 review round 1 (P1-4) the
+    // record's contract refuses anything else in this field, and the fold
+    // reduces anything else to nothing.
+    const CERT: &str = include_str!("../../fixtures/ghostkey-certificate.pem");
+    let planted = harvest_common::to_cbor(&RsaGenerationReputationState {
+        owner_certificate_pem: CERT.into(),
+        feedback: Vec::new(),
+        used_nonces: Vec::new(),
+    })
+    .unwrap();
+    println!("  PUT the V15 record ({} bytes) ...", planted.len());
+    node.put(v15_container, planted).await.expect("PUT V15 record (the V15 contract accepts it)");
+    match node.get(v15_id).await {
+        GetOutcome::State(bytes) => {
+            let s: harvest_common::reputation::ReputationStateV1 =
+                harvest_common::from_cbor(&bytes).expect("an RSA-generation state decodes as the new type");
+            println!("  read back V15: certificate {:?}, {} complaints", s.owner_certificate_pem, s.complaints.len());
+            assert_eq!(s.owner_certificate_pem, CERT);
+        }
+        other => panic!("V15 record did not read back: {other:?}"),
+    }
+
+    println!("\n  -- probe as the current build --");
+    let params = migrate::reputation_params(&store);
+    let mut session = ProbeSession::start_with_candidates(
+        migrate::ReputationOps { params: params.clone() },
+        harvest_common::reputation::ReputationStateV1::default(),
+        migrate::reputation_candidates(&locators()).expect("candidates"),
+        migrate::fold_all_policy(),
+    );
+    while let Some(candidate) = session.next_get() {
+        match node.get(candidate).await {
+            GetOutcome::State(bytes) => {
+                println!("  GET {candidate} -> state, {} bytes", bytes.len());
+                session.on_state(candidate, &bytes)
+            }
+            GetOutcome::Absent => session.on_absent(candidate),
+            GetOutcome::Unknown(_) => session.on_unknown(candidate),
+        }
+    }
+    let (outcome, seal) = session.take_result().expect("probe finished");
+    println!("  describe: {}", migrate::describe(&outcome));
+    println!("  seal decision: {seal:?}");
+    let Outcome::Recovered { merged, source, .. } = &outcome else {
+        panic!("expected Recovered, got {outcome:?}");
+    };
+    assert_eq!(*source, v15_id, "the V15 record is the source");
+    assert_eq!(merged.owner_certificate_pem, CERT, "the certificate is carried");
+    assert!(merged.complaints.is_empty());
+
+    let forward = harvest_common::to_cbor(merged).unwrap();
+    println!("  PUT forward to {curr_id} ({} bytes) ...", forward.len());
+    node.put(curr_container, forward).await.expect("the current contract accepts the carried record");
+    match node.get(curr_id).await {
+        GetOutcome::State(bytes) => {
+            let s: harvest_common::reputation::ReputationStateV1 = harvest_common::from_cbor(&bytes).unwrap();
+            println!("  store-key record now: certificate {:?}, {} complaints", s.owner_certificate_pem, s.complaints.len());
+            assert_eq!(s.owner_certificate_pem, CERT, "the certificate is at the store-key record");
+        }
+        other => panic!("the store-key record did not read back: {other:?}"),
+    }
+    println!("  SCENARIO 4a PASSED: the V15 certificate is at the store-key record");
+
+    scenario_reputation_by_registration(node, repo, &current, CERT).await;
+}
+
+/// Scenario 4b (#143 review round 1, P2-13): a store made BEFORE harvest#93
+/// phase 1b, whose record lives under the Ghost Key's per-device RSA key at
+/// V10, reached ONLY through the registration's id -- the per-device key is
+/// not in the locators, which is the usual case (review P2-11). Then the
+/// registration naming the current record walks nothing (P2-7).
+async fn scenario_reputation_by_registration(node: &mut Node, repo: &Path, current: &[u8], cert: &str) {
+    println!("\n== scenario 4b: a pre-1b V10 record under the per-device key, found only through the registered id ==");
+    const V10: &str = "3c55af21e5658f03121bbeccfe347d4d530b57139251048767089596145e0594";
+    let row = migrate::reputation_lineage()
+        .iter()
+        .find(|e| hex::encode(e.code_hash) == V10)
+        .expect("the registry declares V10");
+    assert_eq!(row.generation, 10);
+    let v10 = legacy_wasm_from_git(repo, "reputation_contract", V10);
+
+    let store = SigningKey::from_bytes(&[0x5D; 32]).verifying_key();
+    let ghost = SigningKey::from_bytes(&[0x6E; 32]).verifying_key();
+    let mut per_device_der = hex::decode(THROWAWAY_RSA_DER_HEX).unwrap();
+    // The per-device key: planted under, never given to the walk.
+    let last = per_device_der.len() - 1;
+    per_device_der[last] ^= 2;
+    let (v10_container, v10_id) = container(
+        &v10,
+        Parameters::from(
+            harvest_common::to_cbor(&RsaReputationParameters {
+                rsa_public_key_der: per_device_der.clone(),
+                owner_verifying_key: ghost,
+            })
+            .unwrap(),
+        ),
+    );
+    let current_params = migrate::encode_params(&migrate::reputation_params(&store)).expect("encode");
+    let (curr_container, curr_id) = container(current, current_params);
+    println!("  V10 record (per-device key): {v10_id}");
+    println!("  store-key record:            {curr_id}");
+
+    let locators = |registered| migrate::ReputationLocators {
+        store_key: store,
+        ghost_key: ghost,
+        rsa_public_keys: Vec::new(),
+        registered_id: registered,
+        current_id: curr_id,
+    };
+    // The derivations alone cannot reach it: no RSA key is known.
+    let derived = migrate::reputation_candidate_ids(&locators(None)).expect("derive");
+    assert!(!derived.contains(&v10_id), "no locator but the registration reaches it");
+    let ids = migrate::reputation_candidate_ids(&locators(Some(v10_id))).expect("derive");
+    assert_eq!(ids.last(), Some(&v10_id), "the registration's id is tried, last");
+
+    let planted = harvest_common::to_cbor(&RsaGenerationReputationState {
+        owner_certificate_pem: cert.into(),
+        feedback: Vec::new(),
+        used_nonces: Vec::new(),
+    })
+    .unwrap();
+    node.put(v10_container, planted).await.expect("PUT V10 record (the V10 contract accepts it)");
+
+    let params = migrate::reputation_params(&store);
+    let mut session = ProbeSession::start_with_candidates(
+        migrate::ReputationOps { params: params.clone() },
+        harvest_common::reputation::ReputationStateV1::default(),
+        migrate::reputation_candidates(&locators(Some(v10_id))).expect("candidates"),
+        migrate::fold_all_policy(),
+    );
+    while let Some(candidate) = session.next_get() {
+        match node.get(candidate).await {
+            GetOutcome::State(bytes) => session.on_state(candidate, &bytes),
+            GetOutcome::Absent => session.on_absent(candidate),
+            GetOutcome::Unknown(_) => session.on_unknown(candidate),
+        }
+    }
+    let (outcome, seal) = session.take_result().expect("probe finished");
+    println!("  describe: {}", migrate::describe(&outcome));
+    println!("  seal decision: {seal:?}");
+    let Outcome::Recovered { merged, source, .. } = &outcome else {
+        panic!("expected Recovered, got {outcome:?}");
+    };
+    assert_eq!(*source, v10_id, "the V10 record is the source");
+    assert_eq!(merged.owner_certificate_pem, cert, "the certificate is carried");
+    node.put(curr_container, harvest_common::to_cbor(merged).unwrap())
+        .await
+        .expect("the current contract accepts the carried record");
+    match node.get(curr_id).await {
+        GetOutcome::State(bytes) => {
+            let s: harvest_common::reputation::ReputationStateV1 = harvest_common::from_cbor(&bytes).unwrap();
+            assert_eq!(s.owner_certificate_pem, cert, "the certificate is at the store-key record");
+        }
+        other => panic!("the store-key record did not read back: {other:?}"),
+    }
+    println!("  SCENARIO 4b PASSED: the pre-1b certificate reached the store-key record through the registered id");
+
+    // P2-7: once the registration names the current record, nothing to walk.
+    let none = migrate::reputation_candidate_ids(&locators(Some(curr_id))).expect("derive");
+    assert!(none.is_empty(), "a registration naming the current record walks nothing: {none:?}");
+    println!("  SCENARIO 4c PASSED: a registration naming the current record yields no candidates");
+}
+
+// --- scenario 4d: existing complaints carried forward, then the cap ------
+//
+// Genuine complaints built the way `tests/merge-laws/gen` builds them
+// (`StoreFx`, `receipted_order`, `complaint_buyer`, `complaint_by`), copied
+// because `harvest_common::test_orders` is private to its crate.
+
+/// The build before #143 round 6 (commit 7421f02): the store-key record with
+/// NO complaint cap. Never published, so no registry lists it.
+const UNCAPPED_REPUTATION: &str =
+    "eb3e0e6711fd716d69415479f7afbb4edb8caad55d5f10f5a4d99274dbf901ce";
+
+struct ComplaintFx {
+    seller: SigningKey,
+    bridge: SigningKey,
+}
+
+impl ComplaintFx {
+    fn order(&self, n: u8) -> Order {
+        Order {
+            id: OrderId([0u8; 32]),
+            buyer_fingerprint: format!("complainer-{n}"),
+            seller_fingerprint: "throwaway-seller-fp".into(),
+            amount_sats: 50_000,
+            network: BitcoinNetwork::Signet,
+            payment_script_pubkey: vec![0x00, 0x14, 0xaa, 0xbb],
+            payment_hash: None,
+            payment_address: "tb1qthrowaway".into(),
+            required_confirmations: 1,
+            trusted_bridges: vec![BridgeId(self.bridge.verifying_key().to_bytes())],
+            bitcoin_address_code_hash: None,
+            // The payment below confirms at height 100, inside the window.
+            anchor: Some(BlockAnchor { height: 90, hash: BlockHash([3u8; 32]) }),
+            order_binding: None,
+            listing_tag: None,
+            buyer_receipt_key: Some(complaint_buyer(n).verifying_key().to_bytes()),
+            created_at: ts(1_700_000_000 + i64::from(n)),
+        }
+        .with_derived_id()
+    }
+
+    fn tip(&self, order: &Order, height: u32) -> SignedTipEntry {
+        SignedTipEntry::sign(
+            &self.bridge,
+            &TipEntryBody {
+                network: order.network,
+                anchor: BlockAnchor { height, hash: BlockHash([9u8; 32]) },
+                prev_hash: BlockHash([8u8; 32]),
+                block_time: 1_700_000_000,
+                tx_count: 1,
+                median_time: 1_700_000_000,
+            },
+        )
+        .unwrap()
+    }
+
+    /// The order at `Paid`, with a genuine SPV proof confirming at 100.
+    fn paid(&self, n: u8) -> AuthorizedOrder {
+        let order = self.order(n);
+        let (spv, txid, block_hash) =
+            payment_proof(&order.payment_script_pubkey, order.amount_sats, 1, [1u8; 32]);
+        let anchor = BlockAnchor { height: 100, hash: block_hash };
+        let claim = SignedClaim::sign(
+            &self.bridge,
+            &ClaimBody {
+                script_id: order.bitcoin_params().script_id(),
+                network: order.network,
+                as_of: anchor,
+                claim: Claim::ConfirmedOutput {
+                    outpoint: OutPoint { txid, vout: 0 },
+                    value_sats: order.amount_sats,
+                    anchor,
+                    spv,
+                },
+            },
+        )
+        .unwrap();
+        let proof = OrderPaymentProof::on_chain(vec![claim], self.tip(&order, 100));
+        let (scoped_payload, signature) = scoped_sign(&self.seller, &order);
+        let rec = AuthorizedOrder {
+            order,
+            scoped_payload,
+            signature,
+            status: OrderStatus::Paid,
+            payment_proof: Some(proof),
+            status_scoped_payload: None,
+            status_signature: None,
+        };
+        rec.verify(&self.seller.verifying_key()).expect("fixture order verifies");
+        rec
+    }
+
+    /// Order `n`'s genuine complaint, dated `after` blocks after its payment.
+    fn dated(&self, n: u8, after: u32) -> Complaint {
+        let order = self.paid(n);
+        let paid_height = harvest_common::payment::paid_height(&order).expect("paid");
+        let terms = ComplaintTerms {
+            tag: ComplaintTag::HarvestComplaintV1,
+            order_id: order.order.id.clone(),
+            category: FeedbackCategory::NonDelivery,
+            block_height: paid_height + after,
+            paid_height,
+        };
+        let (scoped_payload, buyer_signature) = scoped_sign(&complaint_buyer(n), &terms);
+        let c = Complaint {
+            order,
+            category: terms.category,
+            block_height: terms.block_height,
+            paid_height,
+            scoped_payload,
+            buyer_signature,
+        };
+        c.verify(&self.seller.verifying_key()).expect("fixture complaint verifies");
+        c
+    }
+}
+
+fn complaint_buyer(n: u8) -> SigningKey {
+    SigningKey::from_bytes(&[n.wrapping_add(100); 32])
+}
+
+/// 3 honest complaints dated 151..=153 blocks after payment (orders 1..=3)
+/// and 147 dated 5004..=5150 after (orders 4..=150): 150 in all, 4 past
+/// `MAX_COMPLAINTS`. The record must keep the honest ones and drop orders
+/// 147..=150, the four dated farthest.
+fn over_cap_record(fx: &ComplaintFx, cert: &str) -> (ReputationStateV1, Vec<OrderId>, Vec<OrderId>) {
+    let honest: Vec<Complaint> = (1u8..=3).map(|n| fx.dated(n, 150 + u32::from(n))).collect();
+    let late: Vec<Complaint> = (4u8..=150).map(|n| fx.dated(n, 5_000 + u32::from(n))).collect();
+    let farthest = late[late.len() - 4..].iter().map(|c| c.order_id().clone()).collect();
+    let honest_ids = honest.iter().map(|c| c.order_id().clone()).collect();
+    let mut complaints: Vec<Complaint> = honest.into_iter().chain(late).collect();
+    // The uncapped build's canonical form: strictly ascending by order id.
+    complaints.sort_by(|a, b| a.order_id().cmp(b.order_id()));
+    (
+        ReputationStateV1 { owner_certificate_pem: cert.into(), complaints },
+        honest_ids,
+        farthest,
+    )
+}
+
+/// What a record the new build holds must be, after taking the 150.
+fn assert_capped(label: &str, bytes: &[u8], params: &ReputationParameters, honest: &[OrderId], farthest: &[OrderId]) -> ReputationStateV1 {
+    let s: ReputationStateV1 = harvest_common::from_cbor(bytes).expect("decode the new-build record");
+    let held: Vec<&OrderId> = s.complaints.iter().map(|c| c.order_id()).collect();
+    let honest_kept = honest.iter().filter(|o| held.contains(o)).count();
+    let far_kept = farthest.iter().filter(|o| held.contains(o)).count();
+    println!(
+        "  {label}: {} complaints (cap {MAX_COMPLAINTS}), honest kept {honest_kept}/{}, farthest-dated kept {far_kept}/{}, {} bytes",
+        s.complaints.len(), honest.len(), farthest.len(), bytes.len()
+    );
+    assert_eq!(s.complaints.len(), MAX_COMPLAINTS, "{label}: exactly the cap");
+    assert_eq!(honest_kept, honest.len(), "{label}: every honest complaint is kept");
+    assert_eq!(far_kept, 0, "{label}: the four farthest-dated are dropped");
+    s.verify(params).unwrap_or_else(|e| panic!("{label}: the record does not verify: {e}"));
+    s
+}
+
+/// Scenario 4d: a record the uncapped build (eb3e0e67) holds with 150
+/// complaints is carried to this build, whose record keeps 146.
+///
+/// The app's walk cannot reach the uncapped build: it was never published,
+/// so no registry lists it (and it must not be added to one). The fold and
+/// PUT-forward are driven here with an EXPLICIT one-entry candidate list
+/// naming that record, through the same `ProbeSession`/`ReputationOps` code
+/// scenario 4a drives.
+async fn scenario_reputation_cap_carried(node: &mut Node, repo: &Path) {
+    println!("\n== scenario 4d: existing complaints are carried forward, then the cap applies ==");
+    println!("  NOTE: the uncapped build is not in any registry (never published); the walk is driven");
+    println!("        with an explicit candidate list naming its record, through the real ProbeSession/ReputationOps.");
+    const CERT: &str = include_str!("../../fixtures/ghostkey-certificate.pem");
+    let old = legacy_wasm_from_git(repo, "reputation_contract", UNCAPPED_REPUTATION);
+    assert!(
+        migrate::reputation_lineage().iter().all(|e| hex::encode(e.code_hash) != UNCAPPED_REPUTATION),
+        "the uncapped build must not be in the registry"
+    );
+    let current = read_wasm(&repo.join("ui/public/contracts/reputation_contract.wasm"));
+    println!("  current reputation_contract: blake3 {}", hex::encode(code_hash(&current)));
+
+    let fx = ComplaintFx {
+        seller: SigningKey::from_bytes(&[0x5E; 32]),
+        bridge: SigningKey::from_bytes(&[0xB2; 32]),
+    };
+    let store = fx.seller.verifying_key();
+    let params = ReputationParameters::new(store);
+    let pbytes = migrate::encode_params(&params).expect("encode");
+    let (old_container, old_id) = container(&old, pbytes.clone());
+    let (curr_container, curr_id) = container(&current, pbytes.clone());
+    let curr_key = curr_container.key().clone();
+    println!("  uncapped record: {old_id}");
+    println!("  this build's:    {curr_id}");
+
+    let (full, honest, farthest) = over_cap_record(&fx, CERT);
+    let full_bytes = harvest_common::to_cbor(&full).unwrap();
+    println!(
+        "  built {} genuine complaints ({} honest near payment, {} late; farthest 4 = orders 147..=150), {} bytes",
+        full.complaints.len(), honest.len(), full.complaints.len() - honest.len(), full_bytes.len()
+    );
+    assert!(full.complaints.len() > MAX_COMPLAINTS);
+
+    println!("  PUT all {} to the uncapped build ...", full.complaints.len());
+    node.put(old_container, full_bytes.clone()).await.expect("the uncapped build accepts 150");
+    let old_bytes = match node.get(old_id).await {
+        GetOutcome::State(bytes) => bytes,
+        other => panic!("the uncapped record did not read back: {other:?}"),
+    };
+    let old_state: ReputationStateV1 = harvest_common::from_cbor(&old_bytes).unwrap();
+    println!("  read back uncapped record: {} complaints, {} bytes", old_state.complaints.len(), old_bytes.len());
+    assert_eq!(old_state.complaints.len(), full.complaints.len());
+
+    println!("\n  -- probe as the current build, candidate list = [{old_id}] --");
+    let mut session = ProbeSession::start_with_candidates(
+        migrate::ReputationOps { params: params.clone() },
+        ReputationStateV1::default(),
+        freenet_migrate::NewestFirst::assume_ordered(vec![old_id]),
+        migrate::fold_all_policy(),
+    );
+    while let Some(candidate) = session.next_get() {
+        match node.get(candidate).await {
+            GetOutcome::State(bytes) => {
+                println!("  GET {candidate} -> state, {} bytes", bytes.len());
+                session.on_state(candidate, &bytes)
+            }
+            GetOutcome::Absent => session.on_absent(candidate),
+            GetOutcome::Unknown(_) => session.on_unknown(candidate),
+        }
+    }
+    let (outcome, seal) = session.take_result().expect("probe finished");
+    println!("  describe: {}", migrate::describe(&outcome));
+    println!("  seal decision: {seal:?}");
+    let Outcome::Recovered { merged, source, .. } = &outcome else {
+        panic!("expected Recovered, got {outcome:?}");
+    };
+    assert_eq!(*source, old_id);
+    println!("  fold result: {} complaints", merged.complaints.len());
+    let forward = harvest_common::to_cbor(merged).unwrap();
+    println!("  PUT forward to {curr_id} ({} bytes) ...", forward.len());
+    node.put(curr_container, forward).await.expect("this build accepts the carried record");
+    let after_put = match node.get(curr_id).await {
+        GetOutcome::State(bytes) => bytes,
+        other => panic!("this build's record did not read back: {other:?}"),
+    };
+    let carried = assert_capped("after the PUT forward", &after_put, &params, &honest, &farthest);
+    assert_eq!(carried.owner_certificate_pem, CERT, "the certificate is carried");
+
+    println!("\n  -- the uncapped record's full state as an UpdateData::State merge into this build --");
+    node.update_state(curr_key, old_bytes.clone()).await.expect("the node accepts the 150-complaint state merge");
+    let after_update = match node.get(curr_id).await {
+        GetOutcome::State(bytes) => bytes,
+        other => panic!("this build's record did not read back: {other:?}"),
+    };
+    assert_capped("after the state merge", &after_update, &params, &honest, &farthest);
+    assert_eq!(after_update, after_put, "the merge of the full state changes nothing: the same 146");
+    println!("  identical bytes to the carried record: yes");
+
+    // The same merge into a record that holds none of them yet, so the
+    // contract's own `update_state` is what drops the four.
+    println!("\n  -- a second store: its record holds only the certificate, then takes the 150 as one state merge --");
+    let fx2 = ComplaintFx {
+        seller: SigningKey::from_bytes(&[0x5F; 32]),
+        bridge: SigningKey::from_bytes(&[0xB2; 32]),
+    };
+    let params2 = ReputationParameters::new(fx2.seller.verifying_key());
+    let (curr2_container, curr2_id) =
+        container(&current, migrate::encode_params(&params2).expect("encode"));
+    let curr2_key = curr2_container.key().clone();
+    let empty = harvest_common::to_cbor(&ReputationStateV1 { owner_certificate_pem: CERT.into(), complaints: Vec::new() }).unwrap();
+    node.put(curr2_container, empty).await.expect("a certificate-only record");
+    let (full2, honest2, farthest2) = over_cap_record(&fx2, CERT);
+    node.update_state(curr2_key, harvest_common::to_cbor(&full2).unwrap())
+        .await
+        .expect("the node accepts the 150-complaint state merge");
+    match node.get(curr2_id).await {
+        GetOutcome::State(bytes) => {
+            assert_capped("second store after the state merge", &bytes, &params2, &honest2, &farthest2);
+        }
+        other => panic!("the second record did not read back: {other:?}"),
+    }
+
+    println!(
+        "  SCENARIO 4d PASSED: {} complaints under the uncapped build carried to this build's record as {} \
+         (cap {MAX_COMPLAINTS}); all {} honest kept, the 4 farthest-dated dropped, verify OK; the full state \
+         as an UpdateData::State merge gives the same {} (and {} into a certificate-only record)",
+        full.complaints.len(), MAX_COMPLAINTS, honest.len(), MAX_COMPLAINTS, MAX_COMPLAINTS
+    );
+}
+
 // --- the node ------------------------------------------------------------
 
 #[derive(Debug)]
@@ -286,6 +845,30 @@ impl Node {
                 }
                 Ok(Ok(other)) => println!("    (ignoring while awaiting PUT: {other:?})"),
                 Ok(Err(e)) => return Err(format!("PUT failed: {e}")),
+            }
+        }
+    }
+
+    /// An `UpdateData::State` UPDATE: the node runs the contract's own
+    /// `update_state` merge, then `validate_state` on the result.
+    async fn update_state(&mut self, key: ContractKey, state: Vec<u8>) -> Result<(), String> {
+        let expected = *key.id();
+        self.api
+            .send(ClientRequest::ContractOp(ContractRequest::Update {
+                key,
+                data: UpdateData::State(State::from(state)),
+            }))
+            .await
+            .map_err(|e| format!("send UPDATE: {e}"))?;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(60), self.api.recv()).await {
+                Err(_) => return Err("UPDATE timed out after 60s".into()),
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                    key,
+                    ..
+                }))) if *key.id() == expected => return Ok(()),
+                Ok(Ok(other)) => println!("    (ignoring while awaiting UPDATE: {other:?})"),
+                Ok(Err(e)) => return Err(format!("UPDATE failed: {e}")),
             }
         }
     }
@@ -523,6 +1106,11 @@ const ENCODING_BY_GENERATION: &[(u32, Shape)] = {
         // code is a prefix of, not the encoding. Superseded by harvest#93 phase
         // 1a (a store key owns the store).
         (18, Code),
+        // V19 (`b5eddce7`) and V20 (`9e0561ce`) were missed the same way, and
+        // added with harvest#53 Phase C when this harness next ran. Neither
+        // touched `StoreParameters`: still the store code.
+        (19, Code),
+        (20, Code),
     ]
 };
 
@@ -639,6 +1227,16 @@ async fn main() {
     );
 
     let mut node = Node::connect().await;
+
+    // `REHEARSAL_ONLY=reputation` runs scenario 4 alone (harvest#53 Phase C),
+    // so the reputation re-addressing can be rehearsed without the store
+    // scenarios' own preconditions.
+    if std::env::var("REHEARSAL_ONLY").as_deref() == Ok("reputation") {
+        scenario_reputation(&mut node, &repo).await;
+        scenario_reputation_cap_carried(&mut node, &repo).await;
+        println!("\nSCENARIO 4 ONLY: PASSED");
+        return;
+    }
 
     // ================= scenario 1: populated predecessors =================
     println!("\n== scenario 1: populated predecessor generations ==");
@@ -872,6 +1470,8 @@ async fn main() {
         migrate::marker_key(Artifact::Store, &s_curr_id, &current_hash)
     );
     assert!(!would_write_marker);
+
+    scenario_reputation(&mut node, &repo).await;
 
     // ============ scenario 3: the durable marker, on the live delegate ============
     println!("\n== scenario 3: the repeat gate's marker, against the real delegate ==");

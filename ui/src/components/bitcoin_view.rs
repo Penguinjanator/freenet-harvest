@@ -40,7 +40,10 @@ pub fn BitcoinView() -> Element {
     // gets the expanded live-data panel instead of an empty table. Once
     // either appears, the compact status bar plus payments-first layout
     // takes over.
-    let show_first_run = watches_loaded && watches.is_empty() && orders.is_empty();
+    let show_first_run = watches_loaded
+        && watches.is_empty()
+        && orders.is_empty()
+        && app_state.kept_purchases.is_empty();
 
     rsx! {
         div {
@@ -56,6 +59,11 @@ pub fn BitcoinView() -> Element {
             }
 
             BridgeStatusBar { bridge_loaded, bridge: bridge.clone(), network, tip: tip.clone() }
+
+            // The buyer's own kept purchases, from the kept records alone
+            // (R5-B). Shown whatever else is: a buyer with no watch list and
+            // no store of their own still has these.
+            super::buy_view::KeptPurchases {}
 
             if show_first_run {
                 FirstRunPanel { bridge_loaded, bridge, network, tip, has_ghostkey }
@@ -82,32 +90,41 @@ fn active_network(bitcoin: &BitcoinState) -> BitcoinNetwork {
     bitcoin_config::default_network()
 }
 
-/// Every order, across every store we've loaded state for, where one of our
-/// connected Ghost Keys is buyer or seller. Depends on having browsed (or
-/// registered) the relevant store at least once -- same scoping `MyStore`
-/// already uses for listings.
+/// Every order in the stores this node's own Ghost Keys own: the seller's
+/// own book, across every store of theirs whose state has loaded.
+///
+/// # Only the SELLER's orders
+///
+/// This used to include orders naming one of our fingerprints as the buyer.
+/// `buyer_fingerprint` is written by the seller, and each card shows a
+/// payment address, so any seller could put an address in front of a buyer
+/// here that the buyer's own node never kept (review round 3 of #143,
+/// P1-A). A buyer's orders are shown only on the store page's purchase card,
+/// which shows an address only once the buyer's node keeps the order
+/// (`docs/complaint-threat-model.md` section 3.1). Ownership is by this
+/// node's own store registrations, not by the order's `seller_fingerprint`,
+/// which is seller-written too.
+///
+/// A buyer's own purchases, paid or not, are on the store page's purchase
+/// card, which checks the order is really theirs (`AppState::paid_copy`);
+/// this tab lists nothing it cannot check that way. Round 4 briefly listed
+/// a buyer's settled orders here by `buyer_fingerprint`, and round 5 took it
+/// out again: a seller can mint a `Paid` order naming any fingerprint, and
+/// the tab would have shown it as this buyer's (model 3.3).
 ///
 /// An order still awaiting payment is left out when its store is not
 /// `payable` -- closed, or unbacked (harvest#93 review, Must Fix 2): its card
 /// would show a payment address nobody should use. Settled orders stay, as
 /// history.
 pub(crate) fn my_orders(app_state: &crate::state::AppState) -> Vec<AuthorizedOrder> {
-    let my_fingerprints: std::collections::HashSet<&str> = app_state
-        .ghostkeys
-        .iter()
-        .map(|k| k.fingerprint.as_str())
-        .collect();
     let mut orders: Vec<AuthorizedOrder> = app_state
         .browsing_stores
-        .values()
-        .flat_map(|s| {
+        .iter()
+        .filter(|(id, _)| app_state.store_owner_fingerprint(id).is_some())
+        .flat_map(|(_, s)| {
             s.orders
                 .iter()
                 .filter(move |o| s.payable() || o.status != OrderStatus::AwaitingPayment)
-        })
-        .filter(|o| {
-            my_fingerprints.contains(o.order.buyer_fingerprint.as_str())
-                || my_fingerprints.contains(o.order.seller_fingerprint.as_str())
         })
         .cloned()
         .collect();
@@ -411,8 +428,64 @@ pub(crate) fn unrecognised_bridges(order: &harvest_common::payment::Order) -> Ve
         .trusted_bridges
         .iter()
         .map(|b| b.to_bs58())
-        .filter(|id| id != bitcoin_config::TRUSTED_BRIDGE_ID_BS58)
+        .filter(|id| id != bitcoin_config::TRUSTED_BRIDGE_ID_BS58 && !recognised_for_test(id))
         .collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Bridges a test recognises on its own thread, in addition to the
+    /// build's. A test cannot sign a claim as the build's bridge (nobody
+    /// here has its key), so a test of a rule that needs a RECOGNISED bridge
+    /// to have signed the evidence recognises the one its fixture signs
+    /// with, for as long as it holds the [`RecognisedForTest`] guard.
+    static RECOGNISED_FOR_TEST: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A bridge recognised for a test, until this is dropped (review round 3,
+/// testing lens: without a reset, a thread the harness reuses would carry one
+/// test's recognition into the next). Held by the test, or by the
+/// `AppState` a fixture built (`AppState::test_guards`).
+#[cfg(test)]
+#[must_use = "the bridge is recognised only while the guard is held"]
+#[derive(Debug)]
+pub(crate) struct RecognisedForTest(String);
+
+#[cfg(test)]
+impl Drop for RecognisedForTest {
+    fn drop(&mut self) {
+        RECOGNISED_FOR_TEST.with(|ids| {
+            let mut ids = ids.borrow_mut();
+            if let Some(at) = ids.iter().position(|held| *held == self.0) {
+                ids.remove(at);
+            }
+        });
+    }
+}
+
+/// Treat bridge `id` as recognised on this thread while the guard lives.
+#[cfg(test)]
+pub(crate) fn recognise_for_test(id: freenet_bitcoin_common::BridgeId) -> RecognisedForTest {
+    let id = id.to_bs58();
+    RECOGNISED_FOR_TEST.with(|ids| ids.borrow_mut().push(id.clone()));
+    RecognisedForTest(id)
+}
+
+#[cfg(test)]
+fn recognised_for_test(id: &str) -> bool {
+    RECOGNISED_FOR_TEST.with(|ids| ids.borrow().iter().any(|held| held == id))
+}
+
+/// Whether any bridge is recognised for a test on this thread.
+#[cfg(test)]
+pub(crate) fn any_recognised_for_test() -> bool {
+    RECOGNISED_FOR_TEST.with(|ids| !ids.borrow().is_empty())
+}
+
+#[cfg(not(test))]
+fn recognised_for_test(_id: &str) -> bool {
+    false
 }
 
 /// Short, quotable form of a bridge id, for a line that has to fit on a card.
@@ -967,6 +1040,16 @@ mod payable_tests {
         });
         let awaiting = order(OrderStatus::AwaitingPayment, 1);
         let cancelled = order(OrderStatus::Cancelled, 2);
+        state.my_stores.insert(
+            "me".into(),
+            vec![harvest_common::StoreRegistration {
+                store_contract_id: vec![1; 32],
+                reputation_contract_id: vec![2; 32],
+                mailbox_contract_id: vec![3; 32],
+                store_contract_key: None,
+                store_verifying_key: None,
+            }],
+        );
         let store = state.browsing_stores.entry(vec![1; 32]).or_default();
         store.orders = vec![awaiting.clone(), cancelled.clone()];
         store.store_verifying_key = Some([7; 32]);

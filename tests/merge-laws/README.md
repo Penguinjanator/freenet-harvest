@@ -84,10 +84,24 @@ everything, and is a clean sweep of half of it.
 
 ## Known standing violations
 
-`store-adv` (6) and `reputation-adv` (8), on `state_commutativity` and
-`reconciliation_cycle`. These are **pre-existing and tracked as
-[#81](https://github.com/freenet/harvest/issues/81)** — unsigned certificate
-fields and equal-version store info let two peers keep different state. They
-appear with identical counts and properties in sweeps going back weeks; a change
-is a regression only if it moves those numbers or adds a corpus to the list.
+`store-adv` (6), on `state_commutativity` and `reconciliation_cycle`. This is
+**pre-existing and tracked as
+[#81](https://github.com/freenet/harvest/issues/81)** — equal-version store info
+lets two peers keep different state. It appears with identical counts and
+properties in sweeps going back weeks; a change is a regression only if it moves
+that number or adds a corpus to the list.
+
+`reputation-adv` carried 8 of these until #143 (harvest#53 Phase C), from the
+record's unsigned certificate field. The reputation contract now accepts only
+empty or a genuine Ghost Key certificate in its one canonical armour
+(`check_owner_certificate`), so the corpus's divergent certificates are refused
+and the count is 0 (sweep at #143's contracts, 40 corpora, 2026-09-23).
+First-writer-wins between two genuine certificates is still #81.
+
+`reputation-cap` (#143 review round 5, R5-C) exercises the record's cap: a full
+record of late complaints, honest complaints dated near their payments, a far
+second statement by one of those buyers whose terms encode smaller, and the
+full record once the honest ones arrive. It is zero violations and zero
+inconclusive; the generator itself asserts the associativity it is built
+around, so a corpus that stops exercising it fails to generate.
 Everything else is expected to be zero violations and zero inconclusive.

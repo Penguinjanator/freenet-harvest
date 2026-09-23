@@ -72,8 +72,8 @@
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
 use freenet_bitcoin_common::{
-    fold_outpoint_status, BitcoinAddressParameters, BitcoinNetwork, BlockAnchor, BridgeId, Claim,
-    OutpointStatus, SignedClaim, SignedTipEntry,
+    fold_claims_by_outpoint, fold_outpoint_status, BitcoinAddressParameters, BitcoinNetwork,
+    BlockAnchor, BridgeId, Claim, ClaimBody, OutpointStatus, SignedClaim, SignedTipEntry,
 };
 use serde::{Deserialize, Serialize};
 
@@ -657,7 +657,18 @@ impl Order {
     /// A default hash would name some other contract, and a buyer would be
     /// shown its balance under their own order.
     pub fn bitcoin_address_instance_id(&self) -> Option<[u8; 32]> {
-        let code_hash = self.bitcoin_address_code_hash?;
+        Some(self.bitcoin_address_instance_id_under(self.bitcoin_address_code_hash?))
+    }
+
+    /// The instance of the `BitcoinAddressContract` build `code_hash` that
+    /// observes this order's payment address.
+    ///
+    /// A buyer watches the build the recognised bridges' signed generation
+    /// pointer names as well as the one the order names, because the order's
+    /// hash is the seller's choice and is fixed at issue, while the bridges
+    /// write to their current build (`docs/complaint-threat-model.md`
+    /// section 3.2).
+    pub fn bitcoin_address_instance_id_under(&self, code_hash: [u8; 32]) -> [u8; 32] {
         // Infallible: `BitcoinAddressParameters` is plain data with a derived
         // `Serialize`.
         let params = crate::to_cbor(&self.bitcoin_params())
@@ -665,7 +676,7 @@ impl Order {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&code_hash);
         hasher.update(&params);
-        Some(*hasher.finalize().as_bytes())
+        *hasher.finalize().as_bytes()
     }
 
     /// Parameters of the `BitcoinAddressContract` that observes this order's
@@ -1755,6 +1766,404 @@ impl AuthorizedOrder {
     }
 }
 
+/// The block from which `order` counts as paid: the height at which value
+/// confirmed inside its payment window first covered the amount, plus the
+/// confirmations the order requires beyond that one (a seller-chosen zero
+/// counts as one, as the verifier makes of it).
+///
+/// Read out of the record's own evidence, so every reader holding the same
+/// record measures from the same block. `None` when the order is not `Paid`,
+/// carries no on-chain proof, or its evidence does not show it covered.
+///
+/// # One definition, used three ways
+///
+/// * The despatch and complaint windows count from it
+///   (`harvest_ui::fulfilment`).
+/// * A complaint's buyer signs it ([`crate::reputation::ComplaintTerms::paid_height`]),
+///   and the reputation contract checks the complaint's own proof gives the
+///   signed value, so nobody re-submitting the complaint with other evidence
+///   moves its window (`docs/complaint-threat-model.md` section 5.2).
+/// * [`minimal_on_chain_proof`] chooses outpoints such that this is the
+///   latest confirmation it needs.
+///
+/// # Why the claims are decoded without checking their signatures
+///
+/// This reads a height; it does not accept a record. Every caller has
+/// verified the record already, or verifies it next (the contract calls
+/// [`AuthorizedOrder::verify`] on the same complaint).
+pub fn paid_height(order: &AuthorizedOrder) -> Option<u32> {
+    if order.status != OrderStatus::Paid {
+        return None;
+    }
+    let OrderPaymentProof::OnChain(proof) = order.payment_proof.as_ref()? else {
+        // A Lightning payment has no confirmation height at all. No
+        // Lightning order is issued by this build.
+        return None;
+    };
+    let window = order.order.payment_window()?;
+    let bodies: Vec<ClaimBody> = proof
+        .claims
+        .iter()
+        .filter_map(|claim| claim.body().ok())
+        .collect();
+    // The same fold the verifier runs, so the height read here is the one the
+    // winning confirmation of each outpoint names.
+    let mut confirmed: Vec<(u32, u64)> = fold_claims_by_outpoint(&bodies)
+        .into_values()
+        .filter_map(|status| match status {
+            OutpointStatus::Confirmed {
+                value_sats,
+                anchor,
+                attested_depth: _,
+            } if window.contains(&anchor.height) => Some((anchor.height, value_sats)),
+            _ => None,
+        })
+        .collect();
+    confirmed.sort_unstable();
+    let mut total: u64 = 0;
+    for (height, value) in confirmed {
+        total = total.saturating_add(value);
+        if total >= order.order.amount_sats {
+            return Some(
+                height.saturating_add(order.order.required_confirmations.saturating_sub(1)),
+            );
+        }
+    }
+    None
+}
+
+/// How fresh `order`'s payment evidence is: the highest `as_of` height any
+/// of its claims was signed at, or 0 for an order carrying none.
+///
+/// A reorg that retracts and re-confirms a payment adds claims at a later
+/// `as_of`, so fresher evidence is what a reader needs to see through a
+/// reversal built from the stale claims (`docs/complaint-threat-model.md`
+/// section 7.2). One use: the reputation record keeps the freshest of
+/// several evidence copies for one buyer statement
+/// ([`crate::reputation::Complaint`]'s tie-break). The delegate's
+/// fresher-evidence rule was removed in revision 4 of that model.
+///
+/// Reads claim bodies without checking signatures; callers verify the order.
+pub fn evidence_freshness(order: &AuthorizedOrder) -> u32 {
+    let Some(OrderPaymentProof::OnChain(proof)) = order.payment_proof.as_ref() else {
+        return 0;
+    };
+    proof
+        .claims
+        .iter()
+        .filter_map(|claim| claim.body().ok())
+        .map(|body| body.as_of.height)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The largest signed order a complaint may carry, in bytes: both the signed
+/// envelope as the seller wrote it and the order's own canonical encoding.
+///
+/// # Why an order needs a size bound at all
+///
+/// The complaint carries the order, and the buyer's delegate keeps a copy of
+/// it from before payment (`docs/complaint-threat-model.md` section 3). The
+/// seller writes the order, so without a bound the seller decides how big
+/// both are, and can pad the envelope (`verify_scoped_signature` tolerates
+/// trailing bytes) or list one recognised bridge thousands of times, until
+/// the copy no longer fits whatever the delegate or the record will hold.
+/// A bound checked BEFORE payment turns that into an order the buyer does not
+/// pay, which is the safe failure.
+///
+/// 4 KiB against a real order of a few hundred bytes: room for dozens of
+/// bridges, and the strings the seller signs, without admitting padding that
+/// matters.
+pub const MAX_ORDER_ENVELOPE_BYTES: usize = 4 * 1024;
+
+/// The most confirmations an order may require and still take a complaint:
+/// one day of blocks. The seller's invoice forms refuse more, and a buyer
+/// refuses to pay more (`docs/complaint-threat-model.md` section 1).
+pub const MAX_REQUIRED_CONFIRMATIONS: u32 = 144;
+
+/// What an order must satisfy for a complaint about it to be accepted,
+/// beyond being genuinely signed and paid (`docs/complaint-threat-model.md`
+/// section 4).
+///
+/// # ONE predicate, checked in three places
+///
+/// * the reputation contract, in [`crate::reputation::Complaint::verify`];
+/// * the buyer before paying (`harvest_ui::state::PaymentBlocker::UnfitForComplaint`);
+/// * the buyer's delegate before keeping a copy.
+///
+/// Because the buyer refuses to pay anything this refuses, any order a buyer
+/// paid is one the contract takes a complaint about. Review round 2 of #143
+/// (R2-1) found the opposite: the contract checked rules (an exact order
+/// envelope) that nothing checked before payment and that the seller could
+/// break afterwards. Nothing here depends on how the seller ENCODED the
+/// envelope, only on facts about the terms and on sizes, so a seller cannot
+/// re-sign its way out of it.
+///
+/// # What it requires
+///
+/// * **A real payment, provable in time:** a non-zero amount, on chain, needing
+///   between one and [`MAX_REQUIRED_CONFIRMATIONS`] confirmations.
+/// * **A bounded order:** see [`MAX_ORDER_ENVELOPE_BYTES`].
+pub fn complaint_preconditions(order: &AuthorizedOrder) -> Result<(), String> {
+    if order.order.amount_sats == 0 {
+        return Err("the order is for nothing, so paying it proves nothing".into());
+    }
+    // Defence in depth (review round 3): the buyer's blockers refuse all
+    // three before payment, and the delegate must not keep an order no
+    // complaint could ever be filed about.
+    if order.order.anchor.is_none() {
+        return Err(
+            "the order is anchored to no block, so a complaint about it could not be dated".into(),
+        );
+    }
+    if order.order.trusted_bridges.is_empty() {
+        return Err("the order names no bridge, so no payment to it can be proven".into());
+    }
+    if order.order.buyer_receipt_key.is_none() {
+        return Err("the order names no buyer key, so nobody can complain about it".into());
+    }
+    // On-chain only: the window a complaint is judged by counts from a
+    // confirmation height (`paid_height`), which a Lightning payment does not
+    // have. No Lightning order is issued by this build.
+    if order.order.payment_hash.is_some() || order.order.payment_script_pubkey.is_empty() {
+        return Err("the order is not an on-chain order, so its payment has no height".into());
+    }
+    if order.order.required_confirmations == 0 {
+        return Err(
+            "the order counts as paid before any confirmation, so a payment that never \
+             confirms would settle it"
+                .into(),
+        );
+    }
+    // Bounded, or "paid" could be put out of reach by definition: an order
+    // needing 50,000 confirmations reads as paid about a year after payment,
+    // and every window counts from then (review of the threat model, TM-C).
+    if order.order.required_confirmations > MAX_REQUIRED_CONFIRMATIONS {
+        return Err(format!(
+            "the order needs {} confirmations, more than the {MAX_REQUIRED_CONFIRMATIONS} a \
+             complaint allows, so it could not read as paid in time",
+            order.order.required_confirmations
+        ));
+    }
+    if order.scoped_payload.len() > MAX_ORDER_ENVELOPE_BYTES {
+        return Err(format!(
+            "the seller's signed order is {} bytes, more than the {MAX_ORDER_ENVELOPE_BYTES} a \
+             complaint may carry",
+            order.scoped_payload.len()
+        ));
+    }
+    let encoded = crate::to_cbor(&order.order)?.len();
+    if encoded > MAX_ORDER_ENVELOPE_BYTES {
+        return Err(format!(
+            "the order's terms are {encoded} bytes, more than the {MAX_ORDER_ENVELOPE_BYTES} a \
+             complaint may carry"
+        ));
+    }
+    Ok(())
+}
+
+/// The smallest proof that `order` was paid, drawn from `claims`: for each
+/// outpoint it needs, only the one claim that decides that outpoint's fold
+/// (`docs/complaint-threat-model.md` section 5.2).
+///
+/// # Why the buyer's copy does not carry every claim
+///
+/// [`assemble_on_chain_proof`] carries every claim about the address, and
+/// refuses past [`MAX_PROOF_CLAIMS`] or [`MAX_PROOF_CLAIM_BYTES`]. The address
+/// is public, so a third party can send it dust or large transactions until
+/// no complete proof can be assembled at all -- and the buyer's complaint,
+/// which carries a proof, with it. Review round 2 of #143 (R2-4) found the
+/// same pressure on the buyer's kept copy.
+///
+/// # Why this is still honest evidence
+///
+/// The outpoints are chosen by folding EVERY verified claim, retractions
+/// included, so an outpoint is used only if its current status, on
+/// everything this node knows, is confirmed inside the order's window. For
+/// each, the claim kept is one whose own fold IS that status, so the verifier
+/// reaches the same status per outpoint as it would from the full set, and
+/// no retraction of a chosen outpoint is hidden. Outpoints are taken largest
+/// already deep enough first, then the latest confirmation first, until the
+/// amount is covered, then any outpoint the rest already covers is dropped:
+/// that puts the buyer's payment ahead of dust and of anything the seller
+/// paid its own address earlier, and a shallow outpoint behind every deep
+/// one. The result verifies whenever the full proof would, since the full
+/// proof's outpoints are a superset of these, and it is minimal in the sense
+/// [`verify_minimal_proof`] checks.
+///
+/// Returns a proof that [`verify_payment_proof`] accepts, or why there is
+/// none.
+pub fn minimal_on_chain_proof(
+    order: &Order,
+    claims: &[SignedClaim],
+    tip: &SignedTipEntry,
+) -> Result<OrderPaymentProof, String> {
+    use freenet_bitcoin_common::OutPoint;
+
+    let addr_params = order.bitcoin_params();
+    let expected_script = addr_params.script_id();
+    let window = order
+        .payment_window()
+        .ok_or("the order names no block it was made at, so no payment can be dated")?;
+
+    // Every claim about THIS script that verifies, grouped by outpoint, each
+    // group deduplicated by digest.
+    let mut seen = std::collections::BTreeSet::new();
+    let mut by_outpoint: std::collections::BTreeMap<OutPoint, Vec<(&SignedClaim, ClaimBody)>> =
+        std::collections::BTreeMap::new();
+    for claim in claims {
+        if !seen.insert(claim.digest()) {
+            continue;
+        }
+        let Ok(body) = claim.verify(&addr_params) else {
+            continue;
+        };
+        if body.script_id != expected_script {
+            continue;
+        }
+        if let Some(outpoint) = body.claim.outpoint() {
+            by_outpoint.entry(outpoint).or_default().push((claim, body));
+        }
+    }
+
+    // The tip the proof will carry, verified here only to read its height:
+    // depth is measured against it.
+    let tip_height = tip
+        .verify(&freenet_bitcoin_common::BitcoinTipParameters {
+            network: order.network,
+            trusted_bridges: order.trusted_bridges.clone(),
+        })
+        .map_err(|e| format!("chain tip evidence invalid: {e}"))?
+        .anchor
+        .height;
+
+    // Each outpoint confirmed inside the window, with the claim that decides
+    // it and whether it is already as deep as the order asks.
+    let mut qualifying: Vec<(bool, u32, u64, OutPoint, &SignedClaim)> = Vec::new();
+    for (outpoint, group) in &by_outpoint {
+        let Some(
+            status @ OutpointStatus::Confirmed {
+                value_sats, anchor, ..
+            },
+        ) = fold_outpoint_status(group.iter().map(|(_, body)| body))
+        else {
+            continue;
+        };
+        if !window.contains(&anchor.height) {
+            continue;
+        }
+        let Some((decider, _)) = group.iter().find(|(_, body)| {
+            fold_outpoint_status(std::iter::once(body)).as_ref() == Some(&status)
+        }) else {
+            continue;
+        };
+        let deep_enough = status.confirmations_at(tip_height) >= order.required_confirmations;
+        qualifying.push((deep_enough, anchor.height, value_sats, *outpoint, *decider));
+    }
+    // Deep enough first, so a shallow outpoint is used only when nothing
+    // deeper covers the amount. Then the LATEST confirmation first: the
+    // buyer's own payment ahead of anything the seller paid its own address
+    // earlier, which would otherwise move the paid height, and with it every
+    // window, earlier (TM-D). Then the largest, then by outpoint, so every
+    // node picks the same subset.
+    qualifying.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.3.cmp(&b.3))
+    });
+
+    let mut chosen: Vec<(u64, &SignedClaim)> = Vec::new();
+    let mut total: u64 = 0;
+    for (_, _, value, _, claim) in &qualifying {
+        if total >= order.amount_sats {
+            break;
+        }
+        chosen.push((*value, *claim));
+        total = total.saturating_add(*value);
+    }
+    if chosen.is_empty() {
+        return Err("nothing confirmed at this order's address inside its window yet".into());
+    }
+    // Drop, lowest priority first, any outpoint the rest already covers, so
+    // the result is minimal in the sense `verify_minimal_proof` checks. After
+    // one pass every survivor is needed: removals only lower the total.
+    let mut index = chosen.len();
+    while index > 0 {
+        index -= 1;
+        let value = chosen[index].0;
+        if total.saturating_sub(value) >= order.amount_sats {
+            chosen.remove(index);
+            total -= value;
+        }
+    }
+    let covering = chosen.into_iter().map(|(_, claim)| claim.clone()).collect();
+    let proof = OrderPaymentProof::on_chain(covering, tip.clone());
+    verify_payment_proof(order, &proof).map_err(|e| e.to_string())?;
+    Ok(proof)
+}
+
+/// Whether `proof` is the canonical minimal proof for `order`: one claim per
+/// outpoint, none without an outpoint, every outpoint confirmed inside the
+/// order's window, and none the rest already covers
+/// (`docs/complaint-threat-model.md` section 5.2, TM-E).
+///
+/// # Why a complaint must carry one
+///
+/// The verifier accepts any proof up to [`MAX_PROOF_CLAIM_BYTES`], duplicates
+/// included, so without this a complaint could carry 256 KiB of padding for
+/// free, and the record, which lives inside freenet-core's state size limit,
+/// would be bounded only by bytes. With it, a complaint's evidence is as
+/// large as the genuine transactions that paid the order, so padding costs
+/// real fees. [`minimal_on_chain_proof`] builds proofs that pass this.
+///
+/// Reads claim bodies without checking their signatures: the caller verifies
+/// the proof itself ([`AuthorizedOrder::verify`]).
+pub fn verify_minimal_proof(order: &Order, proof: &OrderPaymentProof) -> Result<(), String> {
+    let OrderPaymentProof::OnChain(proof) = proof else {
+        return Err("a complaint's evidence must be an on-chain proof".into());
+    };
+    let window = order
+        .payment_window()
+        .ok_or("the order names no block it was made at")?;
+    let mut outpoints = std::collections::BTreeSet::new();
+    let mut values = Vec::with_capacity(proof.claims.len());
+    for claim in &proof.claims {
+        let body = claim
+            .body()
+            .map_err(|e| format!("a claim in the evidence does not decode: {e}"))?;
+        let outpoint = body
+            .claim
+            .outpoint()
+            .ok_or("the evidence carries a claim about no outpoint, which it does not need")?;
+        if !outpoints.insert(outpoint) {
+            return Err("the evidence carries two claims about one outpoint".into());
+        }
+        match fold_outpoint_status(std::iter::once(&body)) {
+            Some(OutpointStatus::Confirmed {
+                value_sats, anchor, ..
+            }) if window.contains(&anchor.height) => values.push(value_sats),
+            _ => {
+                return Err(
+                    "the evidence carries a claim that does not confirm a payment inside the \
+                     order's window, which it does not need"
+                        .into(),
+                )
+            }
+        }
+    }
+    let total = values.iter().fold(0u64, |sum, v| sum.saturating_add(*v));
+    if values
+        .iter()
+        .any(|value| total.saturating_sub(*value) >= order.amount_sats)
+    {
+        return Err(
+            "the evidence carries a payment the rest already covers, which it does not need".into(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod status_tests {
     use super::*;
@@ -2709,5 +3118,168 @@ mod proof_assembly_tests {
             refused.contains("claims"),
             "the refusal should name what is wrong: {refused}"
         );
+    }
+
+    fn retraction(order: &Order, of: &SignedClaim, scanned_to: u32) -> SignedClaim {
+        let outpoint = of
+            .body()
+            .expect("decodes")
+            .claim
+            .outpoint()
+            .expect("an outpoint claim");
+        SignedClaim::sign(
+            &bridge(),
+            &ClaimBody {
+                script_id: order.bitcoin_params().script_id(),
+                network: order.network,
+                as_of: BlockAnchor {
+                    height: scanned_to,
+                    hash: BlockHash([6u8; 32]),
+                },
+                claim: Claim::Retracted { outpoint },
+            },
+        )
+        .expect("sign")
+    }
+
+    fn claims_of(proof: &OrderPaymentProof) -> &[SignedClaim] {
+        match proof {
+            OrderPaymentProof::OnChain(p) => &p.claims,
+            other => panic!("expected an on-chain proof, got {other:?}"),
+        }
+    }
+
+    /// **Third-party dust cannot stop the buyer proving its payment**
+    /// (`docs/complaint-threat-model.md` section 5.2). Anyone can pay the
+    /// public address; past `MAX_PROOF_CLAIMS` distinct claims no complete
+    /// proof can be assembled at all. The minimal proof carries only the
+    /// buyer's payment and verifies. Red if the minimal proof takes every
+    /// claim (or every qualifying outpoint).
+    #[test]
+    fn dust_that_blocks_the_full_proof_does_not_block_the_minimal_one() {
+        let order = order_for(50_000, 1);
+        let mut claims: Vec<SignedClaim> = (1..=MAX_PROOF_CLAIMS as u64)
+            .map(|dust| confirmation(&order, dust, 100, 100))
+            .collect();
+        claims.push(confirmation(&order, 50_000, 100, 100));
+        let tip = tip_at(&order, 100);
+        assert!(
+            assemble_on_chain_proof(&order, &claims, &tip).is_err(),
+            "precondition: the dust makes the full proof unassemblable"
+        );
+        let minimal = minimal_on_chain_proof(&order, &claims, &tip)
+            .expect("the buyer's own payment still proves it");
+        assert_eq!(claims_of(&minimal).len(), 1, "the dust is left out");
+        verify_payment_proof(&order, &minimal).expect("and it verifies");
+    }
+
+    /// **One claim per outpoint: the one that decides it.** A bridge
+    /// re-attests a payment at deeper rungs; only the deepest attestation
+    /// carries the depth the order asks for. Red if the decider is not
+    /// chosen by the fold (an earlier rung attests too little depth).
+    #[test]
+    fn the_minimal_proof_keeps_the_deciding_claim_of_each_outpoint() {
+        let order = order_for(50_000, 6);
+        let early = confirmation(&order, 50_000, 100, 101);
+        let deep = confirmation(&order, 50_000, 100, 105);
+        let tip = tip_at(&order, 105);
+        let minimal = minimal_on_chain_proof(&order, &[early.clone(), deep.clone()], &tip)
+            .expect("six confirmations are attested by the later rung");
+        assert_eq!(claims_of(&minimal), &[deep][..]);
+        assert!(
+            minimal_on_chain_proof(&order, &[early], &tip).is_err(),
+            "the early rung alone attests two confirmations, not six"
+        );
+    }
+
+    /// **The minimal proof never hides a retraction of what it uses.** The
+    /// outpoints are chosen by folding every claim, so a payment a bridge
+    /// has since retracted is not proven, even though the confirmation
+    /// alone would verify. Red if outpoints are chosen from confirmations
+    /// without folding in their retractions.
+    #[test]
+    fn a_retracted_payment_is_not_proven_by_the_minimal_proof() {
+        let order = order_for(50_000, 1);
+        let paid = confirmation(&order, 50_000, 100, 100);
+        let tip = tip_at(&order, 102);
+        minimal_on_chain_proof(&order, std::slice::from_ref(&paid), &tip)
+            .expect("precondition: the confirmation alone proves it");
+        let retracted = retraction(&order, &paid, 101);
+        assert!(minimal_on_chain_proof(&order, &[paid, retracted], &tip).is_err());
+    }
+
+    /// **A shallow large outpoint does not stand in for deep ones.** Two
+    /// deep payments cover the amount; a larger one is too shallow. The
+    /// minimal proof takes the deep ones. Red if outpoints are ranked by
+    /// value alone.
+    #[test]
+    fn the_minimal_proof_prefers_outpoints_that_are_deep_enough() {
+        let order = order_for(50_000, 3);
+        let shallow = confirmation(&order, 60_000, 104, 104);
+        let deep_a = confirmation(&order, 30_000, 100, 104);
+        let deep_b = confirmation(&order, 25_000, 100, 104);
+        let tip = tip_at(&order, 104);
+        let minimal =
+            minimal_on_chain_proof(&order, &[shallow, deep_a.clone(), deep_b.clone()], &tip)
+                .expect("the deep payments cover the amount");
+        assert_eq!(claims_of(&minimal), &[deep_a, deep_b][..]);
+    }
+
+    /// **The buyer's own payment beats an earlier one the seller made to its
+    /// own address** (TM-D). Both cover the order; the minimal proof takes
+    /// the later, and the paid height is its height. Red if selection goes
+    /// back to largest-first, where the tie falls to the outpoint.
+    #[test]
+    fn the_minimal_proof_takes_the_latest_payment() {
+        let order = order_for(50_000, 1);
+        let early = confirmation(&order, 50_001, 100, 100);
+        let late = confirmation(&order, 50_000, 110, 110);
+        let tip = tip_at(&order, 110);
+        let minimal = minimal_on_chain_proof(&order, &[early, late.clone()], &tip).expect("paid");
+        assert_eq!(claims_of(&minimal), &[late][..]);
+        let paid = AuthorizedOrder {
+            order: order.clone(),
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            status: OrderStatus::Paid,
+            payment_proof: Some(minimal),
+            status_scoped_payload: None,
+            status_signature: None,
+        };
+        assert_eq!(paid_height(&paid), Some(110));
+    }
+
+    /// **The minimal proof carries nothing the rest covers**, and
+    /// `verify_minimal_proof` says the same. Latest-first takes a small late
+    /// payment before a large earlier one that covers the order alone; the
+    /// small one is then dropped. Red if the pruning pass is removed.
+    #[test]
+    fn the_minimal_proof_drops_what_the_rest_covers() {
+        let order = order_for(50_000, 1);
+        let small_late = confirmation(&order, 10_000, 110, 110);
+        let large = confirmation(&order, 60_000, 100, 110);
+        let tip = tip_at(&order, 110);
+        let both =
+            OrderPaymentProof::on_chain(vec![small_late.clone(), large.clone()], tip.clone());
+        verify_payment_proof(&order, &both).expect("precondition: both verify together");
+        let err = verify_minimal_proof(&order, &both).expect_err("not minimal");
+        assert!(err.contains("already covers"), "{err}");
+        let minimal =
+            minimal_on_chain_proof(&order, &[small_late, large.clone()], &tip).expect("paid");
+        assert_eq!(claims_of(&minimal), &[large][..]);
+        verify_minimal_proof(&order, &minimal).expect("and minimal");
+    }
+
+    /// `verify_minimal_proof` refuses a claim that proves nothing: a
+    /// retraction.
+    #[test]
+    fn a_minimal_proof_carries_no_retraction() {
+        let order = order_for(50_000, 1);
+        let paid = confirmation(&order, 50_000, 100, 100);
+        let retracted = retraction(&order, &confirmation(&order, 7, 100, 100), 101);
+        let tip = tip_at(&order, 101);
+        let proof = OrderPaymentProof::on_chain(vec![paid, retracted], tip);
+        let err = verify_minimal_proof(&order, &proof).expect_err("not minimal");
+        assert!(err.contains("does not confirm"), "{err}");
     }
 }

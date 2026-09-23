@@ -63,6 +63,12 @@ pub fn App() -> Element {
                         // existed (harvest#52).
                         crate::gateway::APP_STATE.write().sync_remembered_stores();
 
+                        // And this buyer's kept purchases: what the payment
+                        // details wait on, and what a complaint rests on
+                        // (harvest#53 Phase C). Asked again on the watch
+                        // timer until an answer arrives.
+                        crate::gateway::APP_STATE.write().sync_kept_purchases();
+
                         // Kick off the Bitcoin surface: bridge config (needed
                         // for the first-run status panel, no credential
                         // required) and the private watch list. Each of

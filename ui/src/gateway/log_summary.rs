@@ -37,13 +37,6 @@ pub(crate) fn harvest_response_summary(response: &HarvestDelegateResponse) -> St
     let request = |id: &u64| Some(format!("request {id}"));
     #[allow(clippy::wildcard_enum_match_arm)]
     let (name, id) = match response {
-        R::ReputationKeysInitialized {
-            ghostkey_fingerprint,
-            ..
-        } => (
-            "ReputationKeysInitialized",
-            Some(ghostkey_fingerprint.clone()),
-        ),
         R::RsaPublicKey {
             ghostkey_fingerprint,
             ..
@@ -84,13 +77,7 @@ pub(crate) fn harvest_response_summary(response: &HarvestDelegateResponse) -> St
             "ConversationKeys",
             Some(format!("request {request_id}, {ghostkey_fingerprint}")),
         ),
-        R::BlindSignatureResult { request_id, .. } => ("BlindSignatureResult", request(request_id)),
         R::ListingCreated { request_id, .. } => ("ListingCreated", request(request_id)),
-        R::TransactionRecorded { request_id, .. } => ("TransactionRecorded", request(request_id)),
-        R::BlindSignatureRecorded { request_id, .. } => {
-            ("BlindSignatureRecorded", request(request_id))
-        }
-        R::TransactionList { .. } => ("TransactionList", None),
         R::ContractUpdate { .. } => ("ContractUpdate", None),
         R::ContractState { .. } => ("ContractState", None),
         R::StoreRegistered {
@@ -101,6 +88,8 @@ pub(crate) fn harvest_response_summary(response: &HarvestDelegateResponse) -> St
             ..
         } => ("StoreList", Some(ghostkey_fingerprint.clone())),
         R::RememberedStores { .. } => ("RememberedStores", None),
+        R::KeptPurchases { .. } => ("KeptPurchases", None),
+        R::KeepPurchaseRefused { order_id, .. } => ("KeepPurchaseRefused", Some(order_id.short())),
         R::MigrationMarker { .. } => ("MigrationMarker", None),
         R::MigrationMarkerRecorded { .. } => ("MigrationMarkerRecorded", None),
         R::Error { .. } => ("Error", None),

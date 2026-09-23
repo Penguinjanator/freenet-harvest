@@ -232,8 +232,39 @@ fn PurchaseCard(
                     purchase: purchase.clone(),
                 }
             }
-            if let Some(settled) = purchase.settled() {
+            // A paid order of this buyer's is shown as paid, and offered the
+            // complaint, whatever the payment checks now say: those are about
+            // whether to PAY, and the seller can trip them after payment by
+            // closing the store or retiring its backing (review round 1 of
+            // #143, P1-1).
+            if let Some(paid) = purchase.paid.as_ref() {
+                SettledPurchase { order: paid.clone(), bitcoin: bitcoin.clone() }
+                FileComplaint {
+                    target: ComplaintTarget::AtStore {
+                        store_contract_id: store_contract_id.clone(),
+                        purchase: Box::new(purchase.clone()),
+                    },
+                }
+            } else if let Some(settled) = purchase.settled() {
                 SettledPurchase { order: settled.clone(), bitcoin: bitcoin.clone() }
+            } else if purchase.unconfirmed_paid() {
+                // A `Paid` record the fallback checks refuse: a bridge this app
+                // does not recognise, or an order no complaint could be made
+                // about. Not shown as paid (review round 3, P2-C).
+                p { class: "text-warning",
+                    "The seller's record says this order is paid, but it is not a purchase this \
+                     app can confirm as yours."
+                }
+            } else if purchase.ready_to_keep() {
+                // Everything checks out but this node does not keep its own
+                // copy yet: the press keeps it, and the payment details
+                // appear once the delegate says it holds it
+                // (`docs/complaint-threat-model.md` section 3.1). No address
+                // here, for the reason the blocker arm below gives.
+                PayThisOrder {
+                    store_contract_id: store_contract_id.clone(),
+                    purchase: purchase.clone(),
+                }
             } else {
             match (purchase.blockers.is_empty(), purchase.commitment.as_ref()) {
                 // Everything checks out, so the payment details are shown --
@@ -279,6 +310,70 @@ fn PurchaseCard(
                 },
             }
             }
+        }
+    }
+}
+
+/// "Pay this order": ask this node's delegate to keep the seller-signed terms
+/// before any payment details are shown (`docs/complaint-threat-model.md`
+/// section 3.1). Shown only when keeping them is the one thing left
+/// ([`BuyerPurchase::ready_to_keep`]).
+#[component]
+fn PayThisOrder(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Element {
+    let order_id = purchase.order_id.clone();
+    let mut problem = use_signal(|| Option::<String>::None);
+    let (sent, refusal) = {
+        let state = APP_STATE.read();
+        (
+            state.keep_sent(&order_id),
+            state.keep_refusal(&order_id).map(str::to_string),
+        )
+    };
+    if let Some(why) = refusal {
+        // A refusal may be transient (the node would not save it); the press
+        // asks again (review round 3, P3).
+        return rsx! {
+            p { class: "text-warning",
+                "Your node would not keep a copy of this order, so no payment details are \
+                 shown: {why}"
+            }
+            if let Some(why) = problem() {
+                p { class: "text-warning", "{why}" }
+            }
+            button {
+                class: "btn btn-sm btn-outline",
+                onclick: move |_| {
+                    let result = APP_STATE.write().keep_purchase(&store_contract_id, &order_id);
+                    problem.set(result.err());
+                },
+                "Try again"
+            }
+        };
+    }
+    if sent {
+        return rsx! {
+            p { class: "text-muted",
+                "Keeping your copy of this order. The payment details appear here once your \
+                 node has it."
+            }
+        };
+    }
+    rsx! {
+        p { class: "text-muted",
+            "This order is published, signed by this store's seller, and anchored to a recent \
+             block your node agrees with. Before you pay, your node keeps its own copy of it, \
+             so a complaint about it never depends on what the seller keeps."
+        }
+        if let Some(why) = problem() {
+            p { class: "text-warning", "{why}" }
+        }
+        button {
+            class: "btn btn-sm btn-primary",
+            onclick: move |_| {
+                let result = APP_STATE.write().keep_purchase(&store_contract_id, &order_id);
+                problem.set(result.err());
+            },
+            "Pay this order"
         }
     }
 }
@@ -358,6 +453,267 @@ fn CancelPurchase(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Elemen
     }
 }
 
+/// The buyer's control to complain about one of their PAID purchases
+/// (harvest#53 Phase C).
+///
+/// A category, never free text: the complaint lands on a public, permanent
+/// record nobody can moderate. Two steps, because it cannot be withdrawn.
+/// Shown only when a complaint could be made; otherwise the reason, or the
+/// complaint already on record.
+#[component]
+fn FileComplaint(target: ComplaintTarget) -> Element {
+    use harvest_common::feedback::FeedbackCategory;
+    let order_id = target.order_id();
+    let mut chosen = use_signal(|| Option::<FeedbackCategory>::None);
+    let mut problem = use_signal(|| Option::<String>::None);
+    // The refusal is read only when there is no complaint on record: it ends
+    // in a full verification of the complaint (memoised, review round 3
+    // P2-D), which a card with nothing to offer does not need.
+    let (on_record, sent, refusal) = {
+        let state = APP_STATE.read();
+        let on_record = target.on_record(&state);
+        let sent = state.complaint_sent(&order_id);
+        let refusal = (on_record.is_none() && !sent)
+            .then(|| target.refusal(&state))
+            .flatten();
+        (on_record, sent, refusal)
+    };
+    let short = order_id.short();
+    if let Some(complaint) = on_record {
+        return rsx! {
+            p { class: "text-muted",
+                "Your complaint about order {short} ({super::reputation_view::category_label(&complaint.category)}) \
+                 is on the seller's public record."
+            }
+        };
+    }
+    if sent {
+        return rsx! {
+            p { class: "text-muted",
+                "Complaint about order {short} is being kept on your node. It goes to the \
+                 seller's record once it is kept, and shows there once the network has it."
+            }
+        };
+    }
+    if let Some(why) = refusal {
+        return rsx! {
+            p { class: "text-muted", style: "font-size: 0.85rem;",
+                "No complaint can be made about order {short} right now: {why}."
+            }
+        };
+    }
+    rsx! {
+        if let Some(why) = problem() {
+            p { class: "text-warning", "{why}" }
+        }
+        match chosen() {
+            Some(category) => rsx! {
+                p { class: "text-warning",
+                    "Complain that order {short} was \"{super::reputation_view::category_label(&category)}\"? \
+                     This goes on the seller's public record permanently, cannot be withdrawn, \
+                     and is one per order."
+                }
+                button {
+                    class: "btn btn-sm btn-primary",
+                    onclick: {
+                        let target = target.clone();
+                        move |_| {
+                            chosen.set(None);
+                            let result = target.file(&mut APP_STATE.write(), category.clone());
+                            problem.set(result.err());
+                        }
+                    },
+                    "Yes, complain"
+                }
+                button {
+                    class: "btn btn-sm btn-outline",
+                    onclick: move |_| chosen.set(None),
+                    "Go back"
+                }
+            },
+            None => rsx! {
+                p { class: "text-muted", style: "font-size: 0.85rem;",
+                    "Something wrong with order {short}? You can put one complaint on the \
+                     seller's public record:"
+                }
+                for category in FeedbackCategory::ALL {
+                    {
+                        let label = super::reputation_view::category_label(&category);
+                        rsx! {
+                            button {
+                                class: "btn btn-sm btn-outline",
+                                onclick: move |_| {
+                                    problem.set(None);
+                                    chosen.set(Some(category.clone()));
+                                },
+                                "{label}"
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// What a complaint control is about: a purchase on a loaded store's page,
+/// or a purchase this node keeps, judged from the kept record alone (review
+/// round 5 of #143, R5-B).
+#[derive(Clone, PartialEq)]
+enum ComplaintTarget {
+    AtStore {
+        store_contract_id: Vec<u8>,
+        purchase: Box<BuyerPurchase>,
+    },
+    Kept {
+        store_key: [u8; 32],
+        order_id: harvest_common::payment::OrderId,
+    },
+}
+
+impl ComplaintTarget {
+    fn order_id(&self) -> harvest_common::payment::OrderId {
+        match self {
+            Self::AtStore { purchase, .. } => purchase.order_id.clone(),
+            Self::Kept { order_id, .. } => order_id.clone(),
+        }
+    }
+
+    fn on_record(
+        &self,
+        state: &crate::state::AppState,
+    ) -> Option<harvest_common::reputation::Complaint> {
+        match self {
+            Self::AtStore {
+                store_contract_id,
+                purchase,
+            } => state.complaint_on_record(store_contract_id, &purchase.order_id),
+            Self::Kept {
+                store_key,
+                order_id,
+            } => state.complaint_on_record_by_key(store_key, order_id),
+        }
+    }
+
+    fn refusal(&self, state: &crate::state::AppState) -> Option<String> {
+        match self {
+            Self::AtStore {
+                store_contract_id,
+                purchase,
+            } => state.complaint_refusal(store_contract_id, purchase),
+            Self::Kept {
+                store_key,
+                order_id,
+            } => state.kept_complaint_refusal(store_key, order_id),
+        }
+    }
+
+    fn file(
+        &self,
+        state: &mut crate::state::AppState,
+        category: harvest_common::feedback::FeedbackCategory,
+    ) -> Result<(), String> {
+        match self {
+            Self::AtStore {
+                store_contract_id,
+                purchase,
+            } => state.file_complaint(store_contract_id, &purchase.order_id, category),
+            Self::Kept {
+                store_key,
+                order_id,
+            } => state.file_kept_complaint(store_key, order_id, category),
+        }
+    }
+}
+
+/// Every purchase this node keeps, from the kept records alone, with no
+/// store loaded (review round 5 of #143, R5-B). A store re-keyed while its
+/// seller stays away, or one nobody hosts, still leaves the buyer the paid
+/// copy and the complaint control here.
+///
+/// No payment address, ever: the store page's purchase card is the one place
+/// a buyer is shown one (`docs/complaint-threat-model.md` section 3.1). An
+/// unpaid kept order is listed so the buyer knows it is held, and is paid
+/// from the store's page.
+#[component]
+pub fn KeptPurchases() -> Element {
+    let app_state = APP_STATE.read();
+    if app_state.kept_purchases.is_empty() {
+        return rsx! {};
+    }
+    let mut kept = app_state.kept_purchases.clone();
+    let bitcoin = app_state.bitcoin.clone();
+    drop(app_state);
+    // Newest first, as the orders list below.
+    kept.sort_by_key(|k| std::cmp::Reverse(k.order.order.created_at));
+    let seen_paid: Vec<bool> = {
+        let state = APP_STATE.read();
+        kept.iter().map(|k| state.kept_seen_paid(k)).collect()
+    };
+    rsx! {
+        div { class: "card", style: "margin-top: 1rem;",
+            h3 { "Your purchases" }
+            p { class: "text-muted", style: "font-size: 0.85rem;",
+                "Every order your node keeps its own copy of. A complaint about a paid one "
+                "is made from that copy, so it does not need the seller's store to be "
+                "online or unchanged."
+            }
+            for (purchase, seen_paid) in kept.into_iter().zip(seen_paid) {
+                KeptPurchaseRow {
+                    // A kept purchase is one per order id on this node, but
+                    // its identity is the pair.
+                    key: "{hex::encode(purchase.store_key)}-{purchase.order.order.id}",
+                    purchase,
+                    seen_paid,
+                    bitcoin: bitcoin.clone(),
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn KeptPurchaseRow(
+    purchase: harvest_common::delegate::KeptPurchase,
+    /// Claims this node holds prove the unpaid copy paid, and its upgrade
+    /// is on its way.
+    seen_paid: bool,
+    bitcoin: crate::state::BitcoinState,
+) -> Element {
+    use harvest_common::payment::OrderStatus;
+    let short = purchase.order.order.id.short();
+    let paid = purchase.order.status == OrderStatus::Paid;
+    let amount = super::bitcoin_view::format_sats(purchase.order.order.amount_sats);
+    rsx! {
+        div { style: "margin-top: 0.5rem; border-top: 1px solid var(--border, #ddd); padding-top: 0.5rem;",
+            p { class: "text-muted", style: "font-size: 0.8rem;", "Order {short}" }
+            if paid {
+                SettledPurchase { order: purchase.order.clone(), bitcoin }
+                FileComplaint {
+                    target: ComplaintTarget::Kept {
+                        store_key: purchase.store_key,
+                        order_id: purchase.order.order.id.clone(),
+                    },
+                }
+            } else if seen_paid {
+                p { class: "text-muted",
+                    "{amount} \u{00b7} Payment seen. Your node is keeping its proof of payment, \
+                     and a complaint can be made once it has."
+                }
+            } else {
+                // No "pay it here" (review round 6): a buyer who paid while
+                // the payment went unobserved (model 7.4) would read it as a
+                // prompt to pay again.
+                p { class: "text-muted",
+                    "{amount} \u{00b7} No payment seen yet. Your node keeps this order and \
+                     follows what the bridge reports for its address. If you have not paid, \
+                     the seller's store page is where to."
+                }
+            }
+        }
+    }
+}
+
 /// A purchase that has moved past payment, as its buyer sees it: where it
 /// stands against the reader-side windows (harvest#53), and no payment
 /// address, since there is nothing left to pay.
@@ -415,11 +771,10 @@ pub fn AcceptRequest(
     let mut accepted = use_signal(|| false);
 
     let parsed_amount = amount().trim().parse::<u64>().ok().filter(|n| *n > 0);
-    let parsed_confirmations = confirmations()
-        .trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|n| *n > 0);
+    // The invoice form's own rule, so the two seller controls refuse the
+    // same values (`docs/complaint-threat-model.md` section 4).
+    let confirmations_read = super::invoice_form::parse_required_confirmations(&confirmations());
+    let parsed_confirmations = confirmations_read.as_ref().ok().copied();
     let ready = parsed_amount.is_some() && parsed_confirmations.is_some();
 
     if accepted() {
@@ -474,6 +829,9 @@ pub fn AcceptRequest(
                     min: "1",
                     value: "{confirmations}",
                     oninput: move |event| confirmations.set(event.value()),
+                }
+                if let Err(why) = confirmations_read {
+                    p { class: "text-warning", "{why}" }
                 }
             }
             if let Some(message) = problem() {
@@ -606,7 +964,13 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
         | PaymentBlocker::ChainUnknown
         | PaymentBlocker::AnchorUnverifiable
         | PaymentBlocker::AnchorAheadOfTip { .. }
-        | PaymentBlocker::ConversationNotKept => Remedy::Wait,
+        | PaymentBlocker::AddressContractNotCurrent {
+            generation_known: false,
+        }
+        | PaymentBlocker::ConversationNotKept
+        // The buyer's own press clears it; when it is the only blocker the
+        // card offers the press instead of this text.
+        | PaymentBlocker::PurchaseNotKept => Remedy::Wait,
         // The seller issued something that cannot be acted on, and issuing it
         // again fixes every one of these.
         PaymentBlocker::NoTrustedBridge
@@ -614,13 +978,20 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
         | PaymentBlocker::DestinationDisagrees
         | PaymentBlocker::DestinationUnreadable
         | PaymentBlocker::AnchorMissing
-        | PaymentBlocker::AnchorStale { .. } => Remedy::AskTheSeller,
+        | PaymentBlocker::AnchorStale { .. }
+        | PaymentBlocker::UnfitForComplaint(_)
+        | PaymentBlocker::AddressContractNotCurrent {
+            generation_known: true,
+        } => Remedy::AskTheSeller,
         // The order carries no key for this buyer because the REQUEST it
         // answers carried none (an earlier build), or carried another; the
         // seller copies the key from the request, so only a new request
         // fixes it. The seller's inbox offers a keyed request afresh even
         // beside an unkeyed order (`message_view::unanswered_requests`).
         PaymentBlocker::CommitmentLacksBuyerKey => Remedy::AskAgain,
+        // The thread the order was agreed in is gone; a new request starts a
+        // new one.
+        PaymentBlocker::ConversationForgotten => Remedy::AskAgain,
         // The order is not this buyer's, not this seller's, or not payable at
         // all. None of these is a mistake anybody can undo.
         PaymentBlocker::SellerIdentityUnknown
