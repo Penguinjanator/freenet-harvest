@@ -719,9 +719,19 @@ fn handle_list_stores<S: SecretStore>(
     ghostkey_fingerprint: &str,
 ) -> HarvestDelegateResponse {
     let stores = load_stores(store, ghostkey_fingerprint);
+    // Which of these keys this delegate can actually sign with (harvest#138).
+    // A re-key carries the registrations and never the keys, so a
+    // registration naming a key is not evidence of holding it, and the UI
+    // decides between wrapping a key and recovering it on this.
+    let held_store_keys = stores
+        .iter()
+        .filter_map(|s| s.store_verifying_key)
+        .filter(|key| crate::store_keys::holds(store, key))
+        .collect();
     HarvestDelegateResponse::StoreList {
         ghostkey_fingerprint: ghostkey_fingerprint.to_string(),
         stores,
+        held_store_keys: Some(held_store_keys),
     }
 }
 
@@ -850,6 +860,138 @@ mod origin_gating_tests {
             crate::store_keys::unfinished_creation(&store, FINGERPRINT).is_none(),
             "finished by the duplicate registration"
         );
+    }
+
+    /// A store list says which of the keys it names this delegate HOLDS, and
+    /// a registration that came across a re-key without its key is not one
+    /// of them (harvest#138). The UI decides wrap or recover on this; read
+    /// off the registration, a device whose delegate re-keyed wrapped a key
+    /// it did not have and never recovered it, so it could sign nothing.
+    ///
+    /// The unheld registration arrives the way a re-key delivers it: through
+    /// the import, from a predecessor's export, which never carries the key.
+    /// Mutated red by reporting every registered key as held.
+    #[test]
+    fn a_store_list_names_only_the_store_keys_it_holds() {
+        let mut store = MemSecrets::default();
+        let held = mint(&mut store, 1, false).unwrap();
+        register_as(&mut store, vec![7; 32], Some(held));
+        let carried = ed25519_dalek::SigningKey::from_bytes(&[0x2c; 32])
+            .verifying_key()
+            .to_bytes();
+        let predecessor_registry = to_cbor(&vec![StoreRegistration {
+            store_contract_id: vec![8; 32],
+            reputation_contract_id: vec![1],
+            mailbox_contract_id: vec![2],
+            store_contract_key: None,
+            store_verifying_key: Some(carried),
+        }])
+        .unwrap();
+        crate::import::import(
+            &mut store,
+            [0x99; 32],
+            stores_key(FINGERPRINT),
+            &predecessor_registry,
+        );
+        match handle(
+            &mut store,
+            Some(&harvest()),
+            HarvestDelegateRequest::ListStores {
+                ghostkey_fingerprint: FINGERPRINT.to_string(),
+            },
+        ) {
+            HarvestDelegateResponse::StoreList {
+                stores,
+                held_store_keys,
+                ..
+            } => {
+                assert!(
+                    stores
+                        .iter()
+                        .any(|s| s.store_verifying_key == Some(carried)),
+                    "the carried registration is listed: {stores:?}"
+                );
+                assert_eq!(held_store_keys, Some(vec![held]));
+            }
+            other => panic!("expected a StoreList, got {other:?}"),
+        }
+    }
+
+    /// The other half of the above: once custody's `UnwrapStoreKey` recovers
+    /// the key, the same registration is listed as held, so the UI stops
+    /// recovering and can wrap it again (harvest#138 review). Through the
+    /// real handlers on both devices. Mutated red by `holds` reading another
+    /// secret than the one `keep` writes.
+    #[test]
+    fn a_recovered_store_key_is_listed_as_held() {
+        use ed25519_dalek::Signer;
+        let ghost = ed25519_dalek::SigningKey::from_bytes(&[0x47; 32]);
+        let wrap_signature = |store: [u8; 32]| {
+            let vk = ed25519_dalek::VerifyingKey::from_bytes(&store).unwrap();
+            let scoped = ghostkey_common::to_cbor(&ghostkey_common::ScopedPayload {
+                requestor: harvest_common::expected_harvest_requestor(),
+                payload: harvest_common::custody::wrap_message(&vk),
+            })
+            .unwrap();
+            let signature = ghost.sign(&scoped).to_bytes().to_vec();
+            (scoped, harvest_common::delegate::WrapSignature(signature))
+        };
+
+        // The device that made the store wraps its key to the backer.
+        let mut first = MemSecrets::default();
+        let store = mint(&mut first, 1, false).unwrap();
+        let (scoped_payload, signature) = wrap_signature(store);
+        let copy = match handle(
+            &mut first,
+            Some(&harvest()),
+            HarvestDelegateRequest::WrapStoreKeyFor {
+                request_id: 2,
+                store_verifying_key: store,
+                backer_verifying_key: ghost.verifying_key().to_bytes(),
+                scoped_payload,
+                signature,
+            },
+        ) {
+            HarvestDelegateResponse::StoreKeyWrapped {
+                result: Ok(copy), ..
+            } => copy,
+            other => panic!("expected a wrapped copy, got {other:?}"),
+        };
+
+        // A device holding only the registration, as a re-key leaves it.
+        let mut device = MemSecrets::default();
+        register_as(&mut device, vec![7; 32], Some(store));
+        let held = |device: &mut MemSecrets| match handle(
+            device,
+            Some(&harvest()),
+            HarvestDelegateRequest::ListStores {
+                ghostkey_fingerprint: FINGERPRINT.to_string(),
+            },
+        ) {
+            HarvestDelegateResponse::StoreList {
+                held_store_keys, ..
+            } => held_store_keys,
+            other => panic!("expected a StoreList, got {other:?}"),
+        };
+        assert_eq!(held(&mut device), Some(Vec::new()));
+
+        let (scoped_payload, signature) = wrap_signature(store);
+        match handle(
+            &mut device,
+            Some(&harvest()),
+            HarvestDelegateRequest::UnwrapStoreKey {
+                request_id: 3,
+                store_verifying_key: store,
+                backer_verifying_key: ghost.verifying_key().to_bytes(),
+                scoped_payload,
+                signature,
+                wrapped: copy.copy.wrapped.clone(),
+            },
+        ) {
+            HarvestDelegateResponse::StoreKeyRecovered { result: Ok(()), .. } => {}
+            other => panic!("expected the key recovered, got {other:?}"),
+        }
+        assert_eq!(held(&mut device), Some(vec![store]));
     }
 
     fn mint(store: &mut MemSecrets, id: u64, another_store: bool) -> Result<[u8; 32], String> {

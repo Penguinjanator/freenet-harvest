@@ -186,6 +186,22 @@ pub struct AppState {
     /// buyer browsing a busy store issues one recall per notification.
     pub buyer_conversations_recalled: HashSet<Vec<u8>>,
 
+    /// A store's contract id at an earlier store generation -> its current
+    /// id, for every earlier id its conversations are recalled from
+    /// (harvest#138).
+    ///
+    /// A buyer's conversation is kept under the id the store had when it was
+    /// opened. When the store contract re-keys, the store's current id finds
+    /// none of them, so they are recalled from the earlier ids too and filed
+    /// under the current one. Every recall claim, retry budget and pending
+    /// request is keyed by the id actually ASKED about; this map is only
+    /// where an answer is filed.
+    pub conversation_recall_aliases: HashMap<Vec<u8>, Vec<u8>>,
+
+    /// Stores whose recall failure has been said this session: once per
+    /// store, whichever of its ids failed (harvest#138 review).
+    pub recall_failure_announced: HashSet<Vec<u8>>,
+
     /// How many times a `ListBuyerConversations` send has failed for a given
     /// store, keyed the same way `buyer_conversations_recalled` is. A send
     /// failure is not a refusal -- nothing was ever asked -- so the claim is
@@ -317,6 +333,22 @@ pub struct AppState {
 
     /// Store keys whose subkeys have been asked for this session.
     pub store_subkeys_requested: HashSet<[u8; 32]>,
+
+    /// Whether this device's Harvest delegate HOLDS each registered store
+    /// key, as its last `StoreList` answer said (harvest#138).
+    ///
+    /// A registration is not the key: a delegate re-key carries the
+    /// registrations forward and never the keys, so a device can be
+    /// registered for a store it cannot sign for. Custody decides wrap or
+    /// recover on this ([`AppState::holds_store_key`]). A key the delegate
+    /// has not said anything about is taken as held, which is what every
+    /// build before this one assumed of every registration.
+    pub store_keys_held: HashMap<[u8; 32], bool>,
+
+    /// Store keys this session has told the seller it cannot recover, so it
+    /// is said once (harvest#138 review). See
+    /// `custody_flow::note_unrecoverable_store_key`.
+    pub store_key_unheld_announced: HashSet<[u8; 32]>,
 
     /// Custody requests waiting on the vault's wrap signature, by store key,
     /// and then on the Harvest delegate's answer. See `custody_flow`.
@@ -4007,8 +4039,15 @@ impl AppState {
             .entry(store_contract_id.to_vec())
             .or_insert(0);
         *failures = failures.saturating_add(1);
-        if *failures >= MAX_BUYER_CONVERSATION_RECALL_ATTEMPTS {
-            if *failures == MAX_BUYER_CONVERSATION_RECALL_ATTEMPTS {
+        let failures = *failures;
+        if failures >= MAX_BUYER_CONVERSATION_RECALL_ATTEMPTS {
+            // Once per store, whichever of its ids failed: its earlier ids
+            // fail with it when the delegate is unreachable (harvest#138
+            // review).
+            let store = self.recall_files_under(store_contract_id);
+            if failures == MAX_BUYER_CONVERSATION_RECALL_ATTEMPTS
+                && self.recall_failure_announced.insert(store)
+            {
                 self.notifications.push(format!(
                     "Harvest could not recall your earlier conversations with a store: {why}. \
                      Reload to try again."
@@ -4021,8 +4060,146 @@ impl AppState {
         true
     }
 
-    /// [`Self::buyer_conversations_to_recall`], dispatched.
+    /// Recall a store's kept conversations: under its current id, and under
+    /// the id it had at each earlier store generation, so a conversation
+    /// opened before the store contract re-keyed is still shown with it
+    /// (harvest#138).
     pub fn recall_buyer_conversations(&mut self, store_contract_id: &[u8]) {
+        self.recall_buyer_conversations_kept_under(store_contract_id);
+        for earlier in self.earlier_store_ids(store_contract_id) {
+            let newly = self
+                .conversation_recall_aliases
+                .insert(earlier.clone(), store_contract_id.to_vec())
+                .is_none();
+            if newly {
+                self.adopt_placeholder_for(&earlier);
+            }
+            self.recall_buyer_conversations_kept_under(&earlier);
+        }
+    }
+
+    /// An earlier id asked about BEFORE it was known to be one (a backup
+    /// restored before its store was opened, harvest#138 review) had its
+    /// answer filed under a placeholder entry of its own, and holds the
+    /// claim, so the store's recall would skip it. Its conversations move to
+    /// the store and the claim is dropped, so it is asked again and filed
+    /// with the store; a claim in flight is left to answer, and its answer
+    /// is now filed with the store.
+    ///
+    /// The entry is dropped only if nothing else is in it: it may be more
+    /// than a placeholder (a store being browsed, a mailbox registered under
+    /// that id), and then only its conversations move (harvest#138 review).
+    fn adopt_placeholder_for(&mut self, earlier: &[u8]) {
+        let current = self.recall_files_under(earlier);
+        let moved: Vec<crate::messaging::BuyerConversation> = self
+            .browsing_stores
+            .get_mut(earlier)
+            .map(|entry| std::mem::take(&mut entry.conversations))
+            .unwrap_or_default();
+        // A bare placeholder -- nothing but the conversations just moved --
+        // is dropped; anything more is left.
+        // Compared whole, so a field added later counts as "more".
+        let bare = self.active_store_id.as_deref() != Some(earlier)
+            && self
+                .browsing_stores
+                .get(earlier)
+                .is_some_and(|e| *e == BrowsingStore::default());
+        if bare {
+            self.browsing_stores.remove(earlier);
+        }
+        if !moved.is_empty() {
+            let store = self.browsing_stores.entry(current).or_default();
+            for mut conversation in moved {
+                if store
+                    .conversations
+                    .iter()
+                    .any(|held| held.buyer_public_key == conversation.buyer_public_key)
+                {
+                    continue;
+                }
+                conversation.kept_under = Some(earlier.to_vec());
+                store.conversations.push(conversation);
+            }
+            store
+                .conversations
+                .sort_by_key(|held| (held.created_at, held.buyer_public_key));
+        }
+        let in_flight = self
+            .pending_conversation_recalls
+            .values()
+            .any(|asked| asked.as_slice() == earlier);
+        if !in_flight {
+            self.buyer_conversations_recalled.remove(earlier);
+        }
+    }
+
+    /// The ids `store_contract_id` had at earlier store generations, if this
+    /// tab knows its code and the code opens THIS store.
+    ///
+    /// The code comes from the link the store was opened by, or else from
+    /// the owner its state names (a store's code is its owner's prefix). An
+    /// earlier id is never expanded in turn: its code opens the current id,
+    /// not it, so the check below refuses it.
+    fn earlier_store_ids(&self, store_contract_id: &[u8]) -> Vec<Vec<u8>> {
+        let from_link = self
+            .store_codes
+            .get(store_contract_id)
+            .and_then(|code| StoreParameters::from_code(code));
+        let from_owner = self
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|s| s.owner)
+            .and_then(|owner| ed25519_dalek::VerifyingKey::from_bytes(&owner).ok())
+            .map(StoreParameters::new);
+        // A code that does not open this store names another store's
+        // generations; asking about them would file its conversations here.
+        let opens_this_store = |params: &StoreParameters| {
+            crate::gateway::store_ops::store_instance_id(params)
+                .is_ok_and(|id| id.as_bytes() == store_contract_id)
+        };
+        let Some(params) = [from_link, from_owner]
+            .into_iter()
+            .flatten()
+            .find(|params| opens_this_store(params))
+        else {
+            return Vec::new();
+        };
+        crate::migrate::earlier_code_store_ids(&params)
+            .map(|ids| ids.iter().map(|id| id.as_bytes().to_vec()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The store a recall about `asked` is filed under: the store it is an
+    /// earlier id of, or itself.
+    fn recall_files_under(&self, asked: &[u8]) -> Vec<u8> {
+        self.conversation_recall_aliases
+            .get(asked)
+            .cloned()
+            .unwrap_or_else(|| asked.to_vec())
+    }
+
+    /// The store id the delegate keeps `buyer_public_key`'s conversation with
+    /// `store_contract_id` under: the store's own, or, for one recalled from
+    /// an earlier store generation, that generation's (harvest#138).
+    fn conversation_kept_under(
+        &self,
+        store_contract_id: &[u8],
+        buyer_public_key: &[u8; 32],
+    ) -> Vec<u8> {
+        self.browsing_stores
+            .get(store_contract_id)
+            .and_then(|store| {
+                store
+                    .conversations
+                    .iter()
+                    .find(|held| held.buyer_public_key == *buyer_public_key)
+            })
+            .and_then(|held| held.kept_under.clone())
+            .unwrap_or_else(|| store_contract_id.to_vec())
+    }
+
+    /// [`Self::buyer_conversations_to_recall`], dispatched, for one id.
+    fn recall_buyer_conversations_kept_under(&mut self, store_contract_id: &[u8]) {
         let Some(request) = self.buyer_conversations_to_recall(store_contract_id) else {
             return;
         };
@@ -4101,7 +4278,7 @@ impl AppState {
     ) {
         // Dropping the pending entry is what un-asks it. An answer nothing
         // asked for takes nothing with it and contributes nothing.
-        let Some(store_contract_id) = self.pending_conversation_recalls.remove(&request_id) else {
+        let Some(asked) = self.pending_conversation_recalls.remove(&request_id) else {
             warn!("Conversations arrived for request {request_id}, which nothing asked for");
             return;
         };
@@ -4109,7 +4286,7 @@ impl AppState {
         // echoed a different one, that is a fault worth saying out loud --
         // and filing by the echo would put one store's conversation keys
         // against another store's mailbox.
-        if echoed_store_contract_id != store_contract_id {
+        if echoed_store_contract_id != asked {
             warn!(
                 "The delegate answered conversations for a different store than was asked \
                  about; filing them under the store that was asked about"
@@ -4118,9 +4295,13 @@ impl AppState {
         // A genuine arrival is success: forget any past send failures so a
         // later transient failure gets its own full retry budget rather
         // than inheriting a lifetime count (#107, marker sweep).
-        self.buyer_conversation_recall_failures
-            .remove(&store_contract_id);
-        let store_contract_id = store_contract_id.as_slice();
+        self.buyer_conversation_recall_failures.remove(&asked);
+        // Kept under an earlier generation's id: shown with the store's
+        // current one, and remembered as kept under the id asked about.
+        let filed_under = self.recall_files_under(&asked);
+        self.recall_failure_announced.remove(&filed_under);
+        let kept_under = (filed_under != asked).then(|| asked.clone());
+        let store_contract_id = filed_under.as_slice();
         if conversations.is_empty() {
             return;
         }
@@ -4146,9 +4327,9 @@ impl AppState {
                 held.backed_up = recalled.backed_up;
                 continue;
             }
-            store
-                .conversations
-                .push(crate::messaging::BuyerConversation::recalled(&recalled));
+            let mut conversation = crate::messaging::BuyerConversation::recalled(&recalled);
+            conversation.kept_under = kept_under.clone();
+            store.conversations.push(conversation);
         }
         // Oldest first, so the LAST is the one a new message continues.
         // `buyer_public_key` breaks a tie rather than leaving the order
@@ -4188,7 +4369,7 @@ impl AppState {
             .insert(request_id, (store_contract_id.to_vec(), *buyer_public_key));
         harvest_common::HarvestDelegateRequest::ExportBuyerConversation {
             request_id,
-            store_contract_id: store_contract_id.to_vec(),
+            store_contract_id: self.conversation_kept_under(store_contract_id, buyer_public_key),
             buyer_public_key: *buyer_public_key,
         }
     }
@@ -4250,7 +4431,7 @@ impl AppState {
             .insert(request_id, (store_contract_id.to_vec(), *buyer_public_key));
         harvest_common::HarvestDelegateRequest::MarkConversationBackedUp {
             request_id,
-            store_contract_id: store_contract_id.to_vec(),
+            store_contract_id: self.conversation_kept_under(store_contract_id, buyer_public_key),
             buyer_public_key: *buyer_public_key,
         }
     }
@@ -4361,9 +4542,27 @@ impl AppState {
     }
 
     /// Ask again for a store's conversations, after something changed them.
+    ///
+    /// Asked of the store, not of one id: every id its conversations are
+    /// recalled from is asked again, since the change may have been to one
+    /// kept under an earlier generation's id (harvest#138). An id that is an
+    /// earlier one of a store stands for that store.
     pub fn re_recall_buyer_conversations(&mut self, store_contract_id: &[u8]) {
-        self.buyer_conversations_recalled.remove(store_contract_id);
-        self.recall_buyer_conversations(store_contract_id);
+        let store = self.recall_files_under(store_contract_id);
+        // A claim whose recall is still in flight is kept: its answer is on
+        // the way, and a second chain beside it only races it, as in
+        // `forget_recalled_conversations`.
+        let in_flight: HashSet<Vec<u8>> = self
+            .pending_conversation_recalls
+            .values()
+            .cloned()
+            .collect();
+        let aliases = &self.conversation_recall_aliases;
+        self.buyer_conversations_recalled.retain(|asked| {
+            let this_store = *asked == store || aliases.get(asked) == Some(&store);
+            !this_store || in_flight.contains(asked)
+        });
+        self.recall_buyer_conversations(&store);
     }
 
     /// Ask the delegate to forget one conversation, permanently.
@@ -4380,7 +4579,7 @@ impl AppState {
             .insert(request_id, (store_contract_id.to_vec(), *buyer_public_key));
         harvest_common::HarvestDelegateRequest::ForgetBuyerConversation {
             request_id,
-            store_contract_id: store_contract_id.to_vec(),
+            store_contract_id: self.conversation_kept_under(store_contract_id, buyer_public_key),
             buyer_public_key: *buyer_public_key,
         }
     }
@@ -6278,6 +6477,28 @@ impl AppState {
         crate::messaging::read_mailbox(&store.mailbox_messages, &self.conversation_keys)
     }
 
+    /// Record which of `stores`' keys the delegate said it holds. An answer
+    /// that says nothing (a generation older than the field) changes nothing.
+    pub(crate) fn note_held_store_keys(
+        &mut self,
+        stores: &[StoreRegistration],
+        held: Option<&[[u8; 32]]>,
+    ) {
+        let Some(held) = held else {
+            return;
+        };
+        for key in stores.iter().filter_map(|s| s.store_verifying_key) {
+            self.store_keys_held.insert(key, held.contains(&key));
+        }
+    }
+
+    /// Whether this device's delegate holds the store key `store`, so can sign
+    /// for, wrap and derive from it (harvest#138). See
+    /// [`Self::store_keys_held`] for why this is not the registration.
+    pub fn holds_store_key(&self, store: &[u8; 32]) -> bool {
+        self.store_keys_held.get(store).copied().unwrap_or(true)
+    }
+
     /// Whether this store is one of the connected identities', and if so
     /// which identity owns it.
     /// The verifying key of the identity that owns `store_contract_id`, which
@@ -6288,6 +6509,9 @@ impl AppState {
     /// `None` for a store that is not ours, and for one made before revision
     /// 2, which was owned by its Ghost Key and has no store key: this build
     /// cannot sign for it, and `crate::backing_flow` moves it to one.
+    ///
+    /// A registration is not the key: whether this device can SIGN with it is
+    /// [`Self::holds_store_key`] (harvest#138).
     pub fn store_owner_key(&self, store_contract_id: &[u8]) -> Option<ed25519_dalek::VerifyingKey> {
         let bytes = self
             .my_stores
@@ -7649,12 +7873,14 @@ impl AppState {
             HarvestDelegateResponse::StoreList {
                 ghostkey_fingerprint,
                 stores,
+                held_store_keys,
             } => {
                 info!(
                     "Delegate reports {} store(s) for {}",
                     stores.len(),
                     ghostkey_fingerprint
                 );
+                self.note_held_store_keys(&stores, held_store_keys.as_deref());
                 self.store_lists_answered
                     .insert(ghostkey_fingerprint.clone());
                 self.merge_store_registrations(&ghostkey_fingerprint, stores);
@@ -10046,6 +10272,7 @@ mod tests {
         HarvestDelegateResponse::StoreList {
             ghostkey_fingerprint: FINGERPRINT.to_string(),
             stores,
+            held_store_keys: None,
         }
     }
 
@@ -15251,6 +15478,7 @@ mod delegate_correlation_tests {
                 store_contract_key: None,
                 store_verifying_key: Some(crate::state::test_store_key()),
             }],
+            held_store_keys: None,
         });
 
         assert_eq!(
@@ -18505,6 +18733,7 @@ mod buy_flow_tests {
         state.on_delegate_response(HarvestDelegateResponse::StoreList {
             ghostkey_fingerprint: "seller-fp".to_string(),
             stores: Vec::new(),
+            held_store_keys: None,
         });
         assert!(
             state.settlements_submitted.contains(&order.order.id),
@@ -23438,5 +23667,373 @@ mod delegate_migration_refresh_tests {
         state.forget_recalled_conversations();
         assert!(!state.buyer_conversations_recalled.contains(&vec![1; 32]));
         assert!(state.buyer_conversations_recalled.contains(&vec![2; 32]));
+    }
+}
+
+/// A buyer's conversations with a store whose contract re-keyed
+/// (harvest#138 F2).
+///
+/// A conversation is kept under the store's contract id at the time it was
+/// opened, and a store re-key moves the id. These pin that the app recalls
+/// from the store's earlier ids too, shows what it finds with the store, and
+/// addresses every later request about such a conversation by the id it is
+/// kept under.
+#[cfg(test)]
+mod store_rekey_recall_tests {
+    use super::*;
+    use harvest_common::{HarvestDelegateRequest, RecalledConversation};
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    fn owner() -> ed25519_dalek::VerifyingKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32]).verifying_key()
+    }
+
+    fn params() -> StoreParameters {
+        StoreParameters::new(owner())
+    }
+
+    /// The store's id under this build.
+    fn current() -> Vec<u8> {
+        crate::gateway::store_ops::store_instance_id(&params())
+            .unwrap()
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// The store's ids at the earlier code-addressed generations, newest
+    /// first.
+    fn earlier() -> Vec<Vec<u8>> {
+        crate::migrate::earlier_code_store_ids(&params())
+            .unwrap()
+            .iter()
+            .map(|id| id.as_bytes().to_vec())
+            .collect()
+    }
+
+    fn buyer_state() -> AppState {
+        let mut state = AppState {
+            harvest_delegate_key: Some(freenet_stdlib::prelude::DelegateKey::new(
+                [0xA1; 32],
+                freenet_stdlib::prelude::CodeHash::new([0xA1; 32]),
+            )),
+            ..AppState::default()
+        };
+        state.browsing_stores.entry(current()).or_default();
+        state
+    }
+
+    fn recalled(seed: u8) -> RecalledConversation {
+        let secret = StaticSecret::from([seed; 32]);
+        RecalledConversation {
+            buyer_public_key: *PublicKey::from(&secret).as_bytes(),
+            conversation_id: [seed; 32],
+            buyer_to_seller: [seed; 32],
+            seller_to_buyer: [seed; 32],
+            order_binding: harvest_common::mailbox::order_binding_from_secret(&[seed; 32]),
+            created_at: 1_700_000_000 + seed as i64,
+            imported: false,
+            backed_up: false,
+        }
+    }
+
+    /// The id each recall in flight asked about, by request id.
+    fn asked(state: &AppState) -> Vec<(u64, Vec<u8>)> {
+        state
+            .pending_conversation_recalls
+            .iter()
+            .map(|(id, store)| (*id, store.clone()))
+            .collect()
+    }
+
+    fn answer(state: &mut AppState, store: &[u8], conversations: Vec<RecalledConversation>) {
+        let request_id = asked(state)
+            .into_iter()
+            .find(|(_, asked)| asked == store)
+            .map(|(id, _)| id)
+            .expect("a recall about that id is in flight");
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationList {
+            request_id,
+            store_contract_id: store.to_vec(),
+            conversations,
+        });
+    }
+
+    fn requested_store(request: &HarvestDelegateRequest) -> Vec<u8> {
+        match request {
+            HarvestDelegateRequest::ExportBuyerConversation {
+                store_contract_id, ..
+            }
+            | HarvestDelegateRequest::MarkConversationBackedUp {
+                store_contract_id, ..
+            }
+            | HarvestDelegateRequest::ForgetBuyerConversation {
+                store_contract_id, ..
+            } => store_contract_id.clone(),
+            other => panic!("expected a conversation request, got {other:?}"),
+        }
+    }
+
+    /// The earlier ids are the store's own, derived at the generations its
+    /// code addressed, and agree with the migration probe's derivation. Two
+    /// independent paths to the same ids: mutated red by dropping the
+    /// generation filter and by deriving under the current code hash.
+    #[test]
+    fn the_earlier_ids_are_the_code_addressed_generations_of_this_store() {
+        let ids = earlier();
+        let code_generations = crate::migrate::store_lineage()
+            .iter()
+            .filter(|e| {
+                crate::migrate::store_param_shape(e.generation)
+                    == crate::migrate::StoreParamShape::Code
+            })
+            .count();
+        assert!(code_generations > 0);
+        assert_eq!(ids.len(), code_generations);
+        let probe: Vec<Vec<u8>> = crate::migrate::store_candidate_ids(&owner())
+            .unwrap()
+            .iter()
+            .map(|id| id.as_bytes().to_vec())
+            .collect();
+        assert_eq!(ids, probe[..code_generations].to_vec());
+        assert!(!ids.contains(&current()));
+    }
+
+    /// **A conversation opened before the store re-keyed is shown with the
+    /// store after it.** The store's current id holds none of it; the id the
+    /// store had then does. Mutated red by recalling only the current id and
+    /// by filing the answer under the id asked about.
+    #[test]
+    fn a_conversation_kept_under_an_earlier_store_id_is_shown_with_the_store() {
+        let mut state = buyer_state();
+        state.note_store_code(current(), params().code().to_string());
+        state.recall_buyer_conversations(&current());
+
+        let mut asked_about: Vec<Vec<u8>> = asked(&state).into_iter().map(|(_, s)| s).collect();
+        asked_about.sort();
+        let mut expected = earlier();
+        expected.push(current());
+        expected.sort();
+        assert_eq!(
+            asked_about, expected,
+            "the current id and every earlier one"
+        );
+
+        answer(&mut state, &current(), Vec::new());
+        answer(&mut state, &earlier()[0], vec![recalled(5)]);
+
+        let store = &state.browsing_stores[&current()];
+        assert_eq!(store.conversations.len(), 1);
+        assert_eq!(
+            store.conversations[0].buyer_public_key,
+            recalled(5).buyer_public_key
+        );
+        assert_eq!(
+            store.conversations[0].kept_under,
+            Some(earlier()[0].clone())
+        );
+        assert!(
+            !state.browsing_stores.contains_key(&earlier()[0]),
+            "filed with the store, not as a store of its own"
+        );
+    }
+
+    /// Backing up, marking saved and forgetting such a conversation name the
+    /// id the delegate keeps it under, which is where the delegate looks. A
+    /// conversation kept under the current id is still addressed by it.
+    /// Mutated red by addressing every request by the store's current id.
+    #[test]
+    fn requests_about_it_name_the_id_it_is_kept_under() {
+        let mut state = buyer_state();
+        state.note_store_code(current(), params().code().to_string());
+        state.recall_buyer_conversations(&current());
+        answer(&mut state, &current(), vec![recalled(6)]);
+        answer(&mut state, &earlier()[0], vec![recalled(5)]);
+        let old = recalled(5).buyer_public_key;
+        let new = recalled(6).buyer_public_key;
+
+        for request in [
+            state.conversation_to_export(&current(), &old),
+            state.conversation_to_mark_backed_up(&current(), &old),
+            state.conversation_to_forget(&current(), &old),
+        ] {
+            assert_eq!(requested_store(&request), earlier()[0]);
+        }
+        assert_eq!(
+            requested_store(&state.conversation_to_export(&current(), &new)),
+            current()
+        );
+    }
+
+    /// After the buyer marks one saved, every id is asked again, so the
+    /// answer about the earlier one clears its warning. Mutated red by
+    /// re-asking only the current id.
+    #[test]
+    fn marking_one_saved_asks_every_id_again() {
+        let mut state = buyer_state();
+        state.note_store_code(current(), params().code().to_string());
+        state.recall_buyer_conversations(&current());
+        for id in std::iter::once(current()).chain(earlier()) {
+            answer(&mut state, &id, Vec::new());
+        }
+        assert!(state.pending_conversation_recalls.is_empty());
+
+        state.re_recall_buyer_conversations(&earlier()[0]);
+        let mut asked_about: Vec<Vec<u8>> = asked(&state).into_iter().map(|(_, s)| s).collect();
+        asked_about.sort();
+        let mut expected = earlier();
+        expected.push(current());
+        expected.sort();
+        assert_eq!(asked_about, expected);
+    }
+
+    /// A restored backup kept under an earlier id is shown with the store
+    /// once its store is recalled, whichever came first (harvest#138
+    /// review): restored first, it was filed under a placeholder of its own
+    /// and held the claim, so the store's recall skipped it. Mutated red by
+    /// not adopting the placeholder.
+    #[test]
+    fn a_backup_restored_before_its_store_opened_is_shown_with_the_store() {
+        let mut state = buyer_state();
+        let old = earlier()[0].clone();
+        let tag = recalled(5).buyer_public_key;
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationImported {
+            request_id: 1,
+            result: Ok(harvest_common::ImportedConversation::Imported {
+                store_contract_id: old.clone(),
+                buyer_public_key: tag,
+            }),
+        });
+        answer(&mut state, &old, vec![recalled(5)]);
+        assert!(state.browsing_stores.contains_key(&old), "the placeholder");
+
+        // A bare placeholder is dropped on adoption...
+        let mut bare = state.clone();
+        bare.note_store_code(current(), params().code().to_string());
+        bare.recall_buyer_conversations(&current());
+        assert!(!bare.browsing_stores.contains_key(&old));
+        assert_eq!(bare.browsing_stores[&current()].conversations.len(), 1);
+
+        // ...but one that is more than a placeholder (a mailbox registered
+        // there, say) stays, and only its conversations move.
+        state
+            .browsing_stores
+            .get_mut(&old)
+            .unwrap()
+            .mailbox_contract_id = Some(vec![0x6d; 32]);
+        state.note_store_code(current(), params().code().to_string());
+        state.recall_buyer_conversations(&current());
+        let entry = &state.browsing_stores[&old];
+        assert!(entry.conversations.is_empty(), "moved to the store");
+        assert_eq!(
+            entry.mailbox_contract_id,
+            Some(vec![0x6d; 32]),
+            "and nothing else touched"
+        );
+        let store = &state.browsing_stores[&current()];
+        assert_eq!(store.conversations.len(), 1);
+        assert_eq!(store.conversations[0].kept_under, Some(old.clone()));
+        // Asked again, filed with the store, not doubled.
+        answer(&mut state, &old, vec![recalled(5)]);
+        assert_eq!(state.browsing_stores[&current()].conversations.len(), 1);
+    }
+
+    /// Restored AFTER the store was opened: filed with the store directly.
+    #[test]
+    fn a_backup_restored_after_its_store_opened_is_shown_with_the_store() {
+        let mut state = buyer_state();
+        state.note_store_code(current(), params().code().to_string());
+        state.recall_buyer_conversations(&current());
+        for id in std::iter::once(current()).chain(earlier()) {
+            answer(&mut state, &id, Vec::new());
+        }
+        let old = earlier()[0].clone();
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationImported {
+            request_id: 1,
+            result: Ok(harvest_common::ImportedConversation::Imported {
+                store_contract_id: old.clone(),
+                buyer_public_key: recalled(5).buyer_public_key,
+            }),
+        });
+        answer(&mut state, &old, vec![recalled(5)]);
+        assert_eq!(state.browsing_stores[&current()].conversations.len(), 1);
+        assert!(!state.browsing_stores.contains_key(&old));
+    }
+
+    /// A re-ask leaves a recall still in flight alone rather than starting a
+    /// second beside it (harvest#138 review). Mutated red by dropping every
+    /// claim.
+    #[test]
+    fn a_re_ask_leaves_recalls_in_flight_alone() {
+        let mut state = buyer_state();
+        state.note_store_code(current(), params().code().to_string());
+        state.recall_buyer_conversations(&current());
+        let before = state.pending_conversation_recalls.len();
+        state.re_recall_buyer_conversations(&current());
+        assert_eq!(state.pending_conversation_recalls.len(), before);
+    }
+
+    /// An unreachable delegate is one notice per store, not one per id
+    /// (harvest#138 review). Mutated red by notifying for earlier ids too.
+    #[test]
+    fn a_failed_recall_is_said_once_per_store() {
+        let mut state = buyer_state();
+        state.note_store_code(current(), params().code().to_string());
+        state.recall_buyer_conversations(&current());
+        for (request_id, asked) in asked(&state) {
+            for _ in 0..MAX_BUYER_CONVERSATION_RECALL_ATTEMPTS {
+                state.on_buyer_conversations_recall_failed(&asked, request_id, "down");
+            }
+        }
+        let said = state
+            .notifications
+            .iter()
+            .filter(|n| n.contains("could not recall"))
+            .count();
+        assert_eq!(said, 1);
+    }
+
+    /// A link code that does not open the store does not stop the owner's
+    /// code being used (harvest#138 review). Mutated red by taking the link's
+    /// code or nothing.
+    #[test]
+    fn a_wrong_link_code_falls_back_to_the_owner() {
+        let mut state = buyer_state();
+        let stranger = StoreParameters::new(
+            ed25519_dalek::SigningKey::from_bytes(&[0x3c; 32]).verifying_key(),
+        );
+        state.note_store_code(current(), stranger.code().to_string());
+        state.browsing_stores.get_mut(&current()).unwrap().owner = Some(owner().to_bytes());
+        state.recall_buyer_conversations(&current());
+        assert_eq!(
+            state.pending_conversation_recalls.len(),
+            1 + earlier().len()
+        );
+    }
+
+    /// With no link, the owner the store's state names gives its code. A code
+    /// that does not open THIS store gives nothing: its generations are
+    /// another store's, and their conversations would be filed here. Mutated
+    /// red by removing the check that the code opens the store.
+    #[test]
+    fn only_this_stores_own_code_is_expanded() {
+        let mut state = buyer_state();
+        state.browsing_stores.get_mut(&current()).unwrap().owner = Some(owner().to_bytes());
+        state.recall_buyer_conversations(&current());
+        assert_eq!(
+            state.pending_conversation_recalls.len(),
+            1 + earlier().len()
+        );
+
+        let mut state = buyer_state();
+        let stranger = StoreParameters::new(
+            ed25519_dalek::SigningKey::from_bytes(&[0x3c; 32]).verifying_key(),
+        );
+        state.note_store_code(current(), stranger.code().to_string());
+        state.recall_buyer_conversations(&current());
+        assert_eq!(
+            state.pending_conversation_recalls.len(),
+            1,
+            "the current id only"
+        );
     }
 }
