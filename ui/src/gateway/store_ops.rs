@@ -94,6 +94,9 @@ pub enum KeyOrigin {
     /// Rebuilt from the store contract this build bundles. Correct only if
     /// the store was published with the same contract build.
     Reconstructed,
+    /// Rebuilt for the generation whose contract this build bundles, which
+    /// the registration names (harvest#164): correct by construction.
+    Current,
 }
 
 /// Bytes of a store-contract delta carrying only listings.
@@ -199,11 +202,15 @@ fn store_info_delta_bytes(
 /// because they are already folded into the instance id.
 ///
 /// The one case this does not fix: a store published with an *older* store
-/// contract has a different code hash, so the rebuilt key names a contract
-/// that does not exist and the update will fail. That store is already broken
-/// today, with no key at all, so this is never a regression -- but it is not
-/// a fix for every store either, which is why the caller is told which of the
-/// two it got and can say so.
+/// contract has a different code hash, so the rebuilt key pairs that older
+/// instance with the wrong code. The node addresses by instance and runs the
+/// older contract, so the update is refused, or accepted where no buyer reads
+/// (harvest#164). A write to our own store therefore never reaches here while
+/// the registration names an earlier generation of a store with a store key:
+/// see [`current_store_write`]. What still can is a store from before revision
+/// 2, whose generation cannot be derived, and one registered by a NEWER build
+/// than this tab's, which this build cannot know is current; that is why the
+/// caller is told how its key was found and can say so.
 pub fn store_contract_key(
     registration: &StoreRegistration,
 ) -> Result<(ContractKey, KeyOrigin), String> {
@@ -228,10 +235,10 @@ pub fn store_contract_key(
 /// `my_stores`, which is what lets a BUYER address a seller's store contract
 /// (harvest#75) -- a store nobody on this device has a registration for.
 ///
-/// It carries the same limit [`store_contract_key`] records: a store
-/// published under an OLDER store contract has a different code hash, so the
-/// rebuilt key names a contract that does not exist. That is why every caller
-/// is told its key was reconstructed and says so when a send fails.
+/// It carries the same limit [`store_contract_key`] records: for a store
+/// published under an OLDER store contract, the rebuilt key pairs that
+/// instance with the wrong code, and the node runs the older contract. That is
+/// why a caller is told how its key was found and says so when a send fails.
 pub fn reconstruct_store_key(store_contract_id: &[u8]) -> Result<ContractKey, String> {
     let instance_id: [u8; 32] = store_contract_id.try_into().map_err(|_| {
         format!(
@@ -497,25 +504,167 @@ pub async fn create_store_contracts(
 /// what lets an open legacy invoice still be published as Paid, which needs
 /// no signature (harvest#93 review, Should Fix 6); anything that does need
 /// one is refused earlier, where it would have been signed.
+///
+/// Never the key of an EARLIER generation (harvest#164): see
+/// [`current_store_write`], which this waits on.
 #[cfg(target_arch = "wasm32")]
-fn owned_store_key(
+async fn owned_store_key(
     store_contract_id: &[u8],
     whats_missing: &str,
 ) -> Result<(ContractKey, KeyOrigin, ed25519_dalek::VerifyingKey), String> {
     use dioxus::prelude::ReadableExt;
 
-    let state = super::APP_STATE.read();
-    let registration = state
-        .my_stores
-        .values()
-        .flat_map(|stores| stores.iter())
-        .find(|s| s.store_contract_id == store_contract_id)
+    let registered = current_store_write(store_contract_id)
+        .await?
         .ok_or_else(|| format!("this store is not one of yours -- {whats_missing}"))?;
+    let state = super::APP_STATE.read();
     let owner = state
-        .delta_owner_key(store_contract_id)
+        .delta_owner_key(&registered)
         .ok_or_else(|| format!("{} -- {whats_missing}", crate::state::NO_STORE_KEY_MESSAGE))?;
-    let (key, origin) = store_contract_key(registration)?;
+    let (key, origin) = state.owned_write_key(&registered)?;
     Ok((key, origin, owner))
+}
+
+/// How long a write to one of our stores waits for this session to move to
+/// the store's current generation before it is refused (harvest#164).
+///
+/// The move happens as soon as the node answers for the current generation,
+/// which it does at once when an earlier load moved the store, or when the
+/// migration walk's forward lands. On the E2E node the walk forwarded a live
+/// store a little over two minutes after load, twice; this allows about
+/// twice that.
+pub const STORE_MOVE_WAIT_MS: f64 = 300_000.0;
+
+/// How often a waiting write asks the node again.
+#[cfg(target_arch = "wasm32")]
+const STORE_MOVE_POLL_MS: u32 = 5_000;
+
+/// Said when a write to a store still on an earlier generation gives up.
+pub const STORE_STILL_MOVING: &str = "your store's current version is not on the network \
+    yet, so nothing was sent to it. Harvest moves your store there from its earlier version \
+    after the page loads; try again in a few minutes, and reload if this keeps happening";
+
+/// What a write to one of our stores does next (harvest#164).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriteStep {
+    /// Send it to this id: the registration names the current generation.
+    Send(Vec<u8>),
+    /// Ask the node for this id, the current generation, and look again.
+    /// Its state arriving moves the session there
+    /// (`AppState::adopt_if_current_generation`).
+    Probe(Vec<u8>),
+    /// Waited [`STORE_MOVE_WAIT_MS`] for a store still on an earlier
+    /// generation: refuse, and never send it there.
+    GiveUp,
+    /// No registration on this device names the store.
+    NotOurs,
+}
+
+/// [`WriteStep`] for `target`, `waited_ms` into the wait.
+pub fn write_step(target: crate::state::StoreWriteTarget, waited_ms: f64) -> WriteStep {
+    use crate::state::StoreWriteTarget;
+    match target {
+        StoreWriteTarget::Ready(id) => WriteStep::Send(id),
+        StoreWriteTarget::NotOurs => WriteStep::NotOurs,
+        StoreWriteTarget::Moving { .. } if waited_ms >= STORE_MOVE_WAIT_MS => WriteStep::GiveUp,
+        StoreWriteTarget::Moving { current, .. } => WriteStep::Probe(current),
+    }
+}
+
+/// Wait until a write to one of our stores may go to the id this returns:
+/// the store's CURRENT generation, never an earlier one (harvest#164).
+/// `None` when no registration on this device names the store.
+///
+/// See [`write_step`] for each turn of the wait. A write is never sent to an
+/// earlier generation: an older contract refuses a field it does not know,
+/// and one that accepts the write holds it where no buyer reads.
+#[cfg(target_arch = "wasm32")]
+async fn current_store_write(store_contract_id: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    use dioxus::prelude::ReadableExt;
+
+    let started = js_sys::Date::now();
+    loop {
+        let target = super::APP_STATE
+            .read()
+            .store_write_target(store_contract_id);
+        match write_step(target, js_sys::Date::now() - started) {
+            WriteStep::Send(id) => return Ok(Some(id)),
+            WriteStep::NotOurs => return Ok(None),
+            WriteStep::GiveUp => return Err(STORE_STILL_MOVING.to_string()),
+            WriteStep::Probe(current) => {
+                probe_current_generation(&current).await;
+                // The answer, if it had state, has moved the session by now:
+                // a waiter resumes only after the handler that woke it.
+                if matches!(
+                    super::APP_STATE
+                        .read()
+                        .store_write_target(store_contract_id),
+                    crate::state::StoreWriteTarget::Moving { .. }
+                ) {
+                    gloo_timers::future::TimeoutFuture::new(STORE_MOVE_POLL_MS).await;
+                }
+            }
+        }
+    }
+}
+
+/// Keep asking for our store's current generation until this session has
+/// moved there (harvest#164), backing off from 15 s to 5 min.
+///
+/// The walk's forward creates the current generation on a first load, but a
+/// store forward stops being waited on after 12 s
+/// (`migrate_seal::forward_give_up_ms`), and a forward PUT does not
+/// subscribe, so its landing may never reach this session on its own. Until
+/// it does, reads stay on the earlier generation and instant checkout is off.
+///
+/// One per store: every `StoreList` answer asks, and a store already being
+/// asked about is not asked about twice.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn spawn_move_to_current(current: Vec<u8>) {
+    thread_local! {
+        static ASKING: std::cell::RefCell<std::collections::HashSet<Vec<u8>>> =
+            std::cell::RefCell::default();
+    }
+    if !ASKING.with(|asking| asking.borrow_mut().insert(current.clone())) {
+        return;
+    }
+    wasm_bindgen_futures::spawn_local(async move {
+        use dioxus::prelude::ReadableExt;
+        let mut wait_ms: u32 = 15_000;
+        while super::APP_STATE.read().is_moving_to(&current) {
+            probe_current_generation(&current).await;
+            gloo_timers::future::TimeoutFuture::new(wait_ms).await;
+            wait_ms = (wait_ms * 2).min(300_000);
+        }
+        ASKING.with(|asking| asking.borrow_mut().remove(&current));
+    });
+}
+
+/// Ask the node for our store's current generation, at most once per
+/// [`STORE_MOVE_POLL_MS`] however many writes are waiting on it.
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn probe_current_generation(current: &[u8]) {
+    thread_local! {
+        static ASKED: std::cell::RefCell<std::collections::HashMap<Vec<u8>, f64>> =
+            std::cell::RefCell::default();
+    }
+    let now = js_sys::Date::now();
+    let due = ASKED.with(|asked| {
+        let mut asked = asked.borrow_mut();
+        let due = asked
+            .get(current)
+            .is_none_or(|at| now - at >= f64::from(STORE_MOVE_POLL_MS));
+        if due {
+            asked.insert(current.to_vec(), now);
+        }
+        due
+    });
+    let Ok(instance) = <[u8; 32]>::try_from(current) else {
+        return;
+    };
+    if due {
+        super::prime::reread(ContractInstanceId::new(instance)).await;
+    }
 }
 
 /// The contract key of ANY store a settlement may be published to, ours or
@@ -550,23 +699,22 @@ fn owned_store_key(
 /// reconstruction is right only for a store published under the store
 /// contract this build bundles, and the recorded key is right for any.
 #[cfg(target_arch = "wasm32")]
-fn settlement_store_key(
+async fn settlement_store_key(
     store_contract_id: &[u8],
 ) -> Result<(ContractKey, KeyOrigin, ed25519_dalek::VerifyingKey), String> {
     use dioxus::prelude::ReadableExt;
 
+    // One of ours goes where every other write to it goes: its current
+    // generation, never an earlier one (harvest#164).
+    let ours = current_store_write(store_contract_id).await?;
     let state = super::APP_STATE.read();
     let owner = state
-        .settlement_owner_key(store_contract_id)
+        .settlement_owner_key(ours.as_deref().unwrap_or(store_contract_id))
+        .or_else(|| state.settlement_owner_key(store_contract_id))
         .ok_or("this store's owner key is not known here, so a settlement cannot name it")?;
-    match state
-        .my_stores
-        .values()
-        .flat_map(|stores| stores.iter())
-        .find(|s| s.store_contract_id == store_contract_id)
-    {
-        Some(registration) => {
-            let (key, origin) = store_contract_key(registration)?;
+    match ours {
+        Some(registered) => {
+            let (key, origin) = state.owned_write_key(&registered)?;
             Ok((key, origin, owner))
         }
         None => Ok((
@@ -663,7 +811,7 @@ pub async fn submit_settled_order_by_id(
     // `PaymentReversed` needs retraction evidence and `AwaitingPayment`
     // loses every merge at rank 0, so neither is sent from here. Raised by
     // the authorization lens reviewing harvest#75.
-    let (contract_key, origin, owner) = settlement_store_key(store_contract_id)?;
+    let (contract_key, origin, owner) = settlement_store_key(store_contract_id).await?;
     keyless_publishable(&order, &owner)?;
     if origin == KeyOrigin::Reconstructed {
         warn!("Store contract key rebuilt from the bundled store contract");
@@ -684,7 +832,7 @@ pub async fn submit_settled_order_by_id(
              created with an older version, that key is wrong and the \
              settlement cannot be published."
         ),
-        KeyOrigin::Recorded => e,
+        KeyOrigin::Recorded | KeyOrigin::Current => e,
     })?;
 
     info!("Published the settled order {} to its store contract", id);
@@ -704,7 +852,7 @@ pub async fn submit_listing_by_id(
     use freenet_stdlib::prelude::*;
 
     let (contract_key, origin, owner) =
-        owned_store_key(store_contract_id, "nothing to add a listing to")?;
+        owned_store_key(store_contract_id, "nothing to add a listing to").await?;
     if origin == KeyOrigin::Reconstructed {
         warn!("Store contract key rebuilt from the bundled store contract");
     }
@@ -728,7 +876,7 @@ pub async fn submit_listing_by_id(
              created with an older version, that key is wrong and the \
              listing cannot be submitted."
         ),
-        KeyOrigin::Recorded => e,
+        KeyOrigin::Recorded | KeyOrigin::Current => e,
     })?;
 
     info!("Submitted listing '{}' to store contract", title);
@@ -748,7 +896,7 @@ pub async fn submit_listing_status_by_id(
     use freenet_stdlib::prelude::*;
 
     let (contract_key, _origin, owner) =
-        owned_store_key(store_contract_id, "nothing to update a listing in")?;
+        owned_store_key(store_contract_id, "nothing to update a listing in").await?;
     let delta_bytes = harvest_common::to_cbor(&harvest_common::store::StoreStateV1Delta {
         owner: Some(owner),
         listing_statuses: Some(vec![status]),
@@ -781,7 +929,7 @@ pub fn spawn_publish_copy(
         use freenet_stdlib::prelude::*;
         let result = async {
             let (contract_key, _origin, owner) =
-                owned_store_key(&store_contract_id, "cannot back its key up")?;
+                owned_store_key(&store_contract_id, "cannot back its key up").await?;
             let delta = harvest_common::to_cbor(&harvest_common::store::StoreStateV1Delta {
                 owner: Some(owner),
                 copies: Some(vec![copy]),
@@ -808,7 +956,7 @@ pub async fn submit_store_info_by_id(
     use freenet_stdlib::prelude::*;
 
     let (contract_key, _origin, owner) =
-        owned_store_key(store_contract_id, "cannot publish its details")?;
+        owned_store_key(store_contract_id, "cannot publish its details").await?;
 
     let name = info.info.store_name.clone();
     let delta_bytes = store_info_delta_bytes(owner, info)?;
@@ -837,7 +985,7 @@ pub async fn submit_despatch_by_id(
     use freenet_stdlib::prelude::*;
 
     let (contract_key, origin, owner) =
-        owned_store_key(store_contract_id, "cannot record a despatch on it")?;
+        owned_store_key(store_contract_id, "cannot record a despatch on it").await?;
     if origin == KeyOrigin::Reconstructed {
         warn!("Store contract key rebuilt from the bundled store contract");
     }
@@ -855,7 +1003,7 @@ pub async fn submit_despatch_by_id(
              created with an older version, that key is wrong and the \
              despatch cannot be recorded."
         ),
-        KeyOrigin::Recorded => e,
+        KeyOrigin::Recorded | KeyOrigin::Current => e,
     })?;
     info!(
         "Published the despatch of order {} to its store contract",
@@ -946,7 +1094,7 @@ pub async fn submit_order_by_id(
     use freenet_stdlib::prelude::*;
 
     let (contract_key, origin, owner) =
-        owned_store_key(store_contract_id, "cannot issue an invoice on it")?;
+        owned_store_key(store_contract_id, "cannot issue an invoice on it").await?;
     if origin == KeyOrigin::Reconstructed {
         warn!("Store contract key rebuilt from the bundled store contract");
     }
@@ -966,7 +1114,7 @@ pub async fn submit_order_by_id(
              created with an older version, that key is wrong and the \
              invoice cannot be published."
         ),
-        KeyOrigin::Recorded => e,
+        KeyOrigin::Recorded | KeyOrigin::Current => e,
     })?;
 
     info!("Published invoice {} to store contract", id);
@@ -1022,6 +1170,112 @@ mod tests {
             store_contract_key,
             store_verifying_key: None,
         }
+    }
+
+    /// The body of one `fn` in this file's non-test source, by name.
+    fn body_of(name: &str) -> &'static str {
+        let src = include_str!("store_ops.rs");
+        let src = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        let start = src
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("fn {name} not found"));
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").map_or(rest.len(), |e| e + 3);
+        &rest[..end]
+    }
+
+    /// **No write to one of our stores is keyed off the registration's id
+    /// until it names the current generation (harvest#164).** The
+    /// registration names the generation the store was created under until
+    /// this session moves, so a lookup by it sent listings, invoices and
+    /// despatches to an earlier generation on every load: refused by an
+    /// older contract, or kept where no buyer reads. Every owner write and
+    /// every settlement to a store of ours goes through
+    /// `current_store_write`, which sends only on `WriteStep::Send`, and the
+    /// key comes from `AppState::owned_write_key` for the id it returned.
+    ///
+    /// Mutated red by resolving `owned_store_key` straight from `my_stores`
+    /// again, by dropping `current_store_write` from `settlement_store_key`,
+    /// and by sending on anything but `Send`.
+    #[test]
+    fn every_write_to_our_store_goes_to_its_current_generation() {
+        let squash = |body: &str| body.split_whitespace().collect::<String>();
+        assert!(
+            squash(body_of("owned_store_key"))
+                .contains("letregistered=current_store_write(store_contract_id).await?"),
+            "owned_store_key must write to the id current_store_write returned, and fail with it"
+        );
+        let settlement = squash(body_of("settlement_store_key"));
+        assert!(
+            settlement.contains("letours=current_store_write(store_contract_id).await?;"),
+            "settlement_store_key must fail when the wait does"
+        );
+        assert!(settlement
+            .contains("Some(registered)=>{let(key,origin)=state.owned_write_key(&registered)?;"));
+        for name in ["owned_store_key", "settlement_store_key"] {
+            assert!(
+                body_of(name).contains("owned_write_key(&registered)"),
+                "{name} must key the write by the id current_store_write returned"
+            );
+        }
+        let src = include_str!("store_ops.rs");
+        let src = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        assert_eq!(
+            src.matches("store_contract_id ==").count() + src.matches("== s.store").count(),
+            0,
+            "a store write looked a registration up by id itself"
+        );
+        let wait = body_of("current_store_write");
+        assert_eq!(wait.matches("Ok(Some(").count(), 1);
+        assert!(wait.contains("\n            WriteStep::Send(id) => return Ok(Some(id)),\n"));
+        assert!(wait.contains(".store_write_target(store_contract_id);"));
+        assert!(wait.contains("write_step(target, js_sys::Date::now() - started)"));
+        // And every owner write goes through one of the two.
+        for writer in [
+            "submit_listing_by_id",
+            "submit_listing_status_by_id",
+            "spawn_publish_copy",
+            "submit_store_info_by_id",
+            "submit_despatch_by_id",
+            "submit_order_by_id",
+        ] {
+            assert!(
+                body_of(writer).contains("owned_store_key("),
+                "{writer} must resolve its key through owned_store_key"
+            );
+        }
+        assert!(body_of("submit_settled_order_by_id").contains("settlement_store_key("));
+        // One send per writer above: a new store write has to join the list.
+        assert_eq!(src.matches("super::update_contract(").count(), 7);
+    }
+
+    /// Each turn of a waiting write (harvest#164): a store on its current
+    /// generation is written at once, one still on an earlier generation is
+    /// asked about and never written, and after the wait it is refused.
+    #[test]
+    fn a_write_waits_for_the_current_generation_and_then_gives_up() {
+        use crate::state::StoreWriteTarget;
+        let moving = StoreWriteTarget::Moving {
+            registered: vec![1; 32],
+            current: vec![2; 32],
+        };
+        assert_eq!(
+            write_step(StoreWriteTarget::Ready(vec![2; 32]), 0.0),
+            WriteStep::Send(vec![2; 32])
+        );
+        assert_eq!(
+            write_step(moving.clone(), 0.0),
+            WriteStep::Probe(vec![2; 32])
+        );
+        assert_eq!(
+            write_step(moving.clone(), STORE_MOVE_WAIT_MS - 1.0),
+            WriteStep::Probe(vec![2; 32])
+        );
+        assert_eq!(write_step(moving, STORE_MOVE_WAIT_MS), WriteStep::GiveUp);
+        assert_eq!(
+            write_step(StoreWriteTarget::NotOurs, STORE_MOVE_WAIT_MS),
+            WriteStep::NotOurs
+        );
     }
 
     /// The reload path: after a refresh there is no local state at all, and

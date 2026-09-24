@@ -431,6 +431,12 @@ impl AppState {
     /// first, then the others, since a device may hold an older backing
     /// Ghost Key and not the current one.
     pub(crate) fn custody_needed(&self, store_contract_id: &[u8]) -> Option<CustodyRequest> {
+        // A generation this session moved our store away from stays loaded,
+        // and its state lags the current one's: it is not a store to wrap or
+        // recover for (harvest#164).
+        if self.migrated_contract_ids.contains_key(store_contract_id) {
+            return None;
+        }
         let loaded = self.browsing_stores.get(store_contract_id)?;
         let state = &loaded.backing_state;
         let owner = state.owner?;
@@ -824,7 +830,7 @@ impl AppState {
             .map(|e| e.store_contract_id.clone());
         let edit_is_this_store = edit_id
             .as_deref()
-            .and_then(|id| self.store_owner_key(id))
+            .and_then(|id| self.work_store_key(id))
             .is_some_and(|key| key.to_bytes() == store);
         if edit_is_this_store {
             self.pending_store_edit = None;
@@ -2186,6 +2192,60 @@ mod tests {
             state.pending_custody.contains_key(&second),
             "the deferred store's custody must start when the vault frees up"
         );
+    }
+
+    /// **Custody does not act on a generation this session moved our store
+    /// away from (harvest#164)**, while it still acts on the current one. The
+    /// earlier generation stays loaded with stale state; it is no longer the
+    /// id the registration names, so without this custody would take it for
+    /// a store we do not hold and ask the vault to recover its key on every
+    /// load. Mutated red by dropping the check, and by widening it to the
+    /// current generation.
+    #[test]
+    fn custody_leaves_an_earlier_generation_alone() {
+        let mut state = backed_store();
+        register(&mut state);
+        // The current generation, loaded without a copy, so it calls for a
+        // wrap; the earlier one holds a copy it could "recover" from.
+        let fresh = state.browsing_stores[&vec![ID; 32]].clone();
+        add_copy(&mut state, WrapScope::current());
+        state.adopt_migrated_contract_id(&[ID; 32], vec![0x77; 32]);
+        state.browsing_stores.insert(vec![0x77; 32], fresh);
+
+        assert!(state.custody_needed(&[ID; 32]).is_none());
+        assert!(state.custody_needed(&[0x77; 32]).is_some());
+    }
+
+    /// The same for an edit parked under the store's earlier id and failing
+    /// after this session moved the store (harvest#164): the release finds
+    /// it by that id. Mutated red by an exact-id owner lookup.
+    #[test]
+    fn a_subkeys_failure_releases_an_edit_parked_while_moving() {
+        let (earlier, current) = crate::state::test_store_generations();
+        let mut state = crate::state::AppState::default();
+        state.my_stores.insert(
+            FINGERPRINT.to_string(),
+            vec![harvest_common::StoreRegistration {
+                store_contract_id: earlier.clone(),
+                reputation_contract_id: vec![2; 32],
+                mailbox_contract_id: vec![3; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
+            }],
+        );
+        state.pending_store_edit = Some(crate::state::PendingStoreEdit {
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            store_contract_id: earlier.clone(),
+            reputation_contract_id: [2; 32],
+            next_version: 4,
+            details: Default::default(),
+        });
+        state
+            .store_subkeys_requested
+            .insert(crate::state::test_store_key());
+        state.adopt_migrated_contract_id(&earlier, current);
+        state.on_subkeys_request_failed(crate::state::test_store_key(), "no key here");
+        assert!(state.pending_store_edit.is_none());
     }
 
     /// A subkeys failure releases a parked EDIT, not just a creation (#101
