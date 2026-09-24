@@ -81,129 +81,16 @@
 //! to that store. The buyer's half is ephemeral, which is what stops one
 //! buyer's messages linking across stores; it does not protect the archive.
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
 use harvest_common::mailbox::{
-    conversation_key_from_dh, message_aad, message_aad_for, pad_to_bucket, unpad_from_bucket,
-    ConversationId, EncryptedMessage, MessageDirection,
+    conversation_key_from_dh, ConversationId, EncryptedMessage, MessageDirection,
+};
+// The message plaintext and its sealing live in `harvest-common` so the
+// seller's delegate seals and opens the same format (instant checkout).
+pub use harvest_common::sealed::{
+    decrypt_message, InstantSelection, MessageContent, PlaintextMessage,
 };
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
-
-/// A plaintext message exchanged between buyer and seller.
-/// Serialized to CBOR, padded, then encrypted.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct PlaintextMessage {
-    /// The conversation this message belongs to.
-    pub conversation_id: ConversationId,
-    /// Message content.
-    pub content: MessageContent,
-}
-
-/// The content of a message: text, or one of the purchase steps.
-///
-/// The feedback-token exchange's two variants (`InitiateTransaction`,
-/// `AcceptTransaction`) are gone with the blind signatures they carried
-/// (harvest#53 Phase C). Nothing ever sent either.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub enum MessageContent {
-    /// Free-form text message.
-    Text(String),
-    /// Either party declining or cancelling.
-    Decline { reason: String },
-    /// A buyer asking to buy a listing.
-    ///
-    /// Step 1 of `docs/design/incentive-mechanism.md` Part 5. It rides the
-    /// ordinary sealed conversation rather than a channel of its own, so the
-    /// seller's mailbox is the one place a buyer's approach can arrive from.
-    ///
-    /// # The buyer's conversation key is not a field here
-    ///
-    /// It is the routing tag on the envelope
-    /// ([`EncryptedMessage::sender_public_key`]), carried in the clear by
-    /// every message in both directions, and the delegate files a kept
-    /// conversation under the same value. Repeating it inside the plaintext
-    /// would be a second source for one identity, and the two could disagree:
-    /// a seller replying to the field rather than to the envelope would seal
-    /// their answer under keys the buyer's thread does not read, silently.
-    /// That is the same defect as trusting an echoed conversation tag, which
-    /// this repository has already paid for once.
-    ///
-    /// # What it does NOT establish
-    ///
-    /// Nothing about the buyer. They have no ghostkey and no account, and
-    /// this message costs nothing to send -- a seller who accepts is choosing
-    /// to publish a commitment on the strength of an anonymous request. The
-    /// commitment is what has to be countable, not the request.
-    OrderRequest {
-        listing_id: harvest_common::listing::ListingId,
-        /// How many. Not multiplied by anything here: a listing's price is a
-        /// free-text `PriceInfo` in an arbitrary currency
-        /// ([`harvest_common::listing::PriceInfo`]), so no honest conversion
-        /// to satoshis exists in this crate. The seller names the amount when
-        /// they accept, and the buyer sees that amount before paying.
-        quantity: u32,
-        /// Where the goods should go, as the buyer typed it.
-        ///
-        /// This is the most identifying thing a buyer ever sends, which is
-        /// why it travels inside the AEAD and never near the commitment: the
-        /// published order must reveal nothing about who bought.
-        shipping: String,
-        /// Anything else the buyer wants to say, so a request is not a form
-        /// that forces a second message beside it.
-        note: String,
-        /// What the seller must publish in the commitment so that no OTHER
-        /// buyer reads it as theirs.
-        ///
-        /// [`harvest_common::mailbox::order_binding_from_secret`] over this
-        /// conversation's own secret. Sending it costs the buyer nothing --
-        /// it is a hash of a value only they hold -- and without it one
-        /// published commitment is payable by every buyer who was shown it.
-        ///
-        /// **The buyer does not check the commitment against THIS field.**
-        /// Direction is not authorship, so a seller can seal a request into
-        /// the buyer's own thread; a check against the mailbox copy would let
-        /// the seller supply the value it is compared with. The buyer
-        /// compares against what their own node derives. See
-        /// `state::AppState::payment_blockers`.
-        order_binding: [u8; 32],
-        /// The key the seller must sign into the commitment so the buyer can
-        /// later act on the order themselves: cancel it before paying, or
-        /// complain after (harvest#53 Phase B). The verifying half of
-        /// [`harvest_common::mailbox::buyer_receipt_seed_from_secret`] over
-        /// this conversation's secret.
-        ///
-        /// Checked the same way as `order_binding`: the buyer compares the
-        /// published commitment against what their OWN node derives, never
-        /// against this field.
-        ///
-        /// `serde(default)` so a request sealed by an earlier build still
-        /// opens; it comes back `None`, and a commitment answering it carries
-        /// no buyer key, which the buyer then refuses to pay.
-        #[serde(default)]
-        buyer_receipt_key: Option<[u8; 32]>,
-    },
-    /// The seller has published the order commitment for a request, and this
-    /// is its id.
-    ///
-    /// # This is a pointer, not an authority
-    ///
-    /// Both parties hold both direction keys (see [`Addressing`]), so nothing
-    /// about this message proves the seller wrote it. What makes a commitment
-    /// the seller's is the ghostkey-scoped signature on the published
-    /// [`harvest_common::payment::AuthorizedOrder`], checked against the
-    /// store's own verifying key. A buyer that paid on the strength of this
-    /// message alone would be paying on the strength of a message it could
-    /// have written itself.
-    ///
-    /// The id has to be told rather than derived:
-    /// `harvest_common::payment::OrderId::from_terms` hashes terms the seller
-    /// chooses, including a `created_at` they stamp, so a buyer cannot
-    /// compute it.
-    OrderAccepted {
-        order_id: harvest_common::payment::OrderId,
-    },
-}
 
 /// Both keys of one conversation, derived from a single X25519 exchange.
 ///
@@ -545,18 +432,23 @@ impl BuyerConversation {
     /// taking keys: the request and the ordinary message must travel in the
     /// same thread, under the same tag, or the seller's acceptance comes back
     /// where the buyer is not reading.
+    ///
+    /// `instant` is the buyer's instant-checkout selection, or `None` for a
+    /// quote request.
     pub fn request_order(
         &self,
         listing_id: &harvest_common::listing::ListingId,
         quantity: u32,
         shipping: String,
         note: String,
+        instant: Option<InstantSelection>,
     ) -> Result<EncryptedMessage, String> {
         seal(
             &self.keys.to_seller,
             &self.buyer_public_key,
             &self.conversation_id,
             MessageContent::OrderRequest {
+                instant,
                 listing_id: listing_id.clone(),
                 quantity,
                 shipping,
@@ -757,45 +649,25 @@ pub fn seal_order_accepted(
     )
 }
 
-/// The one place a message is built, whichever direction it travels.
-///
-/// # Why the size is checked HERE
-///
-/// `MailboxStateV1::apply_delta` refuses a message over
-/// [`harvest_common::mailbox::MAX_MESSAGE_BYTES`], and it refuses it
-/// silently -- a contract has nobody to report to. So a compose box that did
-/// not check would seal an unacceptable message, dispatch it, and show the
-/// sender "handed to your Freenet node"; it would then never appear, looking
-/// exactly like the write race and never resolving.
-///
-/// The check is the real one rather than a character limit: it charges the
-/// finished message with the same `message_bytes` the contract uses, so the
-/// two cannot disagree about what fits. A character limit would have to model
-/// CBOR and UTF-8 and would be wrong at the boundary.
+/// The one place a message is built, whichever direction it travels: the
+/// shared [`harvest_common::sealed::seal`], stamped with this browser's clock.
 fn seal(
     key: &[u8; 32],
     tag: &[u8; 32],
     conversation_id: &ConversationId,
     content: MessageContent,
 ) -> Result<EncryptedMessage, String> {
-    let message = encrypt_message(
-        &PlaintextMessage {
-            conversation_id: conversation_id.clone(),
-            content,
-        },
-        tag,
-        key,
-    )?;
+    harvest_common::sealed::seal(key, tag, conversation_id, content, chrono::Utc::now())
+}
 
-    let charged = harvest_common::mailbox::message_bytes(&message);
-    if charged > harvest_common::mailbox::MAX_MESSAGE_BYTES {
-        return Err(format!(
-            "that message is too long: it comes to {charged} bytes once encrypted and padded, \
-             and a mailbox will not accept more than {}. Nothing was sent.",
-            harvest_common::mailbox::MAX_MESSAGE_BYTES
-        ));
-    }
-    Ok(message)
+/// [`harvest_common::sealed::encrypt_message`], stamped with this browser's
+/// clock.
+pub fn encrypt_message(
+    plaintext: &PlaintextMessage,
+    tag: &[u8; 32],
+    aes_key: &[u8; 32],
+) -> Result<EncryptedMessage, String> {
+    harvest_common::sealed::encrypt_message(plaintext, tag, aes_key, chrono::Utc::now())
 }
 
 /// [`seal`], reachable from this crate's tests.
@@ -822,6 +694,11 @@ pub(crate) fn seal_for_test(
 /// to a key this seller no longer holds. Silently hiding them would leave the
 /// seller with a count that never matches what they see and no way to tell
 /// "nobody wrote to me" from "I cannot read what they wrote".
+///
+/// `Readable` is the larger variant by the size of an instant-checkout
+/// selection. One is built per mailbox message on each read, at most
+/// `MAX_MESSAGES` of them, so boxing it would buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum MailboxEntry {
     /// Decrypted successfully. The AES-GCM tag verified, so these bytes were
@@ -961,98 +838,11 @@ pub fn read_mailbox(
     entries
 }
 
-/// Encrypt a plaintext message under a conversation key.
-///
-/// `tag` is the conversation's routing tag -- the buyer's ephemeral public
-/// key, whichever direction this message travels. See
-/// [`harvest_common::mailbox::EncryptedMessage::sender_public_key`].
-///
-/// Returns an `EncryptedMessage` ready to be sent to the mailbox contract.
-pub fn encrypt_message(
-    plaintext: &PlaintextMessage,
-    tag: &[u8; 32],
-    aes_key: &[u8; 32],
-) -> Result<EncryptedMessage, String> {
-    // Serialize the plaintext to CBOR
-    let plaintext_bytes =
-        harvest_common::to_cbor(plaintext).map_err(|e| format!("serialize plaintext: {e}"))?;
-
-    // Pad to reduce size-based analysis
-    let padded = pad_to_bucket(&plaintext_bytes);
-
-    // The whole 24-byte mailbox nonce is drawn first, because it is bound
-    // into the authenticated data below -- it cannot be assembled after the
-    // ciphertext the way it used to be. Its first 12 bytes are the AES-GCM
-    // nonce; the rest exist so that deduplication has more entropy than the
-    // cipher needs.
-    let mut mailbox_nonce = [0u8; 24];
-    getrandom::getrandom(&mut mailbox_nonce).map_err(|e| format!("generate nonce: {e}"))?;
-    let timestamp = chrono::Utc::now();
-
-    // Every field of the message except the ciphertext, authenticated but not
-    // encrypted. See `harvest_common::mailbox::message_aad` for what each one
-    // costs to leave unbound -- the sharpest is the nonce padding, whose
-    // mutation was a working replay.
-    let aad = message_aad(
-        &plaintext.conversation_id,
-        tag.as_slice(),
-        &timestamp,
-        &mailbox_nonce,
-    );
-
-    let cipher = Aes256Gcm::new_from_slice(aes_key).map_err(|e| format!("create cipher: {e}"))?;
-    let ciphertext = cipher
-        .encrypt(
-            Nonce::from_slice(&mailbox_nonce[..12]),
-            Payload {
-                msg: padded.as_ref(),
-                aad: &aad,
-            },
-        )
-        .map_err(|e| format!("encrypt: {e}"))?;
-
-    Ok(EncryptedMessage {
-        conversation_id: plaintext.conversation_id.clone(),
-        sender_public_key: tag.to_vec(),
-        ciphertext,
-        timestamp,
-        nonce: mailbox_nonce,
-    })
-}
-
-/// Decrypt an encrypted message from the mailbox contract.
-pub fn decrypt_message(
-    encrypted: &EncryptedMessage,
-    aes_key: &[u8; 32],
-) -> Result<PlaintextMessage, String> {
-    // The AES nonce is the first 12 bytes of the mailbox nonce; the whole 24
-    // are bound into the associated data, so a change to any of the rest --
-    // or to any other envelope field -- fails the tag rather than passing
-    // unnoticed.
-    let nonce = Nonce::from_slice(&encrypted.nonce[..12]);
-    let aad = message_aad_for(encrypted);
-
-    let cipher = Aes256Gcm::new_from_slice(aes_key).map_err(|e| format!("create cipher: {e}"))?;
-    let padded = cipher
-        .decrypt(
-            nonce,
-            Payload {
-                msg: encrypted.ciphertext.as_ref(),
-                aad: &aad,
-            },
-        )
-        .map_err(|e| format!("decrypt: {e}"))?;
-
-    // Unpad
-    let plaintext_bytes = unpad_from_bucket(&padded).map_err(|e| format!("unpad: {e}"))?;
-
-    // Deserialize from CBOR
-    harvest_common::from_cbor(&plaintext_bytes).map_err(|e| format!("deserialize plaintext: {e}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes256Gcm, Nonce};
     use harvest_common::mailbox::MAX_MESSAGES;
     use std::collections::HashMap;
     use x25519_dalek::StaticSecret;
@@ -1938,7 +1728,13 @@ mod buy_flow_tests {
         let listing = ListingId([7u8; 32]);
 
         let sealed = buyer
-            .request_order(&listing, 3, "12 Example St".into(), "no chilli".into())
+            .request_order(
+                &listing,
+                3,
+                "12 Example St".into(),
+                "no chilli".into(),
+                None,
+            )
             .expect("seal the request");
 
         let inbox = seller.inbox(&[sealed]);
@@ -1952,6 +1748,7 @@ mod buy_flow_tests {
                         note,
                         order_binding,
                         buyer_receipt_key,
+                        instant: None,
                     },
                 ..
             } => {
@@ -1975,6 +1772,40 @@ mod buy_flow_tests {
                 .to_bytes();
                 assert_eq!(buyer_receipt_key, &Some(expected));
             }
+            other => panic!("expected an order request, got {other:?}"),
+        }
+    }
+
+    /// An instant-checkout selection reaches the seller as it was picked, so
+    /// the seller's delegate prices the same region, choices and total the
+    /// buyer was shown.
+    #[test]
+    fn an_instant_selection_reaches_the_seller_intact() {
+        let seller = Seller::new(33);
+        let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+        let selection = InstantSelection {
+            requested_at_ms: 1_700_000_000_000,
+            nonce: [5u8; 16],
+            region: Some("EU".into()),
+            choices: vec!["Fig".into(), "Large".into()],
+            expected_total_sats: 12_000,
+        };
+
+        let sealed = buyer
+            .request_order(
+                &ListingId([7u8; 32]),
+                2,
+                "12 Example St".into(),
+                String::new(),
+                Some(selection.clone()),
+            )
+            .expect("seal the request");
+
+        match &seller.inbox(&[sealed])[0] {
+            MailboxEntry::Readable {
+                content: MessageContent::OrderRequest { instant, .. },
+                ..
+            } => assert_eq!(instant, &Some(selection)),
             other => panic!("expected an order request, got {other:?}"),
         }
     }

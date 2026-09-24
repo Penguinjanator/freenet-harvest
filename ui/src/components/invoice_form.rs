@@ -701,6 +701,7 @@ fn InvoiceForm(
                             // no buyer asked, so nobody can cancel it but the
                             // seller or complain about it.
                             buyer_receipt_key: None,
+                            answers_request: None,
                         });
                         amount.set(String::new());
                         buyer.set(String::new());
@@ -788,6 +789,7 @@ mod tests {
             chrono::DateTime::from_timestamp(1_700_000_000 + minutes * 60, 0).expect("timestamp");
         AuthorizedOrder {
             order: Order {
+                request_id: None,
                 id: OrderId([0u8; 32]),
                 buyer_fingerprint: "buyer".to_string(),
                 seller_fingerprint: seller.to_string(),
@@ -882,6 +884,8 @@ mod issuable_tests {
     fn listing(n: u8) -> AuthorizedListing {
         AuthorizedListing {
             listing: Listing {
+                checkout: None,
+                choices: Vec::new(),
                 id: ListingId([n; 32]),
                 title: format!("Item {n}"),
                 description: String::new(),

@@ -522,6 +522,7 @@ pub(super) mod __address_check_test_support {
     pub fn order_paying(address: &str, script_pubkey: Vec<u8>) -> Order {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         Order {
+            request_id: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: "buyer".to_string(),
             seller_fingerprint: "seller".to_string(),
@@ -988,6 +989,7 @@ mod payable_tests {
     fn order(status: OrderStatus, seed: u8) -> AuthorizedOrder {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000 + seed as i64, 0).unwrap();
         let order = harvest_common::payment::Order {
+            request_id: None,
             id: harvest_common::payment::OrderId([0u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: "me".into(),
@@ -1071,6 +1073,7 @@ mod bridge_check_tests {
     fn order_trusting(bridges: Vec<BridgeId>) -> Order {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         Order {
+            request_id: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: "buyer".into(),
             seller_fingerprint: "seller".into(),
@@ -1603,6 +1606,7 @@ mod address_reading_tests {
 
     fn order_anchored_at(height: u32) -> Order {
         Order {
+            request_id: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: "seller".into(),

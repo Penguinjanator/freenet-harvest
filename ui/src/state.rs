@@ -715,6 +715,9 @@ pub struct AppState {
     /// Bitcoin/Payments state: bridge config, private watch list, and live
     /// on-chain data mirrored from subscribed Bitcoin contracts.
     pub bitcoin: BitcoinState,
+
+    /// Instant checkout, the seller's side (`crate::auto_invoice_flow`).
+    pub auto_invoice: crate::auto_invoice_flow::AutoInvoiceUi,
 }
 
 /// Details for a store being created, waiting on the two delegate responses
@@ -891,6 +894,12 @@ pub const WATCH_PAST_ANCHOR_BLOCKS: u32 = harvest_common::payment::PAYMENT_WINDO
 /// very late payment to one of them is not observed. A fresh invoice is
 /// preferred because it is the one most likely to be paid.
 pub const WATCHES_PER_GHOSTKEY: usize = 500;
+
+/// The part of [`WATCHES_PER_GHOSTKEY`] unpaid orders may use: the rest is
+/// kept for instant checkout's next addresses (`crate::auto_invoice_flow`),
+/// which must never be the requests a bridge over its limit drops.
+pub const ORDER_WATCHES_PER_GHOSTKEY: usize =
+    WATCHES_PER_GHOSTKEY - harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES as usize;
 
 /// Milliseconds since the Unix epoch by this machine's clock.
 pub(crate) fn now_ms() -> u64 {
@@ -1527,8 +1536,10 @@ pub struct PendingInvoice {
     /// perfectly good invoice -- anyone holding the link may pay it.
     ///
     /// When it is `Some`, the buyer is waiting to be told which of the
-    /// store's published commitments is theirs, and cannot work it out for
-    /// themselves: `OrderId::from_terms` hashes terms the seller chooses, including a `created_at` they stamp.
+    /// store's published commitments is theirs, and for a quote request
+    /// cannot work it out for themselves: `OrderId::from_terms` hashes terms
+    /// the seller chooses, including a `created_at` they stamp. (An instant
+    /// request's answer is found by `answers_request` below.)
     /// So this travels with the invoice all the way to the signature, and the
     /// acceptance is sent from the same place the commitment is published --
     /// not left to a second action the seller has to remember.
@@ -1553,6 +1564,12 @@ pub struct PendingInvoice {
     /// `order_binding`: `None` for an unprompted invoice, which no buyer will
     /// pay through the buy flow ([`PaymentBlocker::CommitmentLacksBuyerKey`]).
     pub buyer_receipt_key: Option<[u8; 32]>,
+    /// The instant-checkout request this answers
+    /// ([`harvest_common::payment::Order::request_id`]), when the seller
+    /// answers one by hand. The order carries its id and takes the buyer's
+    /// `requested_at` as `created_at`, which makes it and any order the
+    /// seller's delegate issued for the same request one order in the store.
+    pub answers_request: Option<harvest_common::payment::AnsweredRequest>,
 }
 
 /// A fully-formed invoice awaiting the seller's signature.
@@ -1691,6 +1708,7 @@ pub fn order_for_invoice(
          data to load and issue it again.",
     )?;
     Ok(Order {
+        request_id: pending.answers_request.map(|r| r.request_id),
         // Stamped by `with_derived_id` below, out of the finished terms. A
         // literal here would be a second place deciding an order's identity.
         id: harvest_common::payment::OrderId([0u8; 32]),
@@ -1713,7 +1731,11 @@ pub fn order_for_invoice(
         listing_tag,
         // Copied from the request verbatim too (harvest#53 Phase B).
         buyer_receipt_key: pending.buyer_receipt_key,
-        created_at,
+        // An answer to an instant request is dated at the buyer's request:
+        // the date is part of its id (`OrderId::for_request`).
+        created_at: pending
+            .answers_request
+            .map_or(created_at, |r| r.requested_at),
     }
     .with_derived_id())
 }
@@ -4731,6 +4753,7 @@ impl AppState {
     ///
     /// Returns the sealed message for the caller to dispatch; the dispatch
     /// needs a browser and this does not.
+    #[allow(clippy::too_many_arguments)]
     pub fn request_order(
         &mut self,
         store_contract_id: &[u8],
@@ -4739,6 +4762,7 @@ impl AppState {
         quantity: u32,
         shipping: String,
         note: String,
+        instant: Option<crate::messaging::InstantSelection>,
     ) -> Result<harvest_common::mailbox::EncryptedMessage, String> {
         // Refused before anything is opened or sealed, so a rejected request
         // leaves no conversation behind for the delegate to keep and no
@@ -4756,7 +4780,7 @@ impl AppState {
         }
         let sealed = self
             .conversation_with(store_contract_id, seller_encryption_key)?
-            .request_order(listing_id, quantity, shipping, note)?;
+            .request_order(listing_id, quantity, shipping, note, instant)?;
         self.keep_this_conversation(store_contract_id, seller_encryption_key);
         Ok(sealed)
     }
@@ -5610,9 +5634,11 @@ impl AppState {
     ///
     /// # Why the acceptance message decides WHICH order, and nothing else
     ///
-    /// The order id cannot be derived by the buyer -- `OrderId::from_terms`
-    /// hashes terms the seller chooses, including a `created_at` they stamp
-    /// -- so the seller has to name it. But both parties hold both
+    /// For a quote request the order id cannot be derived by the buyer --
+    /// `OrderId::from_terms` hashes terms the seller chooses, including a
+    /// `created_at` they stamp -- so the seller has to name it. (An instant
+    /// request's answer is identified by the request, and is also found
+    /// without the pointer.) But both parties hold both
     /// conversation direction keys, so the message carrying that name proves
     /// nothing about who wrote it. Everything that matters is therefore
     /// re-derived from the PUBLISHED commitment, this node's kept copy and
@@ -5627,15 +5653,38 @@ impl AppState {
         let mut purchases: Vec<BuyerPurchase> = Vec::new();
         for conversation in &store.conversations {
             for message in conversation.read(&store.mailbox_messages) {
-                let MessageContent::OrderAccepted { order_id } = message.content else {
-                    continue;
+                let order_id = match message.content {
+                    // Addressed to the buyer, or it is something the buyer
+                    // could have composed themselves -- see this method's doc
+                    // comment and `Addressing`.
+                    MessageContent::OrderAccepted { order_id }
+                        if message.addressing == Addressing::ToBuyer =>
+                    {
+                        order_id
+                    }
+                    // The buyer's own instant-checkout request: its answer's
+                    // id comes from the request (`OrderId::for_request`), so
+                    // it is found in the store without the seller's pointer,
+                    // which a lost mailbox write would otherwise cost. Only
+                    // once published; everything else is judged as for any
+                    // acceptance.
+                    MessageContent::OrderRequest {
+                        instant: Some(selection),
+                        ..
+                    } if message.addressing == Addressing::ToSeller => {
+                        let Some(request) =
+                            selection.answered_request(&conversation.buyer_public_key)
+                        else {
+                            continue;
+                        };
+                        let id = request.order_id();
+                        if !store.orders.iter().any(|order| order.order.id == id) {
+                            continue;
+                        }
+                        id
+                    }
+                    _ => continue,
                 };
-                // Addressed to the buyer, or it is something the buyer could
-                // have composed themselves -- see this method's doc comment
-                // and `Addressing`.
-                if message.addressing != Addressing::ToBuyer {
-                    continue;
-                }
                 // A kept purchase is filed under the conversation the delegate
                 // kept it for, whichever thread an acceptance names it in: the
                 // loop below adds it there (review round 3, P3).
@@ -9814,18 +9863,19 @@ impl AppState {
     ///
     /// # Why the seller issues this and not the buyer
     ///
-    /// `AuthorizedOrder::verify_terms` checks a ghostkey-scoped SELLER
-    /// signature over the whole `Order`, so a buyer cannot create one at all.
-    /// "Buyer clicks Buy" would need buyer-to-seller messaging, which is a
-    /// separate decision; a seller handing over an invoice needs nothing that
-    /// does not already exist, and is how a small seller works anyway.
+    /// `AuthorizedOrder::verify_terms` checks the store key's signature over
+    /// the whole `Order`, so a buyer cannot create one at all. A buyer's
+    /// "Buy now" on a fixed-price listing is answered by the seller's own
+    /// delegate instead (instant checkout, `harvest-delegate`'s
+    /// `auto_invoice`); this is the seller doing it by hand.
     ///
     /// # What this starts, and what finishes it
     ///
     /// Two round trips, neither of which can be skipped. The delegate derives
     /// a fresh payment address (`OrderAddress`), and only then is there an
-    /// `Order` to sign; the ghostkey delegate signs it (`SignResult`), and
-    /// only then is there something the store contract will accept. Errors are
+    /// `Order` to sign; the Harvest delegate signs it with the store key
+    /// (harvest#93), and only then is there something the store contract will
+    /// accept. Errors are
     /// returned rather than swallowed so the form can say why nothing
     /// happened.
     pub fn issue_invoice(&mut self, invoice: PendingInvoice) -> Result<(), String> {
@@ -10475,6 +10525,11 @@ impl AppState {
                 );
                 self.on_keep_refused(&order_id, reason)
             }
+
+            HarvestDelegateResponse::AutoInvoice {
+                store_contract_id,
+                result,
+            } => self.on_auto_invoice_status(store_contract_id, result),
 
             // A conversation the delegate did not keep dies with the tab, and
             // the buyer has already been told their message was sent -- so
@@ -11546,6 +11601,11 @@ impl AppState {
                 self.bitcoin.payment_xpub_loaded = true;
             }
 
+            BitcoinDelegateResponse::UpcomingAddresses { result, .. } => {
+                self.on_upcoming_addresses(result, now_ms());
+                self.send_due_watch_requests();
+            }
+
             BitcoinDelegateResponse::OrderAddress {
                 request_id,
                 result,
@@ -12162,6 +12222,7 @@ impl AppState {
                 let wanted: Vec<crate::bitcoin_inbox::WatchWanted> = orders
                     .into_iter()
                     .map(|o| crate::bitcoin_inbox::WatchWanted {
+                        renew_after_ms: crate::bitcoin_inbox::RENEW_AFTER_MS,
                         network: o.order.network,
                         script: o.order.payment_script_pubkey.clone(),
                         anchor_height: o.order.anchor.map(|a| a.height),
@@ -12210,7 +12271,31 @@ impl AppState {
                 }
             }
             *wanted = kept;
-            wanted.truncate(WATCHES_PER_GHOSTKEY);
+            // Room is kept for instant checkout's next addresses below: a
+            // bridge over its per-key limit reads a request and drops it,
+            // which looks exactly like a watch it applied, and the delegate
+            // would then invoice on an address nobody watches.
+            wanted.truncate(ORDER_WATCHES_PER_GHOSTKEY);
+        }
+        // Instant checkout's next addresses, watched before any order names
+        // them (`crate::auto_invoice_flow`), in the room kept above.
+        if let Some((fingerprint, ghostkey, prewatch)) = self.prewatch_wanted(bridge) {
+            match groups
+                .iter_mut()
+                .find(|(f, g, _): &&mut (String, _, Vec<_>)| *f == fingerprint && *g == ghostkey)
+            {
+                Some((_, _, wanted)) => {
+                    for w in prewatch {
+                        if !wanted
+                            .iter()
+                            .any(|held| held.network == w.network && held.script == w.script)
+                        {
+                            wanted.push(w);
+                        }
+                    }
+                }
+                None => groups.push((fingerprint, ghostkey, prewatch)),
+            }
         }
         groups
     }
@@ -13451,6 +13536,8 @@ mod tests {
         PendingSignature::Listing(PendingListing {
             fingerprint: FINGERPRINT.to_string(),
             listing: harvest_common::listing::Listing {
+                checkout: None,
+                choices: Vec::new(),
                 id: harvest_common::listing::ListingId([1u8; 32]),
                 title: "Beans".to_string(),
                 description: String::new(),
@@ -13647,6 +13734,8 @@ mod tests {
 
     fn new_listing(title: &str) -> harvest_common::listing::Listing {
         harvest_common::listing::Listing {
+            checkout: None,
+            choices: Vec::new(),
             id: harvest_common::listing::ListingId([0u8; 32]),
             title: title.to_string(),
             description: String::new(),
@@ -14515,6 +14604,8 @@ mod tests {
     fn listing_with(id: u8, certificate_pem: &str) -> AuthorizedListing {
         AuthorizedListing {
             listing: harvest_common::listing::Listing {
+                checkout: None,
+                choices: Vec::new(),
                 id: harvest_common::listing::ListingId([id; 32]),
                 title: "Beans".to_string(),
                 description: String::new(),
@@ -15799,6 +15890,7 @@ mod invoice_tests {
 
     fn invoice() -> PendingInvoice {
         PendingInvoice {
+            answers_request: None,
             store_contract_id: STORE_ID.to_vec(),
             seller_fingerprint: SELLER.to_string(),
             listing_id: listing_id(),
@@ -16077,6 +16169,7 @@ mod invoice_tests {
     /// A published order paying `script`, as a store holds it.
     fn with_script(script: &[u8]) -> harvest_common::payment::AuthorizedOrder {
         let order = harvest_common::payment::Order {
+            request_id: None,
             id: harvest_common::payment::OrderId([0u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: SELLER.to_string(),
@@ -17016,6 +17109,8 @@ mod invoice_tests {
             .push_back(PendingSignature::Listing(PendingListing {
                 fingerprint: SELLER.to_string(),
                 listing: harvest_common::listing::Listing {
+                    checkout: None,
+                    choices: Vec::new(),
                     id: listing_id(),
                     title: "Other".to_string(),
                     description: String::new(),
@@ -17336,6 +17431,7 @@ mod authorized_order_tests {
     fn order() -> Order {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         Order {
+            request_id: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: "buyer".to_string(),
             seller_fingerprint: "seller".to_string(),
@@ -20322,6 +20418,7 @@ mod buy_flow_tests {
         let created_at =
             chrono::DateTime::from_timestamp(1_700_000_000 + offset, 0).expect("timestamp");
         let order = Order {
+            request_id: None,
             id: OrderId([0u8; 32]),
             // Empty, and that is the point: a buyer has no identity to name.
             buyer_fingerprint: String::new(),
@@ -20571,6 +20668,7 @@ mod buy_flow_tests {
                 2,
                 "12 Example St".into(),
                 String::new(),
+                None,
             )
             .expect("seal the request");
 
@@ -20587,6 +20685,7 @@ mod buy_flow_tests {
 
     fn invoice_answering(tag: [u8; 32]) -> PendingInvoice {
         PendingInvoice {
+            answers_request: None,
             store_contract_id: STORE.to_vec(),
             seller_fingerprint: "seller-fp".to_string(),
             listing_id: ListingId([3u8; 32]),
@@ -20602,10 +20701,10 @@ mod buy_flow_tests {
 
     /// **Accepting a request tells the buyer which commitment is theirs.**
     ///
-    /// The buyer cannot derive the order id -- it hashes a `created_at` the
-    /// seller stamps -- so an acceptance that did not name it would leave the
-    /// buyer looking at a public order book with no way to tell which entry
-    /// they are supposed to pay.
+    /// For a quote request the buyer cannot derive the order id -- it hashes
+    /// a `created_at` the seller stamps -- so an acceptance that did not name
+    /// it would leave the buyer looking at a public order book with no way to
+    /// tell which entry they are supposed to pay.
     ///
     /// Read back through the BUYER's own conversation rather than by
     /// inspecting what the seller composed, because the buyer's side is the
@@ -20779,6 +20878,7 @@ mod buy_flow_tests {
                 2,
                 "12 Example St".to_string(),
                 String::new(),
+                None,
             )
             .expect("a request should be sealable");
 
@@ -20847,6 +20947,7 @@ mod buy_flow_tests {
                 1,
                 "12 Example St".to_string(),
                 String::new(),
+                None,
             )
             .expect("request");
 
@@ -20875,6 +20976,7 @@ mod buy_flow_tests {
             0,
             "12 Example St".to_string(),
             String::new(),
+            None,
         );
         assert!(none.is_err(), "a quantity of zero is not an order");
 
@@ -20885,6 +20987,7 @@ mod buy_flow_tests {
             1,
             "   ".to_string(),
             String::new(),
+            None,
         );
         assert!(nowhere.is_err(), "an order has to go somewhere");
 
@@ -20990,6 +21093,7 @@ mod buy_flow_tests {
             &tag,
             &conversation_id,
             crate::messaging::MessageContent::OrderRequest {
+                instant: None,
                 listing_id: widget(),
                 quantity: 1,
                 shipping: "anywhere".into(),
@@ -23887,7 +23991,7 @@ mod buy_flow_tests {
         // listing than the one the seller committed to.
         let conversation = state.browsing_stores[STORE].conversations[0].clone();
         let request = conversation
-            .request_order(&asked_for, 1, "12 Example St".into(), String::new())
+            .request_order(&asked_for, 1, "12 Example St".into(), String::new(), None)
             .expect("seal the request");
         state
             .browsing_stores
@@ -23918,7 +24022,7 @@ mod buy_flow_tests {
         let (mut state, _) = buyer_after_acceptance(&published);
         let conversation = state.browsing_stores[STORE].conversations[0].clone();
         let request = conversation
-            .request_order(&widget(), 1, "12 Example St".into(), String::new())
+            .request_order(&widget(), 1, "12 Example St".into(), String::new(), None)
             .expect("seal the request");
         state
             .browsing_stores
@@ -23947,7 +24051,7 @@ mod buy_flow_tests {
         let (mut state, _) = buyer_after_acceptance(&published);
         let conversation = state.browsing_stores[STORE].conversations[0].clone();
         let request = conversation
-            .request_order(&widget(), 1, "12 Example St".into(), String::new())
+            .request_order(&widget(), 1, "12 Example St".into(), String::new(), None)
             .expect("seal the request");
         state
             .browsing_stores
@@ -23975,7 +24079,7 @@ mod buy_flow_tests {
         let (mut state, _) = buyer_after_acceptance(&published);
         let conversation = state.browsing_stores[STORE].conversations[0].clone();
         let request = conversation
-            .request_order(&widget(), 1, "12 Example St".into(), String::new())
+            .request_order(&widget(), 1, "12 Example St".into(), String::new(), None)
             .expect("seal the request");
         state
             .browsing_stores
@@ -24865,7 +24969,11 @@ mod buy_flow_tests {
         let wanted = state.watches_wanted(inbox::bridge());
         assert_eq!(wanted.len(), 1, "one key, one group");
         let heights: Vec<Option<u32>> = wanted[0].2.iter().map(|w| w.anchor_height).collect();
-        assert_eq!(heights.len(), WATCHES_PER_GHOSTKEY, "held to the budget");
+        assert_eq!(
+            heights.len(),
+            crate::state::ORDER_WATCHES_PER_GHOSTKEY,
+            "held to the budget, with room kept for instant checkout"
+        );
         assert_eq!(
             heights[0],
             Some(TIP_HEIGHT - 1),
@@ -24875,7 +24983,7 @@ mod buy_flow_tests {
             wanted[0].2.iter().map(|w| &w.script).collect();
         assert_eq!(
             scripts.len(),
-            WATCHES_PER_GHOSTKEY,
+            crate::state::ORDER_WATCHES_PER_GHOSTKEY,
             "every place is a distinct script: the reused address took one"
         );
         let reused_script = on_its_own_address(11).order.payment_script_pubkey;
@@ -25046,6 +25154,8 @@ mod buy_flow_tests {
                 pending: PendingListing {
                     fingerprint: "seller-fp".into(),
                     listing: harvest_common::listing::Listing {
+                        checkout: None,
+                        choices: Vec::new(),
                         id: harvest_common::listing::ListingId([0u8; 32]),
                         title: "Beans".to_string(),
                         description: String::new(),
@@ -29167,6 +29277,269 @@ mod buy_flow_tests {
         let (state, _) = buyer_after_acceptance(&unpaid);
         let purchase = purchases(&state).remove(0);
         assert!(state.complaint_refusal(STORE, &purchase).is_some());
+    }
+
+    /// **An order built the way the seller's delegate builds one is found,
+    /// and judged exactly as an ordinary accepted order**, with no pointer
+    /// in the mailbox: the buyer derives its id from their own instant
+    /// request. Mutated red by dropping the `OrderRequest` arm from
+    /// `buyer_purchases`.
+    #[test]
+    fn an_instant_answer_is_found_and_judged_without_the_pointer() {
+        let conversation = the_buyers_conversation();
+        let tag = conversation.buyer_public_key;
+        let nonce = [7u8; 16];
+        let ordinary = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 1)),
+            OrderStatus::AwaitingPayment,
+        );
+        // The delegate's order: the UI's fields (an empty buyer
+        // fingerprint, one confirmation, this conversation's binding, tag and
+        // receipt key) plus the request id, dated at the buyer's request.
+        let requested_at_ms = 1_700_000_000_000;
+        let request = harvest_common::payment::AnsweredRequest {
+            request_id: harvest_common::payment::request_id(&tag, &nonce),
+            requested_at: chrono::DateTime::from_timestamp_millis(requested_at_ms).unwrap(),
+        };
+        let mut instant = ordinary.clone();
+        instant.order.request_id = Some(request.request_id);
+        instant.order.created_at = request.requested_at;
+        let instant = resigned(instant, &seller_signing_key());
+        assert_eq!(instant.order.id, request.order_id());
+
+        let (baseline, _) = buyer_after_acceptance(&ordinary);
+        let expected = purchases(&baseline).remove(0).blockers;
+
+        let (state, _) = buyer_conversation();
+        let mut state = buyer_holding(state, conversation.clone(), &instant);
+        let request = conversation
+            .request_order(
+                &widget(),
+                1,
+                "1 Lane".into(),
+                String::new(),
+                Some(crate::messaging::InstantSelection {
+                    requested_at_ms,
+                    nonce,
+                    region: None,
+                    choices: vec![],
+                    expected_total_sats: 50_000,
+                }),
+            )
+            .expect("sealed");
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("store")
+            .mailbox_messages = vec![request];
+        let found = purchases(&state);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].order_id, instant.order.id);
+        assert_eq!(found[0].blockers, expected);
+    }
+
+    // --- Instant checkout, the seller's side (`crate::auto_invoice_flow`) ---
+
+    /// A seller selling one instant-checkout listing, with a payment key,
+    /// the delegate's next three addresses known, the tip contract and the
+    /// address generation resolved.
+    fn an_instant_seller(gk: &freenet_bitcoin_inbox::test_support::TestGhostkey) -> AppState {
+        let mut state = a_seller_selling(Vec::new(), gk.id().0);
+        // Instant checkout watches through the bridge its orders will name,
+        // which is the production one; the inbox is still the test one.
+        let bridge =
+            crate::gateway::bitcoin_config::default_trusted_bridges(BitcoinNetwork::Signet)
+                .expect("signet settles")[0];
+        state.bitcoin.inbox = Some(crate::bitcoin_inbox::InboxTracker::new(
+            bridge,
+            inbox::inbox_key(),
+        ));
+        let listing = harvest_common::listing::Listing {
+            id: harvest_common::listing::ListingId([0; 32]),
+            title: "Jam".into(),
+            description: String::new(),
+            kind: harvest_common::listing::ListingKind::Sale,
+            price: None,
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            checkout: Some(harvest_common::listing::FixedCheckout {
+                unit_sats: 1_000,
+                delivery: harvest_common::listing::DeliveryPrice::Included,
+            }),
+            choices: Vec::new(),
+        }
+        .with_derived_id();
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .listings
+            .push(AuthorizedListing {
+                listing,
+                scoped_payload: Vec::new(),
+                signature: Vec::new(),
+                certificate_pem: String::new(),
+            });
+        state.bitcoin.payment_xpub = Some(harvest_common::PaymentXpubStatus {
+            xpub: "vpub-placeholder".into(),
+            network: BitcoinNetwork::Signet,
+            next_index: 4,
+        });
+        state.bitcoin.address_generation =
+            crate::bitcoin_generation::Generation::resolved([0xc2; 32]);
+        state
+            .bitcoin
+            .tip_contract_network
+            .insert(vec![0x7a; 32], BitcoinNetwork::Signet);
+        state.on_upcoming_addresses(
+            Ok((4..7)
+                .map(|i| harvest_common::DerivedAddress {
+                    index: i,
+                    network: BitcoinNetwork::Signet,
+                    script_pubkey: vec![0x00, 0x14, i as u8],
+                    address: format!("tb1q{i}"),
+                })
+                .collect()),
+            1,
+        );
+        state
+    }
+
+    /// The delegate's next addresses are asked to be watched with the
+    /// seller's Ghost Key, before any order names them. Mutated red by
+    /// dropping the `prewatch_wanted` merge from `watches_wanted`.
+    #[test]
+    fn a_seller_with_instant_checkout_has_the_next_addresses_watched() {
+        let gk = inbox::authority().mint();
+        let mut state = an_instant_seller(&gk);
+        serve_inbox(&mut state, &inbox::open_inbox());
+        let queued = queued_watch_requests(&state);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0].scripts,
+            (4..7u8).map(|i| vec![0x00, 0x14, i]).collect::<Vec<_>>()
+        );
+    }
+
+    /// The arm names only addresses the bridge has READ a request for, in
+    /// order from the next one, and the watch lapses a day after the earliest
+    /// of those requests, less the margin; a renewal not yet read keeps the
+    /// lease of the one before it. Mutated red by using the latest send
+    /// whether read or not.
+    #[test]
+    fn an_arm_names_only_watched_addresses() {
+        use crate::auto_invoice_flow::{WATCH_LIFETIME_MS, WATCH_MARGIN_MS};
+        let gk = inbox::authority().mint();
+        let mut state = an_instant_seller(&gk);
+        let registration = state.my_stores["seller-fp"][0].clone();
+        // Nothing sent yet: an arm, but with nothing it may use.
+        let (arm, lapses_at) = state
+            .auto_invoice_arm("seller-fp", &registration, 10)
+            .expect("an arm");
+        assert!(arm.watched_scripts.is_empty());
+        assert_eq!((arm.watch_left_ms, lapses_at), (0, 0));
+
+        let key = |i: u8| (BitcoinNetwork::Signet, vec![0x00, 0x14, i]);
+        let sent =
+            |at: u64, read: bool, read_lease_ms: Option<u64>| crate::bitcoin_inbox::SentWatch {
+                sent_at_ms: at,
+                entry_key: Default::default(),
+                mainnet_height: 0,
+                ghostkey: gk.id(),
+                read,
+                unread_since_ms: at,
+                read_lease_ms,
+            };
+        let inbox = state.bitcoin.inbox.as_mut().unwrap();
+        inbox.sent.insert(key(4), sent(1_000, true, Some(1_000)));
+        // A renewal not yet read: the watch its predecessor started still
+        // runs, from when that was sent.
+        inbox.sent.insert(key(5), sent(3_000, false, Some(500)));
+        // Never read at all: ends the usable run.
+        inbox.sent.insert(key(6), sent(2_000, false, None));
+        let (arm, lapses_at) = state
+            .auto_invoice_arm("seller-fp", &registration, 10)
+            .expect("an arm");
+        assert_eq!(
+            arm.watched_scripts,
+            vec![vec![0x00, 0x14, 4], vec![0x00, 0x14, 5]]
+        );
+        assert_eq!(lapses_at, 500 + WATCH_LIFETIME_MS - WATCH_MARGIN_MS);
+        // A duration, so the node's clock need not agree with this tab's.
+        assert_eq!(arm.watch_left_ms, lapses_at - 10);
+        assert_eq!(arm.tip_contract_id, [0x7a; 32]);
+        assert_eq!(arm.mailbox_contract_id, [11; 32]);
+
+        // Once the watch has lapsed, nothing may be used.
+        let late = 500 + WATCH_LIFETIME_MS;
+        let (arm, _) = state
+            .auto_invoice_arm("seller-fp", &registration, late)
+            .expect("an arm");
+        assert!(arm.watched_scripts.is_empty());
+    }
+
+    /// An arm is sent once, then again only when it changes or is old; the
+    /// addresses are read again when this tab's counter passes them.
+    #[test]
+    fn arms_are_resent_only_when_due() {
+        use crate::auto_invoice_flow::REARM_EVERY_MS;
+        let gk = inbox::authority().mint();
+        let mut state = an_instant_seller(&gk);
+        let first = state.queue_auto_invoice(10);
+        assert_eq!(first.arms.len(), 1);
+        assert!(!first.peek, "the addresses are current");
+        assert!(state.queue_auto_invoice(20).arms.is_empty());
+        // An unchanged arm goes again once it is old (and the addresses are
+        // read again then too).
+        let again = state.queue_auto_invoice(10 + REARM_EVERY_MS);
+        assert_eq!(again.arms.len(), 1);
+        assert!(again.peek);
+
+        // This tab spent an address: no arm names it until the addresses
+        // are read again, and they are.
+        state.bitcoin.payment_xpub.as_mut().unwrap().next_index = 5;
+        let t = 10 + 2 * REARM_EVERY_MS;
+        let spent = state.queue_auto_invoice(t);
+        assert!(spent.peek);
+        assert!(spent.arms.is_empty());
+        assert!(
+            !state.queue_auto_invoice(t + 1).peek,
+            "not again while asked"
+        );
+    }
+
+    /// What the store page says. A delegate that never ran in the background
+    /// long after arming is the hosted case, and is said plainly.
+    #[test]
+    fn the_store_page_says_how_instant_checkout_stands() {
+        use crate::auto_invoice_flow::{instant_checkout_status_text, NO_BACKGROUND_RUN_AFTER_MS};
+        let status = |last_run, paused: Option<&str>| harvest_common::delegate::AutoInvoiceStatus {
+            armed_at_ms: 0,
+            watched_remaining: 7,
+            invoicing_until_ms: 5 * 60 * 60 * 1000,
+            last_background_run_ms: last_run,
+            issued_last_day: 0,
+            oversold: vec![],
+            paused: paused.map(str::to_string),
+        };
+        let hosted = instant_checkout_status_text(&status(None, None), NO_BACKGROUND_RUN_AFTER_MS);
+        assert!(hosted.contains("try.freenet.org"), "{hosted}");
+        let early = instant_checkout_status_text(&status(None, None), 1);
+        assert!(early.contains("is on"), "{early}");
+        let paused = instant_checkout_status_text(&status(Some(1), Some("no recent block")), 1);
+        assert!(paused.contains("paused: no recent block"), "{paused}");
+        let mut oversold = status(Some(1), None);
+        oversold.oversold = vec![OrderId([7; 32])];
+        let told = instant_checkout_status_text(&oversold, 1);
+        assert!(told.contains(&OrderId([7; 32]).short()), "{told}");
+
+        let gk = inbox::authority().mint();
+        let state = an_instant_seller(&gk);
+        assert!(state
+            .instant_checkout_notice(STORE, 1)
+            .unwrap()
+            .contains("starting"));
+        assert!(state.instant_checkout_notice(&[0xee; 32], 1).is_none());
     }
 }
 

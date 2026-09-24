@@ -832,6 +832,7 @@ mod tests {
 
     fn order(status: OrderStatus, amount_sats: u64) -> AuthorizedOrder {
         let order = Order {
+            request_id: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: "seller".into(),

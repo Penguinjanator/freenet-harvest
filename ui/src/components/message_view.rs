@@ -925,6 +925,7 @@ fn Conversation(
                         order_binding: request.order_binding,
                         buyer_receipt_key: request.buyer_receipt_key,
                         quantity: request.quantity,
+                        instant: request.instant,
                     }
                 }
             }
@@ -1060,10 +1061,12 @@ fn unanswered_requests(
                     quantity,
                     order_binding,
                     buyer_receipt_key,
+                    instant,
                     ..
                 },
             digest,
             timestamp,
+            conversation,
             ..
         } = entry
         else {
@@ -1075,12 +1078,28 @@ fn unanswered_requests(
         // buyer cannot forge one. The tag stands in for the listing id orders
         // no longer publish (harvest#57); only this conversation's keys can
         // compute it.
-        let answered = keys.is_some_and(|keys| {
-            let tag = keys.listing_tag(listing_id);
-            let answers: Vec<&harvest_common::payment::AuthorizedOrder> = published
-                .iter()
-                .filter(|order| {
-                    order.order.order_binding == Some(*order_binding)
+        // An instant request is answered by exactly one order: the one its
+        // request id names (`OrderId::for_request`), whatever its status. The
+        // binding-and-tag rule below would also count any other order in the
+        // conversation for the same listing, and so hide a second instant
+        // request the delegate left for the seller.
+        let request = instant.as_ref().and_then(|selection| {
+            let tag: [u8; 32] = conversation.as_slice().try_into().ok()?;
+            selection.answered_request(&tag)
+        });
+        if let Some(request) = request {
+            let id = request.order_id();
+            if published.iter().any(|order| order.order.id == id) {
+                continue;
+            }
+        }
+        let answered = request.is_none()
+            && keys.is_some_and(|keys| {
+                let tag = keys.listing_tag(listing_id);
+                let answers: Vec<&harvest_common::payment::AuthorizedOrder> = published
+                    .iter()
+                    .filter(|order| {
+                        order.order.order_binding == Some(*order_binding)
                         && order.order.listing_tag == Some(tag)
                         // A request carrying the buyer's receipt key
                         // (harvest#53 Phase B) is answered only by an order
@@ -1089,46 +1108,46 @@ fn unanswered_requests(
                         // and the buyer is told to send the request again.
                         && (buyer_receipt_key.is_none()
                             || order.order.buyer_receipt_key == *buyer_receipt_key)
-                })
-                .collect();
-            if answers
-                .iter()
-                .any(|order| order.status != harvest_common::payment::OrderStatus::Cancelled)
-            {
-                return true;
-            }
-            // Only CANCELLED answers. The buyer can now withdraw one (the
-            // buyer cancel, harvest#53 Phase B), and "cancel it and ask
-            // again" is the ordinary way to put a mistake right -- but the
-            // binding, the tag and the key are all fixed per conversation, so
-            // the cancelled order matches the new request exactly as it
-            // matched the old one. Nothing published says WHICH ask an order
-            // answered (an order carries no quantity and no request digest),
-            // so the ask is placed in time instead: a cancelled order answers
-            // every ask made up to the moment the seller issued it (its
-            // signed `created_at`), and an ask made after the newest
-            // cancelled answer is waiting. That holds however the seller
-            // chose among several asks, and however often one was resent
-            // (round 4 of harvest#136: an earlier count of distinct asks
-            // against cancelled orders re-offered a withdrawn request
-            // whenever the seller had not answered oldest first).
-            //
-            // The ask's time is the writer's own timestamp, so a buyer can
-            // only move their own asks. A buyer whose clock runs behind the
-            // seller's by more than the time between the seller issuing and
-            // the buyer asking again is not surfaced until they ask later.
-            // The other direction: a buyer whose clock runs AHEAD of the
-            // seller's by more than the seller took to answer stamps the
-            // answered ask after `issued`, so once that answer is cancelled
-            // the ask is offered to the seller again although the buyer
-            // withdrew it. No tolerance is added for either, because one
-            // would widen the first case's wait to cure the second.
-            answers
-                .iter()
-                .map(|order| order.order.created_at)
-                .max()
-                .is_some_and(|issued| *timestamp <= issued)
-        });
+                    })
+                    .collect();
+                if answers
+                    .iter()
+                    .any(|order| order.status != harvest_common::payment::OrderStatus::Cancelled)
+                {
+                    return true;
+                }
+                // Only CANCELLED answers. The buyer can now withdraw one (the
+                // buyer cancel, harvest#53 Phase B), and "cancel it and ask
+                // again" is the ordinary way to put a mistake right -- but the
+                // binding, the tag and the key are all fixed per conversation, so
+                // the cancelled order matches the new request exactly as it
+                // matched the old one. Nothing published says WHICH ask an order
+                // answered (an order carries no quantity and no request digest),
+                // so the ask is placed in time instead: a cancelled order answers
+                // every ask made up to the moment the seller issued it (its
+                // signed `created_at`), and an ask made after the newest
+                // cancelled answer is waiting. That holds however the seller
+                // chose among several asks, and however often one was resent
+                // (round 4 of harvest#136: an earlier count of distinct asks
+                // against cancelled orders re-offered a withdrawn request
+                // whenever the seller had not answered oldest first).
+                //
+                // The ask's time is the writer's own timestamp, so a buyer can
+                // only move their own asks. A buyer whose clock runs behind the
+                // seller's by more than the time between the seller issuing and
+                // the buyer asking again is not surfaced until they ask later.
+                // The other direction: a buyer whose clock runs AHEAD of the
+                // seller's by more than the seller took to answer stamps the
+                // answered ask after `issued`, so once that answer is cancelled
+                // the ask is offered to the seller again although the buyer
+                // withdrew it. No tolerance is added for either, because one
+                // would widen the first case's wait to cure the second.
+                answers
+                    .iter()
+                    .map(|order| order.order.created_at)
+                    .max()
+                    .is_some_and(|issued| *timestamp <= issued)
+            });
         if answered {
             continue;
         }
@@ -1139,6 +1158,7 @@ fn unanswered_requests(
             held.listing_id == *listing_id
                 && held.quantity == *quantity
                 && held.buyer_receipt_key == *buyer_receipt_key
+                && held.instant.map(|i| i.request) == request
         }) {
             continue;
         }
@@ -1153,6 +1173,13 @@ fn unanswered_requests(
             order_binding: *order_binding,
             buyer_receipt_key: *buyer_receipt_key,
             digest: *digest,
+            instant: instant
+                .as_ref()
+                .zip(request)
+                .map(|(selection, request)| InstantAnswer {
+                    request,
+                    total_sats: selection.expected_total_sats,
+                }),
         });
     }
     // An unkeyed request with a keyed twin (same listing, quantity and
@@ -1205,6 +1232,18 @@ struct PendingRequest {
     /// Used to order the controls deterministically without consulting a
     /// timestamp the sender chose, and to key the rendered list.
     digest: [u8; 32],
+    /// Set when the buyer sent this with instant checkout.
+    instant: Option<InstantAnswer>,
+}
+
+/// What a seller answering an instant-checkout request by hand carries over
+/// from it: the request id, so their order and any the delegate issued for
+/// the same request are one order in the store (`Order::request_id`), and the
+/// total the buyer was shown, to start the amount from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InstantAnswer {
+    pub request: harvest_common::payment::AnsweredRequest,
+    pub total_sats: u64,
 }
 
 /// Enough of a conversation tag to tell two apart on screen, and no more --
@@ -1302,9 +1341,25 @@ fn describe(content: &MessageContent) -> String {
             quantity,
             shipping,
             note,
+            instant,
             ..
         } => {
             let mut described = format!("Wants to buy {quantity}.\n\nShip to:\n{shipping}");
+            // The buyer's instant-checkout picks, so a seller answering the
+            // request by hand invoices the same terms their store would have.
+            if let Some(selection) = instant {
+                described.push('\n');
+                if let Some(region) = &selection.region {
+                    described.push_str(&format!("\nDelivery region: {region}"));
+                }
+                if !selection.choices.is_empty() {
+                    described.push_str(&format!("\nChoices: {}", selection.choices.join(", ")));
+                }
+                described.push_str(&format!(
+                    "\nInstant checkout total: {} sats",
+                    selection.expected_total_sats
+                ));
+            }
             if !note.trim().is_empty() {
                 described.push_str(&format!("\n\n{note}"));
             }
@@ -1389,6 +1444,8 @@ mod inbox_tests {
     fn listing(id: ListingId, title: &str) -> AuthorizedListing {
         AuthorizedListing {
             listing: Listing {
+                checkout: None,
+                choices: Vec::new(),
                 id,
                 title: title.to_string(),
                 description: String::new(),
@@ -1421,6 +1478,7 @@ mod inbox_tests {
     fn request(listing_id: ListingId, quantity: u32, digest: [u8; 32]) -> MailboxEntry {
         readable(
             MessageContent::OrderRequest {
+                instant: None,
                 listing_id,
                 quantity,
                 shipping: "12 Example St".into(),
@@ -1443,6 +1501,7 @@ mod inbox_tests {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         harvest_common::payment::AuthorizedOrder {
             order: harvest_common::payment::Order {
+                request_id: None,
                 id: harvest_common::payment::OrderId([n; 32]),
                 buyer_fingerprint: String::new(),
                 seller_fingerprint: "seller-fp".to_string(),
@@ -1467,6 +1526,63 @@ mod inbox_tests {
             status_scoped_payload: None,
             status_signature: None,
         }
+    }
+
+    /// An instant request is answered only by the order its request id
+    /// names: another order for the same listing in the same conversation
+    /// (the binding and tag match) does not hide it, and two instant requests
+    /// that differ only in their nonce are two asks. The accept control
+    /// carries the request id and the buyer's total. Mutated red by letting
+    /// the binding-and-tag rule decide an instant request.
+    #[test]
+    fn an_instant_request_is_answered_only_by_its_own_order() {
+        let id = ListingId([9u8; 32]);
+        let listings = vec![listing(id.clone(), "Ghost Pepper")];
+        let instant = |nonce: u8, digest: u8| {
+            readable(
+                MessageContent::OrderRequest {
+                    instant: Some(crate::messaging::InstantSelection {
+                        requested_at_ms: 1_700_000_000_000,
+                        nonce: [nonce; 16],
+                        region: None,
+                        choices: vec![],
+                        expected_total_sats: 12_000,
+                    }),
+                    listing_id: id.clone(),
+                    quantity: 1,
+                    shipping: "12 Example St".into(),
+                    note: String::new(),
+                    order_binding: BINDING,
+                    buyer_receipt_key: None,
+                },
+                [digest; 32],
+            )
+        };
+        let request = |nonce: u8| harvest_common::payment::AnsweredRequest {
+            request_id: harvest_common::payment::request_id(&[1u8; 32], &[nonce; 16]),
+            requested_at: chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+        };
+        let entries = vec![instant(1, 1), instant(2, 2)];
+        let found = unanswered_requests(&entries, &listings, &[], Some(&keys()));
+        assert_eq!(found.len(), 2, "two asks");
+        assert_eq!(
+            found
+                .iter()
+                .map(|r| r.instant.unwrap().request.request_id)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [request(1).request_id, request(2).request_id].into()
+        );
+        assert!(found
+            .iter()
+            .all(|r| r.instant.unwrap().total_sats == 12_000));
+
+        // The first ask answered by its own order; an unrelated order in the
+        // same conversation for the same listing answers nothing.
+        let mut answer = published(1, Some(BINDING), Some(keys().listing_tag(&id)));
+        answer.order.id = request(1).order_id();
+        let found = unanswered_requests(&entries, &listings, &[answer], Some(&keys()));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].instant.unwrap().request, request(2));
     }
 
     /// The count beside Orders is the number of accept controls the inbox
@@ -1635,6 +1751,7 @@ mod inbox_tests {
         let keyed = |digest: [u8; 32]| {
             readable(
                 MessageContent::OrderRequest {
+                    instant: None,
                     listing_id: id.clone(),
                     quantity: 1,
                     shipping: "12 Example St".into(),
@@ -1706,6 +1823,7 @@ mod inbox_tests {
         let ask = |quantity: u32, digest: u8, when: i64| {
             let mut entry = readable(
                 MessageContent::OrderRequest {
+                    instant: None,
                     listing_id: id.clone(),
                     quantity,
                     shipping: "12 Example St".into(),
@@ -1890,5 +2008,37 @@ mod inbox_tests {
         let found =
             unanswered_requests(&entries, &[listing(id, "Ghost Pepper")], &[], Some(&keys()));
         assert_eq!(found.len(), 1);
+    }
+
+    /// A seller reading an instant request sees the region, the picks and the
+    /// total the buyer was shown; a quote request shows none of them.
+    #[test]
+    fn an_instant_request_shows_its_terms_to_the_seller() {
+        let request = |instant| MessageContent::OrderRequest {
+            instant,
+            listing_id: ListingId([9u8; 32]),
+            quantity: 2,
+            shipping: "12 Example St".into(),
+            note: "Thanks".into(),
+            order_binding: BINDING,
+            buyer_receipt_key: None,
+        };
+        let shown = describe(&request(Some(crate::messaging::InstantSelection {
+            requested_at_ms: 1_700_000_000_000,
+            nonce: [1u8; 16],
+            region: Some("EU".into()),
+            choices: vec!["Fig".into(), "Large".into()],
+            expected_total_sats: 25_000,
+        })));
+        assert!(shown.contains("Delivery region: EU"), "{shown}");
+        assert!(shown.contains("Choices: Fig, Large"), "{shown}");
+        assert!(
+            shown.contains("Instant checkout total: 25000 sats"),
+            "{shown}"
+        );
+        assert!(shown.ends_with("Thanks"), "{shown}");
+
+        let quote = describe(&request(None));
+        assert!(!quote.contains("Instant checkout"), "{quote}");
     }
 }

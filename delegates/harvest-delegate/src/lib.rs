@@ -1,5 +1,6 @@
 #![allow(unexpected_cfgs)]
 
+mod auto_invoice;
 mod bip32;
 mod bitcoin;
 mod handlers;
@@ -49,6 +50,21 @@ fn harvest_delegate_getrandom(buf: &mut [u8]) -> Result<(), getrandom::Error> {
     Ok(())
 }
 getrandom::register_custom_getrandom!(harvest_delegate_getrandom);
+
+/// The node's clock, in milliseconds since the epoch.
+///
+/// On the delegate host it is `freenet_stdlib::time::now`; off `wasm32` (the
+/// tests) that is an unimplemented stub, so the system clock stands in.
+pub(crate) fn now_ms() -> u64 {
+    #[cfg(target_family = "wasm")]
+    let ms = freenet_stdlib::time::now().timestamp_millis();
+    #[cfg(not(target_family = "wasm"))]
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    ms.max(0) as u64
+}
 
 pub struct HarvestDelegate;
 
@@ -105,6 +121,13 @@ impl DelegateInterface for HarvestDelegate {
                 let _ = key;
                 Ok(vec![])
             }
+
+            // A store update instant checkout sent: on success, send the
+            // replies it was holding back (see `auto_invoice::on_store_updated`).
+            InboundDelegateMsg::UpdateContractResponse(response) => Ok(
+                auto_invoice::on_store_updated(&response.result, response.context.as_ref())
+                    .unwrap_or_default(),
+            ),
 
             other => {
                 let msg_type = match &other {
@@ -178,6 +201,20 @@ fn handle_request(
     // silently misparsing into the wrong shape, which is what makes this
     // fallback safe rather than ambiguous.
     match from_cbor::<HarvestDelegateRequest>(payload) {
+        // Arming answers the UI AND subscribes to the store's contracts, so
+        // it cannot go through `handlers::handle`, whose answer is a response
+        // alone. The caller was checked above; `auto_invoice::arm` re-checks
+        // nothing about who asked, only what they asked for.
+        Ok(HarvestDelegateRequest::ArmAutoInvoice { arm }) => {
+            let (response, subscriptions) = auto_invoice::arm(&mut CtxSecrets(ctx), *arm, now_ms());
+            let response_bytes = to_cbor(&response)
+                .map_err(|e| DelegateError::Other(format!("serialize response: {e}")))?;
+            let mut out = vec![OutboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(response_bytes),
+            )];
+            out.extend(subscriptions);
+            Ok(out)
+        }
         Ok(request) => {
             let response = handlers::handle(&mut CtxSecrets(ctx), origin, request);
 
@@ -244,9 +281,24 @@ fn payload_shape(payload: &[u8]) -> String {
 /// The delegate subscribes to mailbox and reputation contracts. When new
 /// messages or complaints arrive, this handler processes them.
 fn handle_contract_notification(
-    _ctx: &mut DelegateCtx,
+    ctx: &mut DelegateCtx,
     notification: &freenet_stdlib::prelude::ContractNotification,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    // A contract instant checkout subscribed to. Nothing goes to the UI: a
+    // background run has no UI, and one that is open reads these contracts
+    // itself.
+    let contract_id: Option<[u8; 32]> = notification.contract_id.as_bytes().try_into().ok();
+    if let Some(out) = contract_id.and_then(|contract_id| {
+        auto_invoice::on_notification(
+            &mut CtxSecrets(ctx),
+            &contract_id,
+            notification.new_state.as_ref(),
+            now_ms(),
+        )
+    }) {
+        return Ok(out);
+    }
+
     // The notification contains the contract key and the update data.
     // We need to determine which contract type this is and handle accordingly.
     //
@@ -269,9 +321,19 @@ fn handle_contract_notification(
 
 /// Handle a response to a contract GET the delegate initiated.
 fn handle_get_contract_response(
-    _ctx: &mut DelegateCtx,
+    ctx: &mut DelegateCtx,
     response: &freenet_stdlib::prelude::GetContractResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    // The store read instant checkout asked for.
+    if let Some(out) = auto_invoice::on_store_state(
+        &mut CtxSecrets(ctx),
+        response.state.as_ref().map(|s| s.as_ref()),
+        response.context.as_ref(),
+        now_ms(),
+    ) {
+        return Ok(out);
+    }
+
     // Forward contract state to the UI
     let state_bytes = response
         .state
@@ -398,6 +460,7 @@ mod boundary_tests {
             conversation: [2u8; 32],
             order: AuthorizedOrder {
                 order: Order {
+                    request_id: None,
                     id: OrderId([0u8; 32]),
                     buyer_fingerprint: String::new(),
                     seller_fingerprint: String::new(),
@@ -513,6 +576,30 @@ mod boundary_tests {
             })
             .expect("cbor"),
             to_cbor(&HarvestDelegateRequest::ListKeptPurchases).expect("cbor"),
+            // Instant checkout. Arming lets the delegate sign orders and
+            // spend addresses unattended, and is dispatched in `lib.rs`
+            // itself, never reaching `handlers::handle`'s second check; the
+            // peek reads the seller's next payment addresses.
+            to_cbor(&HarvestDelegateRequest::ArmAutoInvoice {
+                arm: Box::new(harvest_common::delegate::AutoInvoiceArm {
+                    store_contract_id: vec![3u8; 32],
+                    store_verifying_key: [5u8; 32],
+                    mailbox_contract_id: [6u8; 32],
+                    seller_fingerprint: "fp".into(),
+                    network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                    tip_contract_id: [7u8; 32],
+                    trusted_bridges: vec![],
+                    address_code_hash: [8u8; 32],
+                    watched_scripts: vec![],
+                    watch_left_ms: 1,
+                }),
+            })
+            .expect("cbor"),
+            to_cbor(&BtcReq::PeekOrderAddresses {
+                request_id: 1,
+                count: 10,
+            })
+            .expect("cbor"),
         ];
         for payload in payloads {
             assert!(refusal(&payload, Some(&a_different_web_app())).contains("Harvest web app"));

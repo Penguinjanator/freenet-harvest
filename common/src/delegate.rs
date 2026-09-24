@@ -498,6 +498,93 @@ pub enum HarvestDelegateRequest {
         request_id: RequestId,
         store_verifying_key: [u8; 32],
     },
+
+    /// Let this delegate answer instant-checkout requests for one store while
+    /// the seller is away (see [`AutoInvoiceArm`]). Rewrites the store's arm
+    /// and subscribes to its mailbox, its store contract and the chain tip, so
+    /// re-sending it is harmless: the UI sends it on every open. Answered
+    /// with [`HarvestDelegateResponse::AutoInvoice`].
+    ArmAutoInvoice { arm: Box<AutoInvoiceArm> },
+}
+
+/// Everything the Harvest delegate needs to issue an instant-checkout invoice
+/// on its own, as the seller's UI knows it when it is open.
+///
+/// # The watched addresses are the whole safety argument
+///
+/// A payment is only ever seen if the Bitcoin bridge was asked to watch its
+/// address before it was paid (the bridge does not look back:
+/// freenet-bitcoin#7), and asking takes the seller's Ghost Key, which a
+/// delegate running in the background cannot reach. So the UI asks while the
+/// seller is present, for the next few addresses the delegate will hand out,
+/// and names them here once the bridge has read the request. The delegate
+/// invoices only on an address in [`Self::watched_scripts`], and only while
+/// the watch will outlast the invoice's payment window (see
+/// [`Self::watch_left_ms`]); the bridge lets a watch lapse unless the
+/// seller's UI renews it. Past either, a request waits for the seller, as
+/// every request did before instant checkout.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct AutoInvoiceArm {
+    /// The store contract's instance id.
+    pub store_contract_id: Vec<u8>,
+    /// The store key: what signs the order and derives the inbox key that
+    /// opens the requests. The delegate must hold it.
+    pub store_verifying_key: [u8; 32],
+    /// The store's mailbox contract's instance id.
+    pub mailbox_contract_id: [u8; 32],
+    /// The Ghost Key fingerprint the store's orders are issued under
+    /// ([`crate::payment::Order::seller_fingerprint`]).
+    pub seller_fingerprint: String,
+    /// The network invoices are on, and its chain-tip contract, whose newest
+    /// block anchors each order.
+    pub network: freenet_bitcoin_common::BitcoinNetwork,
+    pub tip_contract_id: [u8; 32],
+    /// Copied onto each order exactly as the UI's own invoices carry them
+    /// (`order_for_invoice`).
+    pub trusted_bridges: Vec<freenet_bitcoin_common::BridgeId>,
+    pub address_code_hash: [u8; 32],
+    /// Payment scripts the bridge has read a watch request for, from the
+    /// addresses the delegate will hand out next.
+    pub watched_scripts: Vec<Vec<u8>>,
+    /// How long the earliest of those watches has left before the bridge
+    /// lets it lapse, less a margin. A duration rather than a time, so the
+    /// browser's clock and the node's never have to agree: the delegate adds
+    /// it to its own clock when it is armed.
+    pub watch_left_ms: u64,
+}
+
+/// How auto-invoicing stands for one store: see
+/// [`HarvestDelegateRequest::ArmAutoInvoice`].
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct AutoInvoiceStatus {
+    /// When this store was first armed on this device, by the node's clock.
+    /// Re-arming keeps it, so "armed long ago and never run in the
+    /// background" can be told apart from "just armed".
+    pub armed_at_ms: u64,
+    /// Watched addresses still unused, and until when a new instant invoice
+    /// may go out (the watch must outlast its payment window), by the node's
+    /// clock.
+    pub watched_remaining: u32,
+    pub invoicing_until_ms: u64,
+    /// When the delegate last heard from the chain-tip contract while running
+    /// on its own, by the node's clock. `None` means it has not run in the
+    /// background here, which is what a hosted gateway such as
+    /// try.freenet.org looks like: its background runs cannot read the
+    /// seller's arm.
+    pub last_background_run_ms: Option<u64>,
+    /// Instant-checkout invoices issued in the last 24 hours.
+    pub issued_last_day: u32,
+    /// Instant orders that were paid when the listing's published stock
+    /// could no longer cover them: sold more than the seller had. Possible
+    /// because an unpaid invoice stops holding stock once its buyer cancels
+    /// or can no longer start paying, while a payment can still arrive after
+    /// that, or because the seller marked the listing sold out or took it
+    /// down meanwhile. The seller refunds or fulfils these by hand. Each is
+    /// listed for two weeks from when it was found.
+    #[serde(default)]
+    pub oversold: Vec<crate::payment::OrderId>,
+    /// Why the next request would wait for the seller, if it would.
+    pub paused: Option<String>,
 }
 
 /// What the UI asks the delegate to keep (harvest#53 Phase C). See
@@ -905,6 +992,12 @@ pub enum HarvestDelegateResponse {
 
     Error {
         message: String,
+    },
+
+    /// Answer to `ArmAutoInvoice`.
+    AutoInvoice {
+        store_contract_id: Vec<u8>,
+        result: Result<AutoInvoiceStatus, String>,
     },
 }
 
@@ -1460,9 +1553,10 @@ mod tests {
             // Each kept purchase's receipt seed.
             R::KeptPurchases { .. } => (27, true),
             R::KeepPurchaseRefused { .. } => (28, false),
+            R::AutoInvoice { .. } => (29, false),
         }
     }
-    const RESPONSE_VARIANTS: usize = 29;
+    const RESPONSE_VARIANTS: usize = 30;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
@@ -1500,9 +1594,11 @@ mod tests {
             Q::ImportMigratedSecret { .. } => (24, true),
             Q::KeepPurchase { .. } => (25, false),
             Q::ListKeptPurchases => (26, false),
+            // Public payment scripts and contract ids.
+            Q::ArmAutoInvoice { .. } => (27, false),
         }
     }
-    const REQUEST_VARIANTS: usize = 27;
+    const REQUEST_VARIANTS: usize = 28;
 
     /// A valid Ed25519 verifying key for samples that need one.
     fn sample_key() -> ed25519_dalek::VerifyingKey {
@@ -1710,6 +1806,18 @@ mod tests {
                 order_id: crate::payment::OrderId([3u8; 32]),
                 reason: "refused".into(),
             },
+            R::AutoInvoice {
+                store_contract_id: vec![3u8; 32],
+                result: Ok(AutoInvoiceStatus {
+                    armed_at_ms: 1,
+                    watched_remaining: 2,
+                    invoicing_until_ms: 3,
+                    last_background_run_ms: Some(4),
+                    issued_last_day: 5,
+                    oversold: vec![],
+                    paused: None,
+                }),
+            },
         ]
     }
 
@@ -1775,6 +1883,8 @@ mod tests {
                 request_id: 42,
                 ghostkey_fingerprint: fp(),
                 listing: Listing {
+                    checkout: None,
+                    choices: Vec::new(),
                     id: crate::listing::ListingId([17u8; 32]),
                     title: "a mug".into(),
                     description: "blue".into(),
@@ -1857,6 +1967,20 @@ mod tests {
                 keep: Box::new(purchase_to_keep()),
             },
             Q::ListKeptPurchases,
+            Q::ArmAutoInvoice {
+                arm: Box::new(AutoInvoiceArm {
+                    store_contract_id: store(),
+                    store_verifying_key: [5u8; 32],
+                    mailbox_contract_id: [6u8; 32],
+                    seller_fingerprint: fp(),
+                    network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                    tip_contract_id: [7u8; 32],
+                    trusted_bridges: vec![],
+                    address_code_hash: [8u8; 32],
+                    watched_scripts: vec![vec![0u8, 20]],
+                    watch_left_ms: 9,
+                }),
+            },
         ]
     }
 
@@ -1983,9 +2107,10 @@ mod tests {
             B::PaymentXpubSet { .. } => (6, true),
             B::PaymentXpub { .. } => (7, true),
             B::OrderAddress { .. } => (8, false),
+            B::UpcomingAddresses { .. } => (9, false),
         }
     }
-    const BITCOIN_RESPONSE_VARIANTS: usize = 9;
+    const BITCOIN_RESPONSE_VARIANTS: usize = 10;
 
     /// Every Bitcoin-surface request variant, as for [`classify_response`].
     fn classify_bitcoin_request(r: &crate::BitcoinDelegateRequest) -> (usize, bool) {
@@ -2001,9 +2126,10 @@ mod tests {
             B::SetPaymentXpub { .. } => (6, true),
             B::GetPaymentXpub => (7, false),
             B::DeriveOrderAddress { .. } => (8, false),
+            B::PeekOrderAddresses { .. } => (9, false),
         }
     }
-    const BITCOIN_REQUEST_VARIANTS: usize = 9;
+    const BITCOIN_REQUEST_VARIANTS: usize = 10;
 
     fn watch() -> crate::WatchedPayment {
         crate::WatchedPayment {
@@ -2077,6 +2203,10 @@ mod tests {
                 }),
                 matched_scripts: vec![],
             },
+            B::UpcomingAddresses {
+                request_id: 42,
+                result: Ok(vec![]),
+            },
         ]
     }
 
@@ -2120,6 +2250,10 @@ mod tests {
             B::DeriveOrderAddress {
                 request_id: 42,
                 published_scripts: vec![],
+            },
+            B::PeekOrderAddresses {
+                request_id: 42,
+                count: 10,
             },
         ]
     }

@@ -49,6 +49,8 @@ fn signed_listing(title: &str) -> AuthorizedListing {
     // would make every fixture here unmergeable. Distinct titles still give
     // distinct listings, which is all these tests identify them by.
     let listing = Listing {
+        checkout: None,
+        choices: Vec::new(),
         id: ListingId([0u8; 32]),
         title: title.to_string(),
         description: String::new(),
@@ -325,6 +327,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // V21, from `git show 52afb47:ui/public/contracts/store_contract.wasm`.
                 // Superseded by harvest#70: the state gained listing statuses.
                 "4aa47d75444431b8dcecd731aef0e88dd484be0805b2b7fb74798d003a23cca8",
+                // V22, from `git show f9558cd:ui/public/contracts/store_contract.wasm`.
+                // Superseded by instant checkout: listings and orders gained
+                // their fixed terms and request id.
+                "307332ee371b0ed7a21c696180a09e9b55d53cbd07e96b4e219abf9a5ac5ddf1",
             ],
         ),
         (
@@ -388,6 +394,11 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // artifact moves only because `harvest-common` is compiled
                 // into it. The first generation addressed by the store key.
                 "68543c8c1e29a968046ffe3392fb767576aa6a950c6a835d6eb97e8d989e0230",
+                // V17, from `git show f9558cd:ui/public/contracts/\
+                // reputation_contract.wasm`. Superseded by instant checkout;
+                // this artifact moves only because `harvest-common` is
+                // compiled into it.
+                "492c6e74953058477ec0cb736a1ae2f8d751b858e0df8c3176274599d9f1b8df",
             ],
         ),
         (
@@ -439,6 +450,11 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by harvest#53 Phase C; this artifact moves only
                 // because `harvest-common` is compiled into it.
                 "397f30059eea7a5d8cc4fa4a7f364c772cbfda15ce2b62bb65db1c048b0f1d43",
+                // V16, from `git show f9558cd:ui/public/contracts/mailbox_contract.wasm`
+                // (unchanged since 52afb47). Superseded by instant checkout;
+                // this artifact moves only because `harvest-common` is
+                // compiled into it.
+                "4b02a3f41d494efa2570c75fc3044f091775858566569c115a219091346087d4",
             ],
         ),
         (
@@ -457,6 +473,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by harvest#70; this artifact moves only because
                 // `harvest-common` is compiled into it.
                 "0a21fecfdd702dea40d5ccd51d6b7ecc095e101d1c8a8801a5594c4368d60361",
+                // V4, from `git show f9558cd:ui/public/contracts/index_contract.wasm`.
+                // Superseded by instant checkout; this artifact moves only
+                // because `harvest-common` is compiled into it.
+                "e23c43c86fa12acfbed7778b8c15b22d4af87c8c0d6c673f47a5d606d9cca9e5",
             ],
         ),
     ];
@@ -565,6 +585,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // Superseded by harvest#70: the store key also signs a listing
             // status.
             "225214b7d88fcc8e769f50f51279703f11fd5aef13f64657b4646c2af978ef19".to_string(),
+            // V23, from `git show f9558cd:ui/public/contracts/harvest_delegate.wasm`.
+            // Superseded by instant checkout: the delegate answers instant
+            // requests in the background.
+            "9463b53b02e72c444935a024ad8b05268d21eb5c6a5ead049ad88ee456a24ea1".to_string(),
         ],
     );
 }
@@ -1091,6 +1115,8 @@ const PUBLISHED_UNDER: &[(u32, StoreParamShape)] = {
         // V21: harvest#53 Phase C (`52afb47`). Still the store key's code,
         // 29B.
         (21, Code),
+        // V22: harvest#70 (`f9558cd`). Still the store key's code, 29B.
+        (22, Code),
     ]
 };
 
@@ -1421,6 +1447,8 @@ fn the_owner_fill_in_does_not_reassign_a_store_another_key_owns() {
     };
     foreign.listings.listings = vec![{
         let listing = Listing {
+            checkout: None,
+            choices: Vec::new(),
             id: ListingId([0u8; 32]),
             title: "Not the seller's".to_string(),
             description: String::new(),
@@ -2327,6 +2355,7 @@ fn dummy_complaint() -> Complaint {
     Complaint {
         order: AuthorizedOrder {
             order: Order {
+                request_id: None,
                 id: OrderId([4u8; 32]),
                 buyer_fingerprint: String::new(),
                 seller_fingerprint: String::new(),
