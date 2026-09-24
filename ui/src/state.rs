@@ -647,6 +647,32 @@ pub struct AppState {
     /// The UI should pick these up and send them as contract updates.
     pub signed_listings_ready: Vec<AuthorizedListing>,
 
+    /// Remembered stores My purchases is loading in the background: GET out,
+    /// state not yet arrived. See `store_link::load_remembered_store`.
+    pub background_loads: HashSet<Vec<u8>>,
+
+    /// Listing statuses the store key has signed, with the store each is for.
+    /// Filled only off wasm, where nothing publishes them, so a test can see
+    /// what would have been sent (harvest#70).
+    pub signed_statuses_ready: Vec<(Vec<u8>, harvest_common::listing::AuthorizedListingStatus)>,
+
+    /// Listing statuses this session has signed and sent, per (store,
+    /// listing): the revision floor for the next one, and whether the row is
+    /// still waiting for the store's state to show it. See
+    /// `crate::listing_status_flow::SentStatus`.
+    pub listing_statuses_sent: HashMap<
+        (Vec<u8>, harvest_common::listing::ListingId),
+        crate::listing_status_flow::SentStatus,
+    >,
+
+    /// An edited listing's predecessor, to take down once the replacement
+    /// has published, keyed by the replacement's id (harvest#70). See
+    /// `AppState::on_listing_published`.
+    pub withdraw_after_publish: HashMap<
+        harvest_common::listing::ListingId,
+        (Vec<u8>, harvest_common::listing::ListingId, i64),
+    >,
+
     /// Pending messages/events for the UI to display.
     pub notifications: Vec<String>,
 
@@ -1026,7 +1052,7 @@ pub(crate) const PAYMENT_ON_ITS_WAY_BUYER: &str =
 /// no store key for (harvest#93).
 pub(crate) const NO_STORE_KEY_MESSAGE: &str =
     "this store has no store key on this device. A store made before stores had their own \
-     keys has to be moved to one first (My Store offers it); for a store created on another \
+     keys has to be moved to one first (My store offers it); for a store created on another \
      device, open its link here with the Ghost Key that backs it connected, and Harvest \
      recovers the key from the store.";
 
@@ -1243,7 +1269,7 @@ fn unverified_listings(
 
 impl BrowsingStore {
     /// How a reader counts each complaint on this store's record, beside the
-    /// complaint: the ONE place both the store badge and the Reputation page
+    /// complaint: the ONE place both the store badge and the store's record (`StoreRecord`)
     /// read it from, so they cannot disagree.
     ///
     /// Reads the complaint, the store's record of that one order and its
@@ -1281,6 +1307,18 @@ impl BrowsingStore {
         self.complaint_standings()
             .filter(|(_, standing)| standing.counts())
             .count()
+    }
+
+    /// A listing's availability: the status the store holds for it, or on
+    /// sale and uncounted when it holds none (harvest#70).
+    pub fn availability(
+        &self,
+        listing: &harvest_common::listing::ListingId,
+    ) -> harvest_common::listing::ListingAvailability {
+        self.listing_statuses
+            .get(listing)
+            .map(|status| status.availability.clone())
+            .unwrap_or_default()
     }
 
     /// Whether anything on this store may be offered to a buyer as payable
@@ -1380,6 +1418,8 @@ pub enum PendingSignature {
     /// The store key's acceptance of that statement, from the Harvest
     /// delegate.
     BackingAcceptance(Box<crate::backing_flow::PendingBacking>),
+    /// A listing's availability, for the store key (harvest#70).
+    ListingStatus(Box<crate::listing_status_flow::PendingListingStatus>),
 }
 
 /// Which key a pending signature is asked of, and so which answer may settle
@@ -1398,6 +1438,7 @@ impl PendingSignature {
     pub(crate) fn signed_bytes(&self) -> Result<Vec<u8>, String> {
         match self {
             PendingSignature::Listing(pending) => harvest_common::to_cbor(&pending.listing),
+            PendingSignature::ListingStatus(pending) => harvest_common::to_cbor(&pending.status),
             PendingSignature::StoreInfo(pending) => harvest_common::to_cbor(&pending.info),
             PendingSignature::Order(pending) => harvest_common::to_cbor(&pending.order),
             PendingSignature::Cancellation(pending) => pending.signed_bytes(),
@@ -1425,6 +1466,7 @@ impl PendingSignature {
     pub(crate) fn signer(&self) -> Signer {
         match self {
             PendingSignature::Listing(_)
+            | PendingSignature::ListingStatus(_)
             | PendingSignature::StoreInfo(_)
             | PendingSignature::Order(_)
             | PendingSignature::Cancellation(_)
@@ -2573,6 +2615,11 @@ pub fn foreign_owner_message(code: &str, held: &[u8; 32]) -> String {
 pub struct BrowsingStore {
     pub info: Option<StoreInfoV1>,
     pub listings: Vec<AuthorizedListing>,
+    /// Each listing's availability, as the store key last signed it
+    /// (harvest#70). A listing with no entry is on sale and uncounted; see
+    /// [`Self::availability`].
+    pub listing_statuses:
+        HashMap<harvest_common::listing::ListingId, harvest_common::listing::ListingStatus>,
     /// Whether the store's published ghostkey certificate actually holds up.
     ///
     /// Reached once, in `on_contract_state`, rather than being recomputed
@@ -3133,6 +3180,44 @@ impl AppState {
     /// `store_link::is_old_format_link`.
     pub fn note_old_format_link(&mut self) {
         self.store_link_error = Some(crate::store_link::OLD_FORMAT_LINK_MESSAGE.to_string());
+    }
+
+    /// Mark a remembered store as being loaded in the background, unless it is
+    /// already loaded or loading. `true` when the caller should send the GET.
+    /// See `store_link::load_remembered_store`.
+    pub fn begin_background_load(&mut self, store_contract_id: Vec<u8>, code: String) -> bool {
+        if self.browsing_stores.contains_key(&store_contract_id) {
+            return false;
+        }
+        self.browsing_stores
+            .insert(store_contract_id.clone(), BrowsingStore::default());
+        self.background_loads.insert(store_contract_id.clone());
+        self.note_store_code(store_contract_id, code);
+        true
+    }
+
+    /// A background load's GET did not go out: take its placeholder back out,
+    /// so a later visit retries. Only a placeholder this load made and nothing
+    /// has written into since (another flow may have registered the store's
+    /// mailbox or recalled a conversation into the same entry).
+    pub fn end_background_load_failed(&mut self, store_contract_id: &[u8]) {
+        if !self.background_loads.remove(store_contract_id) {
+            return;
+        }
+        if self
+            .browsing_stores
+            .get(store_contract_id)
+            .is_some_and(|store| *store == BrowsingStore::default())
+        {
+            self.browsing_stores.remove(store_contract_id);
+        }
+    }
+
+    /// A background load has waited long enough: stop saying it is loading.
+    /// The placeholder stays, so the store is not asked about again this
+    /// session; its state is still taken if it arrives.
+    pub fn end_background_load_timed_out(&mut self, store_contract_id: &[u8]) {
+        self.background_loads.remove(store_contract_id);
     }
 
     /// Record the code a store was opened under. See [`Self::store_codes`].
@@ -3995,6 +4080,10 @@ impl AppState {
 
     /// Handle full contract state received from a GET response.
     pub fn on_contract_state(&mut self, contract_id: Vec<u8>, state_bytes: Vec<u8>) {
+        // Any answer for a store My purchases is loading ends the wait for
+        // it, whatever it turns out to hold (see `store_link::
+        // load_remembered_store`).
+        let background = self.background_loads.remove(&contract_id);
         // Before anything else, and before the empty check: an empty state is
         // itself an answer to a reuse check (nothing registered there). An id
         // that is ALSO a watched address goes on to the ordinary path below,
@@ -4184,7 +4273,10 @@ impl AppState {
                     // A store the seller just created, or one they own, arrives
                     // without anyone having followed a link. Show it, unless a link
                     // has already named the store this tab is for.
-                    if self.active_store_id.is_none() {
+                    // A store loaded in the background for My purchases is
+                    // not one the user opened, so it does not become the
+                    // store the Stores page shows.
+                    if self.active_store_id.is_none() && !background {
                         self.active_store_id = Some(contract_id.clone());
                     }
 
@@ -4244,6 +4336,12 @@ impl AppState {
                     // At version 0 this is the default (reset above), so a
                     // buyer finds no name, no key and no reputation link in it.
                     store.info = Some(store_state.info.info);
+                    store.listing_statuses = store_state
+                        .listing_statuses
+                        .records
+                        .values()
+                        .map(|record| (record.status.listing.clone(), record.status.clone()))
+                        .collect();
                     store.listings = store_state.listings.listings;
                     store.orders = store_state.orders.orders.into_values().collect();
                     store.despatches = store_state
@@ -5641,6 +5739,31 @@ impl AppState {
 
     /// The delegate's copy of order `order_id` of the store with key
     /// `store_key`, if it keeps one.
+    /// The purchases a store's purchase cards show (`buyer_purchases`), as
+    /// `(store owner key, order id)`: the key a kept purchase is filed under.
+    /// A kept purchase matching one of these is judged by that card from the
+    /// same kept copy the kept list would use (`kept_copy`), so the card
+    /// offers the same complaint control. An acceptance naming an order kept
+    /// under ANOTHER store's key matches nothing, and a store whose owner is
+    /// not known yet shows nothing here, so neither hides a kept purchase
+    /// (harvest#125 review round 2).
+    pub(crate) fn kept_purchases_shown_at(
+        &self,
+        store_contract_id: &[u8],
+    ) -> Vec<([u8; 32], harvest_common::payment::OrderId)> {
+        let Some(owner) = self
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|store| store.owner)
+        else {
+            return Vec::new();
+        };
+        self.buyer_purchases(store_contract_id)
+            .into_iter()
+            .map(|purchase| (owner, purchase.order_id))
+            .collect()
+    }
+
     fn kept_copy(
         &self,
         store_key: &[u8; 32],
@@ -9657,6 +9780,7 @@ impl AppState {
             .and_then(|at| self.pending_signatures.remove(at));
         let what = match &withdrawn {
             Some(PendingSignature::Listing(_)) => "your listing",
+            Some(PendingSignature::ListingStatus(_)) => "the change to your listing",
             Some(PendingSignature::StoreInfo(_)) => "your store's details",
             Some(PendingSignature::Order(_)) => "the invoice",
             Some(PendingSignature::Cancellation(_)) => "the cancellation",
@@ -9665,9 +9789,19 @@ impl AppState {
             _ => "your store",
         };
         warn!("store key did not sign {what}: {reason}");
+        if let Some(PendingSignature::Listing(listing)) = &withdrawn {
+            self.on_listing_published(&listing.listing.id, false);
+        }
         if matches!(withdrawn, Some(PendingSignature::BackingAcceptance(_))) {
             self.store_creation_failed(&format!(
                 "the store's key did not accept the backing: {reason}"
+            ));
+            return;
+        }
+        if matches!(withdrawn, Some(PendingSignature::ListingStatus(_))) {
+            self.notifications.push(format!(
+                "{} ({reason})",
+                crate::listing_status_flow::LISTING_STATUS_NOT_SAVED
             ));
             return;
         }
@@ -9734,6 +9868,20 @@ impl AppState {
                 "this store belongs to {owner}, so only that identity can issue invoices \
                  on it"
             ));
+        }
+        // A listing its seller took down is not one to start a fresh sale of
+        // (harvest#70). An invoice answering a buyer's request is allowed
+        // whatever the listing's state now: the buyer asked while it was on
+        // sale, and an edit replaces a listing's id under them. A sold-out
+        // listing may be invoiced again, for an invoice that expired unpaid.
+        if invoice.reply_to.is_none()
+            && self.listing_availability(&invoice.store_contract_id, &invoice.listing_id)
+                == harvest_common::listing::ListingAvailability::Withdrawn
+        {
+            return Err(
+                "that listing is taken down. Put it back on sale first if you mean to sell it"
+                    .to_string(),
+            );
         }
         if self.bitcoin.payment_xpub.is_none() {
             return Err(
@@ -10689,11 +10837,14 @@ impl AppState {
                 // (#118).
                 if pending.certificate_pem.trim().is_empty() {
                     warn!("a signed listing has no certificate -- not publishing it");
-                    self.notifications.push(format!(
-                        "Your listing \"{}\" was not published: it has no Ghost Key \
-                         certificate, so buyers could not buy it. Add it again.",
-                        pending.listing.title
-                    ));
+                    self.listing_dropped(
+                        &pending.listing.id,
+                        format!(
+                            "Your listing \"{}\" was not published: it has no Ghost Key \
+                             certificate, so buyers could not buy it. Add it again.",
+                            pending.listing.title
+                        ),
+                    );
                     return;
                 }
                 let authorized = AuthorizedListing {
@@ -10712,20 +10863,29 @@ impl AppState {
                 if let Some(store_id) = pending.store_contract_id {
                     let listing = authorized.clone();
                     wasm_bindgen_futures::spawn_local(async move {
-                        if let Err(e) =
+                        let id = listing.listing.id.clone();
+                        let outcome =
                             crate::gateway::store_ops::submit_listing_by_id(&store_id, listing)
-                                .await
-                        {
+                                .await;
+                        if let Err(e) = &outcome {
                             dioxus::logger::tracing::error!("Failed to submit listing: {}", e);
                             crate::gateway::APP_STATE
                                 .write()
                                 .notifications
                                 .push(format!("Failed to submit listing: {e}"));
                         }
+                        // An edit's predecessor comes down only once its
+                        // replacement is up (harvest#70).
+                        crate::gateway::APP_STATE
+                            .write()
+                            .on_listing_published(&id, outcome.is_ok());
                     });
                 }
 
                 self.signed_listings_ready.push(authorized);
+            }
+            Some(PendingSignature::ListingStatus(pending)) => {
+                self.on_listing_status_signed(*pending, scoped_payload, signature);
             }
             Some(PendingSignature::StoreInfo(pending)) => {
                 let authorized = harvest_common::store::AuthorizedStoreInfoV1 {
@@ -14074,6 +14234,7 @@ mod tests {
             .find_map(|pending| match pending {
                 PendingSignature::StoreInfo(store_info) => Some(&store_info.info),
                 PendingSignature::Listing(_)
+                | PendingSignature::ListingStatus(_)
                 | PendingSignature::Order(_)
                 | PendingSignature::Cancellation(_)
                 | PendingSignature::Despatch(_)
@@ -14803,6 +14964,7 @@ mod tests {
             .filter_map(|pending| match pending {
                 PendingSignature::StoreInfo(info) => Some(info.info.version),
                 PendingSignature::Listing(_)
+                | PendingSignature::ListingStatus(_)
                 | PendingSignature::Order(_)
                 | PendingSignature::Cancellation(_)
                 | PendingSignature::Despatch(_)
@@ -16925,6 +17087,52 @@ mod invoice_tests {
         let err = state.issue_invoice(invoice()).expect_err("must refuse");
         assert!(err.contains("payment key"), "unhelpful error: {err}");
         assert!(state.pending_invoices.is_empty());
+    }
+
+    /// A fresh invoice for a listing its seller took down is refused; one
+    /// answering a buyer's request, or for a sold-out listing, is not
+    /// (harvest#70). Mutated red by dropping the check, and by dropping its
+    /// `reply_to` condition.
+    #[test]
+    fn a_taken_down_listing_cannot_be_invoiced_afresh() {
+        use harvest_common::listing::{ListingAvailability, ListingStatus};
+        let with = |availability: ListingAvailability| {
+            let mut state = seller_with_a_store();
+            state
+                .browsing_stores
+                .entry(STORE_ID.to_vec())
+                .or_default()
+                .listing_statuses
+                .insert(
+                    listing_id(),
+                    ListingStatus {
+                        listing: listing_id(),
+                        revision: 1,
+                        availability,
+                    },
+                );
+            state
+        };
+        let mut state = with(ListingAvailability::Withdrawn);
+        let err = state.issue_invoice(invoice()).expect_err("must refuse");
+        assert!(err.contains("taken down"), "{err}");
+        assert!(state.pending_invoices.is_empty());
+
+        let mut state = with(ListingAvailability::Withdrawn);
+        let mut answering = invoice();
+        answering.reply_to = Some([3u8; 32]);
+        // It goes on to the next check (this fixture holds no conversation
+        // key), rather than being refused as taken down.
+        let answered = state.issue_invoice(answering);
+        assert!(
+            answered.as_ref().is_ok() || !answered.as_ref().unwrap_err().contains("taken down"),
+            "a buyer's request is still answered: {answered:?}"
+        );
+
+        let mut state = with(ListingAvailability::SoldOut);
+        state
+            .issue_invoice(invoice())
+            .expect("a sold-out listing can be invoiced again");
     }
 
     #[test]
@@ -21068,6 +21276,63 @@ mod buy_flow_tests {
             !state.needs_reissue(&settled),
             "an order nobody is waiting to pay needs nothing"
         );
+    }
+
+    /// **My store's overview counts the orders a seller must reissue, and
+    /// only those** (harvest#93 phase 2): an aged-out unpaid order counts; a
+    /// fresh one and a cancelled one do not. Pins the composition in
+    /// `my_store::seller_stores` (seller filter, `needs_reissue`, and
+    /// `order_stage` still `AwaitingPayment`), which no other test reaches.
+    #[test]
+    fn the_overview_counts_only_orders_that_need_reissuing() {
+        let fresh = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let expired = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - MAX_ANCHOR_AGE_BLOCKS - 1)),
+            OrderStatus::AwaitingPayment,
+        );
+        let mut settled = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - MAX_ANCHOR_AGE_BLOCKS - 2)),
+            OrderStatus::AwaitingPayment,
+        );
+        cancel(&mut settled, &seller_signing_key());
+        let fingerprint = expired.order.seller_fingerprint.clone();
+
+        let mut state = AppState::default();
+        state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
+        state.my_stores.insert(
+            fingerprint,
+            vec![harvest_common::StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![0u8; 32],
+                mailbox_contract_id: vec![0u8; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(test_store_key()),
+            }],
+        );
+        state.browsing_stores.insert(
+            STORE.to_vec(),
+            BrowsingStore {
+                orders: vec![fresh, expired, settled],
+                ..Default::default()
+            },
+        );
+        let stores = crate::components::my_store::seller_stores(&state);
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].expired_invoices, 1);
+        // Read before the record arrives: never a clean reading.
+        assert_eq!(stores[0].record, RecordLoad::Loading.badge(0).1);
+        state.browsing_stores.get_mut(STORE).unwrap().record = RecordLoad::Loaded;
+        let stores = crate::components::my_store::seller_stores(&state);
+        assert_eq!(stores[0].record, "Clean record");
     }
 
     /// **A seller who cannot see the chain is not told to reissue
@@ -27590,9 +27855,87 @@ mod buy_flow_tests {
         assert_eq!(purchase.commitment.as_ref(), Some(&unpaid));
     }
 
+    /// **My purchases lists a kept purchase once, and never hides one** (the
+    /// harvest#125 review, rounds 1 and 2): a kept order a loaded store's
+    /// card judges from the same kept copy is left out of the kept list below
+    /// it, so a paid order does not carry two complaint controls; but a card
+    /// naming an order that is kept under ANOTHER store's key (an acceptance
+    /// anyone in the conversation can send) hides nothing, and neither does a
+    /// store that is not loaded. Red if the kept list ignores `shown`, or
+    /// matches it on the order id alone.
+    #[test]
+    fn my_purchases_lists_a_kept_purchase_once() {
+        let (mut state, unpaid, _, _) = an_unkept_purchase();
+        state.on_kept_purchases(vec![kept(&unpaid)]);
+        let owner = seller_signing_key().verifying_key().to_bytes();
+        let listed = |state: &AppState| {
+            let rows = crate::components::purchases_view::purchase_rows(state);
+            let shown = crate::components::purchases_view::shown_order_ids(state, &rows);
+            crate::components::buy_view::kept_purchases_to_list(&state.kept_purchases, &shown).len()
+        };
+        let rows = crate::components::purchases_view::purchase_rows(&state);
+        assert_eq!(
+            crate::components::purchases_view::shown_order_ids(&state, &rows),
+            vec![(owner, unpaid.order.id.clone())],
+            "the card shows it"
+        );
+        assert_eq!(listed(&state), 0, "so the kept list does not");
+
+        // Hiding is safe only because the card judges a PAID kept purchase
+        // exactly as the kept row would: paid, with the same complaint
+        // answer (round 3 of the review).
+        let (mut paid_state, unpaid_order, claims, tip) = an_unkept_purchase();
+        paid_state.on_kept_purchases(vec![kept(&paid_on_claims(&unpaid_order, claims, tip))]);
+        past_the_despatch_deadline(&mut paid_state);
+        assert_eq!(listed(&paid_state), 0);
+        let card = purchases(&paid_state).remove(0);
+        assert!(card.paid.is_some(), "the card offers the complaint");
+        assert_eq!(
+            paid_state.complaint_refusal(STORE, &card),
+            None,
+            "open on the card"
+        );
+        assert_eq!(
+            paid_state.complaint_refusal(STORE, &card),
+            paid_state.kept_complaint_refusal(&owner, &unpaid_order.order.id),
+            "with the same answer as the kept row"
+        );
+
+        // The same order id kept under another store's key: this store's
+        // card names it (from an acceptance) but cannot offer its complaint,
+        // so the kept list still does.
+        let mut elsewhere = state.clone();
+        let mut other_store = elsewhere.kept_purchases[0].clone();
+        other_store.store_key = [0xAB; 32];
+        elsewhere.kept_purchases.push(other_store);
+        assert_eq!(
+            crate::components::buy_view::kept_purchases_to_list(
+                &elsewhere.kept_purchases,
+                &crate::components::purchases_view::shown_order_ids(
+                    &elsewhere,
+                    &crate::components::purchases_view::purchase_rows(&elsewhere)
+                ),
+            )
+            .iter()
+            .map(|k| k.store_key)
+            .collect::<Vec<_>>(),
+            vec![[0xAB; 32]],
+            "another store's card hides nothing"
+        );
+        // A store whose owner is not known yet names no kept purchase.
+        let mut ownerless = state.clone();
+        ownerless.browsing_stores.get_mut(STORE).unwrap().owner = None;
+        assert_eq!(listed(&ownerless), 1);
+
+        // A store that is not loaded shows no card, so its kept order stays.
+        state.browsing_stores.remove(STORE);
+        assert_eq!(listed(&state), 1);
+    }
+
     /// **No view offers a buyer a payment address while `PurchaseNotKept`
     /// holds** (review round 3 of #143, P1-A): not the store's invoice list,
-    /// and not the Payments tab, even for an order that names one of this
+    /// and not the payment diagnostics (the Payments tab until harvest#93
+    /// phase 2), even for an order that names one of this
     /// node's Ghost Keys as its buyer. The seller's own book still shows.
     /// Red if either view lists orders of a store this node does not own.
     #[test]
@@ -27613,10 +27956,10 @@ mod buy_flow_tests {
         assert!(state.invoices_shown(STORE).is_empty(), "store page");
         assert!(
             crate::components::bitcoin_view::my_orders(&state).is_empty(),
-            "Payments tab"
+            "payment diagnostics"
         );
         // Another settled order of the same store is on its public list,
-        // with no address (review round 4, P3), and NOT on the Payments tab,
+        // with no address (review round 4, P3), and NOT on the diagnostics,
         // which lists nothing it cannot check is this buyer's (round 5).
         let mut other = unpaid.clone();
         other.order.amount_sats += 1;
@@ -27636,7 +27979,7 @@ mod buy_flow_tests {
         assert_eq!(state.invoices_shown(STORE), vec![settled.clone()]);
         assert!(
             crate::components::bitcoin_view::my_orders(&state).is_empty(),
-            "Payments tab"
+            "payment diagnostics"
         );
         state.browsing_stores.get_mut(STORE).unwrap().orders = vec![unpaid.clone()];
 
@@ -28745,7 +29088,7 @@ mod buy_flow_tests {
     }
 
     /// **Counting never consults closure, retirement or backing** (model
-    /// section 6): the badge's count, and the Reputation page's, are the
+    /// section 6): the badge's count, and the store record's, are the
     /// same whatever the store's status. Red if anything discounts
     /// complaints by it.
     #[test]
