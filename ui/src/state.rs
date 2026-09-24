@@ -671,6 +671,10 @@ pub struct AppState {
     pub publishing_listings:
         HashMap<harvest_common::listing::ListingId, crate::listing_status_flow::Publishing>,
 
+    /// Store-details edits on their way, one per edit (harvest#166). See
+    /// [`AppState::progress_notices`].
+    pub publishing_details: Vec<DetailsPublishing>,
+
     /// An edited listing's predecessor, to take down once the replacement
     /// has published, keyed by the replacement's id (harvest#70). See
     /// `AppState::on_listing_published`.
@@ -1173,6 +1177,23 @@ pub struct StoreDetails {
     pub store_name: String,
     pub description: String,
 }
+
+/// A store-details edit on its way (harvest#166). One per edit rather than
+/// per store: a second edit can be submitted before the first round-trips.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DetailsPublishing {
+    /// The store generation it is written to.
+    pub store: Vec<u8>,
+    /// The version it is published at, which is what names this edit; state
+    /// at this version or later is it landed (or outranked).
+    pub version: u32,
+    /// Signed and handed to the node. Before that it is under way only while
+    /// the edit or its signature is ([`AppState::details_edit_in_flight`]).
+    pub sent: bool,
+}
+
+/// What the notification bar says while a details edit is under way.
+pub(crate) const PUBLISHING_DETAILS: &str = "Publishing your store's details\u{2026}";
 
 /// Where a write to one of our own stores may go: see
 /// [`AppState::store_write_target`].
@@ -4633,6 +4654,7 @@ impl AppState {
                     self.refresh_backing_verdicts();
                     // A new listing this state holds is published (harvest#161).
                     self.settle_publishing(&contract_id);
+                    self.settle_details_publishing(&contract_id);
 
                     // Keep this store's key recoverable from its backing Ghost
                     // Key, or recover it here if this device has lost it
@@ -8667,6 +8689,91 @@ impl AppState {
             .retain(|pending| !pending.signed_bytes().is_ok_and(|queued| queued == bytes));
     }
 
+    /// The notices that last only while something is under way: one
+    /// "Publishing your store's details…" while any details edit is waiting
+    /// on its certificate or signature, or was sent and has not yet shown up
+    /// in its store's state (harvest#166). Derived rather than pushed, so an
+    /// edit abandoned on any of its many failure paths (each of which says
+    /// why) simply stops being shown; an edit sent and not seen is ended by
+    /// its landing ([`Self::settle_details_publishing`]), a refusal
+    /// ([`Self::end_sent_details_publishing`]), or its send failing
+    /// ([`Self::end_details_publishing`]).
+    pub fn progress_notices(&self) -> Vec<String> {
+        let under_way = self
+            .publishing_details
+            .iter()
+            .any(|p| p.sent || self.details_edit_in_flight(&p.store, p.version));
+        if under_way {
+            vec![PUBLISHING_DETAILS.to_string()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Whether the details edit at `version` for `store` (a write
+    /// generation) is still waiting on its certificate or its signature.
+    pub(crate) fn details_edit_in_flight(&self, store: &[u8], version: u32) -> bool {
+        self.pending_store_edit.as_ref().is_some_and(|edit| {
+            edit.next_version == version && self.write_generation(&edit.store_contract_id) == store
+        }) || self.pending_signatures.iter().any(|pending| {
+            matches!(
+                pending,
+                PendingSignature::StoreInfo(info)
+                    if info.info.version == version
+                        && self.write_generation(&info.store_contract_id) == store
+            )
+        })
+    }
+
+    /// The details edit at `version` for `store_contract_id` has been signed
+    /// and sent. Store creation's own details, which no edit recorded, match
+    /// nothing.
+    pub(crate) fn details_sent(&mut self, store_contract_id: &[u8], version: u32) {
+        let store = self.write_generation(store_contract_id);
+        for p in &mut self.publishing_details {
+            if p.store == store && p.version == version {
+                p.sent = true;
+            }
+        }
+    }
+
+    /// The details edit at `version` for `store_contract_id` is over: its
+    /// send failed. What went wrong is said where it went wrong.
+    pub(crate) fn end_details_publishing(&mut self, store_contract_id: &[u8], version: u32) {
+        let store = self.write_generation(store_contract_id);
+        self.publishing_details
+            .retain(|p| !(p.store == store && p.version == version));
+    }
+
+    /// The node refused an update to `store_contract_id`. Its error names no
+    /// request, so every details edit already sent to that store is taken as
+    /// over, including one the refusal was not about.
+    pub(crate) fn end_sent_details_publishing(&mut self, store_contract_id: &[u8]) {
+        let store = self.write_generation(store_contract_id);
+        self.publishing_details
+            .retain(|p| !(p.store == store && p.sent));
+    }
+
+    /// A store's state arrived: every details edit it holds, at its version
+    /// or a later one, is over. So is any edit no longer under way at all,
+    /// which keeps the list from growing with abandoned edits.
+    pub(crate) fn settle_details_publishing(&mut self, contract_id: &[u8]) {
+        let held = self
+            .browsing_stores
+            .get(contract_id)
+            .and_then(|store| store.info.as_ref())
+            .map(|info| info.version);
+        let edits = std::mem::take(&mut self.publishing_details);
+        self.publishing_details = edits
+            .into_iter()
+            .filter(|p| {
+                let landed = p.store == contract_id && held.is_some_and(|held| held >= p.version);
+                let abandoned = !p.sent && !self.details_edit_in_flight(&p.store, p.version);
+                !landed && !abandoned
+            })
+            .collect();
+    }
+
     /// Whether a publish for this store is waiting on its certificate or on
     /// the ghostkey delegate's `SignResult` -- the certificate/sign phase
     /// only, NOT the whole publish.
@@ -8915,6 +9022,26 @@ impl AppState {
             reputation_contract_id,
             next_version,
             details,
+        });
+        // An earlier edit this one replaced before it was signed is no
+        // longer under way; drop it so the list only holds live edits. The
+        // (store, version) pair about to be pushed below is excluded
+        // outright: `pending_store_edit` above already points at THIS edit,
+        // so if an older, unsent entry happens to share that exact pair (a
+        // same-second resubmission), it would otherwise read as still
+        // in-flight and survive alongside the fresh push.
+        let edits = std::mem::take(&mut self.publishing_details);
+        self.publishing_details = edits
+            .into_iter()
+            .filter(|p| {
+                !(p.store == written_to && p.version == next_version)
+                    && (p.sent || self.details_edit_in_flight(&p.store, p.version))
+            })
+            .collect();
+        self.publishing_details.push(DetailsPublishing {
+            store: written_to.clone(),
+            version: next_version,
+            sent: false,
         });
 
         if !self.start_store_edit_if_ready() {
@@ -11343,6 +11470,7 @@ impl AppState {
                 self.on_listing_status_signed(*pending, scoped_payload, signature);
             }
             Some(PendingSignature::StoreInfo(pending)) => {
+                self.details_sent(&pending.store_contract_id, pending.info.version);
                 let authorized = harvest_common::store::AuthorizedStoreInfoV1 {
                     info: pending.info,
                     scoped_payload,
@@ -11356,6 +11484,7 @@ impl AppState {
                 #[cfg(target_arch = "wasm32")]
                 {
                     let store_id = pending.store_contract_id;
+                    let version = authorized.info.version;
                     wasm_bindgen_futures::spawn_local(async move {
                         if let Err(e) = crate::gateway::store_ops::submit_store_info_by_id(
                             &store_id, authorized,
@@ -11366,13 +11495,12 @@ impl AppState {
                                 "Failed to publish store details: {}",
                                 e
                             );
-                            crate::gateway::APP_STATE
-                                .write()
-                                .notifications
-                                .push(format!(
-                                    "Your store's name and description could not be \
+                            let mut app = crate::gateway::APP_STATE.write();
+                            app.end_details_publishing(&store_id, version);
+                            app.notifications.push(format!(
+                                "Your store's name and description could not be \
                                  published: {e}"
-                                ));
+                            ));
                         }
                     });
                 }
@@ -15222,6 +15350,405 @@ mod tests {
             "{:?}",
             state.notifications
         );
+    }
+
+    /// **"Publishing your store's details…" ends (harvest#166).** It shows
+    /// while an edit waits on its signature or has been sent and not yet
+    /// seen, and not once the store's state holds it at its version, once
+    /// the node refuses it or its send fails, or once the edit is abandoned
+    /// before it was sent (every such path says why on its own). It is never
+    /// a pushed notification, which nothing would take down. Mutated red by
+    /// never ending it on landing, by showing it for an abandoned edit, and
+    /// by not ending it on a refusal.
+    #[test]
+    fn the_details_publishing_notice_ends() {
+        let shown =
+            |state: &AppState| state.progress_notices() == vec![PUBLISHING_DETAILS.to_string()];
+        let mut state = seller_with_store(Some(published_info(3, "Bean Shop", REPUTATION_ID)));
+        state
+            .certificates
+            .insert(FINGERPRINT.to_string(), "CERT".to_string());
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        assert!(shown(&state), "waiting on its signature");
+
+        // Signed and sent; the store still shows the old version.
+        assert_eq!(queued_version(&state), 4);
+        state.details_sent(&STORE_ID, 4);
+        state.pending_signatures.clear();
+        assert!(shown(&state), "sent, not yet seen");
+        state.settle_details_publishing(&STORE_ID);
+        assert!(shown(&state), "the old version is not it");
+
+        // The store's state holds it.
+        held_version(&mut state, 4);
+        state.settle_details_publishing(&STORE_ID);
+        assert!(state.progress_notices().is_empty(), "landed");
+
+        // Abandoned before it was sent.
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        assert!(shown(&state));
+        state.pending_signatures.clear();
+        state.pending_store_edit = None;
+        assert!(state.progress_notices().is_empty(), "abandoned");
+
+        // Sent, then refused by the node.
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        let version = queued_version(&state);
+        state.details_sent(&STORE_ID, version);
+        state.pending_signatures.clear();
+        assert!(shown(&state));
+        state.on_update_refused(&STORE_ID, "invalid");
+        assert!(state.progress_notices().is_empty(), "refused");
+
+        // Sent, then the send failed.
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        let version = queued_version(&state);
+        state.details_sent(&STORE_ID, version);
+        state.pending_signatures.clear();
+        assert!(shown(&state));
+        state.end_details_publishing(&STORE_ID, version);
+        assert!(state.progress_notices().is_empty(), "send failed");
+
+        assert!(
+            !state
+                .notifications
+                .iter()
+                .any(|n| n.contains("Publishing your store")),
+            "{:?}",
+            state.notifications
+        );
+    }
+
+    /// The version of the details edit last queued for signing.
+    fn queued_version(state: &AppState) -> u32 {
+        match state.pending_signatures.back() {
+            Some(PendingSignature::StoreInfo(info)) => info.info.version,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Sets the version of the published details this session shows.
+    fn held_version(state: &mut AppState, version: u32) {
+        state
+            .browsing_stores
+            .get_mut(STORE_ID.as_slice())
+            .unwrap()
+            .info
+            .as_mut()
+            .unwrap()
+            .version = version;
+    }
+
+    /// **Two edits in flight are tracked apart (harvest#166).** A second edit
+    /// submitted before the first is seen neither replaces nor ends it: the
+    /// notice lasts until each has landed or failed on its own, and the
+    /// first landing does not end the second. Another signature for the
+    /// store at a different version (store creation's own details) is not
+    /// either edit, nor is an edit waiting on its certificate at another
+    /// version. Mutated red by tracking one edit per store, and by ignoring
+    /// the version when matching a queued edit, a queued signature, or the
+    /// edit marked sent.
+    #[test]
+    fn overlapping_details_edits_are_tracked_apart() {
+        let shown =
+            |state: &AppState| state.progress_notices() == vec![PUBLISHING_DETAILS.to_string()];
+        let mut state = seller_with_store(Some(published_info(3, "Bean Shop", REPUTATION_ID)));
+        state
+            .certificates
+            .insert(FINGERPRINT.to_string(), "CERT".to_string());
+
+        // The first is sent; the second is queued, then abandoned.
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        state.details_sent(&STORE_ID, 4);
+        state.pending_signatures.clear();
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        state.pending_signatures.clear();
+        assert!(shown(&state), "the first is still not seen");
+
+        // The second again, sent this time; the first lands.
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        let second = queued_version(&state);
+        assert!(second > 4);
+        state.details_sent(&STORE_ID, second);
+        state.pending_signatures.clear();
+        held_version(&mut state, 4);
+        state.settle_details_publishing(&STORE_ID);
+        assert!(shown(&state), "the second is not seen yet");
+
+        // A signature queued for the store at another version is not it.
+        state.end_details_publishing(&STORE_ID, second);
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        let Some(PendingSignature::StoreInfo(mut other)) = state.pending_signatures.pop_back()
+        else {
+            panic!("queued");
+        };
+        state.pending_store_edit = None;
+        other.info.version += 100;
+        state
+            .pending_signatures
+            .push_back(PendingSignature::StoreInfo(other));
+        assert!(
+            state.progress_notices().is_empty(),
+            "{:?}",
+            state.publishing_details
+        );
+        state.pending_signatures.clear();
+
+        // Nor is an edit waiting on its certificate at another version.
+        state.certificates.clear();
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        assert!(shown(&state), "waiting on its certificate");
+        state.pending_store_edit.as_mut().unwrap().next_version += 100;
+        assert!(
+            state.progress_notices().is_empty(),
+            "{:?}",
+            state.publishing_details
+        );
+        state.pending_store_edit = None;
+
+        // Marking one edit sent does not mark another: the first is sent
+        // while the second waits, the second is abandoned, the first lands.
+        state
+            .certificates
+            .insert(FINGERPRINT.to_string(), "CERT".to_string());
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        let first = queued_version(&state);
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        state.details_sent(&STORE_ID, first);
+        state.pending_signatures.clear();
+        held_version(&mut state, first);
+        state.settle_details_publishing(&STORE_ID);
+        assert!(
+            state.progress_notices().is_empty(),
+            "{:?}",
+            state.publishing_details
+        );
+    }
+
+    /// **A refusal ends every SENT edit for the store, and only those
+    /// (harvest#166).** The node's refusal names no request, so
+    /// `end_sent_details_publishing` cannot tell which edit it was about and
+    /// takes down every edit already handed to the node -- here, two of
+    /// them -- but an edit still waiting on its signature has not been
+    /// handed to anything yet, so a refusal of an unrelated write must leave
+    /// it alone. Mutated red by dropping the `p.sent` guard (which would
+    /// also end the still-queued edit) and by ending only the first sent
+    /// match instead of every one (which would leave the second sent edit's
+    /// notice stuck up).
+    #[test]
+    fn a_refusal_ends_every_sent_edit_and_only_those() {
+        let mut state = seller_with_store(Some(published_info(3, "Bean Shop", REPUTATION_ID)));
+        state
+            .certificates
+            .insert(FINGERPRINT.to_string(), "CERT".to_string());
+
+        // Two edits, both sent.
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        let a = queued_version(&state);
+        state.details_sent(&STORE_ID, a);
+        state.pending_signatures.clear();
+
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        let b = queued_version(&state);
+        assert!(b > a);
+        state.details_sent(&STORE_ID, b);
+        state.pending_signatures.clear();
+
+        // A third, still waiting on its signature -- never sent.
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        let c = queued_version(&state);
+        assert!(c > b);
+
+        assert_eq!(
+            state.publishing_details.len(),
+            3,
+            "{:?}",
+            state.publishing_details
+        );
+
+        state.on_update_refused(&STORE_ID, "invalid");
+
+        assert_eq!(
+            state.publishing_details,
+            vec![DetailsPublishing {
+                store: STORE_ID.to_vec(),
+                version: c,
+                sent: false,
+            }],
+            "both sent edits end, the queued one stays"
+        );
+        assert!(
+            !state.progress_notices().is_empty(),
+            "the still-queued edit keeps the notice up"
+        );
+    }
+
+    /// **A same-second resubmission while waiting on the certificate does
+    /// not duplicate the edit (harvest#166).** Before the certificate
+    /// arrives, `last_queued_store_version` is never bumped (it is only
+    /// touched once an edit actually reaches signing), so a second
+    /// submission at the same clock second computes the SAME version as the
+    /// first -- and the stale first entry, still keyed by that version, must
+    /// not survive the pre-push filter alongside the fresh one it collides
+    /// with. Mutated red by letting the filter keep the (store, version)
+    /// pair the push is about to add.
+    #[test]
+    fn a_same_second_resubmission_does_not_duplicate_the_edit() {
+        let mut state = seller_with_store(Some(published_info(3, "Bean Shop", REPUTATION_ID)));
+        // No certificate: the edit is stuck waiting, so a resubmission at
+        // the same clock second collides on version with the first.
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        let first_version = state.pending_store_edit.as_ref().unwrap().next_version;
+
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        let second_version = state.pending_store_edit.as_ref().unwrap().next_version;
+        assert_eq!(
+            second_version, first_version,
+            "the collision this test needs"
+        );
+
+        assert_eq!(
+            state.publishing_details,
+            vec![DetailsPublishing {
+                store: STORE_ID.to_vec(),
+                version: first_version,
+                sent: false,
+            }],
+            "one entry, not two"
+        );
+    }
+
+    /// **A details edit is ended by the store's state arriving over the
+    /// network (harvest#166)**, which is what `on_contract_state` does, after
+    /// it has taken the state's details; and for a store that has moved, by
+    /// the state of the generation it was written to. Mutated red by
+    /// dropping the call from `on_contract_state` and by settling before the
+    /// details are taken.
+    #[test]
+    fn a_details_edit_ends_when_its_state_arrives() {
+        let mut state = seller_with_store(Some(published_info(3, "Bean Shop", REPUTATION_ID)));
+        state
+            .certificates
+            .insert(FINGERPRINT.to_string(), "CERT".to_string());
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        state.details_sent(&STORE_ID, 4);
+        state.pending_signatures.clear();
+        ingest(&mut state, &store_state_with("", Vec::new()));
+        assert_eq!(
+            state.browsing_stores[STORE_ID.as_slice()]
+                .info
+                .as_ref()
+                .map(|info| info.version),
+            Some(4)
+        );
+        assert!(
+            state.progress_notices().is_empty(),
+            "{:?}",
+            state.publishing_details
+        );
+
+        // A store written to its current generation.
+        let (earlier, current) = test_store_generations();
+        let mut state = AppState::default();
+        let mut theirs = registration(1, None);
+        theirs.store_contract_id = earlier.clone();
+        state.merge_store_registrations(FINGERPRINT, vec![theirs]);
+        state
+            .certificates
+            .insert(FINGERPRINT.to_string(), "CERT".to_string());
+        state.store_subkeys.insert(
+            test_store_key(),
+            harvest_common::delegate::StoreSubkeyInfo {
+                inbox_public_key: STORE_INBOX_KEY,
+                record_public_key: STORE_RECORD_KEY.to_vec(),
+            },
+        );
+        let mut held = loaded_store("Jam");
+        held.info.as_mut().unwrap().version = 3;
+        state.browsing_stores.insert(earlier.clone(), held);
+        state
+            .publish_store_details_at(&earlier, typed_details(), 0)
+            .expect("queued");
+        state.details_sent(&earlier, 4);
+        state.pending_signatures.clear();
+        assert!(!state.progress_notices().is_empty());
+        state.on_contract_state(
+            current,
+            harvest_common::to_cbor(&store_state_with("", Vec::new())).unwrap(),
+        );
+        assert!(
+            state.progress_notices().is_empty(),
+            "{:?}",
+            state.publishing_details
+        );
+    }
+
+    /// The notice is the state's, and the signed handler marks the edit
+    /// sent, at its version, before it is sent; the send failure ends that
+    /// version. Pinned by source: both are in wasm-only code.
+    #[test]
+    fn the_details_notice_is_wired() {
+        let src = include_str!("state.rs");
+        let line = |within: &str, wanted: &str| {
+            assert!(
+                within.lines().any(|l| l.trim() == wanted),
+                "missing line {wanted:?}"
+            );
+        };
+        let signed = &src[src
+            .find("Some(PendingSignature::StoreInfo(pending)) => {\n                self.details_sent(")
+            .expect("marked sent")..];
+        let signed = &signed[..signed.find("Constructed AuthorizedStoreInfoV1").unwrap()];
+        line(
+            signed,
+            "self.details_sent(&pending.store_contract_id, pending.info.version);",
+        );
+        let failed = &src[src
+            .find("let version = authorized.info.version;")
+            .expect("captured")..];
+        let failed = &failed[..failed.find("could not be").unwrap()];
+        line(failed, "app.end_details_publishing(&store_id, version);");
+        let bar = include_str!("components/app.rs");
+        line(bar, "let progress = app_state.progress_notices();");
+        assert!(bar.contains(".chain(progress.iter())"));
+        let my_store = include_str!("components/my_store.rs");
+        assert!(!my_store.contains("Publishing your store's details"));
+        let refused = include_str!("listing_status_flow.rs");
+        line(refused, "self.end_sent_details_publishing(contract_id);");
     }
 
     /// `registration(1, ..)` files the store's reputation contract under this.
