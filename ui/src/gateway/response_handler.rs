@@ -625,10 +625,15 @@ fn handle_delegate_response(
     key: freenet_stdlib::prelude::DelegateKey,
     values: Vec<freenet_stdlib::prelude::OutboundDelegateMsg>,
 ) {
-    // An answer with no messages at all is how a `freenet network` node says
-    // the delegate is not registered (harvest#150). If the migration walk is
-    // waiting on that delegate, it is the walk's answer; otherwise there is
-    // nothing in it to act on anyway.
+    // An answer with no messages at all means one of two things. From a
+    // delegate this page has just registered, the first one is the node
+    // saying the registration is done (harvest#162), and it releases what
+    // waits on it. Otherwise it is how a `freenet network` node says the
+    // delegate is not registered (harvest#150): the migration walk's answer if
+    // it is waiting on that delegate, and nothing to act on if not.
+    if values.is_empty() && super::delegate_api::acknowledge_registration(&key) {
+        return;
+    }
     #[cfg(target_arch = "wasm32")]
     if values.is_empty() && super::delegate_migrate_ops::offer_empty(&key) {
         return;

@@ -56,8 +56,8 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_bitcoin_common::{BitcoinNetwork, BitcoinTipStateV1, BlockAnchor};
 use freenet_migrate::SecretStore;
 use freenet_stdlib::prelude::{
-    ContractInstanceId, DelegateContext, GetContractRequest, OutboundDelegateMsg, StateDelta,
-    SubscribeContractRequest, UpdateContractRequest, UpdateData,
+    ApplicationMessage, ContractInstanceId, DelegateContext, GetContractRequest,
+    OutboundDelegateMsg, StateDelta, SubscribeContractRequest, UpdateContractRequest, UpdateData,
 };
 use serde::{Deserialize, Serialize};
 
@@ -330,15 +330,21 @@ impl Ledger {
     }
 }
 
-/// The newest block this delegate has seen for a network, and when.
+/// The newest block this delegate has seen for a network.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub(crate) struct TipCache {
     pub anchor: BlockAnchor,
     /// The block header's own time, in seconds.
     pub block_time: u32,
-    /// When a background run last saw the tip contract, by the node's clock.
-    pub seen_at_ms: u64,
 }
+
+/// When this delegate last acted on a notification for something an arm
+/// names, by the node's clock: the evidence that it runs in the background
+/// here, which a hosted gateway never gives (see the module docs). Any such
+/// notification counts, a buyer's request as much as a block; a tip read on
+/// arming does not, because the seller's own request caused it
+/// (harvest#162).
+pub(crate) const RAN_KEY: &[u8] = b"harvest:auto:ran";
 
 /// Carried through the store GET, so the answer knows which entries to
 /// decide. Ciphertext only: the plaintext, keys and the buyer's address never
@@ -436,14 +442,24 @@ pub(crate) fn arm<S: SecretStore>(
     if !save(secrets, &arm_key(&arm.store_contract_id), &record) {
         return refuse("the node refused to store the arm".into());
     }
-    let subscribe = [store_id, arm.mailbox_contract_id, arm.tip_contract_id]
-        .into_iter()
-        .map(|id| {
-            OutboundDelegateMsg::SubscribeContractRequest(SubscribeContractRequest::new(
-                ContractInstanceId::new(id),
-            ))
-        })
-        .collect();
+    let mut subscribe: Vec<OutboundDelegateMsg> =
+        [store_id, arm.mailbox_contract_id, arm.tip_contract_id]
+            .into_iter()
+            .map(|id| {
+                OutboundDelegateMsg::SubscribeContractRequest(SubscribeContractRequest::new(
+                    ContractInstanceId::new(id),
+                ))
+            })
+            .collect();
+    // And read the tip now (harvest#162). A subscription delivers the next
+    // block, not the current one, so a node that had never seen the tip
+    // waited up to a block (about ten minutes on signet) before its first
+    // invoice. The answer is taken by `on_get_answer`. With the three
+    // subscriptions this is four network operations, which is exactly the
+    // node's per-request budget for a delegate.
+    subscribe.push(OutboundDelegateMsg::GetContractRequest(
+        GetContractRequest::new(ContractInstanceId::new(arm.tip_contract_id)),
+    ));
     (
         HarvestDelegateResponse::AutoInvoice {
             store_contract_id,
@@ -461,7 +477,7 @@ fn status_of<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> Au
         armed_at_ms: record.armed_at_ms,
         watched_remaining: remaining,
         invoicing_until_ms: record.watched_until_ms.saturating_sub(WATCH_NEEDED_MS),
-        last_background_run_ms: tip.as_ref().map(|t| t.seen_at_ms),
+        last_background_run_ms: load::<_, u64>(secrets, RAN_KEY),
         issued_last_day: ledger.issued_last_day(now_ms) as u32,
         oversold: ledger
             .oversold
@@ -700,8 +716,17 @@ pub(crate) fn on_notification<S: SecretStore>(
     now_ms: u64,
 ) -> Option<Vec<OutboundDelegateMsg>> {
     let all = arms(secrets);
+    let names = |r: &&ArmRecord| {
+        r.arm.tip_contract_id == *contract_id
+            || r.arm.mailbox_contract_id == *contract_id
+            || r.arm.store_contract_id.as_slice() == contract_id.as_slice()
+    };
+    if all.iter().any(|r| names(&r)) {
+        // Evidence this node runs instant checkout in the background.
+        save(secrets, RAN_KEY, &now_ms);
+    }
     if let Some(record) = all.iter().find(|r| r.arm.tip_contract_id == *contract_id) {
-        note_tip(secrets, record.arm.network, state, now_ms);
+        note_tip(secrets, record.arm.network, state);
         return Some(Vec::new());
     }
     if let Some(record) = all
@@ -873,7 +898,63 @@ pub(crate) fn settle(
         .collect()
 }
 
-fn note_tip<S: SecretStore>(secrets: &mut S, network: BitcoinNetwork, state: &[u8], now_ms: u64) {
+/// A GET answer instant checkout asked for, if it is one: the tip read an
+/// arm sends (harvest#162), which carries no context, or the store read a
+/// mailbox run sends, which carries its batch. `None` for anything else.
+pub(crate) fn on_get_answer<S: SecretStore>(
+    secrets: &mut S,
+    contract_id: &[u8; 32],
+    state: Option<&[u8]>,
+    context: &[u8],
+    now_ms: u64,
+) -> Option<Vec<OutboundDelegateMsg>> {
+    if context.is_empty() {
+        if let Some(out) = on_tip_read(secrets, contract_id, state, now_ms) {
+            return Some(out);
+        }
+    }
+    on_store_state(secrets, state, context, now_ms)
+}
+
+/// The answer to the tip read an arm asks for, if `contract_id` is an armed
+/// tip contract: kept like a notification's (newest block only), and each
+/// arm naming it is told its status again, since the arm's own answer was
+/// written before the read. A missing tip keeps nothing.
+///
+/// It is not a background run: the seller's own request caused it, and on a
+/// hosted gateway it is answered in the seller's scope, where no background
+/// run ever happens.
+fn on_tip_read<S: SecretStore>(
+    secrets: &mut S,
+    contract_id: &[u8; 32],
+    state: Option<&[u8]>,
+    now_ms: u64,
+) -> Option<Vec<OutboundDelegateMsg>> {
+    let armed: Vec<ArmRecord> = arms(secrets)
+        .into_iter()
+        .filter(|r| r.arm.tip_contract_id == *contract_id)
+        .collect();
+    let first = armed.first()?;
+    if let Some(state) = state {
+        note_tip(secrets, first.arm.network, state);
+    }
+    Some(
+        armed
+            .iter()
+            .filter_map(|record| {
+                let status = HarvestDelegateResponse::AutoInvoice {
+                    store_contract_id: record.arm.store_contract_id.clone(),
+                    result: Ok(status_of(secrets, record, now_ms)),
+                };
+                to_cbor(&status).ok().map(|bytes| {
+                    OutboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(bytes))
+                })
+            })
+            .collect(),
+    )
+}
+
+fn note_tip<S: SecretStore>(secrets: &mut S, network: BitcoinNetwork, state: &[u8]) {
     let Ok(tip) = freenet_bitcoin_common::from_cbor::<BitcoinTipStateV1>(state) else {
         return;
     };
@@ -884,22 +965,16 @@ fn note_tip<S: SecretStore>(secrets: &mut S, network: BitcoinNetwork, state: &[u
         return;
     }
     let held: Option<TipCache> = load(secrets, &tip_key(network));
-    // A copy that is behind never replaces a newer one (harvest#74), but it
-    // still counts as a background run.
-    let anchor = match &held {
-        Some(held) if held.anchor.height > newest.anchor.height => held.clone(),
-        _ => TipCache {
-            anchor: newest.anchor,
-            block_time: newest.block_time,
-            seen_at_ms: now_ms,
-        },
-    };
+    // A copy that is behind never replaces a newer one (harvest#74).
+    if held.is_some_and(|held| held.anchor.height > newest.anchor.height) {
+        return;
+    }
     save(
         secrets,
         &tip_key(network),
         &TipCache {
-            seen_at_ms: now_ms,
-            ..anchor
+            anchor: newest.anchor,
+            block_time: newest.block_time,
         },
     );
 }
@@ -1659,7 +1734,6 @@ mod tests {
                     hash: freenet_bitcoin_common::BlockHash([7; 32]),
                 },
                 block_time: (NOW / 1000) as u32 - 600,
-                seen_at_ms: NOW - 600_000,
             },
         );
         let listing = listing(Some(terms()));
@@ -2033,7 +2107,8 @@ mod tests {
     }
 
     /// The newest block is kept, an older one never replaces it, a tip for
-    /// another network is ignored, and every tip counts as a background run.
+    /// another network is ignored, and every notification counts as a
+    /// background run.
     /// Mutated red by dropping the height comparison.
     #[test]
     fn the_tip_cache_keeps_the_newest_block() {
@@ -2081,7 +2156,11 @@ mod tests {
             NOW + 5,
         );
         assert_eq!(cached(&f).anchor.height, 100, "an older block never wins");
-        assert_eq!(cached(&f).seen_at_ms, NOW + 5, "but it is a background run");
+        assert_eq!(
+            load::<_, u64>(&f.secrets, RAN_KEY),
+            Some(NOW + 5),
+            "but it is a background run"
+        );
         on_notification(
             &mut f.secrets,
             &[3; 32],
@@ -2692,7 +2771,9 @@ mod tests {
 
     /// The store read the mailbox run asked for comes back and is decided:
     /// the context carries the batch through, and the answer is one store
-    /// update holding the replies for after it lands.
+    /// update holding the replies for after it lands. Driven through
+    /// `on_get_answer`, the dispatcher's one route. A mailbox run is a
+    /// background run.
     #[test]
     fn the_store_read_is_decided_and_answered() {
         let mut f = fixture();
@@ -2702,12 +2783,23 @@ mod tests {
         })
         .unwrap();
         let out = on_notification(&mut f.secrets, &[2; 32], &state, NOW).unwrap();
+        assert_eq!(
+            load::<_, u64>(&f.secrets, RAN_KEY),
+            Some(NOW),
+            "a background run"
+        );
         let [OutboundDelegateMsg::GetContractRequest(get)] = out.as_slice() else {
             panic!("{out:?}")
         };
         let store = to_cbor(&f.store).unwrap();
-        let answer =
-            on_store_state(&mut f.secrets, Some(&store), get.context.as_ref(), NOW).unwrap();
+        let answer = on_get_answer(
+            &mut f.secrets,
+            &[1; 32],
+            Some(&store),
+            get.context.as_ref(),
+            NOW,
+        )
+        .unwrap();
         let [OutboundDelegateMsg::UpdateContractRequest(update)] = answer.as_slice() else {
             panic!("{answer:?}")
         };
@@ -2846,7 +2938,8 @@ mod tests {
         assert!(subscriptions.is_empty());
     }
 
-    /// Arming stores the arm and subscribes to the three contracts.
+    /// Arming stores the arm, subscribes to the three contracts, and reads
+    /// the tip once (harvest#162).
     #[test]
     fn arming_subscribes_to_mailbox_store_and_tip() {
         let mut f = fixture();
@@ -2859,16 +2952,163 @@ mod tests {
         };
         assert_eq!(status.watched_remaining, 5);
         assert_eq!(status.paused, None);
-        let ids: Vec<[u8; 32]> = subscriptions
+        let ids: Vec<(&str, [u8; 32])> = subscriptions
             .iter()
             .map(|m| match m {
                 OutboundDelegateMsg::SubscribeContractRequest(r) => {
-                    r.contract_id.as_bytes().try_into().unwrap()
+                    ("subscribe", r.contract_id.as_bytes().try_into().unwrap())
+                }
+                OutboundDelegateMsg::GetContractRequest(r) => {
+                    ("get", r.contract_id.as_bytes().try_into().unwrap())
                 }
                 other => panic!("{other:?}"),
             })
             .collect();
-        assert_eq!(ids, vec![[1; 32], [2; 32], [3; 32]]);
+        assert_eq!(
+            ids,
+            vec![
+                ("subscribe", [1; 32]),
+                ("subscribe", [2; 32]),
+                ("subscribe", [3; 32]),
+                ("get", [3; 32]),
+            ]
+        );
+        // The node runs at most four network operations for one delegate
+        // request (freenet-core's `MAX_NETWORK_CONTRACT_OPS_PER_PARK`) and
+        // refuses the rest, the tip read included; a fifth here would stop
+        // instant checkout reading the tip with nothing failing.
+        assert!(subscriptions.len() <= 4, "the node's per-request budget");
+    }
+
+    /// **The tip read on arming turns instant checkout on at once
+    /// (harvest#162)**, instead of waiting for the next block's notification:
+    /// the answer is kept, and the arm is told its new status. It is not a
+    /// background run, however many reads there are, so the hosted-gateway
+    /// notice still rests on real ones. A missing tip keeps nothing but still
+    /// answers; a read for a contract no arm names, or one carrying a store
+    /// read's context, is not taken for the tip. Every arm reads, re-arms
+    /// included. Mutated red by dropping the read from `arm`, by ignoring its
+    /// answer, by counting it as a background run, and by not telling the arm.
+    #[test]
+    fn the_tip_read_on_arming_is_kept_but_is_not_a_background_run() {
+        use freenet_bitcoin_common::{BlockHash, SignedTipEntry, TipEntryBody};
+        let bridge = SigningKey::from_bytes(&[0x77; 32]);
+        let entry = SignedTipEntry::sign(
+            &bridge,
+            &TipEntryBody {
+                network: BitcoinNetwork::Signet,
+                anchor: BlockAnchor {
+                    height: 2_000,
+                    hash: BlockHash([9; 32]),
+                },
+                prev_hash: BlockHash([0; 32]),
+                block_time: (NOW / 1000) as u32 - 300,
+                tx_count: 1,
+                median_time: (NOW / 1000) as u32 - 900,
+            },
+        )
+        .unwrap();
+        let mut tip = BitcoinTipStateV1::default();
+        tip.blocks.blocks.insert(2_000, entry);
+        let tip = freenet_bitcoin_common::to_cbor(&tip).unwrap();
+
+        let mut f = fixture();
+        crate::secrets::RemovableSecrets::remove_secret(
+            &mut f.secrets,
+            &tip_key(BitcoinNetwork::Signet),
+        );
+        let arm_status = |f: &mut Fixture| {
+            let (response, out) = arm(&mut f.secrets, f.record.arm.clone(), NOW);
+            assert!(
+                out.iter()
+                    .any(|m| matches!(m, OutboundDelegateMsg::GetContractRequest(_))),
+                "every arm reads the tip"
+            );
+            let HarvestDelegateResponse::AutoInvoice {
+                result: Ok(status), ..
+            } = response
+            else {
+                panic!("{response:?}")
+            };
+            status
+        };
+        let store_id = f.record.arm.store_contract_id.clone();
+        let told = |out: Vec<OutboundDelegateMsg>| -> AutoInvoiceStatus {
+            let [OutboundDelegateMsg::ApplicationMessage(m)] = out.as_slice() else {
+                panic!("{out:?}")
+            };
+            let HarvestDelegateResponse::AutoInvoice {
+                store_contract_id,
+                result: Ok(status),
+            } = from_cbor(&m.payload).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(store_contract_id, store_id, "told for its own store");
+            status
+        };
+        assert!(arm_status(&mut f).paused.is_some(), "no tip yet");
+
+        assert!(on_get_answer(&mut f.secrets, &[0x44; 32], Some(&tip), &[], NOW).is_none());
+        assert!(
+            on_get_answer(&mut f.secrets, &[3; 32], Some(&tip), &[1, 2, 3], NOW).is_none(),
+            "a context is not a tip read"
+        );
+        let missing = told(on_get_answer(&mut f.secrets, &[3; 32], None, &[], NOW).unwrap());
+        assert!(missing.paused.is_some(), "a missing tip keeps nothing");
+
+        let read = told(on_get_answer(&mut f.secrets, &[3; 32], Some(&tip), &[], NOW).unwrap());
+        assert_eq!(read.paused, None, "on at once, and told");
+        assert_eq!(read.last_background_run_ms, None, "not a background run");
+        on_get_answer(&mut f.secrets, &[3; 32], Some(&tip), &[], NOW + 3).unwrap();
+        assert_eq!(
+            arm_status(&mut f).last_background_run_ms,
+            None,
+            "nor is a second"
+        );
+
+        on_notification(&mut f.secrets, &[3; 32], &tip, NOW + 5);
+        assert_eq!(arm_status(&mut f).last_background_run_ms, Some(NOW + 5));
+        // A later read keeps the background run it had.
+        on_get_answer(&mut f.secrets, &[3; 32], Some(&tip), &[], NOW + 9).unwrap();
+        assert_eq!(arm_status(&mut f).last_background_run_ms, Some(NOW + 5));
+
+        // Every arm naming the tip is told.
+        let mut other = f.record.arm.clone();
+        other.store_contract_id = vec![9; 32];
+        arm(&mut f.secrets, other, NOW);
+        let both = on_get_answer(&mut f.secrets, &[3; 32], Some(&tip), &[], NOW + 11).unwrap();
+        let mut stores: Vec<Vec<u8>> = both
+            .iter()
+            .map(|m| {
+                let OutboundDelegateMsg::ApplicationMessage(m) = m else {
+                    panic!("{m:?}")
+                };
+                let HarvestDelegateResponse::AutoInvoice {
+                    store_contract_id, ..
+                } = from_cbor(&m.payload).unwrap()
+                else {
+                    panic!()
+                };
+                store_contract_id
+            })
+            .collect();
+        stores.sort();
+        assert_eq!(
+            stores,
+            vec![vec![1; 32], vec![9; 32]],
+            "each told for its own"
+        );
+
+        // A store change the delegate acts on is a background run too.
+        crate::secrets::RemovableSecrets::remove_secret(&mut f.secrets, RAN_KEY);
+        on_notification(
+            &mut f.secrets,
+            &[1; 32],
+            &to_cbor(&f.store).unwrap(),
+            NOW + 13,
+        );
+        assert_eq!(load::<_, u64>(&f.secrets, RAN_KEY), Some(NOW + 13));
     }
 
     /// The mailbox run batches only unseen instant requests within a day,

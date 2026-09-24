@@ -55,11 +55,19 @@ use crate::delegate_migrate::{self, CallError, DelegateCalls, Expect, Reply, Set
 /// [`offer_empty`]).
 const PREDECESSOR_TIMEOUT_MS: u32 = 20_000;
 
-/// How long a call to the CURRENT delegate may take: node-local, loaded,
-/// answering in milliseconds. An import that times out is retried next load
-/// and does not stop the walk, so a long deadline here would only make a
-/// load's walk slower.
-const CURRENT_TIMEOUT_MS: u32 = 5_000;
+/// How long a call to the CURRENT delegate may take.
+///
+/// Node-local, and usually milliseconds. But a silence here STOPS the walk
+/// for this load, which also holds back the work the walk gates, and after a
+/// re-key the node takes seconds to register the new generation (one
+/// harvest#162 rehearsal run: 6.9 s on a loaded machine, past the 5 s this
+/// was). The walk now starts only once the node has answered the
+/// registration (`delegate_api::registered`), which removes the race that
+/// caused it; this deadline is the backstop. It costs time only when the
+/// current delegate does not answer the call at all.
+const CURRENT_TIMEOUT_MS: u32 = PREDECESSOR_TIMEOUT_MS;
+// Not back under the measured first answer.
+const _: () = assert!(CURRENT_TIMEOUT_MS >= 10_000);
 
 struct Waiter {
     delegate: DelegateKey,
@@ -214,9 +222,10 @@ fn settle(complete: bool) {
     }
 }
 
-/// Start the walk, once per session. Called after the current delegate is
-/// registered and just before the response loop starts, so no call's deadline
-/// runs while nothing is reading answers.
+/// Start the walk, once per session. Called once the node has answered the
+/// current delegate's registration, from a task spawned beside the response
+/// loop, so no call can overtake the registration and no call's deadline runs
+/// while nothing is reading answers (harvest#162).
 pub fn start() {
     if STARTED.with(|s| s.replace(true)) {
         return;

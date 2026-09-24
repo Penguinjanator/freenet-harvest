@@ -324,13 +324,18 @@ fn handle_get_contract_response(
     ctx: &mut DelegateCtx,
     response: &freenet_stdlib::prelude::GetContractResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-    // The store read instant checkout asked for.
-    if let Some(out) = auto_invoice::on_store_state(
-        &mut CtxSecrets(ctx),
-        response.state.as_ref().map(|s| s.as_ref()),
-        response.context.as_ref(),
-        now_ms(),
-    ) {
+    // What instant checkout asked for: the tip read an arm sends
+    // (harvest#162) and the store read a mailbox run sends.
+    let contract_id: Option<[u8; 32]> = response.contract_id.as_bytes().try_into().ok();
+    if let Some(out) = contract_id.and_then(|contract_id| {
+        auto_invoice::on_get_answer(
+            &mut CtxSecrets(ctx),
+            &contract_id,
+            response.state.as_ref().map(|s| s.as_ref()),
+            response.context.as_ref(),
+            now_ms(),
+        )
+    }) {
         return Ok(out);
     }
 
@@ -650,5 +655,31 @@ mod boundary_tests {
             Ok(BtcResp::WatchList { .. }) => {}
             other => panic!("expected a WatchList, got {other:?}"),
         }
+    }
+}
+
+/// A GET answer goes to instant checkout's own handler before anything is
+/// forwarded to the UI (harvest#162). Pinned by source: the dispatcher's
+/// secrets are inert off the `wasm32` target, so it cannot be driven here;
+/// `auto_invoice::on_get_answer` is tested there.
+#[cfg(test)]
+mod get_answer_routing_tests {
+    #[test]
+    fn a_get_answer_goes_to_instant_checkout_first() {
+        let src = include_str!("lib.rs");
+        let handler = &src[src.find("fn handle_get_contract_response(").unwrap()..];
+        let handler = &handler[..handler.find("\n}\n").unwrap()];
+        let routed = handler
+            .find("auto_invoice::on_get_answer(")
+            .expect("routed");
+        let returned = handler
+            .find("return Ok(out);")
+            .expect("its answer returned");
+        let forwarded = handler.find("ContractState {").expect("forwarded");
+        assert!(routed < returned && returned < forwarded);
+        assert!(
+            !handler.contains("on_store_state("),
+            "one route, the tested one"
+        );
     }
 }
