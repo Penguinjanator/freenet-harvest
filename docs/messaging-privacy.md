@@ -299,14 +299,72 @@ the party who can create the collision could publish the plaintext instead.
 * **What was said.** AES-256-GCM under a key derived from an X25519 exchange
   the observer cannot perform.
 * **Who the buyer is.** The tag is freshly random per conversation and is tied
-  to no identity, no ghostkey, and no payment. Harvest gives a buyer no
-  identity to leak.
+  to no identity, no ghostkey, and no payment. To a watcher, Harvest gives a
+  buyer no identity to leak. The SELLER is another matter once the buyer
+  writes to them: see the next section.
 * **Whether two conversations with the same store are the same buyer.** A
   fresh keypair per conversation is what buys this, and it is the property a
   reasonable-looking optimisation (one keypair per store, reused) would
   silently delete. Pinned by `each_conversation_carries_a_fresh_tag`.
 * **Whether two conversations with *different* stores are the same buyer.**
   Same reason.
+
+## A buyer who writes shows that seller a Ghost Key
+
+Added 2026-09-26. **Buyer-to-seller messages require a Ghost Key
+(anti-spam); buying itself does not.** The mailbox is open-write, so the gate
+cannot live only in the buyer's compose box: a script writes past it. The
+seller's browser therefore shows buyer text only when it carries a voucher
+that verifies for the conversation it arrived in
+(`components::message_view::shown_to_seller`), and says how many it left out.
+
+The voucher is per conversation. The buyer's Ghost Key signs, through the
+vault, `{ domain: "harvest/buyer-voucher/v1", conversation: <tag> }`
+(`harvest_common::sealed::voucher_terms`), and every text the buyer sends in
+that conversation carries the signature and the Ghost Key's certificate
+(`MessageContent::VouchedText`). The seller checks that the certificate chains
+to Freenet's master key, that the key it certifies made the signature, that
+the signed terms name THIS conversation's tag, and that the vault signed it
+for the Harvest web app.
+
+What that costs the buyer, stated plainly:
+
+* **The seller learns a Ghost Key pseudonym.** Not a name, but a stable
+  identifier with a donation behind it. Only that seller learns it: the
+  voucher is inside the encryption, so a watcher of the mailbox sees nothing
+  new in the content.
+* **The same Ghost Key used at two stores links the two conversations** for
+  anyone who can read both -- which is only someone holding both sellers'
+  keys, in practice the two sellers comparing notes. Two conversations with
+  the SAME store are linked for that seller too, which a fresh tag per
+  conversation used to prevent.
+* **Buying reveals none of this.** A request to buy carries no voucher and is
+  shown whatever the conversation holds.
+
+What a watcher DOES learn, which is new: **the size bucket.** A certificate is
+about 1.6 KB, so a buyer's text now pads to the 4 KiB bucket where a short
+text used to sit in the 1 KiB one, while a seller's reply stays at 1 KiB. So
+for short messages, a watcher can now tell a buyer's text from a seller's
+reply by size, which the section "Visible to anyone" says they could not.
+
+And a capacity cost: the 4 KiB size class keeps at most 128 messages
+(`SIZE_CLASS_CAPS`), against 512 for the 1 KiB class, so a mailbox holds
+fewer buyer texts, and junk written into the 4 KiB class (which costs a
+flooder nothing) evicts them sooner than it would have evicted 1 KiB text.
+
+What opens a conversation to the seller: a voucher that verifies for it, or
+a Buy now in it whose order the store has PAID (money, which no spammer
+spends to write). A request to buy on its own opens nothing, because it
+costs nothing to send. In a conversation that is not open the seller still
+sees every step (a request, a decline, an acceptance), so buying needs no
+Ghost Key, but not the free text in them: a request's note and shipping
+address (the address shows once it is paid) and a decline's reason are
+blanked, and text in either direction is left out (both parties hold both
+keys, so direction alone cannot be trusted). The count the seller is shown
+is of buyer text left out or blanked; a blanked address is not counted.
+
+A buyer's plain text sealed before the gate existed, and the seller's own
+replies in a conversation nothing opens, are no longer shown to the seller.
 
 ## The tag is a deliberate trade, and here is the other side of it
 

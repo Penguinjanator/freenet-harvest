@@ -1536,7 +1536,7 @@ dependencies = [
 [[package]]
 name = "freenet-bitcoin-common"
 version = "0.1.0"
-source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#a037181f375e09d4961e27c972a5fa5b702ae4b8"
+source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#d1ce3bbc9f8c80bb916d74da5d89db929e9966bf"
 dependencies = [
  "blake3",
  "bs58",
@@ -1552,7 +1552,7 @@ dependencies = [
 [[package]]
 name = "freenet-bitcoin-generation"
 version = "0.1.0"
-source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#a037181f375e09d4961e27c972a5fa5b702ae4b8"
+source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#d1ce3bbc9f8c80bb916d74da5d89db929e9966bf"
 dependencies = [
  "blake3",
  "bs58",
@@ -1565,7 +1565,7 @@ dependencies = [
 [[package]]
 name = "freenet-bitcoin-inbox"
 version = "0.1.0"
-source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#a037181f375e09d4961e27c972a5fa5b702ae4b8"
+source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#d1ce3bbc9f8c80bb916d74da5d89db929e9966bf"
 dependencies = [
  "blake3",
  "blind-rsa-signatures",
@@ -3108,6 +3108,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
+]
+
+[[package]]
+name = "presence-contract"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "ed25519-dalek",
+ "freenet-stdlib",
+ "getrandom 0.2.17",
+ "harvest-common",
+ "serde",
 ]
 
 [[package]]

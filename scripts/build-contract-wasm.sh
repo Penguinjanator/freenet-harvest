@@ -53,12 +53,12 @@ for arg in "$@"; do
   esac
 done
 
-# The four artifacts whose compiled bytes are network addresses. Keep in step
+# The artifacts whose compiled bytes are network addresses. Keep in step
 # with the workspace members under contracts/ and delegates/; a crate missing
 # from this list is a crate the drift guard does not watch.
-crates=(reputation-contract store-contract mailbox-contract index-contract harvest-delegate)
-artifacts=(reputation_contract store_contract mailbox_contract index_contract harvest_delegate)
-crate_dirs=(contracts/reputation-contract contracts/store-contract contracts/mailbox-contract contracts/index-contract delegates/harvest-delegate)
+crates=(reputation-contract store-contract mailbox-contract index-contract presence-contract harvest-delegate)
+artifacts=(reputation_contract store_contract mailbox_contract index_contract presence_contract harvest_delegate)
+crate_dirs=(contracts/reputation-contract contracts/store-contract contracts/mailbox-contract contracts/index-contract contracts/presence-contract delegates/harvest-delegate)
 
 # `ghostkey_delegate.wasm` is deliberately absent: it is vendored from
 # freenet/ghostkeys, not built here, so nothing in this workspace can move it.
@@ -77,12 +77,38 @@ elif [ ! -f "$workspace/Cargo.lock" ]; then
   exit 1
 fi
 
-# Order matters: rustc applies the FIRST matching prefix, so the checkout has
-# to be remapped before the broader home directories that may contain it.
+# A git dependency is checked out under `$cargo_home/git/checkouts/<repo>-
+# <url hash>/<short rev>/`, and that path (revision included) is baked into
+# panic-location strings like any other. Left in, every bump of such a
+# dependency moves the bytes of every artifact that links it, with no source
+# change in any of them: a freenet-bitcoin bump re-keyed all five contracts
+# through `freenet-bitcoin-common`'s panic lines alone. So each checkout the
+# lockfile names is remapped to its directory WITHOUT the revision. The
+# revision still decides the code; it just no longer decides the bytes when
+# the code is the same.
+# The checkouts have to exist to be named, and on a fresh machine they do not
+# until something fetches them.
+cargo fetch "${locked[@]}" --manifest-path "$workspace/Cargo.toml" >/dev/null
+git_remaps=""
+while read -r rev; do
+  # Cargo names the directory by a short id of at least seven characters,
+  # longer where seven would be ambiguous, so match any length and keep only
+  # a genuine prefix of the revision.
+  for dir in "$cargo_home"/git/checkouts/*/"${rev:0:7}"*; do
+    [ -d "$dir" ] || continue
+    case "$rev" in "$(basename "$dir")"*) ;; *) continue ;; esac
+    git_remaps+=" --remap-path-prefix=$dir=/cargo/git/checkouts/$(basename "$(dirname "$dir")")"
+  done
+done < <(grep -o 'source = "git+[^"]*#[0-9a-f]*"' "$workspace/Cargo.lock" | sed 's/.*#//; s/"$//' | sort -u)
+
+# Order matters: when several prefixes match, rustc applies the LAST one
+# given, so each more specific prefix comes after the broader directory that
+# contains it (the checkouts after `$cargo_home`).
 export RUSTFLAGS="\
 --remap-path-prefix=$workspace=/harvest \
 --remap-path-prefix=$cargo_home=/cargo \
 --remap-path-prefix=$rustup_home=/rustup \
+$git_remaps \
 ${RUSTFLAGS:-}"
 
 cd "$workspace"
@@ -104,7 +130,7 @@ if [ "${HARVEST_ALLOW_MISSING_CRATES:-0}" = "1" ]; then
   crates=("${keep_crates[@]}"); artifacts=("${keep_artifacts[@]}")
 fi
 
-# One invocation for all four. This is NOT cosmetic: cargo unifies features
+# One invocation for all of them. This is NOT cosmetic: cargo unifies features
 # across the packages it is asked to build in a single invocation, so building
 # a subset can resolve different features and produce different bytes than
 # building them together.

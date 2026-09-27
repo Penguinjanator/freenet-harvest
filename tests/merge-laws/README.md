@@ -49,8 +49,28 @@ that would re-key an artifact as a side effect of running the test tooling.
 
 The family names the generator takes (`store`, `claim`, `triad`, `triadcap`,
 `reputation`, `mailbox`, `review`, `rr`, `backing`, `review98`, `index`,
-`copies`, `retire98`, `fulfilment`, `status`, `request`) are not the same as the corpus names the runner takes; one
+`copies`, `retire98`, `fulfilment`, `status`, `request`, `presence`) are not the same as the corpus names the runner takes; one
 family writes several corpora.
+
+## The presence contract
+
+`presence` (`gen_presence`) covers the store presence contract
+(`contracts/presence-contract`, rules in `common/src/presence.rs`): the whole
+state is at most one signed heartbeat, kept by larger `seq` then smaller
+canonical encoding. That is a single-slot total order, unlike mailbox's list
+or index's per-slot map, so it needs no cap corpus (there is nothing to grow
+past a bound).
+
+- **`presence`** — HONEST: several heartbeats at different `seq`, a same-`seq`
+  tie decided by encoding rather than by `at_ms` or `taking_orders`, and both
+  `taking_orders` values, plus the pairwise merges and delta steps.
+- **`presence-adv`** — states the contract must REFUSE (another key's
+  signature, a tampered payload under a genuine signature, a non-canonical
+  encoding — trailing byte and unknown map key, same `noncanon` helper as
+  `store-noncanon`/`mailbox-noncanon`), beside boundary values it must ACCEPT
+  (`seq` at `u64::MAX`, `at_ms` at 0) to stress the ordering and tie-break at
+  the ends of the type rather than test a refusal. No pairwise merges: like
+  `index-bad`, only states.
 
 ## Two ways this sweep has lied
 
@@ -104,4 +124,4 @@ second statement by one of those buyers whose terms encode smaller, and the
 full record once the honest ones arrive. It is zero violations and zero
 inconclusive; the generator itself asserts the associativity it is built
 around, so a corpus that stops exercising it fails to generate.
-Everything else is expected to be zero violations and zero inconclusive.
+Everything else is expected to be zero violations. Corpora that deliberately mix refused states with valid ones (`index-bad`, `presence-adv`, the other `-bad` corpora) also show inconclusive cases, since a refused state cannot be merged; zero inconclusive is expected only of the rest.

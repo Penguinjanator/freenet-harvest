@@ -179,6 +179,12 @@ pub(crate) const WATCH_NEEDED_MS: u64 =
     MAX_ANCHOR_AGE_BLOCKS as u64 * 10 * 60 * 1000 + 3 * 60 * 60 * 1000;
 /// How far ahead of this node's clock a Buy now may be dated.
 pub(crate) const MAX_CLOCK_AHEAD_MS: u64 = 10 * 60 * 1000;
+/// [`WATCH_NEEDED_MS`] in blocks, for a watch that ends at a height
+/// ([`AutoInvoiceArm::watched_until_height`]): the blocks a buyer may still
+/// start paying in, three hours of blocks for the payment to confirm, and six
+/// for the tip the UI read being behind the bridge's (a horizon is clamped
+/// from the bridge's own tip, which a reorg can leave lower).
+pub(crate) const WATCH_NEEDED_BLOCKS: u32 = MAX_ANCHOR_AGE_BLOCKS + 18 + 6;
 /// A sale whose order has not appeared in the store after this long is
 /// taken to have never landed (a refused update), and forgotten.
 pub(crate) const NOT_LANDED_MS: u64 = 10 * 60 * 1000;
@@ -454,6 +460,61 @@ struct PendingReplies {
 }
 
 const BATCH_MAGIC: [u8; 8] = *b"hvauto01";
+const RETRY_MAGIC: [u8; 8] = *b"hvretry1";
+
+/// Carried through a mailbox read a wake-up asks for when a refused update
+/// left requests undecided (`Ledger::retry_pending`).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+struct MailboxRetry {
+    magic: [u8; 8],
+    store_contract_id: Vec<u8>,
+}
+
+/// A mailbox read for every armed store with requests left undecided by a
+/// refused update: the wake-up's way to answer them without waiting for the
+/// mailbox to change (codex on harvest#177).
+pub(crate) fn mailbox_retries<S: SecretStore>(secrets: &S) -> Vec<OutboundDelegateMsg> {
+    if secrets.has_secret(EXPORTED_KEY) {
+        return Vec::new();
+    }
+    arms(secrets)
+        .iter()
+        .filter(|record| load_ledger(secrets, &record.arm.store_contract_id).retry_pending)
+        .filter_map(|record| {
+            let context = to_cbor(&MailboxRetry {
+                magic: RETRY_MAGIC,
+                store_contract_id: record.arm.store_contract_id.clone(),
+            })
+            .ok()?;
+            let mut get =
+                GetContractRequest::new(ContractInstanceId::new(record.arm.mailbox_contract_id));
+            get.context = DelegateContext::new(context);
+            Some(OutboundDelegateMsg::GetContractRequest(get))
+        })
+        .collect()
+}
+
+/// The mailbox read [`mailbox_retries`] asked for: the retry flag cleared,
+/// and the mailbox decided as if it had just changed.
+fn on_mailbox_retry<S: SecretStore>(
+    secrets: &mut S,
+    store_contract_id: &[u8],
+    state: Option<&[u8]>,
+    now_ms: u64,
+) -> Vec<OutboundDelegateMsg> {
+    let Some(record) = load_arm(secrets, store_contract_id) else {
+        return Vec::new();
+    };
+    let Some(state) = state else {
+        return Vec::new();
+    };
+    let mut ledger = load_ledger(secrets, store_contract_id);
+    if ledger.retry_pending {
+        ledger.retry_pending = false;
+        save(secrets, &ledger_key(store_contract_id), &ledger);
+    }
+    on_mailbox(secrets, &record, state, now_ms)
+}
 const REPLIES_MAGIC: [u8; 8] = *b"hvrepl01";
 
 fn load<S: SecretStore, T: for<'de> Deserialize<'de>>(secrets: &S, key: &[u8]) -> Option<T> {
@@ -547,6 +608,14 @@ pub(crate) fn arm<S: SecretStore>(
     subscribe.push(OutboundDelegateMsg::GetContractRequest(
         GetContractRequest::new(ContractInstanceId::new(arm.tip_contract_id)),
     ));
+    // Then the presence contract, last: the node refuses a delegate's
+    // network operations past four per request (`MAX_NETWORK_CONTRACT_OPS_
+    // PER_PARK`, counting only contracts it has never seen), and the four
+    // above matter more. The seller's tab PUTs it anyway; this keeps the node
+    // holding it once the tab is gone (see `resubscribe_all`).
+    if let Some(presence) = arm.presence_contract_id {
+        subscribe.extend(presence_ops(presence));
+    }
     (
         HarvestDelegateResponse::AutoInvoice {
             store_contract_id,
@@ -588,7 +657,255 @@ fn status_of<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> Au
             .as_ref()
             .filter(|(at, _)| now_ms.saturating_sub(*at) < CAPPED_SHOWN_MS)
             .map(|(_, why)| why.clone()),
+        last_wakeup_ms: load::<_, u64>(secrets, WAKEUP_KEY),
     }
+}
+
+/// When the node last woke this delegate on its schedule: what tells the
+/// seller's tab that heartbeats go on without it (`AutoInvoiceStatus::
+/// last_wakeup_ms`). Not exported: it describes this node.
+pub(crate) const WAKEUP_KEY: &[u8] = b"harvest:auto:wakeup";
+
+pub(crate) use harvest_common::presence::HEARTBEAT_MIN_GAP_MS;
+
+fn beat_key(store_contract_id: &[u8]) -> Vec<u8> {
+    format!(
+        "{AUTO_PREFIX}beat:{}",
+        bs58::encode(store_contract_id).into_string()
+    )
+    .into_bytes()
+}
+
+/// The last heartbeat this delegate sent for one store. Not exported.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+struct BeatRecord {
+    at_ms: u64,
+    taking_orders: bool,
+    /// The `seq` it was signed with (`harvest_common::presence::Heartbeat`).
+    #[serde(default)]
+    seq: u64,
+}
+
+pub(crate) fn note_wakeup<S: SecretStore>(secrets: &mut S, now_ms: u64) {
+    save(secrets, WAKEUP_KEY, &now_ms);
+}
+
+/// Whether the store can take an order now: it would issue payment details
+/// for a Buy now (no store-wide refusal) and has a watched address left.
+/// What a heartbeat carries as `taking_orders`.
+///
+/// It does not see the per-request caps, which need the store's state: a
+/// store at its open-order or daily cap still reads as taking orders.
+fn taking_orders<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> bool {
+    let status = status_of(secrets, record, now_ms);
+    status.paused.is_none() && status.watched_remaining > 0
+}
+
+/// Sign a heartbeat for `record`'s store and send it to its presence
+/// contract, unless one went out less than [`HEARTBEAT_MIN_GAP_MS`] ago
+/// saying the same (or `force`). `None` when there is nothing to send: no
+/// presence contract named (an older UI armed it), no store key, this
+/// generation exported, or a heartbeat just sent.
+pub(crate) fn heartbeat<S: SecretStore>(
+    secrets: &mut S,
+    record: &ArmRecord,
+    now_ms: u64,
+    force: bool,
+) -> Option<(
+    harvest_common::presence::SignedHeartbeat,
+    OutboundDelegateMsg,
+)> {
+    use harvest_common::presence::{Heartbeat, SignedHeartbeat};
+    let presence = record.arm.presence_contract_id?;
+    if secrets.has_secret(EXPORTED_KEY) {
+        return None;
+    }
+    let taking = taking_orders(secrets, record, now_ms);
+    let key = beat_key(&record.arm.store_contract_id);
+    if !force {
+        if let Some(last) = load::<_, BeatRecord>(secrets, &key) {
+            if last.taking_orders == taking
+                && now_ms >= last.at_ms
+                && now_ms - last.at_ms < HEARTBEAT_MIN_GAP_MS
+            {
+                return None;
+            }
+        }
+    }
+    let store_sk = store_key(secrets, &record.arm.store_verifying_key)?;
+    // Rising through a clock that jumps back (see `Heartbeat::seq`).
+    let seq = load::<_, BeatRecord>(secrets, &key)
+        .map_or(now_ms, |last| now_ms.max(last.seq.saturating_add(1)));
+    let signed = SignedHeartbeat::sign(&store_sk, Heartbeat::new(seq, now_ms, taking)).ok()?;
+    let delta = to_cbor(&signed).ok()?;
+    save(
+        secrets,
+        &key,
+        &BeatRecord {
+            at_ms: now_ms,
+            taking_orders: taking,
+            seq,
+        },
+    );
+    Some((
+        signed,
+        OutboundDelegateMsg::UpdateContractRequest(UpdateContractRequest::new(
+            ContractInstanceId::new(presence),
+            UpdateData::Delta(StateDelta::from(delta)),
+        )),
+    ))
+}
+
+/// Learn the `seq` of the heartbeat the presence contract holds, so this
+/// delegate's next one outranks it. What `BeatRecord::seq` alone cannot
+/// cover: a heartbeat signed elsewhere with the same store key, by an
+/// earlier generation of this delegate (the record is not exported) or on a
+/// second device, possibly while its clock ran ahead. Without this, a new
+/// generation numbers from `now` and loses to that one until real time
+/// passes it, and the store reads closed all that while.
+///
+/// The state is the node's copy of a contract that checked every signature
+/// in it, and only the store key signs one, so its `seq` is trusted as is.
+fn note_presence_seen<S: SecretStore>(secrets: &mut S, record: &ArmRecord, state: &[u8]) {
+    let Some(seen) = harvest_common::presence::decode_state(state)
+        .ok()
+        .and_then(|state| state.heartbeat)
+        .map(|signed| signed.heartbeat.seq)
+    else {
+        return;
+    };
+    let key = beat_key(&record.arm.store_contract_id);
+    let held = load::<_, BeatRecord>(secrets, &key);
+    if held.is_some_and(|held| held.seq >= seen) {
+        return;
+    }
+    // No record yet: one that sent nothing (`at_ms` 0), so the next
+    // heartbeat is not held back by the gap.
+    let mut next = held.unwrap_or(BeatRecord {
+        at_ms: 0,
+        taking_orders: false,
+        seq: 0,
+    });
+    next.seq = seen;
+    save(secrets, &key, &next);
+}
+
+/// A heartbeat for every armed store that is due one: the wake-up's work.
+pub(crate) fn heartbeats<S: SecretStore>(secrets: &mut S, now_ms: u64) -> Vec<OutboundDelegateMsg> {
+    arms(secrets)
+        .iter()
+        .filter_map(|record| heartbeat(secrets, record, now_ms, false))
+        .map(|(_, message)| message)
+        .collect()
+}
+
+/// The tab's heartbeat request ([`HarvestDelegateRequest::Heartbeat`]): the
+/// answer, and the update to send.
+pub(crate) fn heartbeat_request<S: SecretStore>(
+    secrets: &mut S,
+    store_contract_id: &[u8],
+    force: bool,
+    now_ms: u64,
+) -> (HarvestDelegateResponse, Vec<OutboundDelegateMsg>) {
+    let answer = |result| HarvestDelegateResponse::Heartbeat {
+        store_contract_id: store_contract_id.to_vec(),
+        result,
+    };
+    let Some(record) = load_arm(secrets, store_contract_id) else {
+        return (
+            answer(Err("this store is not armed here".into())),
+            Vec::new(),
+        );
+    };
+    if record.arm.presence_contract_id.is_none() {
+        return (
+            answer(Err(
+                "this store was armed without a presence contract".into()
+            )),
+            Vec::new(),
+        );
+    }
+    let (heartbeat, out) = match heartbeat(secrets, &record, now_ms, force) {
+        Some((signed, message)) => (Some(signed), vec![message]),
+        None => (None, Vec::new()),
+    };
+    (
+        answer(Ok(harvest_common::delegate::HeartbeatAnswer {
+            heartbeat,
+            last_wakeup_ms: load::<_, u64>(secrets, WAKEUP_KEY),
+        })),
+        out,
+    )
+}
+
+/// Subscribe again to every armed store's contracts and read what the
+/// delegate needs now: the node's start (or this delegate's install), after
+/// which subscriptions may be gone and a notification missed.
+///
+/// In order of what matters, since a node refuses a delegate's network
+/// operations past four per run (`MAX_NETWORK_CONTRACT_OPS_PER_PARK`,
+/// counting only contracts it has never seen): each tip once (subscribed and
+/// read), then every store and mailbox, then every presence contract
+/// (subscribed, and read so this generation learns the `seq` to outrank:
+/// [`note_presence_seen`]).
+pub(crate) fn resubscribe_all<S: SecretStore>(secrets: &mut S) -> Vec<OutboundDelegateMsg> {
+    if secrets.has_secret(EXPORTED_KEY) {
+        return Vec::new();
+    }
+    let all = arms(secrets);
+    let mut tips: Vec<[u8; 32]> = Vec::new();
+    for record in &all {
+        if !tips.contains(&record.arm.tip_contract_id) {
+            tips.push(record.arm.tip_contract_id);
+        }
+    }
+    // Each tip first, subscribed and read: without a fresh tip nothing is
+    // invoiced (`NoFreshTip`) and every heartbeat says "not taking orders".
+    // The node refuses a delegate's network operations past four per run
+    // (`MAX_NETWORK_CONTRACT_OPS_PER_PARK`, counting only contracts it has
+    // never seen), so what matters most goes where no cap reaches it.
+    let mut out = Vec::new();
+    for tip in &tips {
+        out.push(OutboundDelegateMsg::SubscribeContractRequest(
+            SubscribeContractRequest::new(ContractInstanceId::new(*tip)),
+        ));
+        out.push(OutboundDelegateMsg::GetContractRequest(
+            GetContractRequest::new(ContractInstanceId::new(*tip)),
+        ));
+    }
+    for record in &all {
+        let Ok(store) = <[u8; 32]>::try_from(record.arm.store_contract_id.as_slice()) else {
+            continue;
+        };
+        for id in [store, record.arm.mailbox_contract_id] {
+            out.push(OutboundDelegateMsg::SubscribeContractRequest(
+                SubscribeContractRequest::new(ContractInstanceId::new(id)),
+            ));
+        }
+    }
+    // The presence contracts last. A wake-up's heartbeat is an UPDATE, which
+    // fails on a node that does not hold the contract (harvest#119; newer
+    // nodes fetch it first), and only the seller's open tab ever PUTs it: a
+    // subscription keeps this node holding it with no tab open.
+    for presence in all.iter().filter_map(|r| r.arm.presence_contract_id) {
+        out.extend(presence_ops(presence));
+    }
+    out
+}
+
+/// Subscribe to a presence contract and read it: the read is what
+/// [`note_presence_seen`] learns a heartbeat signed elsewhere from, which a
+/// notification alone never delivers once that signer has stopped (the
+/// contract merges our lower heartbeats away, so nothing changes).
+fn presence_ops(presence: [u8; 32]) -> [OutboundDelegateMsg; 2] {
+    [
+        OutboundDelegateMsg::SubscribeContractRequest(SubscribeContractRequest::new(
+            ContractInstanceId::new(presence),
+        )),
+        OutboundDelegateMsg::GetContractRequest(GetContractRequest::new(ContractInstanceId::new(
+            presence,
+        ))),
+    ]
 }
 
 /// Stop this generation for good: remove every arm, so no background run
@@ -861,6 +1178,15 @@ fn global_refusal<S: SecretStore>(
     if now_ms.saturating_sub(u64::from(tip.block_time) * 1000) > TIP_MAX_AGE_MS {
         return Err(Refusal::NoFreshTip);
     }
+    // A watch that ends at a height (freenet-bitcoin#26) must outlast the
+    // invoice's window in blocks too: the time above is the UI's estimate
+    // of the same horizon, and blocks can come faster than it assumed.
+    if arm
+        .watched_until_height
+        .is_some_and(|until| tip.anchor.height.saturating_add(WATCH_NEEDED_BLOCKS) > until)
+    {
+        return Err(Refusal::WatchLapsed);
+    }
     Ok(tip.anchor)
 }
 
@@ -884,6 +1210,16 @@ pub(crate) fn on_notification<S: SecretStore>(
     }
     if let Some(record) = all.iter().find(|r| r.arm.tip_contract_id == *contract_id) {
         note_tip(secrets, record.arm.network, state);
+        return Some(Vec::new());
+    }
+    if let Some(record) = all
+        .iter()
+        .find(|r| r.arm.presence_contract_id == Some(*contract_id))
+    {
+        // The subscription that keeps the presence contract here. Mostly
+        // our own heartbeats coming back; nothing for a UI (a background run
+        // has none).
+        note_presence_seen(secrets, record, state);
         return Some(Vec::new());
     }
     if let Some(record) = all
@@ -1095,9 +1431,28 @@ pub(crate) fn on_get_answer<S: SecretStore>(
     context: &[u8],
     now_ms: u64,
 ) -> Option<Vec<OutboundDelegateMsg>> {
+    if let Ok(retry) = from_cbor::<MailboxRetry>(context) {
+        if retry.magic == RETRY_MAGIC {
+            return Some(on_mailbox_retry(
+                secrets,
+                &retry.store_contract_id,
+                state,
+                now_ms,
+            ));
+        }
+    }
     if context.is_empty() {
         if let Some(out) = on_tip_read(secrets, contract_id, state, now_ms) {
             return Some(out);
+        }
+        if let Some(record) = arms(secrets)
+            .into_iter()
+            .find(|r| r.arm.presence_contract_id == Some(*contract_id))
+        {
+            if let Some(state) = state {
+                note_presence_seen(secrets, &record, state);
+            }
+            return Some(Vec::new());
         }
     }
     on_store_state(secrets, state, context, now_ms)
@@ -2177,6 +2532,8 @@ mod tests {
                 address_code_hash: [5; 32],
                 watched_scripts: (0..5).map(script_at).collect(),
                 watch_left_ms: WATCH_NEEDED_MS + 3_600_000,
+                watched_until_height: None,
+                presence_contract_id: Some([9; 32]),
             },
             armed_at_ms: NOW - 1_000,
             watched_until_ms: NOW + WATCH_NEEDED_MS + 3_600_000,
@@ -3623,6 +3980,294 @@ mod tests {
         );
     }
 
+    fn heartbeat_of(out: &[OutboundDelegateMsg]) -> Vec<harvest_common::presence::SignedHeartbeat> {
+        out.iter()
+            .filter_map(|m| match m {
+                OutboundDelegateMsg::UpdateContractRequest(u)
+                    if u.contract_id.as_bytes() == [9; 32] =>
+                {
+                    let UpdateData::Delta(d) = &u.update else {
+                        panic!("a delta")
+                    };
+                    Some(harvest_common::presence::decode_delta(d.as_ref()).unwrap())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A wake-up sends each armed store's heartbeat to its presence
+    /// contract, signed by the store key, saying whether it takes orders;
+    /// a second one inside `HEARTBEAT_MIN_GAP_MS` saying the same is not
+    /// sent; one after it is, with a larger `seq`. The wake-up is recorded
+    /// for the tab. Mutated red by dropping the gap check, by never sending,
+    /// and by not recording the wake-up.
+    #[test]
+    fn a_wake_up_sends_a_heartbeat_and_is_remembered() {
+        use crate::node_glue::{BackgroundRun, HEARTBEAT_TAG};
+        let mut f = fixture();
+        let wake = BackgroundRun::Wakeup {
+            tag: HEARTBEAT_TAG.to_vec(),
+        };
+        let out = crate::background::on_background(&mut f.secrets, &wake, NOW);
+        let beats = heartbeat_of(&out);
+        assert_eq!(beats.len(), 1, "{out:?}");
+        beats[0]
+            .verify(&store_sk().verifying_key())
+            .expect("signed by the store key");
+        assert!(beats[0].heartbeat.taking_orders);
+        assert_eq!(beats[0].heartbeat.at_ms, NOW);
+        assert_eq!(load::<_, u64>(&f.secrets, WAKEUP_KEY), Some(NOW));
+        assert_eq!(
+            status_of(&f.secrets, &f.record, NOW).last_wakeup_ms,
+            Some(NOW)
+        );
+
+        let soon = crate::background::on_background(&mut f.secrets, &wake, NOW + 60_000);
+        assert!(heartbeat_of(&soon).is_empty(), "one per interval");
+        let later =
+            crate::background::on_background(&mut f.secrets, &wake, NOW + HEARTBEAT_MIN_GAP_MS);
+        let again = heartbeat_of(&later);
+        assert_eq!(again.len(), 1);
+        assert!(again[0].heartbeat.seq > beats[0].heartbeat.seq);
+
+        // A tag this generation did not declare does nothing.
+        let other = BackgroundRun::Wakeup { tag: b"x".to_vec() };
+        assert!(crate::background::on_background(&mut f.secrets, &other, NOW + DAY_MS).is_empty());
+    }
+
+    /// A heartbeat says the store is not taking orders when it could not
+    /// issue payment details (here, the watch lapsed), and a change of that
+    /// goes out at once, inside the interval. Its `seq` keeps rising
+    /// through a clock that jumped back. Mutated red by taking orders
+    /// regardless, and by ordering on the clock.
+    #[test]
+    fn a_heartbeat_says_when_the_store_cannot_take_orders() {
+        let mut f = fixture();
+        let (first, _) = heartbeat(&mut f.secrets, &f.record.clone(), NOW, false).unwrap();
+        assert!(first.heartbeat.taking_orders);
+        let mut lapsed = f.record.clone();
+        lapsed.watched_until_ms = NOW;
+        let (closed, _) = heartbeat(&mut f.secrets, &lapsed, NOW + 1_000, false).expect("changed");
+        assert!(!closed.heartbeat.taking_orders);
+        // The clock jumps back an hour: still a later heartbeat.
+        let (back, _) =
+            heartbeat(&mut f.secrets, &f.record.clone(), NOW - 3_600_000, true).unwrap();
+        assert!(back.heartbeat.seq > closed.heartbeat.seq);
+        assert_eq!(back.heartbeat.at_ms, NOW - 3_600_000);
+    }
+
+    /// A generation that has handed on is still woken, and does nothing,
+    /// not even note the wake-up. Mutated red by dropping the check.
+    #[test]
+    fn a_handed_on_generation_ignores_its_wake_ups() {
+        use crate::node_glue::{BackgroundRun, HEARTBEAT_TAG};
+        let mut f = fixture();
+        f.secrets.set_secret(EXPORTED_KEY, b"1");
+        let wake = BackgroundRun::Wakeup {
+            tag: HEARTBEAT_TAG.to_vec(),
+        };
+        assert!(crate::background::on_background(&mut f.secrets, &wake, NOW).is_empty());
+        assert_eq!(load::<_, u64>(&f.secrets, WAKEUP_KEY), None);
+    }
+
+    /// A heartbeat another signer left in the presence contract (an earlier
+    /// generation, a second device, a clock that ran ahead) is learned from a
+    /// read of it or the subscription, and the next one here outranks it at
+    /// once. Mutated red by not learning it, by not routing the read, and by
+    /// learning a lower one.
+    #[test]
+    fn a_heartbeat_signed_elsewhere_is_outranked() {
+        use harvest_common::presence::{Heartbeat, PresenceStateV1, SignedHeartbeat};
+        let mut f = fixture();
+        let sk = store_key(&f.secrets, &f.record.arm.store_verifying_key).unwrap();
+        let ahead = NOW + 365 * 24 * 3_600_000;
+        let elsewhere = SignedHeartbeat::sign(&sk, Heartbeat::new(ahead, ahead, true)).unwrap();
+        let state = to_cbor(&PresenceStateV1 {
+            heartbeat: Some(elsewhere),
+        })
+        .unwrap();
+        // Learned from a read (the node's start sends one; arming does too,
+        // though a node may refuse it past its operation budget): a signer
+        // that has stopped writing sends no notification.
+        assert!(
+            on_get_answer(&mut f.secrets, &[9; 32], Some(&state), &[], NOW)
+                .is_some_and(|out| out.is_empty())
+        );
+        let (next, _) = heartbeat(&mut f.secrets, &f.record.clone(), NOW, false)
+            .expect("nothing sent here yet, so not held back by the gap");
+        assert_eq!(next.heartbeat.seq, ahead + 1);
+        assert_eq!(next.heartbeat.at_ms, NOW);
+        // An older one seen later lowers nothing.
+        let older = SignedHeartbeat::sign(&sk, Heartbeat::new(NOW - 1, NOW - 1, true)).unwrap();
+        let state = to_cbor(&PresenceStateV1 {
+            heartbeat: Some(older),
+        })
+        .unwrap();
+        on_notification(&mut f.secrets, &[9; 32], &state, NOW);
+        let (again, _) = heartbeat(&mut f.secrets, &f.record.clone(), NOW + 1, true).unwrap();
+        assert_eq!(again.heartbeat.seq, ahead + 2);
+    }
+
+    /// No heartbeat without a presence contract (an older UI armed it) or
+    /// once this generation handed its keys on. Mutated red by dropping
+    /// each check.
+    #[test]
+    fn no_heartbeat_without_a_presence_contract_or_after_export() {
+        let mut f = fixture();
+        let mut old_ui = f.record.clone();
+        old_ui.arm.presence_contract_id = None;
+        assert!(heartbeat(&mut f.secrets, &old_ui, NOW, true).is_none());
+        f.secrets.set_secret(EXPORTED_KEY, b"1");
+        assert!(heartbeat(&mut f.secrets, &f.record.clone(), NOW, true).is_none());
+    }
+
+    /// The tab's heartbeat request: answered with the heartbeat it sent and
+    /// the last wake-up, or with why not. Mutated red by answering an
+    /// unarmed store.
+    #[test]
+    fn the_tabs_heartbeat_request_is_answered() {
+        let mut f = fixture();
+        note_wakeup(&mut f.secrets, NOW - 5);
+        let (answer, out) = heartbeat_request(&mut f.secrets, &[1; 32], true, NOW);
+        let HarvestDelegateResponse::Heartbeat { result: Ok(a), .. } = answer else {
+            panic!("{answer:?}")
+        };
+        assert!(a.heartbeat.is_some());
+        assert_eq!(a.last_wakeup_ms, Some(NOW - 5));
+        assert_eq!(heartbeat_of(&out).len(), 1);
+        let (unarmed, out) = heartbeat_request(&mut f.secrets, &[8; 32], true, NOW);
+        assert!(matches!(
+            unarmed,
+            HarvestDelegateResponse::Heartbeat { result: Err(_), .. }
+        ));
+        assert!(out.is_empty());
+    }
+
+    /// The node starting (or this delegate being installed) subscribes again
+    /// to each tip once and reads it, then to every store and mailbox, then
+    /// subscribes to and reads every presence contract: six operations for
+    /// one store.
+    /// Nothing after an export. Mutated red by dropping the tip read, the
+    /// presence subscription, and the export check.
+    #[test]
+    fn the_node_starting_resubscribes_every_arm() {
+        use crate::node_glue::BackgroundRun;
+        let mut f = fixture();
+        let out =
+            crate::background::on_background(&mut f.secrets, &BackgroundRun::NodeStarted, NOW);
+        let subscribed: Vec<[u8; 32]> = out
+            .iter()
+            .filter_map(|m| match m {
+                OutboundDelegateMsg::SubscribeContractRequest(r) => {
+                    Some(<[u8; 32]>::try_from(r.contract_id.as_bytes()).unwrap())
+                }
+                _ => None,
+            })
+            .collect();
+        // The tip once, first, then every store and mailbox, then every
+        // presence contract, subscribed and read.
+        assert_eq!(subscribed, vec![[3; 32], [1; 32], [2; 32], [9; 32]]);
+        let reads: Vec<(usize, [u8; 32])> = out
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| match m {
+                OutboundDelegateMsg::GetContractRequest(r) => {
+                    Some((i, <[u8; 32]>::try_from(r.contract_id.as_bytes()).unwrap()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reads, vec![(1, [3; 32]), (5, [9; 32])]);
+        assert_eq!(out.len(), 6);
+        let installed =
+            crate::background::on_background(&mut f.secrets, &BackgroundRun::Installed, NOW);
+        assert_eq!(installed.len(), 6);
+        // Our own heartbeat coming back through that subscription is taken
+        // and dropped, not forwarded to a UI a background run does not have.
+        assert!(on_notification(&mut f.secrets, &[9; 32], b"any", NOW)
+            .is_some_and(|out| out.is_empty()));
+        f.secrets.set_secret(EXPORTED_KEY, b"1");
+        assert!(
+            crate::background::on_background(&mut f.secrets, &BackgroundRun::NodeStarted, NOW)
+                .is_empty()
+        );
+    }
+
+    /// A wake-up re-reads the mailbox of a store whose update was refused,
+    /// and the answer is decided as a mailbox change is: the undecided
+    /// request goes to the store read again, and the flag clears. Mutated
+    /// red by never asking, and by not clearing the flag.
+    #[test]
+    fn a_wake_up_retries_requests_a_refused_update_left_undecided() {
+        use crate::node_glue::{BackgroundRun, HEARTBEAT_TAG};
+        let mut f = fixture();
+        let buyer = Buyer::new(40);
+        let entry = buyer.request(&jam(), 1, 1, 12_000);
+        let decided = run(&mut f, std::slice::from_ref(&entry));
+        let out = decided.into_messages(&f.record.arm);
+        let [OutboundDelegateMsg::UpdateContractRequest(update)] = out.as_slice() else {
+            panic!("{out:?}")
+        };
+        on_store_update_answer(
+            &mut f.secrets,
+            &Err("refused".into()),
+            update.context.as_ref(),
+        );
+        let wake = BackgroundRun::Wakeup {
+            tag: HEARTBEAT_TAG.to_vec(),
+        };
+        let out = crate::background::on_background(&mut f.secrets, &wake, NOW);
+        let gets: Vec<&GetContractRequest> = out
+            .iter()
+            .filter_map(|m| match m {
+                OutboundDelegateMsg::GetContractRequest(g) => Some(g),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gets.len(), 1, "{out:?}");
+        assert_eq!(gets[0].contract_id.as_bytes(), [2; 32].as_slice());
+        let mailbox = to_cbor(&MailboxStateV1 {
+            messages: vec![entry.clone()],
+        })
+        .unwrap();
+        let answered = on_get_answer(
+            &mut f.secrets,
+            &[2; 32],
+            Some(&mailbox),
+            gets[0].context.as_ref(),
+            NOW,
+        )
+        .expect("ours");
+        let [OutboundDelegateMsg::GetContractRequest(store_read)] = answered.as_slice() else {
+            panic!("{answered:?}")
+        };
+        let batch: PendingBatch = from_cbor(store_read.context.as_ref()).unwrap();
+        assert_eq!(batch.entries, vec![entry]);
+        assert!(!load_ledger(&f.secrets, &f.record.arm.store_contract_id).retry_pending);
+        // Nothing more to retry.
+        let later =
+            crate::background::on_background(&mut f.secrets, &wake, NOW + HEARTBEAT_MIN_GAP_MS);
+        assert!(!later
+            .iter()
+            .any(|m| matches!(m, OutboundDelegateMsg::GetContractRequest(_))));
+    }
+
+    /// A watch that ends at a height must outlast an invoice's window in
+    /// blocks: none is issued once the tip is within `WATCH_NEEDED_BLOCKS`
+    /// of it. Mutated red by dropping the check and by an off-by-one.
+    #[test]
+    fn a_watch_horizon_near_the_tip_stops_invoicing() {
+        let mut f = fixture();
+        f.record.arm.watched_until_height = Some(1_000 + WATCH_NEEDED_BLOCKS);
+        let ok = run(&mut f, &[Buyer::new(70).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(ok.orders.len(), 1, "{:?}", ok.refused);
+        let mut f = fixture();
+        f.record.arm.watched_until_height = Some(1_000 + WATCH_NEEDED_BLOCKS - 1);
+        let near = run(&mut f, &[Buyer::new(71).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(near.refused[0].1, Refusal::WatchLapsed);
+    }
+
     /// I5. Stale tip, a store this key does not own, a closed store and a
     /// binding already published for another conversation all fall back.
     #[test]
@@ -3675,8 +4320,8 @@ mod tests {
         assert!(subscriptions.is_empty());
     }
 
-    /// Arming stores the arm, subscribes to the three contracts, and reads
-    /// the tip once (harvest#162).
+    /// Arming stores the arm, subscribes to the three contracts, reads the
+    /// tip once (harvest#162), and then subscribes to the presence contract.
     #[test]
     fn arming_subscribes_to_mailbox_store_and_tip() {
         let mut f = fixture();
@@ -3708,13 +4353,25 @@ mod tests {
                 ("subscribe", [2; 32]),
                 ("subscribe", [3; 32]),
                 ("get", [3; 32]),
+                ("subscribe", [9; 32]),
+                ("get", [9; 32]),
             ]
         );
         // The node runs at most four network operations for one delegate
-        // request (freenet-core's `MAX_NETWORK_CONTRACT_OPS_PER_PARK`) and
-        // refuses the rest, the tip read included; a fifth here would stop
-        // instant checkout reading the tip with nothing failing.
-        assert!(subscriptions.len() <= 4, "the node's per-request budget");
+        // request (freenet-core's `MAX_NETWORK_CONTRACT_OPS_PER_PARK`,
+        // counting only contracts it has never seen) and refuses the rest.
+        // The four instant checkout needs come first, so what the node may
+        // refuse is the presence contract's, which the seller's tab PUTs in
+        // any case.
+        assert!(
+            subscriptions[..4].iter().all(|m| match m {
+                OutboundDelegateMsg::SubscribeContractRequest(r) =>
+                    r.contract_id.as_bytes() != [9; 32],
+                OutboundDelegateMsg::GetContractRequest(r) => r.contract_id.as_bytes() != [9; 32],
+                _ => true,
+            }),
+            "the presence contract goes last"
+        );
     }
 
     /// **The tip read on arming turns instant checkout on at once

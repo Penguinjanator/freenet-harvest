@@ -7,7 +7,10 @@
 //! # The exchange is one-sided, and that is the design
 //!
 //! A buyer has no identity in Harvest -- no ghostkey, no account, nothing to
-//! register -- so there is nobody to run a two-sided handshake with. Instead
+//! register -- so there is nobody to run a two-sided handshake with. (A buyer
+//! who sends TEXT does show the seller a Ghost Key, inside the encryption, as
+//! the anti-spam price of writing; buying needs none. See
+//! `crate::voucher_flow`.) Instead
 //! the SELLER publishes a long-term X25519 public key in
 //! [`harvest_common::store::StoreInfoV1::encryption_public_key`], and each
 //! buyer generates an ephemeral keypair per message, encrypts to the seller's
@@ -416,13 +419,39 @@ impl BuyerConversation {
         )
     }
 
-    /// Seal one message for the seller.
+    /// Seal one plain-text message for the seller: the pre-voucher format,
+    /// which a seller no longer shows. For this crate's tests of the
+    /// conversation mechanics; a buyer's message goes out through
+    /// [`Self::seal_vouched`].
+    #[cfg(test)]
     pub fn seal(&self, text: String) -> Result<EncryptedMessage, String> {
         seal(
             &self.keys.to_seller,
             &self.buyer_public_key,
             &self.conversation_id,
             MessageContent::Text(text),
+        )
+    }
+
+    /// Seal one message for the seller, carrying the Ghost Key voucher for
+    /// this conversation (`crate::voucher_flow`).
+    ///
+    /// `timestamp` is the caller's, so several messages queued behind one
+    /// signature can be stamped in the order they were typed: the thread
+    /// sorts by it, and one clock reading for all of them would let the
+    /// nonce decide their order.
+    pub fn seal_vouched(
+        &self,
+        text: String,
+        voucher: harvest_common::sealed::MessageVoucher,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<EncryptedMessage, String> {
+        harvest_common::sealed::seal(
+            &self.keys.to_seller,
+            &self.buyer_public_key,
+            &self.conversation_id,
+            MessageContent::VouchedText { text, voucher },
+            timestamp,
         )
     }
 
@@ -768,6 +797,11 @@ impl MailboxEntry {
     }
 }
 
+/// What an entry that did not open says, whatever the decoder said: see
+/// [`read_mailbox`].
+pub(crate) const UNREADABLE_WHY: &str =
+    "it did not open with this conversation's keys, or it is not a Harvest message";
+
 /// Read a mailbox with whatever conversation keys are on hand.
 ///
 /// `keys` maps a conversation's routing tag to the key pair the seller's
@@ -822,12 +856,18 @@ pub fn read_mailbox(
                     Err(why) => last_error = why,
                 }
             }
+            // The decoder's own error can quote the message's text (serde
+            // names an unknown variant or a mistyped string it met), and the
+            // mailbox is open-write: shown as it is, it would carry anyone's
+            // text past the seller's Ghost Key gate. A fixed reason is shown;
+            // the detail goes to the log.
+            dioxus::logger::tracing::debug!("a mailbox entry did not open: {last_error}");
             MailboxEntry::Unreadable {
                 conversation,
                 nonce: message.nonce,
                 digest,
                 timestamp: message.timestamp,
-                why: last_error,
+                why: UNREADABLE_WHY.to_string(),
             }
         })
         .collect();
@@ -1324,9 +1364,11 @@ mod tests {
             other => panic!("expected an unreadable entry: {other:?}"),
         }
         match by_nonce(foreign.nonce) {
-            MailboxEntry::Unreadable { why, .. } => assert!(
-                !why.contains("waiting"),
-                "a message that will never decrypt must not read as merely pending: {why}"
+            // A fixed reason, never the decoder's error, which can quote an
+            // open-write message's own text past the seller's gate.
+            MailboxEntry::Unreadable { why, .. } => assert_eq!(
+                why, UNREADABLE_WHY,
+                "a message that will never decrypt must not read as merely pending"
             ),
             other => panic!("a message we hold no key for must not read as decrypted: {other:?}"),
         }

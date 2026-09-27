@@ -37,14 +37,25 @@ const CONTRACT_REGISTRIES: &[(&str, &str, &str)] = &[
         "legacy_index_contract.rs",
         "LEGACY_INDEX_CONTRACT",
     ),
+    (
+        "presence_contract.toml",
+        "legacy_presence_contract.rs",
+        "LEGACY_PRESENCE_CONTRACT",
+    ),
 ];
 
-/// Registries that may have no rows yet, and why. An artifact belongs here
-/// only while it genuinely has no predecessor generation (the Ghost Key index
-/// did, until harvest#53 Phase B recorded its first). A new artifact's FIRST
-/// superseded generation must be recorded as a row, and its entry removed,
-/// in the change that supersedes it.
-const MAY_BE_EMPTY: &[&str] = &[];
+/// Registries that may have no rows, and why. An artifact belongs here only
+/// while it genuinely has no predecessor generation worth probing (the Ghost
+/// Key index did, until harvest#53 Phase B recorded its first). A new
+/// artifact's FIRST superseded generation must be recorded as a row, and its
+/// entry removed, in the change that supersedes it.
+///
+/// The one PERMANENT entry is the presence contract: its state is a heartbeat
+/// that is worthless ten minutes after it is signed, and readers follow only
+/// the current address, so its registry stays empty for good. See the header
+/// of `legacy/presence_contract.toml`. If a row is ever added there, the
+/// guard below fails until this entry goes.
+const MAY_BE_EMPTY: &[&str] = &["presence_contract.toml"];
 
 const DELEGATE_REGISTRY: (&str, &str, &str) = (
     "harvest_delegate.toml",
@@ -65,10 +76,11 @@ fn main() {
     for (file, out, const_name) in CONTRACT_REGISTRIES {
         let path = legacy.join(file);
         if MAY_BE_EMPTY.contains(file) {
-            // The allowance expires the moment it is not needed: the first
-            // superseded generation appends a row here, and that row must
-            // also take this file out of `MAY_BE_EMPTY`, or the next
-            // artifact added to the list inherits a permanent exemption.
+            // A registry listed here has no rows. For a new artifact that is
+            // temporary: its first superseded generation appends a row, and
+            // that change must also take it out of `MAY_BE_EMPTY`, or the
+            // next artifact added to the list inherits an exemption it does
+            // not need. (The presence contract's is permanent; see above.)
             let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
                 panic!("cannot read migration registry {}: {e}", path.display())
             });

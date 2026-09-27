@@ -505,6 +505,17 @@ pub enum HarvestDelegateRequest {
     /// re-sending it is harmless: the UI sends it on every open. Answered
     /// with [`HarvestDelegateResponse::AutoInvoice`].
     ArmAutoInvoice { arm: Box<AutoInvoiceArm> },
+
+    /// Sign a heartbeat for one armed store now, and send it to the store's
+    /// presence contract (`crate::presence`): the open seller tab's fallback
+    /// on a node that does not wake the delegate on its own. `force` signs
+    /// one even if the delegate sent one moments ago, which the tab asks for
+    /// once a session so it has a heartbeat to create the presence contract
+    /// with. Answered with [`HarvestDelegateResponse::Heartbeat`].
+    Heartbeat {
+        store_contract_id: Vec<u8>,
+        force: bool,
+    },
 }
 
 /// The most unpaid instant orders one buyer conversation may hold at a
@@ -564,6 +575,18 @@ pub struct AutoInvoiceArm {
     /// browser's clock and the node's never have to agree: the delegate adds
     /// it to its own clock when it is armed.
     pub watch_left_ms: u64,
+    /// The last block the bridge was asked to keep watching
+    /// [`Self::watched_scripts`] through (freenet-bitcoin#26's
+    /// `watch_until_height`), when a request carrying one was read. The
+    /// delegate issues no invoice once the tip is too close to it for the
+    /// invoice's payment window. `None`: no horizon, the day-long watch alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watched_until_height: Option<u32>,
+    /// The store's presence contract (`crate::presence`), which the delegate
+    /// sends this store's heartbeats to. `None` from a UI that predates
+    /// presence: no heartbeat is sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_contract_id: Option<[u8; 32]>,
 }
 
 /// How auto-invoicing stands for one store: see
@@ -612,6 +635,22 @@ pub struct AutoInvoiceStatus {
     /// The buyer was told; the seller is too.
     #[serde(default)]
     pub capped: Option<String>,
+    /// When the node last woke this delegate on its own schedule, by the
+    /// node's clock (freenet-core#5747). `None`, or long ago, means this node
+    /// does not wake it: heartbeats then come only from an open tab.
+    #[serde(default)]
+    pub last_wakeup_ms: Option<u64>,
+}
+
+/// A heartbeat the delegate signed for the tab ([`HarvestDelegateRequest::
+/// Heartbeat`]).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct HeartbeatAnswer {
+    /// The heartbeat just signed and sent, or `None` when one went out too
+    /// recently to send another (and `force` was not set).
+    pub heartbeat: Option<crate::presence::SignedHeartbeat>,
+    /// See [`AutoInvoiceStatus::last_wakeup_ms`].
+    pub last_wakeup_ms: Option<u64>,
 }
 
 /// What the UI asks the delegate to keep (harvest#53 Phase C). See
@@ -1025,6 +1064,11 @@ pub enum HarvestDelegateResponse {
     AutoInvoice {
         store_contract_id: Vec<u8>,
         result: Result<AutoInvoiceStatus, String>,
+    },
+    /// The answer to [`HarvestDelegateRequest::Heartbeat`].
+    Heartbeat {
+        store_contract_id: Vec<u8>,
+        result: Result<HeartbeatAnswer, String>,
     },
 }
 
@@ -1581,9 +1625,11 @@ mod tests {
             R::KeptPurchases { .. } => (27, true),
             R::KeepPurchaseRefused { .. } => (28, false),
             R::AutoInvoice { .. } => (29, false),
+            // A store-key signature over a public heartbeat, published.
+            R::Heartbeat { .. } => (30, false),
         }
     }
-    const RESPONSE_VARIANTS: usize = 30;
+    const RESPONSE_VARIANTS: usize = 31;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
@@ -1623,9 +1669,10 @@ mod tests {
             Q::ListKeptPurchases => (26, false),
             // Public payment scripts and contract ids.
             Q::ArmAutoInvoice { .. } => (27, false),
+            Q::Heartbeat { .. } => (28, false),
         }
     }
-    const REQUEST_VARIANTS: usize = 28;
+    const REQUEST_VARIANTS: usize = 29;
 
     /// A valid Ed25519 verifying key for samples that need one.
     fn sample_key() -> ed25519_dalek::VerifyingKey {
@@ -1846,6 +1893,14 @@ mod tests {
                     wallet_gap_paid_at_ms: None,
                     wallet_gap_limit: 0,
                     capped: None,
+                    last_wakeup_ms: Some(6),
+                }),
+            },
+            R::Heartbeat {
+                store_contract_id: vec![3u8; 32],
+                result: Ok(HeartbeatAnswer {
+                    heartbeat: None,
+                    last_wakeup_ms: Some(7),
                 }),
             },
         ]
@@ -2009,7 +2064,13 @@ mod tests {
                     address_code_hash: [8u8; 32],
                     watched_scripts: vec![vec![0u8, 20]],
                     watch_left_ms: 9,
+                    watched_until_height: Some(10),
+                    presence_contract_id: Some([11u8; 32]),
                 }),
+            },
+            Q::Heartbeat {
+                store_contract_id: store(),
+                force: true,
             },
         ]
     }
