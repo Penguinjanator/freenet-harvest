@@ -507,6 +507,19 @@ pub enum HarvestDelegateRequest {
     ArmAutoInvoice { arm: Box<AutoInvoiceArm> },
 }
 
+/// The most unpaid instant orders one buyer conversation may hold at a
+/// store at once. The seller's delegate refuses a Buy now past it, and the
+/// buyer's app says so before sending. Generous on purpose (Ian, 2026-09-26):
+/// no genuine buyer should reach it, and sellers are not told about it. It
+/// bounds how many payment addresses one buyer can make a store hand out
+/// without paying.
+pub const MAX_UNPAID_INSTANT_PER_BUYER: usize = 5;
+
+/// What a buyer at [`MAX_UNPAID_INSTANT_PER_BUYER`] is told, by their own app
+/// before sending and by the seller's store if one gets through anyway.
+pub const TOO_MANY_UNPAID: &str =
+    "You have too many unpaid orders at this store. Pay or cancel one to continue.";
+
 /// Everything the Harvest delegate needs to issue an instant-checkout invoice
 /// on its own, as the seller's UI knows it when it is open.
 ///
@@ -585,6 +598,20 @@ pub struct AutoInvoiceStatus {
     pub oversold: Vec<crate::payment::OrderId>,
     /// Why the next request would wait for the seller, if it would.
     pub paused: Option<String>,
+    /// When, in the last two weeks, a buyer paid an address past a run of 20
+    /// or more unpaid ones: a wallet with the usual gap limit may not show
+    /// that payment, so the seller is told to raise it (Ian, 2026-09-26).
+    #[serde(default)]
+    pub wallet_gap_paid_at_ms: Option<u64>,
+    /// The gap limit the seller's wallet needs to show every payment, when
+    /// [`Self::wallet_gap_paid_at_ms`] is set: 100 unless a longer run of
+    /// unused addresses was paid past. 0 otherwise.
+    #[serde(default)]
+    pub wallet_gap_limit: u32,
+    /// Which store limit turned a Buy now away in the last hour, if one did.
+    /// The buyer was told; the seller is too.
+    #[serde(default)]
+    pub capped: Option<String>,
 }
 
 /// What the UI asks the delegate to keep (harvest#53 Phase C). See
@@ -1816,6 +1843,9 @@ mod tests {
                     issued_last_day: 5,
                     oversold: vec![],
                     paused: None,
+                    wallet_gap_paid_at_ms: None,
+                    wallet_gap_limit: 0,
+                    capped: None,
                 }),
             },
         ]

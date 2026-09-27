@@ -378,6 +378,18 @@ impl AppState {
         self.auto_invoice.status.insert(store_contract_id, result);
     }
 
+    /// Whether this store has, in the last two weeks, been paid at an
+    /// address a wallet with the usual gap limit may not look at
+    /// (`AutoInvoiceStatus::wallet_gap_paid_at_ms`). Per store, on the page
+    /// of the store it happened at.
+    /// The gap limit to tell the seller to set, when that is due.
+    pub fn wallet_gap_note_due(&self, store_contract_id: &[u8]) -> Option<u32> {
+        match self.auto_invoice.status.get(store_contract_id) {
+            Some(Ok(s)) if s.wallet_gap_paid_at_ms.is_some() => Some(s.wallet_gap_limit.max(100)),
+            _ => None,
+        }
+    }
+
     /// What the seller's store page says about instant checkout, or `None`
     /// when the store sells nothing with it.
     pub fn instant_checkout_notice(&self, store_contract_id: &[u8], now_ms: u64) -> Option<String> {
@@ -390,14 +402,14 @@ impl AppState {
         }
         if self.bitcoin.payment_xpub.is_none() {
             return Some(
-                "Instant checkout needs your wallet's payment key. Until you add it, buyers \
-                 send you a request instead."
+                "Buyers can't buy from this store until you add your wallet's payment key in \
+                 Settings. Each order is paid to a new address from it."
                     .into(),
             );
         }
         Some(match self.auto_invoice.status.get(store_contract_id) {
-            None => "Instant checkout is starting on this device.".into(),
-            Some(Err(why)) => format!("Instant checkout is off on this device: {why}."),
+            None => "Your store is starting to take orders on this device.".into(),
+            Some(Err(why)) => format!("Your store can't take orders on this device: {why}."),
             Some(Ok(status)) => instant_checkout_status_text(status, now_ms),
         })
     }
@@ -429,31 +441,41 @@ pub fn instant_checkout_status_text(status: &AutoInvoiceStatus, now_ms: u64) -> 
 }
 
 fn instant_checkout_state_text(status: &AutoInvoiceStatus, now_ms: u64) -> String {
+    let line = instant_checkout_state_line(status, now_ms);
+    match &status.capped {
+        Some(why) => format!(
+            "In the last hour a buyer couldn't order because {why}; they were told to try again \
+             later. {line}"
+        ),
+        None => line,
+    }
+}
+
+fn instant_checkout_state_line(status: &AutoInvoiceStatus, now_ms: u64) -> String {
     if status.last_background_run_ms.is_none()
         && now_ms.saturating_sub(status.armed_at_ms) >= NO_BACKGROUND_RUN_AFTER_MS
     {
-        return "Instant checkout is not running on this node. This happens when you use Harvest \
-                through a hosted service such as try.freenet.org: buyers send you a request \
-                instead, and you answer it when you are here. Run Harvest on your own Freenet \
-                node for instant checkout."
+        return "Your store can't take orders on this node. This happens when you use Harvest \
+                through a hosted service such as try.freenet.org, where nothing runs while you \
+                are away. Run Harvest on your own Freenet node to sell."
             .into();
     }
     if let Some(why) = &status.paused {
-        return format!("Instant checkout is paused: {why}. Buyers send you a request instead.");
+        return format!("Your store isn't taking orders right now: {why}.");
     }
     // Ready, but this node has not yet shown it runs in the background: the
     // tip read on arming (harvest#162) is answered even on a hosted gateway,
     // where nothing ever runs. The next block or buyer request is the proof.
     if status.last_background_run_ms.is_none() {
-        return "Instant checkout is starting: it is on once this node has run it in the \
-                background, at the next Bitcoin block or buyer request. On a hosted service \
+        return "Your store is starting to take orders: it can once this node has run it in \
+                the background, at the next Bitcoin block or buyer order. On a hosted service \
                 such as try.freenet.org that never happens."
             .into();
     }
     let hours = status.invoicing_until_ms.saturating_sub(now_ms) / (60 * 60 * 1000);
     format!(
-        "Instant checkout is on. This device invoices buyers for you for about {hours} more \
-         hours, up to {} more orders, and renews that whenever Harvest is open.",
+        "Your store is taking orders. This device sends buyers the payment details for about \
+         {hours} more hours, up to {} more orders, and renews that whenever Harvest is open.",
         status.watched_remaining
     )
 }

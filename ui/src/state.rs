@@ -8654,7 +8654,18 @@ impl AppState {
                 .collect();
         }
         if store.payable() {
-            store.orders.clone()
+            // Less the Buy now orders nobody has paid: not orders, as the
+            // seller sees them (`fulfilment::is_unpaid_buy_now`). Their
+            // buyers see them on their own purchase cards.
+            store
+                .orders
+                .iter()
+                .filter(|order| {
+                    !crate::fulfilment::is_unpaid_buy_now(order)
+                        || self.withheld_settlements.contains_key(&order.order.id)
+                })
+                .cloned()
+                .collect()
         } else {
             // A closed or unbacked store of the viewer's own: its settled
             // history, as everyone else sees it (review round 5, P3).
@@ -31131,31 +31142,51 @@ mod buy_flow_tests {
             issued_last_day: 0,
             oversold: vec![],
             paused: paused.map(str::to_string),
+            wallet_gap_paid_at_ms: None,
+            wallet_gap_limit: 0,
+            capped: None,
         };
         let hosted = instant_checkout_status_text(&status(None, None), NO_BACKGROUND_RUN_AFTER_MS);
         assert!(
-            hosted.starts_with("Instant checkout is not running on this node"),
+            hosted.starts_with("Your store can't take orders on this node"),
             "{hosted}"
         );
         // A node that did run is not told it does not, however long ago it armed.
         let ran = instant_checkout_status_text(&status(Some(1), None), NO_BACKGROUND_RUN_AFTER_MS);
-        assert!(ran.starts_with("Instant checkout is on"), "{ran}");
+        assert!(ran.starts_with("Your store is taking orders"), "{ran}");
         // Ready before any background run (the tip read on arming,
         // harvest#162): starting, not on, since a hosted gateway gets here
         // too. On once a background run is seen.
         let early = instant_checkout_status_text(&status(None, None), 1);
-        assert!(early.starts_with("Instant checkout is starting"), "{early}");
+        assert!(
+            early.starts_with("Your store is starting to take orders"),
+            "{early}"
+        );
         let on = instant_checkout_status_text(&status(Some(1), None), 1);
-        assert!(on.starts_with("Instant checkout is on"), "{on}");
+        assert!(on.starts_with("Your store is taking orders"), "{on}");
         // Paused before any background run says why it is paused.
         let waiting = instant_checkout_status_text(&status(None, Some("no recent block")), 1);
-        assert!(waiting.contains("paused: no recent block"), "{waiting}");
+        assert!(
+            waiting.contains("taking orders right now: no recent block"),
+            "{waiting}"
+        );
         let paused = instant_checkout_status_text(&status(Some(1), Some("no recent block")), 1);
-        assert!(paused.contains("paused: no recent block"), "{paused}");
+        assert!(
+            paused.contains("taking orders right now: no recent block"),
+            "{paused}"
+        );
         let mut oversold = status(Some(1), None);
         oversold.oversold = vec![OrderId([7; 32])];
         let told = instant_checkout_status_text(&oversold, 1);
         assert!(told.contains(&OrderId([7; 32]).short()), "{told}");
+        // A store limit that turned a buyer away is said, ahead of the rest.
+        let mut capped = status(Some(1), None);
+        capped.capped = Some("50 instant invoices are waiting for payment".into());
+        let said = instant_checkout_status_text(&capped, 1);
+        assert!(
+            said.starts_with("In the last hour a buyer couldn't order because 50 instant"),
+            "{said}"
+        );
 
         let gk = inbox::authority().mint();
         let state = an_instant_seller(&gk);

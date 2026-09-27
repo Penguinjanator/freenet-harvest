@@ -68,6 +68,7 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
         let mine = invoices_issued_by(
             store.map(|s| s.orders.as_slice()).unwrap_or_default(),
             &seller_fingerprint,
+            |id| state.withheld_settlements.contains_key(id),
         );
         // Decided once, here, against this node's own view of the chain --
         // the same read `payment_blockers` makes on the buyer's side, so the
@@ -394,7 +395,12 @@ fn sold_out_ids(store: &crate::state::BrowsingStore) -> Vec<ListingId> {
         .collect()
 }
 
-/// The invoices on a store that THIS seller issued, newest first.
+/// The invoices on a store that THIS seller issued, newest first, less the
+/// Buy now orders nobody has paid ([`crate::fulfilment::is_unpaid_buy_now`]):
+/// the seller hears of a Buy now once it is paid. Except one whose payment
+/// is `withheld` for the seller to confirm (`AppState::settlement_hold`):
+/// its card is where they confirm it, so it is shown while it waits
+/// (review round 1 of harvest#177).
 ///
 /// A store contract carries every order, and the seller's panel is about
 /// their own. The filter is on `seller_fingerprint` rather than on ownership
@@ -405,10 +411,12 @@ fn sold_out_ids(store: &crate::state::BrowsingStore) -> Vec<ListingId> {
 fn invoices_issued_by(
     orders: &[harvest_common::payment::AuthorizedOrder],
     seller_fingerprint: &str,
+    withheld: impl Fn(&harvest_common::payment::OrderId) -> bool,
 ) -> Vec<harvest_common::payment::AuthorizedOrder> {
     let mut mine: Vec<_> = orders
         .iter()
         .filter(|o| o.order.seller_fingerprint == seller_fingerprint)
+        .filter(|o| !crate::fulfilment::is_unpaid_buy_now(o) || withheld(&o.order.id))
         .cloned()
         .collect();
     mine.sort_by_key(|o| std::cmp::Reverse(o.order.created_at));
@@ -507,6 +515,12 @@ fn PaymentKeyForm(replacing: bool, on_done: EventHandler<()>) -> Element {
                 code { "vpub" }
                 " on signet and testnet. Harvest derives a fresh receiving "
                 "address from it for each invoice, so no address is ever reused."
+            }
+            p {
+                "In your wallet's settings, set the "
+                strong { "gap limit" }
+                " to 100. Buyers who press Buy now and never pay still use up addresses, and "
+                "a wallet left at the usual 20 can miss a payment that comes after them."
             }
             p { class: "text-muted",
                 "This is a "
@@ -824,7 +838,7 @@ mod tests {
     fn a_sellers_panel_shows_only_their_own_invoices() {
         let orders = vec![order("me", 1), order("someone-else", 2), order("me", 3)];
 
-        let mine = invoices_issued_by(&orders, "me");
+        let mine = invoices_issued_by(&orders, "me", |_| false);
 
         assert_eq!(mine.len(), 2);
         assert!(mine.iter().all(|o| o.order.seller_fingerprint == "me"));
@@ -836,7 +850,7 @@ mod tests {
     fn invoices_are_listed_newest_first() {
         let orders = vec![order("me", 1), order("me", 3), order("me", 2)];
 
-        let mine = invoices_issued_by(&orders, "me");
+        let mine = invoices_issued_by(&orders, "me", |_| false);
 
         let addresses: Vec<&str> = mine
             .iter()
@@ -848,10 +862,45 @@ mod tests {
         );
     }
 
+    /// An unpaid Buy now is not an order, as the seller sees it: left out
+    /// while it awaits payment, and when it was cancelled unpaid. Once paid it
+    /// is listed. An invoice the seller issued by hand (no request id) is
+    /// always listed. Mutated red by dropping the `is_unpaid_buy_now` filter,
+    /// and by widening it to every `AwaitingPayment` order.
+    #[test]
+    fn an_unpaid_buy_now_is_not_on_the_sellers_list() {
+        let buy_now = |minutes: i64, status: OrderStatus| {
+            let mut o = order("me", minutes);
+            o.order.request_id = Some([minutes as u8; 32]);
+            o.status = status;
+            o
+        };
+        let orders = vec![
+            order("me", 1),
+            buy_now(2, OrderStatus::AwaitingPayment),
+            buy_now(3, OrderStatus::Cancelled),
+            buy_now(4, OrderStatus::Paid),
+            buy_now(5, OrderStatus::PaymentReversed),
+        ];
+        let shown: Vec<i64> = invoices_issued_by(&orders, "me", |_| false)
+            .iter()
+            .map(|o| o.order.payment_script_pubkey[2] as i64)
+            .collect();
+        assert_eq!(shown, vec![5, 4, 1]);
+        // One whose payment waits for the seller to confirm it is shown:
+        // its card is where they do. Mutated red by dropping the exception.
+        let waiting = orders[1].order.id.clone();
+        let shown: Vec<i64> = invoices_issued_by(&orders, "me", |id| *id == waiting)
+            .iter()
+            .map(|o| o.order.payment_script_pubkey[2] as i64)
+            .collect();
+        assert_eq!(shown, vec![5, 4, 2, 1]);
+    }
+
     #[test]
     fn a_seller_with_no_invoices_gets_an_empty_list() {
-        assert!(invoices_issued_by(&[], "me").is_empty());
-        assert!(invoices_issued_by(&[order("someone-else", 1)], "me").is_empty());
+        assert!(invoices_issued_by(&[], "me", |_| false).is_empty());
+        assert!(invoices_issued_by(&[order("someone-else", 1)], "me", |_| false).is_empty());
     }
 
     /// **The seller's forms refuse what a buyer would refuse to pay**
