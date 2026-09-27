@@ -15,6 +15,7 @@ mod node_glue;
 mod origin;
 mod secrets;
 mod store_keys;
+mod watch_delegation;
 
 use freenet_stdlib::prelude::{
     ApplicationMessage, DelegateCtx, DelegateError, DelegateInterface, InboundDelegateMsg,
@@ -120,15 +121,33 @@ impl DelegateInterface for HarvestDelegate {
                 handle_get_contract_response(ctx, &response)
             }
 
-            InboundDelegateMsg::SubscribeContractResponse(key) => {
-                // Subscription confirmed -- nothing to do for now
-                let _ = key;
+            // The delegated watch's copies count as settled only from the
+            // node's Ok here (`watch_delegation::on_subscribed`); every other
+            // subscription's answer needs nothing.
+            InboundDelegateMsg::SubscribeContractResponse(response) => {
+                if let Ok(contract_id) = <[u8; 32]>::try_from(response.contract_id.as_bytes()) {
+                    watch_delegation::on_subscribed(
+                        &mut CtxSecrets(ctx),
+                        &contract_id,
+                        &response.result,
+                        now_ms(),
+                    );
+                }
                 Ok(vec![])
             }
 
             // A store update instant checkout sent: on success, send the
             // replies it was holding back (see `auto_invoice::on_store_updated`).
             InboundDelegateMsg::UpdateContractResponse(response) => {
+                // The delegated watch's inbox UPDATE first: a refused one was
+                // never sent (`watch_delegation::on_update_answer`).
+                if let Some(out) = watch_delegation::on_update_answer(
+                    &mut CtxSecrets(ctx),
+                    &response.result,
+                    response.context.as_ref(),
+                ) {
+                    return Ok(out);
+                }
                 Ok(auto_invoice::on_store_update_answer(
                     &mut CtxSecrets(ctx),
                     &response.result,
@@ -242,6 +261,22 @@ fn handle_request(
             out.extend(updates);
             Ok(out)
         }
+        // The watch key and the Ghost Key's delegation to it
+        // (`watch_delegation`). Checked above like everything else: only the
+        // Harvest web app may read the watch key or hand it a delegation.
+        Ok(
+            request @ (HarvestDelegateRequest::GetWatchKey
+            | HarvestDelegateRequest::SetWatchDelegation { .. }
+            | HarvestDelegateRequest::UpdateWatchDelegation { .. }),
+        ) => {
+            let response =
+                watch_delegation::handle_request(&mut CtxSecrets(ctx), request, now_ms());
+            let response_bytes = to_cbor(&response)
+                .map_err(|e| DelegateError::Other(format!("serialize response: {e}")))?;
+            Ok(vec![OutboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(response_bytes),
+            )])
+        }
         Ok(request) => {
             let response = handlers::handle(&mut CtxSecrets(ctx), origin, request);
 
@@ -324,6 +359,12 @@ fn handle_contract_notification(
         )
     }) {
         return Ok(out);
+    }
+    // A bridge inbox or address contract the delegated watch subscribed to
+    // keep the node's copy fresh: every verdict comes from a GET, so the
+    // notification itself needs nothing, and a background run has no UI.
+    if contract_id.is_some_and(|id| watch_delegation::subscribed_to(&CtxSecrets(ctx), &id)) {
+        return Ok(Vec::new());
     }
 
     // The notification contains the contract key and the update data.
@@ -479,6 +520,46 @@ mod boundary_tests {
             message.contains("Harvest web app"),
             "the refusal must say why: {message}"
         );
+    }
+
+    /// Only the Harvest web app may read the watch key or hand the delegate
+    /// a Ghost Key's delegation: another web app could otherwise have this
+    /// node's delegate ask the bridge for watches in the seller's name, or
+    /// learn which delegate serves which seller. Mutated red by removing the
+    /// `authorize` call from `handle_request`.
+    #[test]
+    fn a_foreign_web_app_cannot_touch_the_watch_key() {
+        use harvest_common::delegate::WatchDelegationGrant;
+        let bridge = freenet_bitcoin_common::BridgeId([1u8; 32]);
+        for request in [
+            HarvestDelegateRequest::GetWatchKey,
+            HarvestDelegateRequest::SetWatchDelegation {
+                grant: Box::new(WatchDelegationGrant {
+                    network: BitcoinNetwork::Signet,
+                    bridge,
+                    ghostkey: [2u8; 32],
+                    certificate_pem: String::new(),
+                    delegation_scoped_payload: vec![],
+                    delegation_signature: vec![],
+                    inbox_contract_id: [3u8; 32],
+                    last_made_at_ms: 0,
+                }),
+            },
+            HarvestDelegateRequest::UpdateWatchDelegation {
+                bridge,
+                inbox_contract_id: [3u8; 32],
+                last_made_at_ms: 0,
+            },
+        ] {
+            let payload = to_cbor(&request).expect("cbor");
+            for origin in [Some(a_different_web_app()), None] {
+                let message = refusal(&payload, origin.as_ref());
+                assert!(
+                    message.contains("Harvest web app") || message.contains("origin"),
+                    "{request:?}: {message}"
+                );
+            }
+        }
     }
 
     /// A `PurchaseToKeep` that decodes but never verifies -- good enough for a
@@ -699,6 +780,33 @@ mod boundary_tests {
 /// `auto_invoice::on_get_answer` is tested there.
 #[cfg(test)]
 mod get_answer_routing_tests {
+    /// The dispatcher routes the delegated watch's notifications and answers
+    /// to `watch_delegation`: source-pinned because its secrets are inert off
+    /// `wasm32`; the decisions are tested in `watch_delegation::tests`.
+    /// Mutated red by dropping the `subscribed_to` check.
+    #[test]
+    fn watched_contract_notifications_are_dropped_and_answers_routed() {
+        let src = include_str!("lib.rs");
+        let handler = &src[src.find("fn handle_contract_notification(").unwrap()..];
+        let handler = &handler[..handler.find("\n}\n").unwrap()];
+        let dropped = handler
+            .find("watch_delegation::subscribed_to(")
+            .expect("checked");
+        let forwarded = handler.find("ContractUpdate {").expect("forwarded");
+        assert!(dropped < forwarded, "dropped before anything is forwarded");
+        let process = &src[src.find("fn process(").unwrap()..];
+        assert!(process.contains("watch_delegation::on_subscribed("));
+        let update = &process[process.find("UpdateContractResponse(response)").unwrap()..];
+        let watch = update.find("watch_delegation::on_update_answer(").unwrap();
+        let store = update
+            .find("auto_invoice::on_store_update_answer(")
+            .unwrap();
+        assert!(
+            watch < store,
+            "the delegated watch's UPDATE answer is recognised first"
+        );
+    }
+
     #[test]
     fn a_get_answer_goes_to_instant_checkout_first() {
         let src = include_str!("lib.rs");

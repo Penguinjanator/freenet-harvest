@@ -419,7 +419,7 @@ impl AppState {
             || self
                 .pending_signatures
                 .iter()
-                .any(|p| matches!(p, crate::state::PendingSignature::InboxEntry(_)))
+                .any(crate::state::PendingSignature::is_watch_signature)
     }
 
     /// The custody request a loaded store calls for, if any. Pure over the
@@ -1267,6 +1267,40 @@ mod tests {
         // Holding the key, the old backer is not wrapped for.
         register(&mut state);
         assert_eq!(purpose(&state), None, "the current backer is not connected");
+    }
+
+    /// A pending delegation of watch requests holds custody back like a
+    /// watch request does: both are vault prompts, and a refusal names no
+    /// request. (Leaving it out of `is_watch_signature` alone does not turn
+    /// this red, since it would then count as the seller's own signature;
+    /// that mutation is caught by `the_seller_delegates_once_per_ghost_key_
+    /// and_bridge`.)
+    #[test]
+    fn custody_waits_behind_a_watch_delegation() {
+        let mut state = backed_store();
+        register(&mut state);
+        state
+            .pending_signatures
+            .push_back(crate::state::PendingSignature::WatchDelegation(Box::new(
+                crate::auto_invoice_flow::PendingWatchDelegation {
+                    fingerprint: FINGERPRINT.to_string(),
+                    ghostkey: freenet_bitcoin_inbox::GhostkeyId([1; 32]),
+                    network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                    bridge: freenet_bitcoin_common::BridgeId([2; 32]),
+                    inbox_contract_id: [3; 32],
+                    issued_mainnet_height: 4,
+                    signing_payload: vec![5],
+                    queued_at_ms: 6,
+                },
+            )));
+        state.start_custody_for(&[ID; 32]);
+        assert!(
+            state.pending_custody.is_empty(),
+            "deferred behind the vault"
+        );
+        state.pending_signatures.clear();
+        state.start_custody_where_needed();
+        assert!(!state.pending_custody.is_empty(), "started once it is free");
     }
 
     /// Custody waits while anything else waits on the vault, and counts as

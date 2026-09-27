@@ -18,12 +18,12 @@
 //!   No heartbeat here: on a node without wake-ups the tab heartbeats, and on
 //!   one with them the first wake-up comes within about a minute of start.
 //!
-//! What none of them can do is ask the Bitcoin bridge to watch new
-//! addresses: that request is signed with the seller's Ghost Key, and a run
-//! with no tab cannot reach the Ghost Key vault (freenet-core refuses
-//! delegate-to-delegate messages from background runs). The watches the
-//! delegate relies on are requested by the tab, for weeks at a time
-//! (freenet-bitcoin#26); see `auto_invoice::global_refusal`.
+//! - **A `heartbeat` wake-up** also keeps the next payment addresses
+//!   watched: a run with no tab cannot reach the Ghost Key vault
+//!   (freenet-core refuses delegate-to-delegate messages from background
+//!   runs), so it signs its own watch requests with a watch key the seller's
+//!   Ghost Key delegated to it once, while the tab was open
+//!   (freenet-bitcoin#30). One inbox read per run; see `watch_delegation`.
 
 use freenet_migrate::SecretStore;
 use freenet_stdlib::prelude::{DelegateCtx, DelegateError, OutboundDelegateMsg};
@@ -54,13 +54,31 @@ pub(crate) fn on_background<S: SecretStore>(
                 return Vec::new();
             }
             crate::auto_invoice::note_wakeup(secrets, now_ms);
-            let mut out = crate::auto_invoice::heartbeats(secrets, now_ms);
+            // The delegated watch's one read (the bridge inbox, or an
+            // address contract) first in the list. Order in the list is not
+            // order of execution: the node handles a run's GETs first, then
+            // its UPDATEs, then its SUBSCRIBEs (freenet-core `contract.rs`),
+            // and runs at most four operations per run that must reach the
+            // network (`MAX_NETWORK_CONTRACT_OPS_PER_PARK`): a GET of a
+            // contract it has never seen, the fetch an UPDATE to one it does
+            // not hold sets off, or a SUBSCRIBE of an unseen one, all sharing
+            // that budget and refused past it. The read's GET therefore goes
+            // before the heartbeat UPDATEs' self-heal fetches can use the
+            // budget up, and its SUBSCRIBE after them: a SUBSCRIBE refused
+            // leaves the copy unsettled, which delays a verdict, never fakes
+            // one.
+            let mut out = crate::watch_delegation::on_wakeup(secrets, now_ms);
+            out.extend(crate::auto_invoice::heartbeats(secrets, now_ms));
+            // The mailbox re-reads last (rare: only after a refused update).
             out.extend(crate::auto_invoice::mailbox_retries(secrets));
             out
         }
         // A tag this generation did not declare (a successor's, say): nothing.
         BackgroundRun::Wakeup { .. } => Vec::new(),
         BackgroundRun::Installed | BackgroundRun::NodeStarted => {
+            // Subscriptions of an earlier run may be gone: none of the
+            // delegated watch's counts as settled until renewed.
+            crate::watch_delegation::on_node_started(secrets);
             crate::auto_invoice::resubscribe_all(secrets)
         }
     }

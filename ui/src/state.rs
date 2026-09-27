@@ -1556,6 +1556,10 @@ pub enum PendingSignature {
     /// A buyer's Ghost Key vouching for one conversation, so their messages
     /// in it are shown to the seller (`crate::voucher_flow`).
     MessageVoucher(Box<crate::voucher_flow::PendingMessageVoucher>),
+    /// A seller's Ghost Key delegating its bridge watch requests to the
+    /// Harvest delegate's watch key (`crate::auto_invoice_flow`). A
+    /// background request, handled as the watch requests are.
+    WatchDelegation(Box<crate::auto_invoice_flow::PendingWatchDelegation>),
 }
 
 /// Which key a pending signature is asked of, and so which answer may settle
@@ -1580,6 +1584,7 @@ impl PendingSignature {
             PendingSignature::Cancellation(pending) => pending.signed_bytes(),
             PendingSignature::Despatch(pending) => harvest_common::to_cbor(&pending.despatch),
             PendingSignature::InboxEntry(pending) => Ok(pending.signing_payload.clone()),
+            PendingSignature::WatchDelegation(pending) => Ok(pending.signing_payload.clone()),
             PendingSignature::MessageVoucher(pending) => {
                 harvest_common::sealed::voucher_message(&pending.tag)
             }
@@ -1612,8 +1617,35 @@ impl PendingSignature {
             | PendingSignature::Despatch(_)
             | PendingSignature::BackingAcceptance(_) => Signer::StoreKey,
             PendingSignature::InboxEntry(_)
+            | PendingSignature::WatchDelegation(_)
             | PendingSignature::BackingStatement(_)
             | PendingSignature::MessageVoucher(_) => Signer::GhostKey,
+        }
+    }
+
+    /// Whether this is one of the vault signatures the seller did not ask
+    /// for: a bridge watch request, or the delegation of them to the
+    /// delegate's watch key. Both are held back behind the seller's own
+    /// signing and stopped for the session on a refusal.
+    pub(crate) fn is_watch_signature(&self) -> bool {
+        self.watch_fingerprint().is_some()
+    }
+
+    /// The Ghost Key a watch signature is asked of, by fingerprint.
+    pub(crate) fn watch_fingerprint(&self) -> Option<&str> {
+        match self {
+            PendingSignature::InboxEntry(entry) => Some(&entry.fingerprint),
+            PendingSignature::WatchDelegation(delegation) => Some(&delegation.fingerprint),
+            _ => None,
+        }
+    }
+
+    /// When a watch signature was queued.
+    fn watch_queued_at_ms(&self) -> Option<u64> {
+        match self {
+            PendingSignature::InboxEntry(entry) => Some(entry.queued_at_ms),
+            PendingSignature::WatchDelegation(delegation) => Some(delegation.queued_at_ms),
+            _ => None,
         }
     }
 }
@@ -8740,6 +8772,13 @@ impl AppState {
     /// answer is matched, so this cannot withdraw a different request that
     /// happens to sit at the same position.
     pub(crate) fn withdraw_pending_signature(&mut self, withdrawn: &PendingSignature) {
+        // A delegation whose request never left this tab was not asked in
+        // effect: free its once-per-session marker (see `retire_inbox`).
+        if let PendingSignature::WatchDelegation(delegation) = withdrawn {
+            self.auto_invoice
+                .delegation_asked
+                .remove(&(delegation.ghostkey, delegation.bridge));
+        }
         let Ok(bytes) = withdrawn.signed_bytes() else {
             return;
         };
@@ -11103,6 +11142,12 @@ impl AppState {
                 self.on_auto_invoice_status(store_contract_id, result)
             }
 
+            HarvestDelegateResponse::WatchKey { result } => self.on_watch_key(result),
+
+            HarvestDelegateResponse::WatchDelegation { bridge, result } => {
+                self.on_watch_delegation(bridge, result)
+            }
+
             HarvestDelegateResponse::Heartbeat {
                 store_contract_id,
                 result,
@@ -11684,6 +11729,21 @@ impl AppState {
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 let _ = (submitted, contract_key);
+            }
+            Some(PendingSignature::WatchDelegation(pending)) => {
+                let request = self.on_watch_delegation_signed(
+                    *pending,
+                    certificate_pem,
+                    scoped_payload,
+                    signature,
+                    now_ms(),
+                );
+                #[cfg(target_arch = "wasm32")]
+                if let Some(request) = request {
+                    spawn_harvest_request(request, "the watch delegation");
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = request;
             }
             Some(PendingSignature::BackingStatement(pending)) => {
                 self.on_backing_statement_signed(*pending, scoped_payload, signature);
@@ -12789,10 +12849,44 @@ impl AppState {
         self.bitcoin
             .retired_contracts
             .insert(old.contract_key.id().as_bytes().to_vec());
-        self.pending_signatures.retain(|pending| {
-            !matches!(pending, PendingSignature::InboxEntry(entry)
-                if entry.contract_key == old.contract_key)
+        let old_id = old.contract_key.id().as_bytes().to_vec();
+        let mut abandoned = Vec::new();
+        self.pending_signatures.retain(|pending| match pending {
+            PendingSignature::InboxEntry(entry) => entry.contract_key != old.contract_key,
+            PendingSignature::WatchDelegation(delegation) => {
+                let keep = delegation.inbox_contract_id.as_slice() != old_id.as_slice();
+                if !keep {
+                    abandoned.push((delegation.ghostkey, delegation.bridge));
+                }
+                keep
+            }
+            _ => true,
         });
+        // A delegation abandoned before it reached the delegate was never
+        // asked in effect: nothing can report it stalled, so without this the
+        // once-per-session marker would keep delegated watching off for the
+        // session (codex, review round 4 of #179).
+        // The same for one signed and handed to the delegate but not taken
+        // yet: resending it would only name the retired inbox.
+        self.auto_invoice.delegation_in_flight.retain(|_, f| {
+            let harvest_common::HarvestDelegateRequest::SetWatchDelegation { grant } = &f.request
+            else {
+                return true;
+            };
+            let keep = grant.inbox_contract_id.as_slice() != old_id.as_slice();
+            if !keep {
+                abandoned.push((
+                    freenet_bitcoin_inbox::GhostkeyId(grant.ghostkey),
+                    grant.bridge,
+                ));
+            }
+            keep
+        });
+        // `delegation_unanswered` is left as it is: it describes whether the
+        // delegate answers at all, which a new inbox does not change.
+        for pair in abandoned {
+            self.auto_invoice.delegation_asked.remove(&pair);
+        }
     }
 
     /// The payment scripts each of this node's sellers needs `bridge` to
@@ -13012,15 +13106,17 @@ impl AppState {
         let mut work = WatchWork::default();
 
         let mut timed_out = Vec::new();
-        self.pending_signatures.retain(|pending| match pending {
-            PendingSignature::InboxEntry(entry)
-                if now_ms.saturating_sub(entry.queued_at_ms)
-                    >= crate::bitcoin_inbox::SIGNATURE_TIMEOUT_MS =>
-            {
-                timed_out.push(entry.fingerprint.clone());
-                false
+        self.pending_signatures.retain(|pending| {
+            match (pending.watch_fingerprint(), pending.watch_queued_at_ms()) {
+                (Some(fingerprint), Some(queued_at))
+                    if now_ms.saturating_sub(queued_at)
+                        >= crate::bitcoin_inbox::SIGNATURE_TIMEOUT_MS =>
+                {
+                    timed_out.push(fingerprint.to_string());
+                    false
+                }
+                _ => true,
             }
-            _ => true,
         });
         for fingerprint in timed_out {
             self.stop_watch_requests_for(&fingerprint, "the Ghost Key vault did not answer");
@@ -13092,7 +13188,7 @@ impl AppState {
         if self
             .pending_signatures
             .iter()
-            .any(|p| matches!(p, PendingSignature::InboxEntry(_)))
+            .any(PendingSignature::is_watch_signature)
         {
             return work;
         }
@@ -13157,7 +13253,7 @@ impl AppState {
         };
         self.pending_signatures
             .iter()
-            .any(|p| matches!(p, PendingSignature::InboxEntry(_)))
+            .any(PendingSignature::is_watch_signature)
             || !self.watches_wanted(inbox.bridge).is_empty()
     }
 
@@ -13171,10 +13267,10 @@ impl AppState {
         // A custody request counts (#99 review): it is a vault prompt the
         // seller sees, so a refusal while it waits must not be taken for a
         // watch request's, and watch requests hold back behind it.
-        self.pending_signatures.iter().any(|pending| {
-            pending.signer() == Signer::GhostKey
-                && !matches!(pending, PendingSignature::InboxEntry(_))
-        }) || self.pending_store_creation.is_some()
+        self.pending_signatures
+            .iter()
+            .any(|pending| pending.signer() == Signer::GhostKey && !pending.is_watch_signature())
+            || self.pending_store_creation.is_some()
             || self.pending_store_edit.is_some()
             || !self.listings_awaiting_certificate.is_empty()
             || self.request_any_access_in_flight
@@ -13193,9 +13289,10 @@ impl AppState {
     /// With the seller's own work also under way the two cannot be told apart,
     /// and it is handled as the seller's.
     fn named_refusal_is_a_watch_request(&self, fingerprint: &str) -> bool {
-        let outstanding = self.pending_signatures.iter().any(|pending| {
-            matches!(pending, PendingSignature::InboxEntry(entry) if entry.fingerprint == fingerprint)
-        });
+        let outstanding = self
+            .pending_signatures
+            .iter()
+            .any(|pending| pending.watch_fingerprint() == Some(fingerprint));
         outstanding
             || (self.bitcoin.watch_requests_stopped.contains(fingerprint)
                 && !self.user_signature_under_way())
@@ -13207,8 +13304,9 @@ impl AppState {
     fn only_watch_signatures_outstanding(&self, fingerprint: Option<&str>) -> bool {
         !self.user_signature_under_way()
             && self.pending_signatures.iter().any(|pending| {
-                matches!(pending, PendingSignature::InboxEntry(entry)
-                    if fingerprint.is_none_or(|fp| entry.fingerprint == fp))
+                pending
+                    .watch_fingerprint()
+                    .is_some_and(|fp| fingerprint.is_none_or(|named| named == fp))
             })
     }
 
@@ -13232,15 +13330,14 @@ impl AppState {
             );
         }
         let mut refused = Vec::new();
-        self.pending_signatures.retain(|pending| match pending {
-            PendingSignature::InboxEntry(entry)
-                if fingerprint.is_none_or(|fp| entry.fingerprint == fp) =>
-            {
-                refused.push(entry.fingerprint.clone());
-                false
-            }
-            _ => true,
-        });
+        self.pending_signatures
+            .retain(|pending| match pending.watch_fingerprint() {
+                Some(fp) if fingerprint.is_none_or(|named| named == fp) => {
+                    refused.push(fp.to_string());
+                    false
+                }
+                _ => true,
+            });
         for fingerprint in refused {
             self.stop_watch_requests_for(&fingerprint, reason);
         }
@@ -15930,6 +16027,7 @@ mod tests {
                 | PendingSignature::Cancellation(_)
                 | PendingSignature::Despatch(_)
                 | PendingSignature::InboxEntry(_)
+                | PendingSignature::WatchDelegation(_)
                 | PendingSignature::BackingStatement(_)
                 | PendingSignature::BackingAcceptance(_)
                 | PendingSignature::MessageVoucher(_) => None,
@@ -16665,6 +16763,7 @@ mod tests {
                 | PendingSignature::Cancellation(_)
                 | PendingSignature::Despatch(_)
                 | PendingSignature::InboxEntry(_)
+                | PendingSignature::WatchDelegation(_)
                 | PendingSignature::BackingStatement(_)
                 | PendingSignature::BackingAcceptance(_)
                 | PendingSignature::MessageVoucher(_) => None,
@@ -31188,11 +31287,31 @@ mod buy_flow_tests {
         assert!(arm.presence_contract_id.is_some());
     }
 
+    /// A status the delegate would send for a store it has stored an arm
+    /// for.
+    fn an_answered_arm() -> harvest_common::delegate::AutoInvoiceStatus {
+        harvest_common::delegate::AutoInvoiceStatus {
+            armed_at_ms: 0,
+            watched_remaining: 5,
+            invoicing_until_ms: 0,
+            last_background_run_ms: None,
+            issued_last_day: 0,
+            oversold: vec![],
+            paused: None,
+            wallet_gap_paid_at_ms: None,
+            wallet_gap_limit: 0,
+            capped: None,
+            last_wakeup_ms: None,
+            watch_delegation: None,
+        }
+    }
+
     /// The open tab heartbeats an armed store every five minutes, forcing
     /// the first of the session (which creates the presence contract), and
     /// leaves it to the node once wake-ups are seen, except for that first
-    /// one. Mutated red by never forcing, by ignoring wake-ups, and by
-    /// dropping the interval.
+    /// one; and asks only once the delegate has answered the arm. Mutated
+    /// red by never forcing, by ignoring wake-ups, by dropping the interval,
+    /// and by asking before the arm is answered.
     #[test]
     fn the_tab_heartbeats_until_the_node_does() {
         use harvest_common::presence::HEARTBEAT_EVERY_MS;
@@ -31205,6 +31324,14 @@ mod buy_flow_tests {
             .auto_invoice_arm("seller-fp", &registration, 10)
             .expect("an arm");
         state.auto_invoice.sent.insert(store.clone(), (arm, 0, 0));
+        assert!(
+            state.heartbeats_due(100).is_empty(),
+            "the arm is sent but the delegate has not answered it"
+        );
+        state
+            .auto_invoice
+            .status
+            .insert(store.clone(), Ok(an_answered_arm()));
         assert_eq!(state.queue_heartbeats(100), vec![(store.clone(), true)]);
         assert!(state.heartbeats_due(200).is_empty(), "asked just now");
         state.presence.published.insert(store.clone());
@@ -31220,6 +31347,622 @@ mod buy_flow_tests {
         let late = 100 + HEARTBEAT_EVERY_MS + crate::presence_flow::WAKEUPS_FRESH_MS;
         assert!(!state.wakeups_live(late));
         assert_eq!(state.heartbeats_due(late), vec![(store, false)]);
+    }
+
+    // --- The delegation of watch requests to the delegate's watch key ---
+
+    const DELEGATION_NOW: u64 = 1_900_000_000_000;
+
+    /// [`an_instant_seller`] with the inbox served at `inbox::FLOOR`, and
+    /// the delegate's answer for the store naming `delegation`.
+    fn a_seller_to_delegate(
+        gk: &freenet_bitcoin_inbox::test_support::TestGhostkey,
+        delegation: Option<harvest_common::delegate::WatchDelegationStatus>,
+    ) -> AppState {
+        let mut state = an_instant_seller(gk);
+        state
+            .bitcoin
+            .inbox
+            .as_mut()
+            .unwrap()
+            .on_state(inbox::open_inbox(), DELEGATION_NOW);
+        state.on_auto_invoice_status(
+            instant_store(),
+            Ok(harvest_common::delegate::AutoInvoiceStatus {
+                armed_at_ms: 1,
+                watched_remaining: 3,
+                invoicing_until_ms: 0,
+                last_background_run_ms: Some(1),
+                issued_last_day: 0,
+                oversold: vec![],
+                paused: None,
+                wallet_gap_paid_at_ms: None,
+                wallet_gap_limit: 0,
+                capped: None,
+                last_wakeup_ms: None,
+                watch_delegation: delegation,
+            }),
+        );
+        state
+    }
+
+    fn inbox_id(state: &AppState) -> [u8; 32] {
+        state
+            .bitcoin
+            .inbox
+            .as_ref()
+            .unwrap()
+            .contract_key
+            .id()
+            .as_bytes()
+            .try_into()
+            .unwrap()
+    }
+
+    fn held_delegation(
+        state: &AppState,
+        gk: &freenet_bitcoin_inbox::test_support::TestGhostkey,
+    ) -> harvest_common::delegate::WatchDelegationStatus {
+        harvest_common::delegate::WatchDelegationStatus {
+            bridge: state.bitcoin.inbox.as_ref().unwrap().bridge,
+            ghostkey: gk.id().0,
+            issued_mainnet_height: freenet_bitcoin_inbox::sender_height(inbox::FLOOR),
+            inbox_contract_id: inbox_id(state),
+            made_at_ms: 5,
+            watched: 3,
+            outstanding: false,
+            stalled: false,
+        }
+    }
+
+    /// The seller's Ghost Key is asked once, for a delegation to the
+    /// delegate's own watch key issued at `sender_height` of the inbox floor,
+    /// for the bridge the store's orders name; the signed delegation goes to
+    /// the delegate with the tab's last `made_at_ms`; and it is not asked
+    /// again this session, whatever the delegate's older answers say.
+    /// Mutated red by: dropping the `delegation_asked` check (asked again),
+    /// and by dating the delegation at the floor itself.
+    #[test]
+    fn the_seller_delegates_once_per_ghost_key_and_bridge() {
+        use crate::auto_invoice_flow::PendingWatchDelegation;
+        let gk = inbox::authority().mint();
+        let state = an_instant_seller(&gk);
+        assert_eq!(
+            state.plan_watch_delegation(DELEGATION_NOW),
+            Default::default(),
+            "nothing before the delegate has answered for the store"
+        );
+        let mut state = a_seller_to_delegate(&gk, None);
+        let bridge = state.bitcoin.inbox.as_ref().unwrap().bridge;
+
+        let work = state.queue_auto_invoice(DELEGATION_NOW);
+        assert!(work.delegation.get_watch_key, "the watch key first");
+        assert!(!state.plan_watch_delegation(DELEGATION_NOW).get_watch_key);
+        let watch_key = ed25519_dalek::SigningKey::from_bytes(&[0x3d; 32]);
+        state.on_watch_key(Ok(watch_key.verifying_key().to_bytes()));
+
+        let work = state.queue_auto_invoice(DELEGATION_NOW + 1);
+        let pending: PendingWatchDelegation = work.delegation.delegate.expect("the vault is asked");
+        let body =
+            freenet_bitcoin_inbox::DelegationBody::from_signing_payload(&pending.signing_payload)
+                .unwrap();
+        assert_eq!(body.bridge, bridge);
+        assert_eq!(body.watch_key.0, watch_key.verifying_key().to_bytes());
+        assert_eq!(
+            body.issued_mainnet_height,
+            freenet_bitcoin_inbox::sender_height(inbox::FLOOR)
+        );
+        assert_eq!(body.expires_mainnet_height, None);
+        assert_eq!(
+            (pending.ghostkey, pending.fingerprint.as_str()),
+            (gk.id(), "seller-fp")
+        );
+        assert!(state
+            .pending_signatures
+            .iter()
+            .any(|p| matches!(p, PendingSignature::WatchDelegation(_))));
+        assert!(
+            !state.user_signature_under_way(),
+            "a background signature, not the seller's"
+        );
+
+        // Signed: taken off the queue, and handed to the delegate.
+        let (scoped, signature) = inbox::sign_result(&gk, pending.signing_payload.clone());
+        state.on_signature(
+            crate::state::Signer::GhostKey,
+            scoped.clone(),
+            signature.clone(),
+            gk.pem.clone(),
+        );
+        assert!(!state
+            .pending_signatures
+            .iter()
+            .any(|p| matches!(p, PendingSignature::WatchDelegation(_))));
+        state.bitcoin.inbox.as_mut().unwrap().raise_made_at(77);
+        let Some(harvest_common::HarvestDelegateRequest::SetWatchDelegation { grant }) = state
+            .on_watch_delegation_signed(
+                pending.clone(),
+                gk.pem.clone(),
+                scoped.clone(),
+                signature.clone(),
+                DELEGATION_NOW + 1,
+            )
+        else {
+            panic!("a SetWatchDelegation");
+        };
+        assert_eq!(grant.ghostkey, gk.id().0);
+        assert_eq!(grant.bridge, bridge);
+        assert_eq!(grant.inbox_contract_id, inbox_id(&state));
+        assert_eq!(grant.last_made_at_ms, 77);
+        assert_eq!(grant.delegation_scoped_payload, scoped);
+        let delegation = freenet_bitcoin_inbox::Delegation::from_sign_result(
+            grant.delegation_scoped_payload.clone(),
+            grant.delegation_signature.clone(),
+        );
+        assert_eq!(delegation.body().unwrap(), body);
+
+        // Not again this session, even on an answer from before it landed.
+        state.on_auto_invoice_status(
+            instant_store(),
+            state.auto_invoice.status[&instant_store()].clone(),
+        );
+        assert_eq!(
+            state.plan_watch_delegation(DELEGATION_NOW + 2),
+            Default::default()
+        );
+    }
+
+    /// A signed delegation the delegate has not taken is sent again as it
+    /// is, with no new vault prompt: after a minute with no answer, and at
+    /// once after a refusal, at most `DELEGATION_SEND_ATTEMPTS` times in all;
+    /// the delegate's answer that it holds it (or a later one) stops it.
+    /// Mutated red by: never resending, resending before the minute, not
+    /// capping the attempts, and not clearing it on the delegate's answer.
+    #[test]
+    fn a_signed_delegation_is_sent_again_until_the_delegate_takes_it() {
+        use crate::auto_invoice_flow::{DELEGATION_RESEND_MS, DELEGATION_SEND_ATTEMPTS};
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_to_delegate(&gk, None);
+        state.queue_auto_invoice(DELEGATION_NOW);
+        let watch_key = ed25519_dalek::SigningKey::from_bytes(&[0x3d; 32]);
+        state.on_watch_key(Ok(watch_key.verifying_key().to_bytes()));
+        let pending = state
+            .queue_auto_invoice(DELEGATION_NOW + 1)
+            .delegation
+            .delegate
+            .expect("the vault is asked");
+        let (scoped, signature) = inbox::sign_result(&gk, pending.signing_payload.clone());
+        let sent = state
+            .on_watch_delegation_signed(
+                pending.clone(),
+                gk.pem.clone(),
+                scoped,
+                signature,
+                DELEGATION_NOW + 2,
+            )
+            .expect("a SetWatchDelegation");
+        let bridge = pending.bridge;
+
+        // Not before the minute; then the same request, and no vault prompt.
+        let early = state.queue_auto_invoice(DELEGATION_NOW + 1 + DELEGATION_RESEND_MS);
+        assert_eq!(early.delegation.resend, None);
+        let t = DELEGATION_NOW + 2 + DELEGATION_RESEND_MS;
+        let again = state.queue_auto_invoice(t);
+        assert_eq!(again.delegation.resend.as_ref(), Some(&sent));
+        assert_eq!(again.delegation.delegate, None, "no new vault prompt");
+        // A refusal: due at once, until the attempts run out.
+        state.on_watch_delegation(bridge, Err("the node refused the write".into()));
+        assert_eq!(
+            state.queue_auto_invoice(t + 1).delegation.resend.as_ref(),
+            Some(&sent)
+        );
+        assert_eq!(
+            state.auto_invoice.delegation_in_flight[&bridge].attempts,
+            DELEGATION_SEND_ATTEMPTS
+        );
+        state.on_watch_delegation(bridge, Err("the node refused the write".into()));
+        assert!(!state
+            .auto_invoice
+            .delegation_in_flight
+            .contains_key(&bridge));
+        assert_eq!(
+            state
+                .queue_auto_invoice(t + 10 * DELEGATION_RESEND_MS)
+                .delegation
+                .resend,
+            None
+        );
+
+        // Sent every time and never answered: given up, and the vault may be
+        // asked afresh (nothing would ever report it stalled).
+        let (scoped, signature) = inbox::sign_result(&gk, pending.signing_payload.clone());
+        state.on_watch_delegation_signed(pending.clone(), gk.pem.clone(), scoped, signature, t);
+        let mut at = t;
+        for _ in 1..DELEGATION_SEND_ATTEMPTS {
+            at += DELEGATION_RESEND_MS;
+            assert!(state.queue_auto_invoice(at).delegation.resend.is_some());
+        }
+        assert!(state
+            .auto_invoice
+            .delegation_in_flight
+            .contains_key(&bridge));
+        state.queue_auto_invoice(at + DELEGATION_RESEND_MS);
+        assert!(!state
+            .auto_invoice
+            .delegation_in_flight
+            .contains_key(&bridge));
+        assert!(!state
+            .auto_invoice
+            .delegation_asked
+            .contains_key(&(pending.ghostkey, bridge)));
+        // But the vault is not asked again at once: a delegate that is simply
+        // unreachable would otherwise bring a prompt every few minutes.
+        let given_up = at + DELEGATION_RESEND_MS;
+        assert_eq!(state.plan_watch_delegation(given_up + 1).delegate, None);
+        let (times, until) = state.auto_invoice.delegation_unanswered[&(pending.ghostkey, bridge)];
+        assert_eq!(
+            (times, until),
+            (
+                1,
+                given_up + crate::auto_invoice_flow::UNANSWERED_BACKOFF_MS
+            )
+        );
+        // It is the backoff alone that holds it back.
+        // (The first prompt was answered by hand above, so its queue entry
+        // is still there; the vault's answer would have taken it off.)
+        state
+            .pending_signatures
+            .retain(|p| !matches!(p, PendingSignature::WatchDelegation(_)));
+        assert_eq!(state.plan_watch_delegation(given_up + 1).delegate, None);
+        let mut without = state.clone();
+        without.auto_invoice.delegation_unanswered.clear();
+        assert!(without
+            .plan_watch_delegation(given_up + 1)
+            .delegate
+            .is_some());
+
+        // Doubling each time in a row, up to four hours.
+        use crate::auto_invoice_flow::{unanswered_wait, UNANSWERED_BACKOFF_MAX_MS};
+        assert_eq!(
+            unanswered_wait(1),
+            crate::auto_invoice_flow::UNANSWERED_BACKOFF_MS
+        );
+        assert_eq!(
+            unanswered_wait(2),
+            2 * crate::auto_invoice_flow::UNANSWERED_BACKOFF_MS
+        );
+        assert_eq!(
+            unanswered_wait(3),
+            4 * crate::auto_invoice_flow::UNANSWERED_BACKOFF_MS
+        );
+        assert_eq!(unanswered_wait(6), UNANSWERED_BACKOFF_MAX_MS);
+        assert_eq!(unanswered_wait(u32::MAX), UNANSWERED_BACKOFF_MAX_MS);
+
+        // A retired inbox takes the one in flight for it with it, and frees
+        // the marker.
+        let (scoped, signature) = inbox::sign_result(&gk, pending.signing_payload.clone());
+        state.on_watch_delegation_signed(pending.clone(), gk.pem.clone(), scoped, signature, t);
+        state
+            .auto_invoice
+            .delegation_asked
+            .insert((pending.ghostkey, bridge), pending.issued_mainnet_height);
+        state.retire_inbox();
+        assert!(!state
+            .auto_invoice
+            .delegation_in_flight
+            .contains_key(&bridge));
+        assert!(!state
+            .auto_invoice
+            .delegation_asked
+            .contains_key(&(pending.ghostkey, bridge)));
+        state.bitcoin.inbox = Some(crate::bitcoin_inbox::InboxTracker::new(
+            bridge,
+            inbox::inbox_key(),
+        ));
+
+        // Taken: nothing more to send.
+        let (scoped, signature) = inbox::sign_result(&gk, pending.signing_payload.clone());
+        state.on_watch_delegation_signed(pending, gk.pem.clone(), scoped, signature, t);
+        let held = held_delegation(&state, &gk);
+        state.on_watch_delegation(bridge, Ok(held));
+        assert!(!state
+            .auto_invoice
+            .delegation_in_flight
+            .contains_key(&bridge));
+        assert!(
+            state.auto_invoice.delegation_unanswered.is_empty(),
+            "taken: the backoff is over"
+        );
+        assert_eq!(
+            state
+                .queue_auto_invoice(t + 10 * DELEGATION_RESEND_MS)
+                .delegation
+                .resend,
+            None
+        );
+    }
+
+    /// A delegation the delegate holds is not asked for again; the tab tells
+    /// it a moved inbox (once, not every minute), and dates its own requests
+    /// above the delegate's. Mutated red by: dropping the `raise_made_at`,
+    /// and dropping the "just sent" check.
+    #[test]
+    fn a_held_delegation_is_kept_current() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_to_delegate(&gk, None);
+        let mut held = held_delegation(&state, &gk);
+        held.inbox_contract_id = [0x44; 32];
+        held.made_at_ms = DELEGATION_NOW + 9_000;
+        let bridge = held.bridge;
+        state.on_watch_delegation(bridge, Ok(held.clone()));
+        let tracker = state.bitcoin.inbox.as_ref().unwrap();
+        assert_eq!(tracker.last_made_at_ms(), Some(DELEGATION_NOW + 9_000));
+
+        let work = state.queue_auto_invoice(DELEGATION_NOW);
+        assert_eq!(work.delegation.delegate, None, "held, so not asked again");
+        assert!(!work.delegation.get_watch_key);
+        assert_eq!(
+            work.delegation.update,
+            Some(
+                harvest_common::HarvestDelegateRequest::UpdateWatchDelegation {
+                    bridge,
+                    inbox_contract_id: inbox_id(&state),
+                    last_made_at_ms: DELEGATION_NOW + 9_000,
+                }
+            )
+        );
+        assert_eq!(
+            state.plan_watch_delegation(DELEGATION_NOW + 60_000).update,
+            None
+        );
+
+        // Its next own request dates above the delegate's.
+        let wanted = crate::bitcoin_inbox::WatchWanted {
+            network: BitcoinNetwork::Signet,
+            script: vec![0x00, 0x14, 9],
+            anchor_height: None,
+            renew_after_ms: crate::bitcoin_inbox::RENEW_AFTER_MS,
+            until_height: None,
+        };
+        let requests =
+            state
+                .bitcoin
+                .inbox
+                .as_mut()
+                .unwrap()
+                .plan(gk.id(), &[wanted], &[], DELEGATION_NOW + 1);
+        assert_eq!(requests[0].made_at_ms, DELEGATION_NOW + 9_001);
+
+        // Up to date: nothing to say.
+        held.inbox_contract_id = inbox_id(&state);
+        held.made_at_ms = DELEGATION_NOW + 9_001;
+        state.on_watch_delegation(bridge, Ok(held));
+        assert_eq!(
+            state.plan_watch_delegation(DELEGATION_NOW + 60_000),
+            Default::default()
+        );
+    }
+
+    /// A delegation the bridge stopped honouring (the delegate says stalled)
+    /// is replaced, but only by one issued at a later height than it, so the
+    /// bridge prefers the new one. Mutated red by dropping the height check.
+    #[test]
+    fn a_stalled_delegation_is_replaced_by_a_later_one() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_to_delegate(&gk, None);
+        let mut held = held_delegation(&state, &gk);
+        held.stalled = true;
+        state.on_watch_delegation(held.bridge, Ok(held));
+        state.on_watch_key(Ok([0x3e; 32]));
+        assert_eq!(
+            state.plan_watch_delegation(DELEGATION_NOW).delegate,
+            None,
+            "the floor has not moved"
+        );
+        let tracker = state.bitcoin.inbox.as_mut().unwrap();
+        let mut served = tracker.state.clone().unwrap();
+        inbox::raise_floor(&mut served, inbox::FLOOR + 1);
+        tracker.on_state(served, DELEGATION_NOW);
+        let pending = state
+            .plan_watch_delegation(DELEGATION_NOW)
+            .delegate
+            .expect("asked again, later");
+        let body =
+            freenet_bitcoin_inbox::DelegationBody::from_signing_payload(&pending.signing_payload)
+                .unwrap();
+        assert_eq!(
+            body.issued_mainnet_height,
+            freenet_bitcoin_inbox::sender_height(inbox::FLOOR + 1)
+        );
+    }
+
+    /// Asked once per session, and again only when the delegate reports THAT
+    /// delegation stalled (review round 1 of #179): not while it may still be
+    /// on its way, not for an older one's stall, and then at a later height.
+    /// Mutated red by keeping the once-per-session rule, and by ignoring the
+    /// height asked.
+    #[test]
+    fn a_delegation_that_stalls_is_asked_again_in_the_session() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_to_delegate(&gk, None);
+        state.on_watch_key(Ok([0x3c; 32]));
+        let asked = state
+            .queue_auto_invoice(DELEGATION_NOW)
+            .delegation
+            .delegate
+            .expect("asked");
+        state.pending_signatures.clear();
+        let mut held = held_delegation(&state, &gk);
+        // An OLDER delegation's stall: the one just asked for may be on its way.
+        held.issued_mainnet_height = asked.issued_mainnet_height - 1;
+        held.stalled = true;
+        state.on_watch_delegation(held.bridge, Ok(held.clone()));
+        assert_eq!(state.plan_watch_delegation(DELEGATION_NOW).delegate, None);
+        // The one asked for, stalled: asked again once the floor moves.
+        held.issued_mainnet_height = asked.issued_mainnet_height;
+        state.on_watch_delegation(held.bridge, Ok(held));
+        assert_eq!(state.plan_watch_delegation(DELEGATION_NOW).delegate, None);
+        let tracker = state.bitcoin.inbox.as_mut().unwrap();
+        let mut served = tracker.state.clone().unwrap();
+        inbox::raise_floor(&mut served, inbox::FLOOR + 1);
+        tracker.on_state(served, DELEGATION_NOW);
+        let again = state
+            .plan_watch_delegation(DELEGATION_NOW)
+            .delegate
+            .expect("asked again");
+        assert!(again.issued_mainnet_height > asked.issued_mainnet_height);
+    }
+
+    /// Codex, review round 4: a delegation abandoned before it reached the
+    /// delegate (its inbox retired mid-signature, or its send failed) frees
+    /// the once-per-session marker, so the next plan asks again against the
+    /// new inbox. Mutated red by leaving the marker in `retire_inbox`, and in
+    /// `withdraw_pending_signature`.
+    #[test]
+    fn an_abandoned_delegation_is_asked_again() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_to_delegate(&gk, None);
+        state.on_watch_key(Ok([0x3a; 32]));
+        let first = state
+            .queue_auto_invoice(DELEGATION_NOW)
+            .delegation
+            .delegate
+            .expect("asked");
+        assert!(state
+            .plan_watch_delegation(DELEGATION_NOW)
+            .delegate
+            .is_none());
+        // The bridge's inbox pointer moves mid-signature.
+        let bridge = state.bitcoin.inbox.as_ref().unwrap().bridge;
+        state.retire_inbox();
+        state.bitcoin.inbox = Some(crate::bitcoin_inbox::InboxTracker::new(
+            bridge,
+            crate::bitcoin_inbox::inbox_contract_key(
+                bridge,
+                freenet_stdlib::prelude::CodeHash::new([0x39; 32]),
+            )
+            .unwrap(),
+        ));
+        state
+            .bitcoin
+            .inbox
+            .as_mut()
+            .unwrap()
+            .on_state(inbox::open_inbox(), DELEGATION_NOW);
+        let again = state
+            .plan_watch_delegation(DELEGATION_NOW + 1)
+            .delegate
+            .expect("asked again against the new inbox");
+        assert_ne!(again.inbox_contract_id, first.inbox_contract_id);
+
+        // A send that failed frees it too.
+        let queued = state
+            .queue_auto_invoice(DELEGATION_NOW + 2)
+            .delegation
+            .delegate
+            .unwrap();
+        state.withdraw_pending_signature(&PendingSignature::WatchDelegation(Box::new(queued)));
+        assert!(state
+            .plan_watch_delegation(DELEGATION_NOW + 3)
+            .delegate
+            .is_some());
+    }
+
+    /// Retiring an inbox drops a delegation queued against it, and keeps one
+    /// queued against another. Mutated red by dropping the `WatchDelegation`
+    /// arm of `retire_inbox`.
+    #[test]
+    fn a_retired_inbox_takes_its_queued_delegation_with_it() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_to_delegate(&gk, None);
+        let old = inbox_id(&state);
+        let pending = |inbox: [u8; 32]| {
+            PendingSignature::WatchDelegation(Box::new(
+                crate::auto_invoice_flow::PendingWatchDelegation {
+                    fingerprint: "seller-fp".into(),
+                    ghostkey: gk.id(),
+                    network: BitcoinNetwork::Signet,
+                    bridge: state.bitcoin.inbox.as_ref().unwrap().bridge,
+                    inbox_contract_id: inbox,
+                    issued_mainnet_height: 1,
+                    signing_payload: inbox.to_vec(),
+                    queued_at_ms: DELEGATION_NOW,
+                },
+            ))
+        };
+        let (on_old, elsewhere) = (pending(old), pending([0x55; 32]));
+        state.pending_signatures.push_back(on_old);
+        state.pending_signatures.push_back(elsewhere);
+        assert!(state.watch_check_could_act());
+        state.retire_inbox();
+        let left: Vec<[u8; 32]> = state
+            .pending_signatures
+            .iter()
+            .filter_map(|p| match p {
+                PendingSignature::WatchDelegation(d) => Some(d.inbox_contract_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(left, vec![[0x55; 32]]);
+        assert_eq!(state.pending_signatures.len(), 1);
+    }
+
+    /// A pending delegation is something the minute check acts on, and one
+    /// the vault never answers times out like a watch request: dropped, and
+    /// its key not asked again this session. Mutated red by leaving
+    /// `WatchDelegation` out of `is_watch_signature`, and out of the timeout.
+    #[test]
+    fn an_unanswered_delegation_times_out_like_a_watch_request() {
+        let mut state = AppState::default();
+        state.bitcoin.inbox = Some(crate::bitcoin_inbox::InboxTracker::new(
+            inbox::bridge(),
+            inbox::inbox_key(),
+        ));
+        assert!(!state.watch_check_could_act());
+        state
+            .pending_signatures
+            .push_back(PendingSignature::WatchDelegation(Box::new(
+                crate::auto_invoice_flow::PendingWatchDelegation {
+                    fingerprint: "seller-fp".into(),
+                    ghostkey: freenet_bitcoin_inbox::GhostkeyId([1; 32]),
+                    network: BitcoinNetwork::Signet,
+                    bridge: inbox::bridge(),
+                    inbox_contract_id: [2; 32],
+                    issued_mainnet_height: 3,
+                    signing_payload: vec![4],
+                    queued_at_ms: DELEGATION_NOW,
+                },
+            )));
+        assert!(state.watch_check_could_act());
+        state.queue_due_watch_requests(DELEGATION_NOW + crate::bitcoin_inbox::SIGNATURE_TIMEOUT_MS);
+        assert!(state.pending_signatures.is_empty());
+        assert!(state.bitcoin.watch_requests_stopped.contains("seller-fp"));
+    }
+
+    /// A refused delegation is a watch signature: dropped, the key not asked
+    /// again this session, and nothing of the seller's cleared. It also holds
+    /// the watch requests back while it waits, so a refusal is about one
+    /// thing. Mutated red by leaving `WatchDelegation` out of
+    /// `watch_fingerprint`.
+    #[test]
+    fn a_refused_delegation_stops_like_a_watch_request() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_to_delegate(&gk, None);
+        state.on_watch_key(Ok([0x3f; 32]));
+        state.queue_auto_invoice(DELEGATION_NOW);
+        assert!(state.only_watch_signatures_outstanding(Some("seller-fp")));
+        assert!(state.named_refusal_is_a_watch_request("seller-fp"));
+        assert!(state
+            .queue_due_watch_requests(DELEGATION_NOW)
+            .sign
+            .is_empty());
+        state.watch_signature_failed(Some("seller-fp"), "access denied");
+        assert!(state.pending_signatures.is_empty());
+        assert!(state.bitcoin.watch_requests_stopped.contains("seller-fp"));
+        assert_eq!(
+            state.plan_watch_delegation(DELEGATION_NOW + 1),
+            Default::default()
+        );
     }
 
     /// A store's presence is followed once its key is known, and a state
@@ -31373,6 +32116,10 @@ mod buy_flow_tests {
             .auto_invoice_arm("seller-fp", &registration, 10)
             .expect("an arm");
         state.auto_invoice.sent.insert(store.clone(), (arm, 0, 0));
+        state
+            .auto_invoice
+            .status
+            .insert(store.clone(), Ok(an_answered_arm()));
         let key = crate::state::test_store_key();
         state.browsing_stores.get_mut(&store).unwrap().owner = Some(key);
         let now = crate::state::now_ms();
@@ -31538,6 +32285,7 @@ mod buy_flow_tests {
             wallet_gap_limit: 0,
             capped: None,
             last_wakeup_ms: None,
+            watch_delegation: None,
         };
         let hosted = instant_checkout_status_text(&status(None, None), NO_BACKGROUND_RUN_AFTER_MS);
         assert!(
