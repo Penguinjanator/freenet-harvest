@@ -190,7 +190,7 @@ pub fn BuyForm(
                 div { class: "form-group",
                     label { class: "form-label", "Deliver to" }
                     select {
-                        class: "form-select",
+                        class: "form-select field-fit",
                         value: "{region}",
                         onchange: move |event| region.set(event.value()),
                         option { value: "", "Choose a region" }
@@ -204,7 +204,7 @@ pub fn BuyForm(
                 div { key: "{group.name}", class: "form-group",
                     label { class: "form-label", "{group.name}" }
                     select {
-                        class: "form-select",
+                        class: "form-select field-fit",
                         value: "{picks()[i]}",
                         onchange: move |event| picks.with_mut(|p| p[i] = event.value()),
                         option { value: "", "Choose one" }
@@ -217,7 +217,7 @@ pub fn BuyForm(
             div { class: "form-group",
                 label { class: "form-label", "How many" }
                 select {
-                    class: "form-select",
+                    class: "form-select field-fit",
                     value: "{quantity}",
                     onchange: move |event| quantity.set(event.value()),
                     for n in 1..=MAX_INSTANT_QUANTITY {
@@ -240,11 +240,17 @@ pub fn BuyForm(
             }
             div { class: "form-group",
                 label { class: "form-label", "Note for the seller (optional)" }
+                // One line, growing as the buyer types (Ian, 2026-09-29):
+                // most notes are a line.
                 textarea {
-                    class: "form-textarea",
+                    class: "form-textarea grow-textarea",
+                    rows: 1,
                     value: "{note}",
                     placeholder: "Delivery date, gift message...",
-                    oninput: move |event| note.set(event.value()),
+                    oninput: move |event| {
+                        note.set(event.value());
+                        super::grow_focused_textarea();
+                    },
                 }
             }
             if let Some(total) = total {
@@ -1382,9 +1388,11 @@ pub fn AcceptRequest(
                 // total they agreed to (`PaymentBlocker::AmountNotAsked`), so
                 // any other amount would publish an order nobody can pay.
                 input {
-                    class: "form-input",
-                    r#type: "number",
-                    min: "1",
+                    class: "form-input field-num",
+                    // Text with a numeric keyboard, as every other number
+                    // field: a number input's spinner eats the width.
+                    r#type: "text",
+                    inputmode: "numeric",
                     readonly: instant.is_some(),
                     value: "{amount}",
                     oninput: move |event| amount.set(event.value()),
@@ -1399,9 +1407,9 @@ pub fn AcceptRequest(
             div { class: "form-group",
                 label { class: "form-label", "Confirmations required" }
                 input {
-                    class: "form-input",
-                    r#type: "number",
-                    min: "1",
+                    class: "form-input field-count",
+                    r#type: "text",
+                    inputmode: "numeric",
                     value: "{confirmations}",
                     oninput: move |event| confirmations.set(event.value()),
                 }

@@ -656,7 +656,7 @@ fn PaymentKeyForm(replacing: bool, on_done: EventHandler<()>) -> Element {
 
             label { class: "form-label", "Network" }
             select {
-                class: "form-input",
+                class: "form-select field-fit",
                 value: "{network().as_str()}",
                 onchange: move |e| {
                     if let Some(picked) =
@@ -670,15 +670,19 @@ fn PaymentKeyForm(replacing: bool, on_done: EventHandler<()>) -> Element {
                 }
             }
 
-            button {
-                class: "btn btn-primary",
-                disabled: xpub().trim().is_empty(),
-                onclick: move |_| {
-                    save_payment_key(xpub().trim().to_string(), network());
-                    xpub.set(String::new());
-                    on_done.call(());
-                },
-                "Save payment key"
+            // On its own row: beside the content-sized network picker it
+            // read as part of it (round-6 critique).
+            div { class: "form-actions",
+                button {
+                    class: "btn btn-primary",
+                    disabled: xpub().trim().is_empty(),
+                    onclick: move |_| {
+                        save_payment_key(xpub().trim().to_string(), network());
+                        xpub.set(String::new());
+                        on_done.call(());
+                    },
+                    "Save payment key"
+                }
             }
         }
     }

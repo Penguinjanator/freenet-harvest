@@ -65,6 +65,67 @@ fn select_all_of(field: &web_sys::Element) {
     }
 }
 
+/// Grow the focused text area to fit what is typed, for a field that starts
+/// one line tall (`.grow-textarea`). Browsers that support CSS
+/// `field-sizing: content` do this themselves; this covers the rest.
+pub(crate) fn grow_focused_textarea() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsCast;
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        // Only where the browser cannot size the field itself: a height set
+        // here would pin what `field-sizing: content` keeps live.
+        let supported = js_sys::Reflect::get(&window, &"CSS".into())
+            .ok()
+            .and_then(|css| {
+                let supports = js_sys::Reflect::get(&css, &"supports".into())
+                    .ok()?
+                    .dyn_into::<js_sys::Function>()
+                    .ok()?;
+                supports
+                    .call2(&css, &"field-sizing".into(), &"content".into())
+                    .ok()?
+                    .as_bool()
+            })
+            .unwrap_or(false);
+        if supported {
+            return;
+        }
+        let Some(field) = window.document().and_then(|d| d.active_element()) else {
+            return;
+        };
+        // Looked up rather than typed, as in `select_all_of`: the style
+        // object would need another web-sys feature.
+        let Some(style) = js_sys::Reflect::get(&field, &"style".into()).ok() else {
+            return;
+        };
+        let set_height = |value: &str| {
+            if let Some(set) = js_sys::Reflect::get(&style, &"setProperty".into())
+                .ok()
+                .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+            {
+                let _ = set.call2(&style, &"height".into(), &value.into());
+            }
+        };
+        set_height("auto");
+        let number = |name: &str| {
+            js_sys::Reflect::get(&field, &name.into())
+                .ok()
+                .and_then(|h| h.as_f64())
+                .unwrap_or(0.0)
+        };
+        let height = number("scrollHeight");
+        if height > 0.0 {
+            // Plus the borders, which scrollHeight leaves out and the
+            // border-box height includes.
+            let borders = (number("offsetHeight") - number("clientHeight")).max(0.0);
+            set_height(&format!("{}px", height + borders));
+        }
+    }
+}
+
 /// Focus and select all of the field with this `id`, for a Copy button the
 /// clipboard refused.
 pub(crate) fn select_field_by_id(id: &str) {

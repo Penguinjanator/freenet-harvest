@@ -166,10 +166,10 @@ body::before {
       field are one unit and keep the label's own small margin. */
 :where(p, div, section, header, nav, footer, form, ul, ol, pre, blockquote,
        table, hr, h1, h2, h3, h4, h5, h6, textarea,
-       .form-input, .form-textarea, .form-select, .copy-field) + *,
+       .form-input, .form-textarea, .form-select) + *,
 :where(button, .btn) + :where(p, div, section, form, ul, ol, pre, blockquote,
        table, h1, h2, h3, h4, h5, h6, textarea, .form-label, .form-input,
-       .form-textarea, .form-select, .copy-field) {
+       .form-textarea, .form-select) {
   margin-top: var(--space-sm);
 }
 
@@ -206,7 +206,7 @@ body::before {
        .btc-block-row, .btc-tx-row, .row-between, .harvest-footer,
        .form-actions, .dashboard-head, .checklist li, .share-row,
        .seller-listing, .seller-listing-actions, .own-store-banner,
-       .pay-ways, .copy-line, .notice-row) > * {
+       .pay-ways, .copy-line, .notice-row, .link-btn) > * {
   margin-top: 0;
   margin-left: 0;
 }
@@ -750,33 +750,6 @@ h4 {
   border-color: var(--accent);
 }
 
-/* A value to copy, not a field to fill in.
- *
- * A readonly `input` is still the right element: it gives select-all, and it
- * works in the gateway's sandboxed iframe where the clipboard API does not
- * (see `bitcoin_view`'s note on why there is no copy button). But wearing
- * `.form-input` it looked editable, which is what a store's share link and an
- * invoice's payment address are not. Monospace because both are strings a
- * person checks character by character. */
-.copy-field {
-  width: 100%;
-  overflow-wrap: anywhere;
-  padding: 0.45rem 0.6rem;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  font-family: var(--font-mono);
-  font-size: 0.82rem;
-  color: var(--text-secondary);
-  background: var(--bg-card-hover);
-  cursor: text;
-}
-
-.copy-field:focus {
-  outline: none;
-  border-color: var(--accent);
-  color: var(--text-primary);
-}
-
 .form-textarea {
   min-height: 80px;
   resize: vertical;
@@ -945,10 +918,6 @@ h4 {
 
 .form-row > * {
   flex: 1;
-}
-
-.form-row > .form-narrow {
-  flex: 0 0 120px;
 }
 
 /* ---- Identity cards ---- */
@@ -1209,7 +1178,10 @@ h4 {
   flex-wrap: wrap;
 }
 
+/* min-height: a text-styled button is a tap target too, at least 24 px
+   tall (WCAG 2.5.8), which its bare line box was not. */
 .link-btn {
+  min-height: 24px;
   background: none;
   border: none;
   padding: 0;
@@ -1244,8 +1216,85 @@ h4 {
   align-items: center;
 }
 
-.form-input-short {
-  max-width: 16rem;
+/* Fields sized to what goes in them, not to the card (Ian, on the #187
+   screenshots). `ch` is the width of a digit, and the 1.5rem covers the
+   field's own padding and border. */
+.field-num {
+  width: calc(12ch + 1.5rem);
+  max-width: 100%;
+}
+
+.field-count {
+  width: calc(6ch + 1.5rem);
+  max-width: 100%;
+}
+
+.field-short-text {
+  width: calc(22ch + 1.5rem);
+  max-width: 100%;
+}
+
+.field-name {
+  max-width: 32rem;
+}
+
+.field-title {
+  max-width: calc(40ch + 1.5rem);
+}
+
+/* One line to start, growing with what is typed (a note for the seller). */
+.grow-textarea {
+  min-height: 0;
+  resize: none;
+  overflow: hidden;
+  field-sizing: content;
+}
+
+/* A select as wide as its longest option. */
+.field-fit {
+  width: auto;
+  max-width: 100%;
+}
+
+.field-grow {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+
+/* A row of fields that keep their own widths, and wrap on a phone rather
+   than squeeze. */
+.form-row-fit {
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.form-row.form-row-fit > * {
+  flex: 0 1 auto;
+}
+
+.form-row.form-row-fit > .field-grow {
+  flex: 1 1 12rem;
+}
+
+/* Column heads over a run of such rows (a region's name and its delivery
+   price): small, muted, and as wide as the fields beneath them. */
+.form-row-head {
+  margin-bottom: calc(-1 * var(--space-xs));
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+/* At a phone's width a name and its value share one line, so the heads
+   stay over their fields (round-5 critique: the choice row wrapped, and
+   "Options" sat over "Size"). The Remove button still wraps below. */
+@media (max-width: 600px) {
+  .form-row.form-row-fit > .field-short-text {
+    width: calc(45% - var(--space-sm));
+  }
+
+  .form-row.form-row-fit > .field-grow {
+    flex: 1 1 0;
+  }
 }
 
 .card h3 {
@@ -1299,6 +1348,9 @@ h4 {
   align-items: baseline;
   gap: var(--space-sm);
   padding: 0.2rem 0;
+  /* Every row as tall as one holding a 24 px link button, so the rows
+     keep one rhythm. */
+  min-height: calc(24px + 0.4rem);
 }
 
 .checklist li::before {
@@ -1472,6 +1524,25 @@ h4 {
 }
 
 /* ---- Narrow screens ---- */
+
+/* On a phone every button is a 44 px tap target (Ian, 2026-09-29; Apple's
+   and Android's guidance), and so is a select, which is tapped like one.
+   Text-styled buttons stay text: they get the height, centred, not a box. */
+@media (max-width: 600px), (pointer: coarse) {
+  .btn,
+  .btn-sm,
+  .nav-btn,
+  .tab,
+  .form-select {
+    min-height: 44px;
+  }
+
+  .link-btn {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
+}
 
 @media (max-width: 600px) {
   .harvest-app {
