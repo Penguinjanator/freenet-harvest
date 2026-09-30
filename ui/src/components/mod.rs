@@ -5,6 +5,7 @@ mod invoice_form;
 mod listing_form;
 pub(crate) mod message_view;
 pub(crate) mod my_store;
+pub(crate) mod pay_card;
 pub(crate) mod purchases_view;
 pub(crate) mod reputation_view;
 mod seller_listings;
@@ -19,9 +20,10 @@ pub(crate) use my_store::{ensure_encryption_key, mint_encryption_key};
 /// link, a payment address, a backup) call it on focus and on click, so one
 /// tap selects the whole value ready to copy. A click alone only places a
 /// caret, which left a buyer pressing Ctrl+A, Ctrl+C (the 2026-09-27 friction
-/// report). A clipboard button is not the alternative it looks like: the app
-/// runs in the gateway's sandboxed iframe, where the clipboard API is not
-/// reliably available, and selection works there.
+/// report). Selection works in the gateway's sandboxed iframe, where the
+/// clipboard API may not be available, so a Copy button is only ever an
+/// addition that falls back to selecting (`pay_card`'s `CopyField`), never
+/// a replacement.
 pub(crate) fn select_focused_field() {
     #[cfg(target_arch = "wasm32")]
     {
@@ -32,14 +34,58 @@ pub(crate) fn select_focused_field() {
         else {
             return;
         };
-        // `select` exists on both inputs and textareas, so it is looked up
-        // rather than cast to either.
-        if let Ok(select) = js_sys::Reflect::get(&field, &"select".into()) {
-            if let Some(select) = select.dyn_ref::<js_sys::Function>() {
-                let _ = select.call0(&field);
+        select_all_of(&field);
+    }
+}
+
+/// Select the whole of `field`: an input or textarea by its own `select`,
+/// anything else (a `.copy-value` box) by selecting its contents.
+#[cfg(target_arch = "wasm32")]
+fn select_all_of(field: &web_sys::Element) {
+    use wasm_bindgen::JsCast;
+    let call = |target: &wasm_bindgen::JsValue, name: &str, arg: Option<&wasm_bindgen::JsValue>| {
+        js_sys::Reflect::get(target, &name.into())
+            .ok()
+            .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+            .map(|f| match arg {
+                Some(arg) => f.call1(target, arg),
+                None => f.call0(target),
+            })
+    };
+    // `select` exists on inputs and textareas, so it is looked up rather
+    // than cast to either.
+    if call(field, "select", None).is_some() {
+        return;
+    }
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    if let Some(Ok(selection)) = call(&window, "getSelection", None) {
+        let _ = call(&selection, "selectAllChildren", Some(field));
+    }
+}
+
+/// Focus and select all of the field with this `id`, for a Copy button the
+/// clipboard refused.
+pub(crate) fn select_field_by_id(id: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsCast;
+        let Some(field) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id(id))
+        else {
+            return;
+        };
+        if let Ok(f) = js_sys::Reflect::get(&field, &"focus".into()) {
+            if let Some(f) = f.dyn_ref::<js_sys::Function>() {
+                let _ = f.call0(&field);
             }
         }
+        select_all_of(&field);
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = id;
 }
 
 #[cfg(test)]

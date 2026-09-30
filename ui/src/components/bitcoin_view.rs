@@ -578,21 +578,24 @@ impl DestinationNote {
 /// the store see it. Shared rather than duplicated: the bridge warning below
 /// is the check a buyer has to make before parting with coin, and a second
 /// copy of this card is how one of them ends up without it.
+///
+/// `buyer`: the card is on a buyer's purchase, which carries the order's
+/// reference itself, so the card leaves that line out and offers the address
+/// as the three pay steps ([`super::pay_card::PaySteps`]) instead of a bare
+/// field. Every check before the address is the same either way.
 #[component]
-pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> Element {
+pub(crate) fn OrderCard(
+    order: AuthorizedOrder,
+    live: Option<AddressView>,
+    #[props(default)] buyer: bool,
+) -> Element {
     let o = &order.order;
     let destination = DestinationNote::of(o);
     let unrecognised = unrecognised_bridges(o);
     let bridge_note = if o.trusted_bridges.is_empty() {
         BridgeNote::None
     } else if unrecognised.is_empty() {
-        BridgeNote::Recognised(
-            o.trusted_bridges
-                .iter()
-                .map(|b| short_bridge(&b.to_bs58()))
-                .collect::<Vec<_>>()
-                .join(", "),
-        )
+        BridgeNote::Recognised
     } else {
         BridgeNote::Unrecognised(
             unrecognised
@@ -651,10 +654,17 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
     rsx! {
         div { class: "listing-card",
             div { class: "listing-header",
-                span { class: "listing-price", "{format_sats(o.amount_sats)}" }
+                span { class: "listing-price",
+                    "{super::pay_card::amount_text(o.amount_sats, o.network)}"
+                    if super::pay_card::is_test_network(o.network) {
+                        span { class: "test-coins", "{super::pay_card::TEST_COIN_NOTE}" }
+                    }
+                }
                 span { class: "{status_class}", "{status_text}" }
             }
-            p { class: "text-muted", "Order {o.id.short()} · {o.network.as_str()}" }
+            if !buyer {
+                p { class: "text-muted", "Order {o.id.short()}" }
+            }
             if let Some(note) = stage_note {
                 p { class: if stage.needs_attention() { "text-warning" } else { "" }, "{note}" }
             }
@@ -692,33 +702,69 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                 // of a cancelled, lapsed or settled order is not offered, so
                 // nobody sends coin the order will not recognise or does not
                 // need (harvest#53).
+            } else if destination.payable() && buyer && sight.settles() {
+                // A payment covering the amount is already in sight: the
+                // steps are folded away rather than shown, so nobody is told
+                // to send twice. Only a covering payment folds them: anyone
+                // can send dust to a published address, and that must not
+                // take the buyer's way to pay away (round 2 of harvest#187).
+                // Still reachable, because a covering payment that never
+                // confirms is possible too.
+                p {
+                    "A payment covering this order has been seen. It shows as paid once the \
+                     payment is final, usually \
+                     {super::pay_card::confirmation_wait(o.required_confirmations)} after it was \
+                     sent. You can close Harvest while you wait."
+                }
+                details {
+                    summary { class: "text-muted small", "Didn\u{2019}t send it? Show how to pay" }
+                    super::pay_card::PaySteps {
+                        address: o.payment_address.clone(),
+                        amount_sats: o.amount_sats,
+                        network: o.network,
+                        confirmations: o.required_confirmations,
+                        order_ref: o.id.short(),
+                    }
+                }
+            } else if destination.payable() && buyer {
+                // Something at the address that does not settle this order:
+                // said, and the steps left at the full amount. No remainder is
+                // worked out for the buyer: value in sight may be in flight
+                // and never arrive, or another order's on a reused address,
+                // and a figure built on either would underpay or overpay
+                // (rounds 3 and 4 of #187). Anyone can send dust to a
+                // published address, so it never hides the steps.
+                if reading.in_window_sats >= o.amount_sats {
+                    p { class: "text-warning",
+                        "A payment of this order\u{2019}s amount has arrived, but this address was \
+                         also used for another order. If you sent it, do not pay again: the \
+                         seller confirms which order it is for."
+                    }
+                } else if reading.in_window_sats > 0 || reading.unconfirmed_sats > 0 {
+                    p { class: "text-warning",
+                        "A payment smaller than this order\u{2019}s amount has been seen at its \
+                         address. If it was yours, message the seller before you send more."
+                    }
+                }
+                super::pay_card::PaySteps {
+                    address: o.payment_address.clone(),
+                    amount_sats: o.amount_sats,
+                    network: o.network,
+                    confirmations: o.required_confirmations,
+                    order_ref: o.id.short(),
+                }
             } else if destination.payable() {
-                // A readonly input rather than a paragraph, so the address can
-                // be selected and copied without hand-transcribing 42
-                // characters -- the same thing the store share link does, and
-                // for the same reason. A clipboard button is not the
-                // alternative it looks like: the app runs in the gateway's
-                // sandboxed iframe, where the clipboard API is not reliably
-                // available, and a copy button that silently does nothing is
-                // worse than a field that visibly works.
-                // A textarea rather than an input, so the whole address is
-                // visible at once. In an input, 42-62 characters of bech32
-                // scroll sideways at this width: a buyer cannot check the
-                // destination they are paying, and a partial selection pastes
-                // a truncated address, which sends coin nowhere an order can
-                // recognise. That is the failure this panel exists to avoid.
-                textarea {
-                    class: "copy-field",
-                    readonly: true,
-                    spellcheck: false,
-                    rows: 2,
-                    aria_label: "Payment address, select to copy",
-                    onfocus: |_| super::select_focused_field(),
-                    onclick: |_| super::select_focused_field(),
-                    // `value`, not a text child: a text child is the initial
-                    // content, and this card re-renders with a different
-                    // address when another invoice is issued.
-                    value: "{o.payment_address}",
+                // The seller's own view of an unpaid invoice: the same
+                // content-sized, select-on-tap value as the buyer's pay steps,
+                // so the whole address is visible and never scrolls sideways
+                // (a partial selection of a scrolled field pastes a truncated
+                // address). Keyed by the order, so a card showing another
+                // invoice re-renders with its address.
+                super::pay_card::CopyField {
+                    key: "{o.id}",
+                    label: "Payment address",
+                    value: o.payment_address.clone(),
+                    salt: o.id.short(),
                 }
             } else {
                 p { class: "text-warning",
@@ -748,9 +794,11 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                          you have no reason to trust — check with the seller before paying."
                     }
                 },
-                BridgeNote::Recognised(ids) => rsx! {
-                    p { class: "text-muted", "Settled by bridge {ids}" }
-                },
+                // A bridge this app recognises is the normal case and says
+                // nothing a buyer or seller acts on, so it is not shown
+                // (the 2026-09-27 friction report: "Settled by bridge" under
+                // "Awaiting payment" read as a status).
+                BridgeNote::Recognised => rsx! {},
             }
         }
     }
@@ -982,7 +1030,7 @@ enum BridgeNote {
     /// No bridge named: the invoice can never be proven paid.
     None,
     /// Every named bridge is one this build trusts.
-    Recognised(String),
+    Recognised,
     /// At least one named bridge is a stranger.
     Unrecognised(String),
 }
@@ -1713,6 +1761,26 @@ mod address_reading_tests {
         assert_eq!(reading.in_window_sats, 10_000);
         assert_eq!(reading.in_window_heights, vec![151]);
         assert_eq!(reading.outside_note(false), None);
+    }
+
+    /// The buyer's pay steps fold away only for a payment covering the
+    /// amount in sight, so nobody is told to send twice, and dust (anyone can
+    /// send it to a published address) never takes them away (round 2 of
+    /// harvest#187). Red if dust or a payment from before the order counts.
+    #[test]
+    fn only_a_covering_payment_folds_the_pay_steps() {
+        let order = order_anchored_at(150);
+        let amount = order.amount_sats;
+        let tip = Some(170);
+        let reading = |rows: &[(u32, u64)]| AddressReading::of(&order, Some(&address_with(rows)));
+        // What `OrderCard` folds on is `AppState::payment_sight`, which is
+        // this reading's `sight` less a payment another order on a reused
+        // address may own.
+        let folds = |r: AddressReading| r.sight(&order, tip).settles();
+        assert!(!folds(AddressReading::of(&order, None)));
+        assert!(folds(reading(&[(160, amount)])));
+        assert!(!folds(reading(&[(160, 1)])), "dust");
+        assert!(!folds(reading(&[(140, amount)])), "before the order");
     }
 
     /// **PR #83 round 2, Should Fix 5.** Dust inside the window is not a
