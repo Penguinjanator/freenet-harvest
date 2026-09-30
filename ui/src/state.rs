@@ -720,9 +720,55 @@ pub struct AppState {
     /// The UI should pick these up and send them as contract updates.
     pub signed_listings_ready: Vec<AuthorizedListing>,
 
-    /// Remembered stores My purchases is loading in the background: GET out,
-    /// state not yet arrived. See `store_link::load_remembered_store`.
+    /// Remembered stores Stores and Purchases are loading in the background:
+    /// GET out, state not yet arrived. See `store_link::load_remembered_store`.
     pub background_loads: HashSet<Vec<u8>>,
+
+    /// Stores opened this session (`store_link::open_store`) whose GET is
+    /// out and whose state has not arrived. A store the user opened and then
+    /// left is still loading, not failed (the Stores page review).
+    pub foreground_loads: HashSet<Vec<u8>>,
+
+    /// Loads of a store that failed (the GET did not go out) or timed out,
+    /// per store: how many, and when the last one ended. A background load
+    /// is sent again after [`store_load_retry_after`], up to
+    /// [`MAX_STORE_LOAD_ATTEMPTS`] in all, and the store reads as loading
+    /// until then; a store opened by the user that fails is given up on at
+    /// once, since it says so on its page. Cleared when the store's state
+    /// arrives.
+    ///
+    /// The pages that load stores also ask on every change of state, and
+    /// with the connection down a failed send is itself a change, so without
+    /// the wait they would send, fail and send again without end.
+    pub store_load_failures: HashMap<Vec<u8>, (u32, u64)>,
+
+    /// Stores loaded only to be listed (the Stores page's rows): fetched
+    /// once, not subscribed to, and their record not followed (the Stores
+    /// page review, item 5). Their presence is still followed as any loaded
+    /// store's is: read once and never again, a row would call an open store
+    /// closed ten minutes later, when the heartbeat it read goes stale.
+    /// Leaves the set only when a subscribed GET's state arrives (opening
+    /// the store, Purchases, or our own store's subscribe): one that fails
+    /// leaves it here, so it is asked again. Never holds one of our own.
+    pub light_stores: HashSet<Vec<u8>>,
+
+    /// Stores in `light_stores` whose subscribed GET is out
+    /// ([`AppState::follows_record`]): their answer is followed like any
+    /// other's, and takes them out of `light_stores` when it arrives.
+    pub light_upgrading: HashSet<Vec<u8>>,
+
+    /// When this session's state was made, which is when the app started.
+    /// The Stores page waits for `seller_known` until
+    /// [`SELLER_ANSWER_WAIT_MS`] after it, and no longer, however often the
+    /// page is opened (round 2 of #197: the wait was per mount).
+    pub session_started: SessionStart,
+
+    /// Whether the ghostkey delegate has answered what identities this app
+    /// may use (a list, empty or not, or a refusal). Until it has, and each
+    /// listed identity's `ListStores` has been answered
+    /// ([`AppState::seller_known`]), the Stores page cannot tell a seller's
+    /// own stores from ones they visited.
+    pub ghostkeys_answered: bool,
 
     /// Listing statuses the store key has signed, with the store each is for.
     /// Filled only off wasm, where nothing publishes them, so a test can see
@@ -1174,9 +1220,9 @@ pub(crate) const PAYMENT_ON_ITS_WAY_BUYER: &str =
 /// no store key for (harvest#93).
 pub(crate) const NO_STORE_KEY_MESSAGE: &str =
     "this store has no store key on this device. A store made before stores had their own \
-     keys has to be moved to one first (My store offers it); for a store created on another \
-     device, open its link here with the Ghost Key that backs it connected, and Harvest \
-     recovers the key from the store.";
+     keys has to be moved to one first (open a store with its Ghost Key, from Stores, and \
+     Harvest offers the move); for a store created on another device, open its link here \
+     with the Ghost Key that backs it connected, and Harvest recovers the key from the store.";
 
 /// What a seller is told when their store's key is registered on this device
 /// but the delegate does not hold it (harvest#138): after a delegate re-key,
@@ -1474,6 +1520,19 @@ fn unverified_listings(
 }
 
 impl BrowsingStore {
+    /// Whether this store can take an order at all, whatever its presence:
+    /// not closed for good, it publishes a key to seal a buyer's address to,
+    /// and its backing identity verified (`seller_verifying_key` is `None`
+    /// otherwise). The store-level half of `store_view::buyable`.
+    pub fn takes_orders(&self) -> bool {
+        !self.closed
+            && self
+                .info
+                .as_ref()
+                .is_some_and(|info| info.encryption_public_key.is_some())
+            && self.seller_verifying_key.is_some()
+    }
+
     /// How a reader counts each complaint on this store's record, beside the
     /// complaint: the ONE place both the store badge and the store's record (`StoreRecord`)
     /// read it from, so they cannot disagree.
@@ -1527,7 +1586,7 @@ impl BrowsingStore {
     }
 
     /// The store's badge: its load state and counted complaints, except
-    /// that a FULL record never reads "Clean record" (harvest#144).
+    /// that a FULL record never reads "No complaints" (harvest#144).
     ///
     /// A full record keeps the complaints dated nearest their payments
     /// (`reputation::MAX_COMPLAINTS`), and a seller's complaints on its own
@@ -2871,7 +2930,7 @@ fn paid_on(
 /// How far a store's reputation record has loaded (harvest#53 Phase C,
 /// review round 1 of #143, P1-5).
 ///
-/// An empty complaint list reads as "Clean record" only once the record
+/// An empty complaint list reads as "No complaints" only once the record
 /// itself has been read. Before that, and when the node said it holds
 /// nothing or the fetch failed, an empty list is an absence of information,
 /// and a badge that turned it into praise would be the one thing on the page
@@ -2895,8 +2954,9 @@ impl RecordLoad {
     /// `counted` complaints that count: `(css class, text)`.
     pub fn badge(self, counted: usize) -> (&'static str, String) {
         match self {
-            RecordLoad::Loaded if counted == 0 => ("reputation-clean", "Clean record".into()),
-            RecordLoad::Loaded => ("reputation-negative", format!("{counted} complaint(s)")),
+            RecordLoad::Loaded if counted == 0 => ("reputation-clean", "No complaints".into()),
+            RecordLoad::Loaded if counted == 1 => ("reputation-negative", "1 complaint".into()),
+            RecordLoad::Loaded => ("reputation-negative", format!("{counted} complaints")),
             RecordLoad::Loading => ("text-muted", "Record loading".into()),
             RecordLoad::NotFound => ("text-muted", "No record found".into()),
             RecordLoad::Unavailable => ("text-muted", "Record unavailable".into()),
@@ -2904,15 +2964,97 @@ impl RecordLoad {
     }
 }
 
-/// One row of the store list. See [`AppState::store_list_rows`].
+/// One row of "Stores you've visited". See [`AppState::store_list_rows`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoreListRow {
     pub code: String,
-    pub label: String,
+    /// What the row is called. Never the store's code (see [`StoreName`]).
+    pub name: StoreName,
+    /// The first line of the store's description, plain
+    /// (`markdown::first_line`), once its state has arrived.
+    pub tagline: Option<String>,
     pub archived: bool,
-    /// The store is closed (`presence_flow`): greyed, and listed after the
-    /// open ones.
+    /// The store is closed (`AppState::buyer_open`): greyed, and listed
+    /// after the open ones.
     pub closed: bool,
+    /// Closed only for now: its seller's computer is not online or not
+    /// taking orders (`presence_flow`), as opposed to closed for good or
+    /// unable to take an order at all. Said "Closed right now" only then.
+    pub closed_for_now: bool,
+}
+
+/// What a store is called on screen.
+///
+/// Never its code. A code is what a seller hands out and what a link
+/// carries, and shown as a name it read as a label on a button ("Store
+/// Hyqno9kqmxYLezD1"), which Ian called out on the 2026-09-30 Stores page.
+/// Until the store's own name arrives it is "Loading…", and a store that
+/// did not arrive says so.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StoreName {
+    Named(String),
+    /// Its state arrived with an empty name.
+    Unnamed,
+    /// Its state has not arrived yet, or not been asked for yet.
+    Loading,
+    /// It was asked for and did not arrive.
+    Unreachable,
+}
+
+impl StoreName {
+    /// The words shown for it.
+    pub fn label(&self) -> String {
+        match self {
+            StoreName::Named(name) => name.clone(),
+            StoreName::Unnamed => "Unnamed store".to_string(),
+            StoreName::Loading => "Loading\u{2026}".to_string(),
+            StoreName::Unreachable => "Couldn\u{2019}t load this store".to_string(),
+        }
+    }
+
+    /// The store's own name, if it has arrived.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            StoreName::Named(name) => Some(name),
+            _ => None,
+        }
+    }
+}
+
+/// When the app started: see [`AppState::session_started`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionStart(pub u64);
+
+impl Default for SessionStart {
+    fn default() -> Self {
+        SessionStart(now_ms())
+    }
+}
+
+/// How long after the app starts the Stores page waits to learn which stores
+/// are this node's own (`AppState::seller_known`) before showing the lists
+/// anyway: a ghostkey delegate that never answers must not hide them for
+/// good.
+pub const SELLER_ANSWER_WAIT_MS: u64 = 10_000;
+
+/// Whether a buyer can buy from a store now. See [`AppState::buyer_open`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuyerOpen {
+    Open,
+    /// Too soon to say.
+    Checking,
+    Closed,
+}
+
+impl BuyerOpen {
+    /// The pill that says it: "Open", "Checking" or "Closed".
+    pub fn pill(self) -> &'static str {
+        match self {
+            BuyerOpen::Open => "Open",
+            BuyerOpen::Checking => "Checking",
+            BuyerOpen::Closed => "Closed",
+        }
+    }
 }
 
 /// What a seller is told when their store's address is held by another key
@@ -3152,6 +3294,21 @@ const MAX_MAILBOX_SUBSCRIBE_ATTEMPTS: u8 = 3;
 /// trying again, giving a transient hiccup a chance to clear rather than
 /// hammering the same failure immediately.
 const SUBSCRIBE_RETRY_DELAY_MS: u32 = 5_000;
+
+/// How long the first retry of a failed background load waits; each later
+/// one waits twice as long as the one before. See
+/// [`AppState::store_load_failures`].
+pub const BACKGROUND_LOAD_RETRY_MS: u64 = 30_000;
+
+/// How many times a background load is tried before its store reads as
+/// unreachable: the first try and three retries, about five minutes in all
+/// with their timeouts, which covers a node still finding its peers.
+pub const MAX_STORE_LOAD_ATTEMPTS: u32 = 4;
+
+/// How long after its `attempts`-th failure a background load is sent again.
+pub fn store_load_retry_after(attempts: u32) -> u64 {
+    BACKGROUND_LOAD_RETRY_MS << attempts.saturating_sub(1).min(8)
+}
 
 /// GET-and-subscribe a store's mailbox contract, learned from the delegate's
 /// `StoreRegistration`, OR from a buyer sending a message or recalling a kept
@@ -3484,7 +3641,8 @@ fn send_remember_store_request(
 
 impl AppState {
     /// Start browsing a store: prepare its state and make it the store the
-    /// Browse tab shows. The caller is responsible for the GET/subscribe.
+    /// store page shows. The caller is responsible for the GET/subscribe,
+    /// and for showing the page (`components::app::show_store`).
     pub fn begin_browsing(&mut self, store_contract_id: Vec<u8>) {
         self.browsing_stores
             .entry(store_contract_id.clone())
@@ -3494,34 +3652,151 @@ impl AppState {
     }
 
     /// A link named a store the old way (a whole contract id): say so on the
-    /// Browse tab instead of showing nothing. See
+    /// store page instead of showing nothing. See
     /// `store_link::is_old_format_link`.
     pub fn note_old_format_link(&mut self) {
         self.store_link_error = Some(crate::store_link::OLD_FORMAT_LINK_MESSAGE.to_string());
     }
 
+    /// Whether a background load of this store should be sent now.
+    /// `subscribe`: the load is for Purchases, which follows the store, so a
+    /// store loaded only to be listed (`light_stores`) is loaded again, with
+    /// a subscription. Otherwise: its state is not here, no GET for it is out
+    /// (`background_loads`, `foreground_loads`), and it has not failed, or
+    /// its wait since the last failure is over and it has tries left
+    /// (`store_load_failures`). Changes nothing, so a page can ask under a
+    /// read.
+    pub fn background_load_due(
+        &self,
+        store_contract_id: &[u8],
+        now_ms: u64,
+        subscribe: bool,
+    ) -> bool {
+        if self.background_loads.contains(store_contract_id)
+            || self.foreground_loads.contains(store_contract_id)
+        {
+            return false;
+        }
+        // The wait after a failure holds for a subscribed re-load of a
+        // listed store too, or a failing one would be sent again on every
+        // change of state.
+        let waited = match self.store_load_failures.get(store_contract_id) {
+            None => true,
+            Some((attempts, at)) => {
+                *attempts < MAX_STORE_LOAD_ATTEMPTS
+                    && now_ms.saturating_sub(*at) >= store_load_retry_after(*attempts)
+            }
+        };
+        if !waited {
+            return false;
+        }
+        let loaded = self
+            .browsing_stores
+            .get(store_contract_id)
+            .is_some_and(|store| store.info.is_some());
+        !loaded || (subscribe && self.light_stores.contains(store_contract_id))
+    }
+
+    /// Whether the answer to a GET for this store is followed through to its
+    /// record (`gateway::response_handler`): not for a store loaded only to
+    /// be listed, unless a subscribed GET for it is out; always for one of
+    /// our own.
+    pub fn follows_record(&self, store_contract_id: &[u8]) -> bool {
+        !self.light_stores.contains(store_contract_id)
+            || self.light_upgrading.contains(store_contract_id)
+            || self.store_owner_fingerprint(store_contract_id).is_some()
+    }
+
+    /// A subscribed GET for this store is going out: a store listed only
+    /// stays listed only until its answer arrives
+    /// ([`Self::on_subscribed_state`]), so a GET that fails leaves it to be
+    /// asked again.
+    fn note_subscribing(&mut self, store_contract_id: &[u8]) {
+        if self.light_stores.contains(store_contract_id) {
+            self.light_upgrading.insert(store_contract_id.to_vec());
+        }
+    }
+
+    /// A store's state arrived: if a subscribed GET for it was out, it is no
+    /// longer a store loaded only to be listed.
+    fn on_subscribed_state(&mut self, store_contract_id: &[u8]) {
+        if self.light_upgrading.remove(store_contract_id) {
+            self.light_stores.remove(store_contract_id);
+        }
+    }
+
+    /// Whether the Stores page may show its lists: this node knows which
+    /// stores are its own, or has waited long enough since the app started.
+    /// Whether the delegate's list of remembered stores is still awaited:
+    /// not arrived yet, and the app started less than
+    /// [`SELLER_ANSWER_WAIT_MS`] ago. Past that, a list that never comes
+    /// stops holding pages on "Checking…".
+    pub fn remembered_stores_awaited(&self, now_ms: u64) -> bool {
+        self.remembered_stores.is_none()
+            && now_ms.saturating_sub(self.session_started.0) < SELLER_ANSWER_WAIT_MS
+    }
+
+    pub fn seller_known_or_waited(&self, now_ms: u64) -> bool {
+        self.seller_known()
+            || now_ms.saturating_sub(self.session_started.0) >= SELLER_ANSWER_WAIT_MS
+    }
+
     /// Mark a remembered store as being loaded in the background, unless it is
-    /// already loaded or loading. `true` when the caller should send the GET.
-    /// See `store_link::load_remembered_store`.
-    pub fn begin_background_load(&mut self, store_contract_id: Vec<u8>, code: String) -> bool {
-        if self.browsing_stores.contains_key(&store_contract_id) {
+    /// not due ([`Self::background_load_due`]). `true` when the caller should
+    /// send the GET, subscribing as `subscribe` says. See
+    /// `store_link::load_remembered_store`.
+    pub fn begin_background_load(
+        &mut self,
+        store_contract_id: Vec<u8>,
+        code: String,
+        subscribe: bool,
+    ) -> bool {
+        if !self.background_load_due(&store_contract_id, now_ms(), subscribe) {
             return false;
         }
         self.browsing_stores
-            .insert(store_contract_id.clone(), BrowsingStore::default());
+            .entry(store_contract_id.clone())
+            .or_default();
+        if subscribe {
+            self.note_subscribing(&store_contract_id);
+        } else if self.store_owner_fingerprint(&store_contract_id).is_none() {
+            // One of our own is never only listed: it is subscribed to when
+            // its store list arrives (round 2 of #197).
+            self.light_stores.insert(store_contract_id.clone());
+        }
         self.background_loads.insert(store_contract_id.clone());
         self.note_store_code(store_contract_id, code);
         true
     }
 
-    /// A background load's GET did not go out: take its placeholder back out,
-    /// so a later visit retries. Only a placeholder this load made and nothing
-    /// has written into since (another flow may have registered the store's
-    /// mailbox or recalled a conversation into the same entry).
+    /// One more failed load of this store, now.
+    fn note_store_load_failed(&mut self, store_contract_id: &[u8]) {
+        let now = now_ms();
+        let entry = self
+            .store_load_failures
+            .entry(store_contract_id.to_vec())
+            .or_insert((0, now));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = now;
+    }
+
+    /// When a background load of this store that has just failed should be
+    /// sent again, or `None` when it has no tries left.
+    pub fn background_retry_after(&self, store_contract_id: &[u8]) -> Option<u64> {
+        let (attempts, _) = self.store_load_failures.get(store_contract_id)?;
+        (*attempts < MAX_STORE_LOAD_ATTEMPTS).then(|| store_load_retry_after(*attempts))
+    }
+
+    /// A background load's GET did not go out: count the failure, and take
+    /// its placeholder back out. Only a placeholder this load made and
+    /// nothing has written into since (another flow may have registered the
+    /// store's mailbox or recalled a conversation into the same entry).
     pub fn end_background_load_failed(&mut self, store_contract_id: &[u8]) {
         if !self.background_loads.remove(store_contract_id) {
             return;
         }
+        self.light_upgrading.remove(store_contract_id);
+        self.note_store_load_failed(store_contract_id);
         if self
             .browsing_stores
             .get(store_contract_id)
@@ -3531,11 +3806,55 @@ impl AppState {
         }
     }
 
-    /// A background load has waited long enough: stop saying it is loading.
-    /// The placeholder stays, so the store is not asked about again this
-    /// session; its state is still taken if it arrives.
+    /// A background load has waited long enough: count it as a failure,
+    /// unless its state arrived meanwhile (which ends the load first). The
+    /// placeholder stays, so state that arrives late is still taken; it is
+    /// sent again after its wait, while it has tries left.
     pub fn end_background_load_timed_out(&mut self, store_contract_id: &[u8]) {
-        self.background_loads.remove(store_contract_id);
+        if self.background_loads.remove(store_contract_id) {
+            self.light_upgrading.remove(store_contract_id);
+            self.note_store_load_failed(store_contract_id);
+        }
+    }
+
+    /// The user opened this store (`store_link::open_store`): its GET is on
+    /// its way, with a subscription. `false` when one already is: the store
+    /// is only shown, and the GET already out keeps its own wait rather than
+    /// a second one cutting it short.
+    ///
+    /// Only an open the user made counts here, not a background load that
+    /// happens to be out (round 3 of #197): a background GET may not
+    /// subscribe, and one that does ends in a retry, not in the "didn't
+    /// load" the page needs. Opening a store while its background GET is out
+    /// costs one extra round trip, no more.
+    pub fn begin_foreground_load(&mut self, store_contract_id: &[u8]) -> bool {
+        if self.foreground_loads.contains(store_contract_id) {
+            return false;
+        }
+        self.store_load_failures.remove(store_contract_id);
+        self.foreground_loads.insert(store_contract_id.to_vec());
+        self.note_subscribing(store_contract_id);
+        true
+    }
+
+    /// A store the user opened did not load: its GET did not go out, or its
+    /// wait is over. Given up on (its page says so; opening it again tries
+    /// again), unless its state arrived.
+    pub fn end_foreground_load(&mut self, store_contract_id: &[u8]) {
+        if !self.foreground_loads.remove(store_contract_id) {
+            return;
+        }
+        self.light_upgrading.remove(store_contract_id);
+        let loaded = self
+            .browsing_stores
+            .get(store_contract_id)
+            .is_some_and(|store| store.info.is_some());
+        if !loaded {
+            self.store_load_failures.insert(
+                store_contract_id.to_vec(),
+                (MAX_STORE_LOAD_ATTEMPTS, now_ms()),
+            );
+        }
     }
 
     /// Record the code a store was opened under. See [`Self::store_codes`].
@@ -3607,8 +3926,13 @@ impl AppState {
         *failures = failures.saturating_add(1);
         if *failures >= MAX_STORE_REMEMBER_ATTEMPTS {
             if *failures == MAX_STORE_REMEMBER_ATTEMPTS {
+                // By name where it has one: a code is not a name.
+                let name = StoreParameters::from_code(code)
+                    .and_then(|p| crate::gateway::store_ops::store_instance_id(&p).ok())
+                    .and_then(|id| self.store_name_of(id.as_bytes()).name().map(str::to_string))
+                    .unwrap_or_else(|| "a store you opened".to_string());
                 self.notifications.push(format!(
-                    "Harvest could not save store {code} to your remembered stores: {why}. \
+                    "Harvest could not save {name} to your remembered stores: {why}. \
                      Reload to try again."
                 ));
             }
@@ -3704,47 +4028,201 @@ impl AppState {
         self.send_to_harvest_delegate("archive this store", &request);
     }
 
-    /// The rows of the store list, and how many archived ones it is not
-    /// showing.
+    /// What the store `store_contract_id` is called on screen: see
+    /// [`StoreName`].
     ///
-    /// Labelled by name wherever the store's state has arrived this session,
-    /// by code otherwise. Archived stores are included only when asked for,
-    /// and come after the others.
-    pub fn store_list_rows(&self, show_archived: bool) -> (Vec<StoreListRow>, usize) {
+    /// Loading until a load has actually given up. A store with no entry at
+    /// all has not been asked for yet: the pages that list stores ask for
+    /// each one (`store_link::load_visited_stores`, and a seller's own
+    /// stores are subscribed to when the Ghost Key connects). A store whose
+    /// load failed or timed out still reads as loading while a retry is
+    /// pending, and a store opened and then left is still loading until its
+    /// own wait is over.
+    pub fn store_name_of(&self, store_contract_id: &[u8]) -> StoreName {
+        let info = self
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|store| store.info.as_ref());
+        if let Some(info) = info {
+            return match info.store_name.trim() {
+                "" => StoreName::Unnamed,
+                name => StoreName::Named(name.to_string()),
+            };
+        }
+        let active = self.active_store_id.as_deref() == Some(store_contract_id);
+        let own_given_up = self
+            .own_store_subscribe_failures
+            .get(store_contract_id)
+            .is_some_and(|failures| *failures >= MAX_OWN_STORE_SUBSCRIBE_ATTEMPTS);
+        let given_up = self
+            .store_load_failures
+            .get(store_contract_id)
+            .is_some_and(|(attempts, _)| *attempts >= MAX_STORE_LOAD_ATTEMPTS);
+        if self.store_state_unavailable.contains(store_contract_id)
+            || (active && self.store_link_error.is_some())
+            || own_given_up
+            || given_up
+        {
+            return StoreName::Unreachable;
+        }
+        StoreName::Loading
+    }
+
+    /// The codes of the stores this node owns, from its registrations' store
+    /// keys. By code rather than by contract id, because a code names a
+    /// store across its generations (harvest#164): a remembered store whose
+    /// registration still names an older generation is still ours.
+    pub fn own_store_codes(&self) -> HashSet<String> {
+        self.my_stores
+            .values()
+            .flatten()
+            .filter_map(|registration| registration.store_verifying_key)
+            .filter_map(|key| ed25519_dalek::VerifyingKey::from_bytes(&key).ok())
+            .map(|key| harvest_common::store::store_code(&key))
+            .collect()
+    }
+
+    /// The remembered stores that are not this node's own, each with its
+    /// contract id when its code derives one. Archived ones only when asked.
+    fn visited_remembered(
+        &self,
+        include_archived: bool,
+    ) -> Vec<(&harvest_common::RememberedStore, Option<Vec<u8>>)> {
         let Some(remembered) = self.remembered_stores.as_ref() else {
-            return (Vec::new(), 0);
+            return Vec::new();
         };
+        let own = self.own_store_codes();
+        remembered
+            .iter()
+            .filter(|s| include_archived || !s.archived)
+            .filter(|s| !own.contains(&s.store_code))
+            .map(|s| {
+                let id = StoreParameters::from_code(&s.store_code)
+                    .and_then(|p| crate::gateway::store_ops::store_instance_id(&p).ok())
+                    .map(|id| id.as_bytes().to_vec());
+                (s, id)
+            })
+            .filter(|(_, id)| {
+                id.as_ref()
+                    .is_none_or(|id| self.store_owner_fingerprint(id).is_none())
+            })
+            .collect()
+    }
+
+    /// The codes of the visited stores ([`Self::store_list_rows`]'s), for
+    /// loading them: cheap enough to ask on every change of state, where the
+    /// rows are not (they parse each description).
+    pub fn visited_store_codes(&self, include_archived: bool) -> Vec<String> {
+        self.visited_remembered(include_archived)
+            .into_iter()
+            .map(|(s, _)| s.store_code.clone())
+            .collect()
+    }
+
+    /// How the loading of the visited stores stands, for Purchases, which
+    /// lists a store only once it has loaded: how many are still being
+    /// asked for (a GET out, or a retry pending) and how many could not be
+    /// loaded at all. Neither is a confirmed empty history (codex on #197
+    /// round 4: during a retry's wait, and after the last, Purchases said
+    /// "Nothing yet").
+    pub fn visited_load_state(&self) -> (usize, usize) {
+        let mut pending = 0;
+        let mut failed = 0;
+        for (_, id) in self.visited_remembered(false) {
+            let Some(id) = id else { continue };
+            match self.store_name_of(&id) {
+                StoreName::Loading => pending += 1,
+                StoreName::Unreachable => failed += 1,
+                StoreName::Named(_) | StoreName::Unnamed => {}
+            }
+        }
+        (pending, failed)
+    }
+
+    /// Whether this node knows which stores are its own: the ghostkey
+    /// delegate has answered, and each identity it listed has had its
+    /// `ListStores` answered (or failed to send, which a reload retries).
+    pub fn seller_known(&self) -> bool {
+        self.ghostkeys_answered
+            && self.ghostkeys.iter().all(|key| {
+                self.store_lists_answered.contains(&key.fingerprint)
+                    || self.store_list_failed.contains(&key.fingerprint)
+            })
+    }
+
+    /// Whether a buyer can buy from this store now, in one answer for the
+    /// store page's pill, the visited rows and the seller's own cards: closed
+    /// when its seller closed it for good, when its presence says so, or
+    /// when it cannot take an order at all (`BrowsingStore::takes_orders`).
+    pub fn buyer_open(&self, store_contract_id: &[u8], now_ms: u64) -> BuyerOpen {
+        let store = self.browsing_stores.get(store_contract_id);
+        if store.is_some_and(|store| store.closed) {
+            return BuyerOpen::Closed;
+        }
+        match self.store_presence(store_contract_id, now_ms) {
+            crate::presence_flow::StorePresence::Closed(_) => BuyerOpen::Closed,
+            crate::presence_flow::StorePresence::Checking => BuyerOpen::Checking,
+            crate::presence_flow::StorePresence::Open => {
+                if store.is_some_and(|store| store.info.is_some() && !store.takes_orders()) {
+                    BuyerOpen::Closed
+                } else {
+                    BuyerOpen::Open
+                }
+            }
+        }
+    }
+
+    /// The rows of "Stores you've visited", and how many archived ones it is
+    /// not showing.
+    ///
+    /// Every store this node remembers except its own, which the Stores page
+    /// lists on their own above. Each is named by [`Self::store_name_of`],
+    /// never by its code. Archived stores ("Remove from list") are included
+    /// only when asked for, and come after the others; then closed ones
+    /// after open ones; then stores with no name yet; then by name.
+    pub fn store_list_rows(&self, show_archived: bool) -> (Vec<StoreListRow>, usize) {
+        let visited = self.visited_remembered(true);
         let hidden = if show_archived {
             0
         } else {
-            remembered.iter().filter(|s| s.archived).count()
+            visited.iter().filter(|(s, _)| s.archived).count()
         };
         let now_ms = now_ms();
-        let mut rows: Vec<StoreListRow> = remembered
-            .iter()
-            .filter(|s| show_archived || !s.archived)
-            .map(|s| {
-                let id = StoreParameters::from_code(&s.store_code)
-                    .and_then(|p| crate::gateway::store_ops::store_instance_id(&p).ok());
-                let name = id
+        let mut rows: Vec<StoreListRow> = visited
+            .into_iter()
+            .filter(|(s, _)| show_archived || !s.archived)
+            .map(|(s, id)| {
+                let info = id
                     .as_ref()
-                    .and_then(|id| self.browsing_stores.get(id.as_bytes()))
-                    .and_then(|store| store.info.as_ref())
-                    .map(|info| info.store_name.clone());
+                    .and_then(|id| self.browsing_stores.get(id))
+                    .and_then(|store| store.info.as_ref());
                 StoreListRow {
-                    label: crate::store_link::store_label(&s.store_code, name.as_deref()),
+                    name: id
+                        .as_ref()
+                        .map_or(StoreName::Unreachable, |id| self.store_name_of(id)),
+                    tagline: info.and_then(|info| crate::markdown::first_line(&info.description)),
                     code: s.store_code.clone(),
                     archived: s.archived,
                     closed: id
-                        .is_some_and(|id| self.store_presence(id.as_bytes(), now_ms).is_closed()),
+                        .as_ref()
+                        .is_some_and(|id| self.buyer_open(id, now_ms) == BuyerOpen::Closed),
+                    closed_for_now: id.as_ref().is_some_and(|id| {
+                        self.browsing_stores
+                            .get(id)
+                            .is_some_and(|store| store.takes_orders())
+                            && self.store_presence(id, now_ms).is_closed()
+                    }),
                 }
             })
             .collect();
         rows.sort_by(|a, b| {
+            let name = |row: &StoreListRow| row.name.name().map(str::to_lowercase);
             a.archived
                 .cmp(&b.archived)
                 .then(a.closed.cmp(&b.closed))
-                .then(a.label.cmp(&b.label))
+                .then(name(a).is_none().cmp(&name(b).is_none()))
+                .then(name(a).cmp(&name(b)))
+                .then(a.code.cmp(&b.code))
         });
         (rows, hidden)
     }
@@ -4301,17 +4779,18 @@ impl AppState {
         }
     }
 
-    /// The store the Browse tab is showing.
+    /// The store the store page is showing: the one last opened
+    /// (`active_store_id`), once its state has arrived.
     ///
-    /// Prefer the store a link named; fall back to any store whose state has
-    /// actually arrived. `browsing_stores` also holds placeholder entries --
-    /// one is created the moment a link is opened, before any state arrives,
-    /// and another whenever reputation state turns up for a store we haven't
-    /// loaded -- so "whichever entry the map iterates first" picks
-    /// arbitrarily among them and can show "no store" while a perfectly good
-    /// one is loaded.
+    /// Only that one. `browsing_stores` also holds placeholder entries (one
+    /// is created the moment a store is opened, before any state arrives)
+    /// and every other store loaded this session. This used to fall back to
+    /// any loaded store while the opened one was still a placeholder, which
+    /// on a page of its own (the 2026-09-30 Stores page) would show one
+    /// store under the name of another the user had just asked for. Until
+    /// the opened store arrives the page says it is loading.
     ///
-    /// Both `StoreView` and the document title resolve the shown store, and
+    /// Both `StorePage` and the document title resolve the shown store, and
     /// they answered differently until they shared this: the title took the
     /// map's first loaded entry, so with two stores open the page was titled
     /// after one the user was not looking at.
@@ -4320,11 +4799,6 @@ impl AppState {
             .as_ref()
             .and_then(|id| self.browsing_stores.get_key_value(id))
             .filter(|(_, store)| store.info.is_some())
-            .or_else(|| {
-                self.browsing_stores
-                    .iter()
-                    .find(|(_, store)| store.info.is_some())
-            })
     }
 
     /// Record that we have asked the gateway for a store contract. Returns
@@ -4338,6 +4812,12 @@ impl AppState {
     /// notification -- contradicting `on_own_store_subscribe_send_failed`'s
     /// doc comment, which promises a fresh start.
     pub fn note_store_subscribed(&mut self, store_contract_id: &[u8]) -> bool {
+        // Ours, and subscribed to: never a store loaded only to be listed,
+        // even if the Stores page listed it before our store list arrived
+        // (round 2 of #197). Its answer, and every later one, follows its
+        // record.
+        self.light_stores.remove(store_contract_id);
+        self.light_upgrading.remove(store_contract_id);
         let fresh = self.subscribed_stores.insert(store_contract_id.to_vec());
         if fresh {
             self.own_store_subscribe_failures.remove(store_contract_id);
@@ -4577,6 +5057,20 @@ impl AppState {
         // it, whatever it turns out to hold (see `store_link::
         // load_remembered_store`).
         let background = self.background_loads.remove(&contract_id);
+        // Counted as a failed try from the start, and forgiven where the
+        // state turns out to be a store's (`store_load_failures` is cleared
+        // there). Any other answer -- empty, or bytes that are not a store --
+        // stays a failure, with its wait and its end (codex on #197 round 4:
+        // undecodable bytes ended the load with nothing counted, so the page
+        // asked again at once, without end). A store the user opened ends on
+        // its own timer (`store_link::open_store_id`), which says "didn't
+        // load".
+        // Whether this was a listed store's subscribed re-load: it stops
+        // being only listed if this turns out to be its state.
+        let upgraded = background && self.light_upgrading.remove(&contract_id);
+        if background {
+            self.note_store_load_failed(&contract_id);
+        }
         // Before anything else, and before the empty check: an empty state is
         // itself an answer to a reuse check (nothing registered there). An id
         // that is ALSO a watched address goes on to the ordinary path below,
@@ -4590,6 +5084,8 @@ impl AppState {
             return;
         }
         if state_bytes.is_empty() {
+            // A background load's empty answer is already a failed try
+            // (above).
             return;
         }
         if self.bitcoin.retired_contracts.contains(&contract_id) {
@@ -4783,6 +5279,12 @@ impl AppState {
 
                     // Whatever we concluded from a timeout, the state is here now.
                     self.store_state_unavailable.remove(&contract_id);
+                    self.store_load_failures.remove(&contract_id);
+                    self.foreground_loads.remove(&contract_id);
+                    if upgraded {
+                        self.light_stores.remove(&contract_id);
+                    }
+                    self.on_subscribed_state(&contract_id);
                     // A genuine arrival is success: forget any past send
                     // failures so a later transient failure gets its own
                     // full retry budget rather than inheriting a lifetime
@@ -9150,53 +9652,6 @@ impl AppState {
         ed25519_dalek::VerifyingKey::from_bytes(&held).ok()
     }
 
-    /// The invoices the store page lists: every order of a store this node
-    /// owns, while the store is payable; for anyone else's store, only the
-    /// orders past `AwaitingPayment` (review round 3 of #143, P1-A; narrowed
-    /// in round 4, P3). A buyer sees a payment address only on their
-    /// purchase card, once their node keeps the order
-    /// (`docs/complaint-threat-model.md` section 3.1). The public record of
-    /// settled invoices stays readable to everyone, and carries no address:
-    /// the card offers one only for an order awaiting payment
-    /// (`fulfilment::offers_payment_address`).
-    pub fn invoices_shown(&self, store_contract_id: &[u8]) -> Vec<AuthorizedOrder> {
-        use harvest_common::payment::OrderStatus;
-        let Some(store) = self.browsing_stores.get(store_contract_id) else {
-            return Vec::new();
-        };
-        if self.store_owner_fingerprint(store_contract_id).is_none() {
-            return store
-                .orders
-                .iter()
-                .filter(|order| order.status != OrderStatus::AwaitingPayment)
-                .cloned()
-                .collect();
-        }
-        if store.payable() {
-            // Less the Buy now orders nobody has paid: not orders, as the
-            // seller sees them (`fulfilment::is_unpaid_buy_now`). Their
-            // buyers see them on their own purchase cards.
-            store
-                .orders
-                .iter()
-                .filter(|order| {
-                    !crate::fulfilment::is_unpaid_buy_now(order)
-                        || self.withheld_settlements.contains_key(&order.order.id)
-                })
-                .cloned()
-                .collect()
-        } else {
-            // A closed or unbacked store of the viewer's own: its settled
-            // history, as everyone else sees it (review round 5, P3).
-            store
-                .orders
-                .iter()
-                .filter(|order| order.status != OrderStatus::AwaitingPayment)
-                .cloned()
-                .collect()
-        }
-    }
-
     pub fn store_owner_fingerprint(&self, store_contract_id: &[u8]) -> Option<String> {
         self.my_stores.iter().find_map(|(fingerprint, stores)| {
             stores
@@ -12267,6 +12722,21 @@ impl AppState {
 
     /// Handle a response from the ghostkey delegate.
     pub fn on_ghostkey_response(&mut self, response: ghostkey_common::GhostkeyResponse) {
+        // The answer to `ListGhostKeys`: a list, or a refusal while no
+        // "Choose a Ghost Key" is waiting (that one answers the choice). Any
+        // other error does not count; the Stores page's wait covers a list
+        // that never comes.
+        let answers_the_list = match &response {
+            ghostkey_common::GhostkeyResponse::GhostKeyList { .. } => true,
+            ghostkey_common::GhostkeyResponse::AccessDenied { .. }
+            | ghostkey_common::GhostkeyResponse::NoIdentityAvailable => {
+                !self.request_any_access_in_flight
+            }
+            _ => false,
+        };
+        if answers_the_list {
+            self.ghostkeys_answered = true;
+        }
         match response {
             ghostkey_common::GhostkeyResponse::GhostKeyList { keys } => {
                 info!("Received {} ghostkeys", keys.len());
@@ -15166,18 +15636,25 @@ mod tests {
         assert_eq!(store.info.as_ref().unwrap().store_name, "store 5");
     }
 
-    /// A placeholder entry -- created the moment a link is opened -- is not a
-    /// loaded store, and must not shadow one that is.
+    /// A placeholder entry -- created the moment a store is opened -- is not
+    /// a loaded store, and no other loaded store stands in for it: the store
+    /// page says "Loading" rather than showing a store the user did not ask
+    /// for. (Until the 2026-09-30 Stores page this fell back to the loaded
+    /// one, which on a page of the store's own is the wrong store.)
     #[test]
-    fn a_placeholder_active_store_falls_back_to_a_loaded_one() {
+    fn a_placeholder_active_store_is_not_replaced_by_another() {
         let mut state = AppState::default();
         state
             .browsing_stores
             .insert(vec![1u8; 32], loaded_store("loaded"));
         state.begin_browsing(vec![2u8; 32]);
+        assert!(state.displayed_store().is_none());
 
-        let (id, _) = state.displayed_store().expect("the loaded store");
-        assert_eq!(id, &vec![1u8; 32]);
+        state
+            .browsing_stores
+            .insert(vec![2u8; 32], loaded_store("opened"));
+        let (id, _) = state.displayed_store().expect("the opened store");
+        assert_eq!(id, &vec![2u8; 32]);
     }
 
     #[test]
@@ -23846,7 +24323,7 @@ mod buy_flow_tests {
         assert_eq!(stores[0].record, RecordLoad::Loading.badge(0).1);
         state.browsing_stores.get_mut(STORE).unwrap().record = RecordLoad::Loaded;
         let stores = crate::components::my_store::seller_stores(&state);
-        assert_eq!(stores[0].record, "Clean record");
+        assert_eq!(stores[0].record, "No complaints");
     }
 
     /// **A seller who cannot see the chain is not told to reissue
@@ -30151,7 +30628,7 @@ mod buy_flow_tests {
         }
     }
 
-    /// **An unread record is never "Clean record"** (review round 1 of
+    /// **An unread record is never "No complaints"** (review round 1 of
     /// #143, P1-5): loading, not found and unavailable each say so, and only
     /// a record that was read with nothing counted is clean. A NotFound or a
     /// failed fetch after the record was read does not un-read it. Red if
@@ -30163,11 +30640,12 @@ mod buy_flow_tests {
             (RecordLoad::Loading, "Record loading"),
             (RecordLoad::NotFound, "No record found"),
             (RecordLoad::Unavailable, "Record unavailable"),
-            (RecordLoad::Loaded, "Clean record"),
+            (RecordLoad::Loaded, "No complaints"),
         ] {
             assert_eq!(state.badge(0).1, text);
         }
-        assert_eq!(RecordLoad::Loaded.badge(2).1, "2 complaint(s)");
+        assert_eq!(RecordLoad::Loaded.badge(1).1, "1 complaint");
+        assert_eq!(RecordLoad::Loaded.badge(2).1, "2 complaints");
         assert_eq!(RecordLoad::default(), RecordLoad::Loading);
 
         let (mut state, _) = a_paid_purchase();
@@ -30448,8 +30926,9 @@ mod buy_flow_tests {
     }
 
     /// **No view offers a buyer a payment address while `PurchaseNotKept`
-    /// holds** (review round 3 of #143, P1-A): not the store's invoice list,
-    /// and not the payment diagnostics (the Payments tab until harvest#93
+    /// holds** (review round 3 of #143, P1-A): not the store's invoice list
+    /// (gone from the store page since the 2026-09-30 Stores page), and not
+    /// the payment diagnostics (the Payments tab until harvest#93
     /// phase 2), even for an order that names one of this
     /// node's Ghost Keys as its buyer. The seller's own book still shows.
     /// Red if either view lists orders of a store this node does not own.
@@ -30468,14 +30947,15 @@ mod buy_flow_tests {
         state.browsing_stores.get_mut(STORE).unwrap().orders = vec![unpaid.clone()];
         assert!(state.browsing_stores[STORE].payable());
         assert!(!purchases(&state)[0].blockers.is_empty(), "not kept");
-        assert!(state.invoices_shown(STORE).is_empty(), "store page");
+        // The store page lists no invoices at all since the 2026-09-30
+        // Stores page (critique S2-8), so it offers no address either.
         assert!(
             crate::components::bitcoin_view::my_orders(&state).is_empty(),
             "payment diagnostics"
         );
-        // Another settled order of the same store is on its public list,
-        // with no address (review round 4, P3), and NOT on the diagnostics,
-        // which lists nothing it cannot check is this buyer's (round 5).
+        // Another settled order of the same store, with no address (review
+        // round 4, P3), is NOT on the diagnostics, which lists nothing it
+        // cannot check is this buyer's (round 5).
         let mut other = unpaid.clone();
         other.order.amount_sats += 1;
         let mut settled = resigned(other, &seller_signing_key());
@@ -30491,14 +30971,13 @@ mod buy_flow_tests {
             .unwrap()
             .orders
             .push(settled.clone());
-        assert_eq!(state.invoices_shown(STORE), vec![settled.clone()]);
         assert!(
             crate::components::bitcoin_view::my_orders(&state).is_empty(),
             "payment diagnostics"
         );
         state.browsing_stores.get_mut(STORE).unwrap().orders = vec![unpaid.clone()];
 
-        // The seller's own store lists its own invoices.
+        // The seller's own diagnostics list its own invoices.
         state.my_stores.insert(
             "seller-fp".to_string(),
             vec![StoreRegistration {
@@ -30509,7 +30988,6 @@ mod buy_flow_tests {
                 store_verifying_key: Some(seller_signing_key().verifying_key().to_bytes()),
             }],
         );
-        assert_eq!(state.invoices_shown(STORE), vec![unpaid.clone()]);
         assert_eq!(
             crate::components::bitcoin_view::my_orders(&state),
             vec![unpaid]
@@ -33770,17 +34248,320 @@ mod store_code_tests {
             rows,
             vec![StoreListRow {
                 code: named.clone(),
-                label: "Bean Shop".to_string(),
+                name: StoreName::Named("Bean Shop".to_string()),
+                tagline: None,
                 archived: false,
                 closed: false,
+                closed_for_now: false,
             }]
         );
         let (rows, hidden) = state.store_list_rows(true);
         assert_eq!(hidden, 0);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].code, plain, "archived after the rest");
-        assert_eq!(rows[1].label, format!("Store {plain}"), "labelled by code");
+        assert_eq!(
+            rows[1].name,
+            StoreName::Loading,
+            "not asked for yet: loading, never its code"
+        );
         assert!(rows[1].archived);
+    }
+
+    /// **A store's code is never its name** (the 2026-09-30 Stores page):
+    /// "Loading…" until its state arrives, and "Couldn't load this store"
+    /// once the wait is over, whichever way it was opened. Red with the old
+    /// `store_label`, which fell back to "Store <code>".
+    #[test]
+    fn a_store_is_never_named_by_its_code() {
+        let mut state = AppState::default();
+        let id = vec![7u8; 32];
+        assert_eq!(
+            state.store_name_of(&id),
+            StoreName::Loading,
+            "not asked yet"
+        );
+
+        // Opened by a link or a typed code: loading until the link fails.
+        state.begin_browsing(id.clone());
+        assert_eq!(state.store_name_of(&id), StoreName::Loading);
+        assert!(state.note_store_link_failed(&id, "didn't load"));
+        assert_eq!(state.store_name_of(&id), StoreName::Unreachable);
+
+        // Opened, then left for another store before it answered: still
+        // loading, not failed, until its own wait is over (review of #197).
+        let left = vec![6u8; 32];
+        state.begin_browsing(left.clone());
+        state.begin_foreground_load(&left);
+        state.begin_browsing(vec![5u8; 32]);
+        assert_eq!(state.store_name_of(&left), StoreName::Loading);
+        state.end_foreground_load(&left);
+        assert_eq!(state.store_name_of(&left), StoreName::Unreachable);
+
+        // Loaded in the background for a list: loading, and still loading
+        // while a retry is pending after it times out (a node still finding
+        // its peers), until its tries run out.
+        let other = vec![8u8; 32];
+        assert!(state.begin_background_load(other.clone(), "3Bn8xWqLd6Tz9Kf2".into(), false));
+        assert_eq!(state.store_name_of(&other), StoreName::Loading);
+        state.end_background_load_timed_out(&other);
+        assert_eq!(state.store_name_of(&other), StoreName::Loading);
+        state
+            .store_load_failures
+            .insert(other.clone(), (MAX_STORE_LOAD_ATTEMPTS, now_ms()));
+        assert_eq!(state.store_name_of(&other), StoreName::Unreachable);
+
+        // One of our own whose subscribe could not be sent, past its tries.
+        let own = vec![4u8; 32];
+        state
+            .own_store_subscribe_failures
+            .insert(own.clone(), MAX_OWN_STORE_SUBSCRIBE_ATTEMPTS);
+        assert_eq!(state.store_name_of(&own), StoreName::Unreachable);
+
+        // Its state arrives: its own name, trimmed; an empty one says so.
+        state.browsing_stores.get_mut(&other).unwrap().info = Some(StoreInfoV1 {
+            version: 1,
+            certificate_pem: String::new(),
+            seller_fingerprint: String::new(),
+            reputation_contract_id: [0u8; 32],
+            store_name: "  Bean Shop ".to_string(),
+            description: String::new(),
+            encryption_public_key: None,
+            record_public_key: None,
+        });
+        assert_eq!(
+            state.store_name_of(&other),
+            StoreName::Named("Bean Shop".to_string())
+        );
+        state
+            .browsing_stores
+            .get_mut(&other)
+            .unwrap()
+            .info
+            .as_mut()
+            .unwrap()
+            .store_name = " ".to_string();
+        assert_eq!(state.store_name_of(&other), StoreName::Unnamed);
+
+        for name in [
+            StoreName::Loading,
+            StoreName::Unreachable,
+            StoreName::Unnamed,
+        ] {
+            let label = name.label();
+            assert!(
+                !label.contains("3Bn8") && !label.contains("Store "),
+                "{label:?}"
+            );
+        }
+        assert_eq!(StoreName::Loading.label(), "Loading\u{2026}");
+    }
+
+    /// "Stores you've visited" leaves out this node's own stores (they are
+    /// listed above it, as "Your store"), and names the rest by their own
+    /// name with the first line of their description under it; stores with
+    /// no name yet come after named ones. Red without the own-store filter.
+    #[test]
+    fn visited_stores_leave_out_our_own_and_name_the_rest() {
+        let mut state = AppState::default();
+        let code =
+            |k: &ed25519_dalek::SigningKey| harvest_common::store::store_code(&k.verifying_key());
+        let id_of = |k: &ed25519_dalek::SigningKey| {
+            crate::gateway::store_ops::store_instance_id(
+                &StoreParameters::from_code(&code(k)).expect("a code"),
+            )
+            .expect("derive")
+            .as_bytes()
+            .to_vec()
+        };
+        let mine = seller();
+        let theirs = other();
+        let unnamed = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        state.on_delegate_response(HarvestDelegateResponse::RememberedStores {
+            stores: [&unnamed, &mine, &theirs]
+                .iter()
+                .map(|k| harvest_common::RememberedStore {
+                    store_code: code(k),
+                    archived: false,
+                })
+                .collect(),
+        });
+        state.my_stores.insert(
+            "my-ghost-key".to_string(),
+            vec![harvest_common::StoreRegistration {
+                store_contract_id: id_of(&mine),
+                reputation_contract_id: Vec::new(),
+                mailbox_contract_id: Vec::new(),
+                store_contract_key: None,
+                store_verifying_key: Some(mine.verifying_key().to_bytes()),
+            }],
+        );
+        for (key, name) in [(&mine, "Mine"), (&theirs, "Theirs")] {
+            state.browsing_stores.entry(id_of(key)).or_default().info = Some(StoreInfoV1 {
+                version: 1,
+                certificate_pem: String::new(),
+                seller_fingerprint: String::new(),
+                reputation_contract_id: [0u8; 32],
+                store_name: name.to_string(),
+                description: "Hand-thrown **stoneware**.\n\nMore about it.".to_string(),
+                encryption_public_key: None,
+                record_public_key: None,
+            });
+        }
+        let (rows, hidden) = state.store_list_rows(false);
+        assert_eq!(hidden, 0);
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.name.label(), r.tagline.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "Theirs".to_string(),
+                    Some("Hand-thrown stoneware.".to_string())
+                ),
+                ("Loading\u{2026}".to_string(), None),
+            ]
+        );
+
+        // Our store between generations (harvest#164): its registration
+        // still names an older contract id, and it is still ours, by its
+        // code. Red comparing by the current generation's id alone.
+        state.my_stores.insert(
+            "my-ghost-key".to_string(),
+            vec![harvest_common::StoreRegistration {
+                store_contract_id: vec![0xEE; 32],
+                reputation_contract_id: Vec::new(),
+                mailbox_contract_id: Vec::new(),
+                store_contract_key: None,
+                store_verifying_key: Some(mine.verifying_key().to_bytes()),
+            }],
+        );
+        let (rows, _) = state.store_list_rows(false);
+        assert!(
+            rows.iter().all(|r| r.name.label() != "Mine"),
+            "our own store is not a store we visited"
+        );
+        assert!(!state.visited_store_codes(false).contains(&code(&mine)));
+    }
+
+    /// Stores with no name yet sort after named ones, and among themselves
+    /// by code, so two "Loading…" rows keep their places.
+    #[test]
+    fn nameless_rows_sort_last_and_by_code() {
+        let mut state = AppState::default();
+        let codes: Vec<String> = [3u8, 1, 2]
+            .iter()
+            .map(|seed| {
+                harvest_common::store::store_code(
+                    &ed25519_dalek::SigningKey::from_bytes(&[*seed; 32]).verifying_key(),
+                )
+            })
+            .collect();
+        state.on_delegate_response(HarvestDelegateResponse::RememberedStores {
+            stores: codes
+                .iter()
+                .map(|code| harvest_common::RememberedStore {
+                    store_code: code.clone(),
+                    archived: false,
+                })
+                .collect(),
+        });
+        let (rows, _) = state.store_list_rows(false);
+        let mut sorted = codes.clone();
+        sorted.sort();
+        assert_eq!(
+            rows.iter().map(|r| r.code.clone()).collect::<Vec<_>>(),
+            sorted
+        );
+        assert!(rows.iter().all(|r| r.name == StoreName::Loading));
+    }
+
+    /// One answer for "can a buyer buy here": Closed when the seller closed
+    /// the store for good or it cannot take an order, whatever its presence
+    /// says; otherwise its presence. Red if a store closed for good reads
+    /// Open (the visited rows and own cards looked only at presence).
+    #[test]
+    fn a_store_is_open_only_where_a_buyer_can_buy() {
+        let mut state = AppState::default();
+        let id = vec![3u8; 32];
+        assert_eq!(
+            state.buyer_open(&id, now_ms()),
+            BuyerOpen::Checking,
+            "nothing known"
+        );
+        let mut store = BrowsingStore {
+            info: Some(StoreInfoV1 {
+                version: 1,
+                certificate_pem: String::new(),
+                seller_fingerprint: String::new(),
+                reputation_contract_id: [0u8; 32],
+                store_name: "Pots".to_string(),
+                description: String::new(),
+                encryption_public_key: Some([1u8; 32]),
+                record_public_key: None,
+            }),
+            seller_verifying_key: Some([2u8; 32]),
+            ..Default::default()
+        };
+        assert!(store.takes_orders());
+        store.closed = true;
+        assert!(!store.takes_orders());
+        state.browsing_stores.insert(id.clone(), store);
+        assert_eq!(
+            state.buyer_open(&id, now_ms()),
+            BuyerOpen::Closed,
+            "closed for good"
+        );
+        assert_eq!(BuyerOpen::Closed.pill(), "Closed");
+        assert_eq!(BuyerOpen::Open.pill(), "Open");
+    }
+
+    /// The Stores page knows which stores are this node's own only once the
+    /// ghostkey delegate has answered and every identity it listed has had
+    /// its store list answered (or failed to send).
+    #[test]
+    fn the_seller_is_known_once_every_answer_is_in() {
+        let mut state = AppState::default();
+        assert!(!state.seller_known());
+        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::GhostKeyList {
+            keys: Vec::new(),
+        });
+        assert!(state.seller_known(), "no identity: nothing of our own");
+        state.ghostkeys.push(ghostkey_common::GhostKeyInfo {
+            fingerprint: "fp".into(),
+            label: None,
+            notary_info: String::new(),
+            verifying_key_bytes: None,
+            backed_up: false,
+        });
+        assert!(!state.seller_known(), "its store list is not in yet");
+        state.store_lists_answered.insert("fp".into());
+        assert!(state.seller_known());
+
+        // A refusal answers the list only while no "Choose a Ghost Key" is
+        // waiting; any other vault error does not answer it.
+        let mut state = AppState {
+            request_any_access_in_flight: true,
+            ..Default::default()
+        };
+        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::NoIdentityAvailable);
+        assert!(!state.ghostkeys_answered, "that answered the choice");
+        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::NoIdentityAvailable);
+        assert!(state.ghostkeys_answered);
+
+        // The page stops waiting a fixed time after the app started, however
+        // often it is opened (round 2 of #197).
+        let mut state = AppState::default();
+        let now = now_ms();
+        assert!(!state.seller_known_or_waited(now));
+        assert!(state.seller_known_or_waited(state.session_started.0 + SELLER_ANSWER_WAIT_MS));
+        // The list of remembered stores is awaited only within that wait,
+        // and not once it has arrived.
+        let started = state.session_started.0;
+        state.remembered_stores = None;
+        assert!(state.remembered_stores_awaited(started));
+        assert!(!state.remembered_stores_awaited(started + SELLER_ANSWER_WAIT_MS));
+        state.remembered_stores = Some(Vec::new());
+        assert!(!state.remembered_stores_awaited(started));
     }
 
     /// A closed store is greyed and listed after the open ones, whatever its
@@ -33813,6 +34594,8 @@ mod store_code_tests {
                 .entry(id.as_bytes().to_vec())
                 .or_default();
             store.owner = Some(key.verifying_key().to_bytes());
+            // Able to take an order, so only presence decides.
+            store.seller_verifying_key = Some([2u8; 32]);
             store.info = Some(StoreInfoV1 {
                 version: 1,
                 certificate_pem: String::new(),
@@ -33820,7 +34603,7 @@ mod store_code_tests {
                 reputation_contract_id: [0u8; 32],
                 store_name: name.to_string(),
                 description: String::new(),
-                encryption_public_key: None,
+                encryption_public_key: Some([1u8; 32]),
                 record_public_key: None,
             });
         }
@@ -33841,9 +34624,12 @@ mod store_code_tests {
         let (rows, _) = state.store_list_rows(false);
         assert_eq!(
             rows.iter()
-                .map(|r| (r.label.as_str(), r.closed))
+                .map(|r| (r.name.label(), r.closed))
                 .collect::<Vec<_>>(),
-            vec![("Z open", false), ("A closed", true)]
+            vec![
+                ("Z open".to_string(), false),
+                ("A closed".to_string(), true)
+            ]
         );
     }
 }

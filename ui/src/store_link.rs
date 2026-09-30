@@ -173,18 +173,6 @@ pub fn share_link(code: &str) -> String {
     )
 }
 
-/// The label shown beside a store's share link and in the store list.
-///
-/// Prefer the store's own name; fall back to its code, which is what the
-/// seller hands out and what the buyer's link carries. The fallback is not a
-/// rare path: a store's state may not have arrived yet.
-pub fn store_label(code: &str, store_name: Option<&str>) -> String {
-    match store_name.map(str::trim).filter(|name| !name.is_empty()) {
-        Some(name) => name.to_string(),
-        None => format!("Store {code}"),
-    }
-}
-
 /// If this page was opened with a store link, start browsing that store.
 ///
 /// Called once the websocket is up. It deliberately does not wait for the
@@ -202,8 +190,7 @@ pub fn open_store_from_url() {
     let search = location.search().unwrap_or_default();
     let Some(params) = parse_store_code(&hash).or_else(|| parse_store_code(&search)) else {
         if is_old_format_link(&hash) || is_old_format_link(&search) {
-            use dioxus::prelude::WritableExt;
-            crate::gateway::APP_STATE.write().note_old_format_link();
+            crate::components::show_old_format_link();
         }
         return;
     };
@@ -213,12 +200,13 @@ pub fn open_store_from_url() {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn open_store_from_url() {}
 
-/// Open the store `params` names: browse it, fetch it, and remember it.
+/// Open the store `params` names: show its page, fetch it, and remember it.
 ///
 /// The one path for a followed link, a typed code and a row of the store
-/// list, so all three resolve an address the same way and all three leave
-/// the store remembered.
-#[cfg(target_arch = "wasm32")]
+/// list, so all three resolve an address the same way, all three land on
+/// the store's own page (`components::show_store`), and all three leave the
+/// store remembered. Off wasm it does everything but the GET, so a test can
+/// see where each lands.
 pub fn open_store(params: StoreParameters) {
     use dioxus::prelude::WritableExt;
 
@@ -231,50 +219,91 @@ pub fn open_store(params: StoreParameters) {
     };
     let code = params.code().to_string();
     dioxus::logger::tracing::info!("Opening store {code} ({store_id})");
-    {
-        let mut state = crate::gateway::APP_STATE.write();
-        state.begin_browsing(store_id.as_bytes().to_vec());
-        // Remembered only once its state arrives (`AppState::
-        // remember_loaded_store`), so a mistyped or unreachable code does not
-        // stay in the list for good.
-        state.note_store_code(store_id.as_bytes().to_vec(), code.clone());
-    }
-
-    wasm_bindgen_futures::spawn_local(async move {
-        let contract_id = store_id.as_bytes().to_vec();
-        if let Err(e) = crate::gateway::get_contract(&store_id, true).await {
-            crate::gateway::APP_STATE
-                .write()
-                .note_store_link_failed(&contract_id, &format!("Couldn't open that store: {e}"));
-            return;
-        }
-
-        // The GET is out. Nothing will report back if it dead-ends -- a
-        // contract nobody holds simply never answers -- so give it a
-        // deadline and say so if it passes.
-        gloo_timers::future::TimeoutFuture::new(LINK_LOAD_TIMEOUT_MS).await;
-        crate::gateway::APP_STATE.write().note_store_link_failed(
-            &contract_id,
-            "That store didn't load. The code may be wrong, or the store may \
-             not be reachable right now.",
-        );
-    });
+    // Remembered only once its state arrives (`AppState::
+    // remember_loaded_store`), so a mistyped or unreachable code does not
+    // stay in the list for good.
+    crate::gateway::APP_STATE
+        .write()
+        .note_store_code(store_id.as_bytes().to_vec(), code);
+    open_store_id(store_id);
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-pub fn open_store(_params: StoreParameters) {}
+/// Open the store with this address: show its page, and fetch it with a
+/// subscription, giving up after [`LINK_LOAD_TIMEOUT_MS`] so the page never
+/// waits for good. For a store whose code this node does not know, too
+/// (`components::open_store_page`).
+pub fn open_store_id(store_id: freenet_stdlib::prelude::ContractInstanceId) {
+    use dioxus::prelude::WritableExt;
+    let contract_id = store_id.as_bytes().to_vec();
+    crate::components::show_store(contract_id.clone());
+    // `false` when its GET is already out, with its own wait: only shown.
+    let started = crate::gateway::APP_STATE
+        .write()
+        .begin_foreground_load(&contract_id);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = started;
+
+    #[cfg(target_arch = "wasm32")]
+    if started {
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = crate::gateway::get_contract(&store_id, true).await {
+                let mut state = crate::gateway::APP_STATE.write();
+                state.note_store_link_failed(
+                    &contract_id,
+                    &format!("Couldn't open that store: {e}"),
+                );
+                state.end_foreground_load(&contract_id);
+                return;
+            }
+
+            // The GET is out. Nothing will report back if it dead-ends -- a
+            // contract nobody holds simply never answers -- so give it a
+            // deadline and say so if it passes.
+            gloo_timers::future::TimeoutFuture::new(LINK_LOAD_TIMEOUT_MS).await;
+            let mut state = crate::gateway::APP_STATE.write();
+            state.note_store_link_failed(
+                &contract_id,
+                "That store didn't load. The code may be wrong, or the store may \
+             not be reachable right now.",
+            );
+            state.end_foreground_load(&contract_id);
+        });
+    }
+}
+
+/// Load, in the background, every store this node remembers visiting that
+/// is not loaded yet, so a page listing them can give each its own name
+/// (the Stores page, `subscribe` false) or find this device's
+/// conversations with it and follow its orders (Purchases, `subscribe`
+/// true). `include_archived`: the ones removed from the list too, for when
+/// they are being shown. Idempotent per store (`load_remembered_store`), and
+/// cheap to call on every change of state.
+pub fn load_visited_stores(include_archived: bool, subscribe: bool) {
+    use dioxus::prelude::ReadableExt;
+    let codes = crate::gateway::APP_STATE
+        .read()
+        .visited_store_codes(include_archived);
+    for code in codes {
+        load_remembered_store(&code, subscribe);
+    }
+}
 
 /// Load a remembered store in the background without opening it (harvest#93
-/// phase 2): My purchases lists a store only once its state has arrived,
-/// because that is what recalls this device's conversations with it.
+/// phase 2).
 ///
-/// A store already in `browsing_stores` (loaded, or its GET already out) is
-/// left alone. The placeholder entry this adds is what says a GET is out, and
-/// it is taken back out if the GET fails to send, so a later visit retries. A
-/// GET that goes out and is never answered leaves the placeholder for the
-/// session, which only means the store is not asked about again until reload.
+/// `subscribe` false (the Stores page's rows): one GET, no subscription, so
+/// the row can show the store's name and whether it is open, and nothing
+/// more is kept up (`AppState::light_stores`). `subscribe` true (Purchases):
+/// a GET with a subscription, since a purchase's store has to stay current,
+/// and what recalls this device's conversations with it; a store loaded
+/// only for the list is loaded again this way.
+///
+/// Sent only when due (`AppState::background_load_due`). A GET that fails
+/// to go out, or goes out and is never answered, is sent again on its own
+/// timer after a growing wait, a few times, and the store reads as loading
+/// until the last one gives up.
 #[cfg(target_arch = "wasm32")]
-pub fn load_remembered_store(code: &str) {
+pub fn load_remembered_store(code: &str, subscribe: bool) {
     use dioxus::prelude::WritableExt;
 
     let Some(params) = StoreParameters::from_code(code) else {
@@ -284,42 +313,64 @@ pub fn load_remembered_store(code: &str) {
         return;
     };
     let contract_id = store_id.as_bytes().to_vec();
-    // Checked under a READ first: My purchases calls this from an effect
-    // that reads the app state, and a write, even one that changes nothing,
-    // would re-run that effect for ever.
+    // Checked under a READ first: Stores and Purchases call this from an
+    // effect that reads the app state, and a write, even one that changes
+    // nothing, would re-run that effect for ever.
     {
         use dioxus::prelude::ReadableExt;
-        if crate::gateway::APP_STATE
-            .read()
-            .browsing_stores
-            .contains_key(&contract_id)
-        {
+        if !crate::gateway::APP_STATE.read().background_load_due(
+            &contract_id,
+            crate::state::now_ms(),
+            subscribe,
+        ) {
             return;
         }
     }
-    if !crate::gateway::APP_STATE
-        .write()
-        .begin_background_load(contract_id.clone(), code.to_string())
-    {
+    if !crate::gateway::APP_STATE.write().begin_background_load(
+        contract_id.clone(),
+        code.to_string(),
+        subscribe,
+    ) {
         return;
     }
+    let code = code.to_string();
     wasm_bindgen_futures::spawn_local(async move {
-        if let Err(e) = crate::gateway::get_contract(&store_id, true).await {
+        if let Err(e) = crate::gateway::get_contract(&store_id, subscribe).await {
             dioxus::logger::tracing::warn!("Could not load a remembered store: {e}");
             crate::gateway::APP_STATE
                 .write()
                 .end_background_load_failed(&contract_id);
-            return;
+        } else {
+            gloo_timers::future::TimeoutFuture::new(LINK_LOAD_TIMEOUT_MS).await;
+            crate::gateway::APP_STATE
+                .write()
+                .end_background_load_timed_out(&contract_id);
         }
-        gloo_timers::future::TimeoutFuture::new(LINK_LOAD_TIMEOUT_MS).await;
-        crate::gateway::APP_STATE
-            .write()
-            .end_background_load_timed_out(&contract_id);
+        // Sent again on its own timer: the pages ask only when the state
+        // changes, and nothing may change when the wait is over (codex on
+        // #197). `None` once it has arrived or has no tries left, and not
+        // for a store taken off the list meanwhile.
+        let retry = {
+            use dioxus::prelude::ReadableExt;
+            let state = crate::gateway::APP_STATE.read();
+            state
+                .visited_store_codes(false)
+                .contains(&code)
+                .then(|| state.background_retry_after(&contract_id))
+                .flatten()
+        };
+        if let Some(wait) = retry {
+            // A little past the wait, so the check it meets is not a
+            // millisecond early.
+            let wait = wait.saturating_add(250).min(u64::from(u32::MAX)) as u32;
+            gloo_timers::future::TimeoutFuture::new(wait).await;
+            load_remembered_store(&code, subscribe);
+        }
     });
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn load_remembered_store(_code: &str) {}
+pub fn load_remembered_store(_code: &str, _subscribe: bool) {}
 
 #[cfg(test)]
 mod tests {
@@ -496,19 +547,5 @@ mod tests {
             "#store={}",
             "z".repeat(50_000)
         )));
-    }
-
-    #[test]
-    fn a_store_is_labelled_by_its_name_when_it_has_one() {
-        assert_eq!(store_label(&code(), Some("Bean Shop")), "Bean Shop");
-    }
-
-    #[test]
-    fn a_nameless_store_is_labelled_by_its_code() {
-        let code = code();
-        let label = store_label(&code, None);
-        assert_eq!(label, format!("Store {code}"));
-        assert_eq!(store_label(&code, Some("   ")), label);
-        assert_eq!(store_label(&code, Some("")), label);
     }
 }

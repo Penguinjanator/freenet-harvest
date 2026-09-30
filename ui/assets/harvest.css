@@ -95,6 +95,10 @@
   --accent: var(--color-moss);
   --accent-warm: var(--color-terracotta);
   --border: #d8cfbe;
+  /* Amber: only for what needs the seller (the mockup's, 2026-09-30). */
+  --amber: #9a5b00;
+  --amber-bg: #fcefd6;
+  --amber-line: #e6c07a;
 
   /* Typography */
   --font-display: 'Libre Baskerville', Georgia, serif;
@@ -201,12 +205,14 @@ body::before {
       makes a container `display: flex` or `display: grid` must name the
       container here too. A test in ui/src/components/mod.rs checks it. */
 :where(.harvest-header, .harvest-title-group, .harvest-nav, .tabs,
-       .listing-header, .listing-footer, .store-header-inner, .feedback-header,
+       .listing-header, .listing-terms, .store-status, .feedback-header,
        .form-row, .identity-card, .btc-status-bar, .btc-block-list,
        .btc-block-row, .btc-tx-row, .row-between, .harvest-footer,
        .form-actions, .dashboard-head, .checklist li, .share-row,
        .seller-listing, .seller-listing-actions, .own-store-banner,
-       .pay-ways, .copy-line, .notice-row, .link-btn) > * {
+       .pay-ways, .copy-line, .notice-row, .link-btn, .rowcard, .rc-status,
+       .find-store, .vrow, .crumb, .harvest-header-right, .record-head,
+       .needs-hit) > * {
   margin-top: 0;
   margin-left: 0;
 }
@@ -248,7 +254,7 @@ body::before {
   letter-spacing: -0.02em;
 }
 
-/* Top-level pages: Stores / My purchases / My store (harvest#93 phase 2).
+/* Top-level pages: Stores / Purchases (the 2026-09-30 Stores page).
    A row of text tabs under the title, underlined when current: the
    difference is carried by weight and a rule, not by colour. */
 .harvest-nav {
@@ -270,6 +276,10 @@ body::before {
   font-size: 0.75rem;
   color: var(--text-muted);
   margin-right: var(--space-sm);
+  /* A long connection error wraps rather than pushing the needs pill off
+     a phone's width. */
+  overflow-wrap: anywhere;
+  text-align: right;
   font-family: var(--font-body);
   font-weight: 300;
 }
@@ -381,44 +391,12 @@ h4 {
   line-height: 1.5;
 }
 
-.listing-footer {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: var(--space-xs) var(--space-md);
-  margin-top: var(--space-sm);
-}
-
 .listing-price {
   font-family: var(--font-display);
   font-weight: 700;
   color: var(--accent);
   font-size: 1.05rem;
 }
-
-.listing-date {
-  font-size: 0.75rem;
-  color: var(--text-muted);
-  font-weight: 300;
-}
-
-/* ---- Badges ---- */
-
-.badge {
-  font-family: var(--font-body);
-  font-size: 0.7rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  padding: 0.2rem 0.6rem;
-  border-radius: 3px;
-  color: white;
-}
-
-.badge-sale { background: var(--accent); }
-.badge-gift { background: var(--color-sage); }
-.badge-request { background: var(--accent-warm); }
 
 /* ---- Buttons ---- */
 
@@ -442,7 +420,8 @@ h4 {
   background: var(--moss-dark, #3a5233);
 }
 
-.btn-primary:disabled {
+.btn-primary:disabled,
+.btn-outline:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
@@ -458,7 +437,7 @@ h4 {
   color: var(--text-secondary);
 }
 
-.btn-outline:hover {
+.btn-outline:hover:not(:disabled) {
   border-color: var(--accent);
   color: var(--accent);
 }
@@ -470,14 +449,40 @@ h4 {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   padding: var(--space-xl);
-  margin-bottom: var(--space-xl);
+  margin-bottom: var(--space-lg);
 }
 
-.store-header-inner {
+/* The store's name, and beside it Open or Closed. */
+.store-status {
   display: flex;
   justify-content: space-between;
-  align-items: flex-start;
-  gap: var(--space-lg);
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-xs) var(--space-md);
+}
+
+/* Closed: switched off, like a sold-out listing, with its text left at
+   full contrast since it says why. */
+.store-header-closed {
+  background: transparent;
+}
+
+/* What the seller has at stake, and the store's record, in one line. */
+.trust {
+  font-size: 0.92rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+/* The record's count: one neutral link colour, whatever it says. */
+.trust .trust-record {
+  font: inherit;
+  color: inherit;
+}
+
+.trust-why {
+  font-size: 0.85rem;
+  color: var(--text-muted);
 }
 
 .store-name {
@@ -595,40 +600,6 @@ h4 {
 .store-desc a,
 .listing-desc a {
   color: var(--accent);
-}
-
-.store-meta {
-  text-align: right;
-  flex-shrink: 0;
-}
-
-.reputation-clean {
-  font-family: var(--font-display);
-  font-weight: 700;
-  color: var(--accent);
-  font-size: 0.9rem;
-}
-
-.reputation-negative {
-  font-family: var(--font-display);
-  font-weight: 700;
-  color: #b44;
-  font-size: 0.9rem;
-}
-
-/* The ghostkey verdict, beside the reputation line. Deliberately quiet when
-   it passes and coloured only when it does not: a badge that is always
-   shouting is one a reader stops seeing. */
-.cert-verified {
-  font-size: 0.75rem;
-  color: var(--text-muted);
-}
-
-.cert-unverified {
-  font-family: var(--font-display);
-  font-weight: 700;
-  color: #b44;
-  font-size: 0.8rem;
 }
 
 .seller-id {
@@ -887,19 +858,21 @@ h4 {
 /* The store's status on the seller's Overview: outlined, colour only when
    open (the one state that means "buyers can buy"). */
 .pill {
-  font-size: 0.7rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  padding: 0.2rem 0.6rem;
-  border-radius: 3px;
-  border: 1px solid var(--border);
-  color: var(--text-muted);
+  display: inline-block;
+  font-size: 0.78rem;
+  font-weight: 500;
+  line-height: 1.2;
+  padding: 0.3rem 0.65rem;
+  border-radius: 999px;
+  background: var(--color-parchment);
+  color: var(--text-secondary);
+  white-space: nowrap;
 }
 
+/* Open: the one state that means "buyers can buy". */
 .pill-open {
-  color: var(--accent);
-  border-color: var(--accent);
+  background: #e3ecdf;
+  color: var(--color-moss-dark);
 }
 
 /* "test coins, no value" beside a test-network amount. */
@@ -932,26 +905,6 @@ h4 {
   border-radius: var(--radius-lg);
   padding: var(--space-md) var(--space-lg);
   margin-bottom: var(--space-sm);
-}
-
-.store-share {
-  margin: 0 0 var(--space-md);
-}
-
-.store-share p {
-  margin-bottom: var(--space-xs);
-  font-size: 0.85rem;
-}
-
-.store-share-row + .store-share-row {
-  margin-top: var(--space-xs);
-}
-
-.store-share-label {
-  display: block;
-  margin-bottom: 2px;
-  font-size: 0.8rem;
-  font-weight: 600;
 }
 
 .identity-name {
@@ -1104,37 +1057,46 @@ h4 {
 
 /* ---- Payment status pills ---- */
 
+/* An order's status: the same soft, sentence-case pill as a store's. */
 .btc-pill {
+  display: inline-block;
   font-family: var(--font-body);
-  font-size: 0.7rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  padding: 0.2rem 0.6rem;
-  border-radius: 3px;
+  font-size: 0.78rem;
+  font-weight: 500;
+  line-height: 1.2;
+  padding: 0.3rem 0.65rem;
+  border-radius: 999px;
+  background: var(--color-parchment);
+  color: var(--text-secondary);
 }
 
 .btc-pill.paid {
-  background: var(--accent);
-  color: var(--color-cream);
+  background: #e3ecdf;
+  color: var(--color-moss-dark);
 }
 
+/* Waiting on a payment is not something the seller must act on: neutral. */
 .btc-pill.pending,
 .btc-pill.waiting {
-  background: transparent;
-  border: 1px solid var(--accent-warm);
-  color: var(--accent-warm);
+  background: var(--color-parchment);
+  color: var(--text-secondary);
+}
+
+/* A paid order to send: what needs the seller, so amber. */
+.btc-pill.needs {
+  background: var(--amber-bg);
+  color: var(--amber);
+  box-shadow: inset 0 0 0 1px var(--amber-line);
+  font-weight: 600;
 }
 
 .btc-pill.reversed {
-  background: #b44;
-  color: white;
+  background: #f6dcd8;
+  color: #9b2c22;
 }
 
 .btc-pill.cancelled,
 .btc-pill.done {
-  background: transparent;
-  border: 1px solid var(--border);
   color: var(--text-muted);
 }
 
@@ -1477,6 +1439,254 @@ h4 {
   flex: none;
 }
 
+/* ---- Stores page (the 2026-09-30 redesign, after the mockup) ---- */
+
+/* A section's label: small capitals, muted. The headings of the page's
+   parts ("Your store", "Find a store", "Stores you've visited"). */
+.sec-lbl {
+  font-family: var(--font-body);
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin: var(--space-xl) 0 var(--space-sm);
+}
+
+.sec-lbl-first {
+  margin-top: 0;
+}
+
+/* A whole card that is one button: a store, with its status and a chevron
+   on the right. */
+.rowcard {
+  display: flex;
+  width: 100%;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-md);
+  text-align: left;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-md) 1.25rem;
+  margin: 0 0 var(--space-sm);
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+
+.rowcard:hover {
+  border-color: var(--accent);
+}
+
+.rc-main {
+  display: block;
+  flex: 1;
+  min-width: 0;
+}
+
+.rc-name {
+  display: block;
+  font-family: var(--font-display);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+/* "Loading…" or "Couldn't load this store" in place of a name. */
+.rc-pending {
+  font-family: var(--font-body);
+  font-weight: 400;
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+/* One line under the name: the store's tagline, cut with an ellipsis. */
+.rc-sub {
+  display: block;
+  font-size: 0.88rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* What needs the seller, and whether buyers can buy: one pill each. */
+.rc-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-xs) var(--space-sm);
+  flex-shrink: 0;
+}
+
+.chev {
+  color: var(--text-muted);
+  font-size: 1.2rem;
+  line-height: 1;
+}
+
+/* Something needs the seller: the one amber pill. */
+.pill-needs {
+  background: var(--amber-bg);
+  color: var(--amber);
+  box-shadow: inset 0 0 0 1px var(--amber-line);
+  font-weight: 600;
+}
+
+/* A count on a tab that needs the seller ("Orders (2)"). */
+.tab-needs {
+  color: var(--amber);
+  font-weight: 600;
+}
+
+/* The header's "2 need you", top right: to what needs the seller. */
+.harvest-header-right {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-xs) var(--space-sm);
+  min-width: 0;
+}
+
+.needs-hit {
+  display: inline-flex;
+  align-items: center;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+}
+
+.needs-pill {
+  font-family: var(--font-body);
+  font-size: 0.85rem;
+  font-weight: 600;
+  line-height: 1.2;
+  padding: 0.4rem 0.8rem;
+  border-radius: 999px;
+  border: 1px solid var(--amber-line);
+  background: var(--amber-bg);
+  color: var(--amber);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.needs-hit:hover .needs-pill {
+  border-color: var(--amber);
+}
+
+.find-store {
+  display: flex;
+  gap: var(--space-sm);
+}
+
+.find-store .form-input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The stores visited: one white box, a row per store. */
+.vlist {
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+/* The name and tagline (the row's button), then "Remove from list" and
+   the chevron on the right. */
+.vrow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-areas: "go remove chev";
+  align-items: center;
+  column-gap: var(--space-md);
+  padding: 0.8rem 1.1rem;
+  border-top: 1px solid var(--color-parchment);
+}
+
+.vrow-chev {
+  grid-area: chev;
+  cursor: pointer;
+}
+
+.vrow:first-child {
+  border-top: 0;
+}
+
+/* Closed, or removed from the list and being shown: switched off, like a
+   sold-out listing. */
+.vrow-off {
+  opacity: 0.6;
+}
+
+.vrow-off .rc-name {
+  color: var(--text-muted);
+}
+
+.vrow-go {
+  grid-area: go;
+  min-width: 0;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.vrow-go:hover .rc-name {
+  color: var(--accent);
+}
+
+.vrow-remove {
+  grid-area: remove;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* A quiet invitation rather than a card of its own weight: selling, for
+   someone with no store. */
+.card-quiet {
+  background: transparent;
+  border-style: dashed;
+}
+
+.sell-card {
+  margin-top: var(--space-xl);
+}
+
+/* "‹ Stores": the way back from a page reached from Stores. */
+.crumb {
+  display: inline-block;
+  min-height: 24px;
+  margin: 0 0 var(--space-sm);
+  padding: 0;
+  background: none;
+  border: 0;
+  font: inherit;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.crumb:hover {
+  color: var(--accent);
+}
+
+/* The page's heading sits just under the way back, not a section away. */
+.crumb + h2 {
+  margin-top: var(--space-sm);
+}
+
 /* ---- Store page ---- */
 
 .own-store-banner {
@@ -1493,19 +1703,49 @@ h4 {
   color: var(--text-secondary);
 }
 
-.store-record {
-  margin: calc(-1 * var(--space-sm)) 0 var(--space-lg);
+/* The store's record, opened from the trust line: "Record" and Hide on
+   one line, at any width. */
+.record-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.record-head h3 {
+  margin: 0;
+}
+
+/* "You have 1 order from this store ›", and "Ask the seller a question". */
+.store-orders-line {
+  margin-bottom: var(--space-sm);
+}
+
+.store-ask {
+  margin-top: var(--space-lg);
+}
+
+.buy-control {
+  margin-top: 0.75rem;
+}
+
+/* A listing's price, and its delivery under it. */
+.listing-terms {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: var(--space-sm);
+}
+
+.listing-delivery {
+  font-size: 0.85rem;
+  color: var(--text-muted);
 }
 
 .listing-stock {
   font-size: 0.85rem;
   color: var(--text-secondary);
-}
-
-/* A closed store (presence_flow): its row in the store list reads as
-   switched off, like a sold-out listing. */
-.store-row-closed {
-  opacity: 0.55;
+  white-space: nowrap;
 }
 
 .listing-sold-out {
@@ -1533,11 +1773,14 @@ h4 {
   .btn-sm,
   .nav-btn,
   .tab,
-  .form-select {
+  .form-select,
+  .vrow-go,
+  .needs-hit {
     min-height: 44px;
   }
 
-  .link-btn {
+  .link-btn,
+  .crumb {
     display: inline-flex;
     align-items: center;
     min-height: 44px;
@@ -1577,7 +1820,60 @@ h4 {
     gap: var(--space-xs);
   }
 
-  .store-header-inner {
+  .store-header {
+    padding: var(--space-lg);
+  }
+
+  /* The status goes under the name, the chevron stays on the right
+     (critique 01s-3). */
+  .rowcard {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "main chev" "status chev";
+    row-gap: var(--space-xs);
+    padding: var(--space-md);
+  }
+
+  .rc-main {
+    grid-area: main;
+  }
+
+  .rc-status {
+    grid-area: status;
+    justify-content: flex-start;
+  }
+
+  .rowcard > .chev {
+    grid-area: chev;
+  }
+
+  /* The field above its Open button, both full width. */
+  .find-store {
     flex-direction: column;
+  }
+
+  /* The name with the chevron, then the tagline with "Remove from list"
+     right-aligned on its line (critique 01-2). */
+  .vrow {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "go chev" "remove chev";
+  }
+
+  /* The chevron centred on the row, "Remove from list" under the tagline
+     (round-6 critique: at the top right it read as Remove's). */
+  .vrow-chev {
+    align-self: center;
+  }
+
+  .vrow-remove {
+    justify-self: start;
+  }
+}
+
+/* A phone's width: the store's header gives its text the room (critique
+   S2-12). */
+@media (max-width: 480px) {
+  .store-header {
+    padding: var(--space-md);
   }
 }
