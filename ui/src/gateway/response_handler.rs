@@ -188,6 +188,16 @@ fn handle_contract_response(response: ContractResponse) {
             APP_STATE
                 .write()
                 .on_address_reuse_absent(instance_id.as_bytes());
+            // And to an upcoming address instant checkout reads before it may
+            // be watched (harvest#183): absence counts as clear there too.
+            #[cfg(target_arch = "wasm32")]
+            {
+                let mut state = APP_STATE.write();
+                if state.on_address_vet_absent(instance_id.as_bytes(), crate::state::now_ms()) {
+                    state.send_due_auto_invoice();
+                    state.send_due_watch_requests();
+                }
+            }
             // And to a store's reputation record, so the store page says
             // "no record found" rather than "No complaints" (#143 review
             // round 1, P1-5). Only a record id matches, so any other
