@@ -68,6 +68,10 @@ pub fn presence_refresh_after(misses: u32) -> u64 {
 /// most one heartbeat per [`HEARTBEAT_MIN_GAP_MS`] whoever asks.
 pub const WAKEUPS_FRESH_MS: u64 = HEARTBEAT_EVERY_MS + 30 * 1000;
 
+/// How recent a wake-up has to be for the seller to be TOLD the store stays
+/// open without Harvest open ([`AppState::wakeups_seen_recently`]).
+pub const WAKEUPS_SEEN_MS: u64 = 3 * HEARTBEAT_EVERY_MS;
+
 // The handover. The last heartbeat SENT may predate the last wake-up by up to
 // the gap (that wake-up was held back by it); the tab takes over
 // `WAKEUPS_FRESH_MS` after the wake-up, at its next minute tick. All of that
@@ -260,6 +264,19 @@ impl AppState {
         }
     }
 
+    /// Whether the delegate has woken on its own recently enough to say the
+    /// store stays open with Harvest closed. For what the seller READS only:
+    /// three heartbeat intervals, so one late wake-up does not flip the
+    /// wording back and forth (the 2026-09-27 friction report saw it flip
+    /// between two contradictory lines). What the tab DOES still follows
+    /// [`Self::wakeups_live`], whose shorter window decides whether the tab
+    /// sends heartbeats itself.
+    pub fn wakeups_seen_recently(&self, now_ms: u64) -> bool {
+        self.presence
+            .last_wakeup_ms
+            .is_some_and(|at| now_ms.saturating_sub(at) < WAKEUPS_SEEN_MS)
+    }
+
     /// Whether this node wakes the delegate on its own, as far as the tab
     /// knows: a wake-up within [`WAKEUPS_FRESH_MS`].
     pub fn wakeups_live(&self, now_ms: u64) -> bool {
@@ -395,35 +412,133 @@ impl AppState {
     }
 }
 
-/// What the seller reads about their own store's presence.
-pub fn seller_presence_line(presence: StorePresence, wakeups: bool) -> String {
-    let state = match presence {
-        StorePresence::Open => "Buyers see your store as open.".to_string(),
-        StorePresence::Checking => "Checking whether buyers see your store as open\u{2026}".into(),
-        StorePresence::Closed(ClosedWhy::NotTakingOrders) => {
-            "Buyers see your store as closed: it can\u{2019}t take orders right now (see below)."
-                .into()
+/// Whether this device can answer buyers' orders for one of our stores, as
+/// the seller's status needs it ([`AppState::instant_checkout_local`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalSelling {
+    /// It answers them. `delegated`: the delegate keeps its own payment
+    /// watches going with no tab (harvest#179), so the store stays open with
+    /// Harvest closed if the node also wakes it.
+    Ready { delegated: bool },
+    /// Just armed, not yet shown to run in the background here. Orders are
+    /// answered while Harvest is open.
+    Starting,
+    /// Armed a while ago and never seen to run in the background: a hosted
+    /// node such as try.freenet.org, where orders go unanswered once the tab
+    /// closes, looks like this, and so does a quiet stretch on a real node.
+    /// Said as a warning, not as closed.
+    Unconfirmed(String),
+    /// It cannot, and this is why (no payout wallet, paused, a delegate
+    /// error).
+    Blocked(String),
+}
+
+/// The one status the seller reads about their own store (the friction
+/// report found "Buyers see your store as open" above "Your store is
+/// starting to take orders"). It says what happens to a buyer: open only
+/// when buyers see the store open AND this device answers their orders, and
+/// otherwise the one reason that matters (review of #190: the device's
+/// reason was hidden under an Open pill; a device that may be a hosted node
+/// is now a warning under it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SellerStatus {
+    /// "Open", "Closed", "Checking" or "Not taking orders".
+    pub pill: &'static str,
+    pub open: bool,
+    /// The line itself.
+    pub line: String,
+    /// The reason buyers can't buy, when there is one to give.
+    pub why_not: Option<String>,
+}
+
+/// See [`SellerStatus`]. `wakeups`: the node has been waking the delegate on
+/// its own ([`AppState::wakeups_seen_recently`]).
+pub fn seller_status(presence: StorePresence, wakeups: bool, local: &LocalSelling) -> SellerStatus {
+    let blocked = match local {
+        LocalSelling::Blocked(why) => Some(why.clone()),
+        _ => None,
+    };
+    let caution = match local {
+        LocalSelling::Unconfirmed(why) => Some(why.clone()),
+        _ => None,
+    };
+    match presence {
+        StorePresence::Open => match blocked {
+            Some(why) => SellerStatus {
+                pill: "Not taking orders",
+                open: false,
+                line: "Buyers see your store as open, but this device can\u{2019}t answer their \
+                       orders."
+                    .to_string(),
+                why_not: Some(why),
+            },
+            None => SellerStatus {
+                pill: "Open",
+                open: true,
+                // "With Harvest open or not" only when both halves hold: the
+                // node wakes the delegate, and the delegate keeps its own
+                // watches (otherwise the watches lapse with the tab closed).
+                line: if wakeups && matches!(local, LocalSelling::Ready { delegated: true }) {
+                    "Buyers can buy now. Your store stays open while this computer is on and \
+                     Freenet is running, with Harvest open or not."
+                        .to_string()
+                } else {
+                    "Buyers can buy now. Your store stays open while Harvest is open here."
+                        .to_string()
+                },
+                // Starting: nothing to add (the line already says "while
+                // Harvest is open here"). Unconfirmed: the warning.
+                why_not: caution,
+            },
+        },
+        StorePresence::Checking => SellerStatus {
+            pill: "Checking",
+            open: false,
+            line: "Checking whether buyers can reach your store\u{2026}".to_string(),
+            why_not: None,
+        },
+        StorePresence::Closed(why_closed) => {
+            let line = if why_closed == ClosedWhy::NotTakingOrders || blocked.is_some() {
+                "Buyers can\u{2019}t buy from your store right now."
+            } else {
+                "Buyers can\u{2019}t reach your store right now."
+            };
+            // This device's own reason when it has one; otherwise why buyers
+            // see it closed. Never this device's "taking orders" line under
+            // a closed pill (codex and review round 1 of #190).
+            // A clock ahead of the buyers' is why they see it closed,
+            // whatever else is true here, so it wins.
+            let why_not = (why_closed != ClosedWhy::FromTheFuture)
+                .then_some(())
+                .and(blocked.or(caution))
+                .or_else(|| {
+                    Some(
+                    match why_closed {
+                        ClosedWhy::FromTheFuture => {
+                            "This computer\u{2019}s clock is ahead of the buyers\u{2019}. Check \
+                             that its date and time are set correctly."
+                        }
+                        ClosedWhy::NotTakingOrders => {
+                            "Your store told buyers it can\u{2019}t take orders yet. This \
+                             usually clears within a few minutes."
+                        }
+                        ClosedWhy::NoHeartbeat | ClosedWhy::Stale { .. } => {
+                            "Your store\u{2019}s signal isn\u{2019}t reaching buyers. It is sent \
+                             while Freenet runs here, or, on a Freenet that can\u{2019}t run \
+                             Harvest in the background, only while Harvest is open."
+                        }
+                    }
+                    .to_string(),
+                )
+                });
+            SellerStatus {
+                pill: "Closed",
+                open: false,
+                line: line.to_string(),
+                why_not,
+            }
         }
-        StorePresence::Closed(_) => "Buyers see your store as closed.".into(),
-    };
-    // Said of an open store as it is, and of any other as what will happen
-    // once it can take orders.
-    let lead = if presence.is_open() {
-        "It stays open"
-    } else {
-        "Once it can take orders, it stays open"
-    };
-    let how = if wakeups {
-        format!(
-            "{lead} while this computer is on and Freenet is running, with Harvest open or not."
-        )
-    } else {
-        format!(
-            "{lead} only while Harvest is open here. Once Freenet updates to a version that \
-             keeps stores open in the background, it will stay open while this computer is on."
-        )
-    };
-    format!("{state} {how}")
+    }
 }
 
 /// The age past which a heartbeat no longer opens a store, for display.
@@ -474,20 +589,91 @@ mod tests {
         );
     }
 
-    /// The seller's line says how the store stays open as a fact only when
-    /// it is open. Mutated red by always saying it as a fact.
+    /// ONE status, saying what happens to a buyer. Open only when buyers
+    /// see it open and this device answers orders; a blocked device says so
+    /// even while buyers see it open (a hosted node, review of #190); a
+    /// closed store never carries the device's "taking orders" line; "with
+    /// Harvest open or not" only with wake-ups AND delegated watches. Red if
+    /// a blocked device reads Open, if the closed reason is dropped, or if
+    /// the "open or not" wording ignores the delegation.
     #[test]
-    fn the_seller_is_told_how_the_store_stays_open() {
-        let open = seller_presence_line(StorePresence::Open, true);
+    fn the_seller_reads_one_status_driven_by_what_buyers_see() {
+        let ready = LocalSelling::Ready { delegated: true };
+        let open = seller_status(StorePresence::Open, true, &ready);
+        assert_eq!((open.pill, open.open), ("Open", true));
         assert!(
-            open.starts_with("Buyers see your store as open. It stays open while"),
-            "{open}"
+            open.line.contains("with Harvest open or not"),
+            "{}",
+            open.line
         );
-        let closed = seller_presence_line(StorePresence::Closed(ClosedWhy::NotTakingOrders), false);
+        assert_eq!(open.why_not, None);
+        let undelegated = seller_status(
+            StorePresence::Open,
+            true,
+            &LocalSelling::Ready { delegated: false },
+        );
         assert!(
-            closed.contains("Once it can take orders, it stays open only while Harvest is open"),
-            "{closed}"
+            undelegated.line.contains("while Harvest is open here"),
+            "{}",
+            undelegated.line
         );
+        let tab = seller_status(StorePresence::Open, false, &ready);
+        assert!(
+            tab.line.contains("while Harvest is open here"),
+            "{}",
+            tab.line
+        );
+
+        let hosted = LocalSelling::Blocked("nothing runs here while you are away".into());
+        let false_open = seller_status(StorePresence::Open, true, &hosted);
+        assert!(!false_open.open);
+        assert_eq!(false_open.pill, "Not taking orders");
+        assert_eq!(
+            false_open.why_not.as_deref(),
+            Some("nothing runs here while you are away")
+        );
+
+        let closed = seller_status(
+            StorePresence::Closed(ClosedWhy::NotTakingOrders),
+            true,
+            &hosted,
+        );
+        assert_eq!((closed.pill, closed.open), ("Closed", false));
+        assert_eq!(
+            closed.why_not.as_deref(),
+            Some("nothing runs here while you are away")
+        );
+        let offline = seller_status(StorePresence::Closed(ClosedWhy::NoHeartbeat), true, &ready);
+        assert!(
+            offline.line.contains("can\u{2019}t reach"),
+            "{}",
+            offline.line
+        );
+        let reason = offline.why_not.expect("a closed store says why");
+        assert!(reason.contains("signal"), "{reason}");
+        assert!(!reason.contains("taking orders"), "{reason}");
+        let clock = seller_status(
+            StorePresence::Closed(ClosedWhy::FromTheFuture),
+            true,
+            &ready,
+        );
+        assert!(clock.why_not.unwrap().contains("clock"));
+        // A guess that the node never runs in the background: a warning
+        // under the Open pill, not closed (round 2 of #190).
+        let guess = LocalSelling::Unconfirmed("maybe a hosted node".into());
+        let warned = seller_status(StorePresence::Open, false, &guess);
+        assert_eq!((warned.pill, warned.open), ("Open", true));
+        assert_eq!(warned.why_not.as_deref(), Some("maybe a hosted node"));
+        // A clock ahead of the buyers' wins over the device's reason.
+        let clock_blocked = seller_status(
+            StorePresence::Closed(ClosedWhy::FromTheFuture),
+            true,
+            &hosted,
+        );
+        assert!(clock_blocked.why_not.unwrap().contains("clock"));
+        let checking = seller_status(StorePresence::Checking, false, &hosted);
+        assert_eq!(checking.pill, "Checking");
+        assert_eq!(checking.why_not, None);
     }
 
     #[test]

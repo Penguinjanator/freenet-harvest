@@ -588,6 +588,9 @@ pub(crate) fn OrderCard(
     order: AuthorizedOrder,
     live: Option<AddressView>,
     #[props(default)] buyer: bool,
+    /// Read by someone who is neither party (a store's public order list).
+    #[props(default)]
+    onlooker: bool,
 ) -> Element {
     let o = &order.order;
     let destination = DestinationNote::of(o);
@@ -645,8 +648,21 @@ pub(crate) fn OrderCard(
     };
     let stage = crate::fulfilment::order_stage(&order, despatch.as_ref(), tip_height, sight);
     let stage_note = stage
-        .describe(tip_height, order.status)
-        .or_else(|| crate::fulfilment::closed_window_note(&order, tip_height, sight));
+        .describe(
+            tip_height,
+            order.status,
+            crate::state::now_ms(),
+            if buyer {
+                crate::fulfilment::Reader::Buyer
+            } else if onlooker {
+                crate::fulfilment::Reader::Onlooker
+            } else {
+                crate::fulfilment::Reader::Seller
+            },
+        )
+        .or_else(|| {
+            crate::fulfilment::closed_window_note(&order, tip_height, sight, crate::state::now_ms())
+        });
     let offers_address = crate::fulfilment::offers_payment_address(&order, tip_height);
     let (status_class, status_text) = card_pill(order.status, &reading, hold.is_some(), stage);
     let order_id = o.id.clone();
@@ -668,9 +684,27 @@ pub(crate) fn OrderCard(
             if let Some(note) = stage_note {
                 p { class: if stage.needs_attention() { "text-warning" } else { "" }, "{note}" }
             }
-            if order.status == OrderStatus::AwaitingPayment {
+            // Seller's notes (what to cancel, what not to ship against): not
+            // on a buyer's card, which gets its own words for the one case a
+            // buyer acts on: a payment seen after the window.
+            if order.status == OrderStatus::AwaitingPayment && !buyer {
                 if let Some(note) = reading.outside_note(late_is_another_orders) {
                     p { class: "text-warning", "{note}" }
+                }
+            }
+            // Only when the payment is not provably another order's on a
+            // reused address (as the seller's note tells apart), and only
+            // with a tip, so it never sits beside the pay steps.
+            if order.status == OrderStatus::AwaitingPayment
+                && buyer
+                && reading.after_window.is_some()
+                && !late_is_another_orders
+                && tip_height.is_some()
+            {
+                p { class: "text-warning",
+                    "A payment to this order\u{2019}s address arrived after the time to pay \
+                     had passed, so it can\u{2019}t mark the order paid. If it was yours, \
+                     message the seller: they can see it in their wallet."
                 }
             }
             if let Some(hold) = hold {
@@ -813,8 +847,17 @@ pub(crate) fn card_pill(
     awaiting_confirmation: bool,
     stage: crate::fulfilment::OrderStage,
 ) -> (&'static str, &'static str) {
+    // Where a paid order stands after payment, rather than "Paid" on every
+    // card (the 2026-09-30 critique: a pill that says the stage the order
+    // has left tells the reader nothing).
     match stage {
         crate::fulfilment::OrderStage::Lapsed { .. } => ("btc-pill cancelled", "Lapsed"),
+        crate::fulfilment::OrderStage::Despatched { .. } => ("btc-pill done", "Sent"),
+        crate::fulfilment::OrderStage::DespatchWindowClosed { .. } => {
+            ("btc-pill pending", "Not sent in time")
+        }
+        // Not "Complete": a stage reached by silence too, when nothing was
+        // ever marked as sent (review), so it keeps the neutral "Paid".
         _ => status_pill(status, reading, awaiting_confirmation),
     }
 }
@@ -987,29 +1030,29 @@ impl AddressReading {
         if self.no_anchor {
             return Some(
                 "This invoice names no Bitcoin block it was made at, so no payment can ever \
-                 settle it. Issue a new invoice."
+                 settle it. Cancel it; the buyer can order again."
                     .to_string(),
             );
         }
         let paid_in_window = self.in_window_sats > 0 && self.in_window_sats >= self.amount_sats;
-        if let Some(height) = self.before_order {
+        // Said without the block it confirmed in: a person reads "before
+        // this invoice", not a block height.
+        if self.before_order.is_some() {
             return Some(if paid_in_window {
                 // A valid payment is also here: no reason to reissue.
-                format!(
-                    "This address also holds an older payment, confirmed in block {height} \
-                     before this invoice was made. That one paid for something else; only the \
-                     payment made after this invoice counts for it."
-                )
+                "This address also holds an older payment, confirmed before this invoice \
+                 was made. That one paid for something else; only the payment made after \
+                 this invoice counts for it."
+                    .to_string()
             } else {
-                format!(
-                    "This address already holds a payment that confirmed in block {height}, \
-                     before this invoice was made. It paid for something else and does not \
-                     settle this invoice, so do not ship against it. Issue a new invoice, \
-                     which gets a new address."
-                )
+                "This address already holds a payment that confirmed before this invoice \
+                 was made. It paid for something else and does not settle this invoice, so \
+                 do not ship against it. Cancel it; the buyer can order again, which gets a \
+                 new address."
+                    .to_string()
             });
         }
-        self.after_window.map(|height| {
+        self.after_window.map(|_| {
             let whose = if late_is_another_orders {
                 "It falls inside another of your invoices' windows on this address, so it may \
                  be that invoice's payment."
@@ -1018,8 +1061,8 @@ impl AddressReading {
                  with them directly."
             };
             format!(
-                "A payment to this address confirmed in block {height}, after this invoice's \
-                 payment window closed, so Harvest will not mark it paid. {whose}"
+                "A payment to this address confirmed after this invoice's payment window \
+                 closed, so Harvest will not mark it paid. {whose}"
             )
         })
     }
@@ -1726,7 +1769,11 @@ mod address_reading_tests {
         let note = reading
             .outside_note(false)
             .expect("the seller must be told");
-        assert!(note.contains("block 100"), "{note}");
+        assert!(note.contains("before this invoice was made"), "{note}");
+        assert!(
+            !note.contains("block 100"),
+            "a person reads no block height: {note}"
+        );
         assert!(note.contains("do not ship"), "{note}");
     }
 
@@ -1880,6 +1927,39 @@ mod address_reading_tests {
             ),
             ("btc-pill waiting", "Awaiting payment")
         );
+    }
+
+    /// A paid order's pill says where it stands after payment, not "Paid"
+    /// on every card (the 2026-09-30 critique).
+    #[test]
+    fn a_paid_order_pills_by_where_it_stands() {
+        use crate::fulfilment::OrderStage;
+        use harvest_common::payment::OrderStatus;
+        let order = order_anchored_at(150);
+        let nothing = AddressReading::of(&order, None);
+        let pill = |stage| super::card_pill(OrderStatus::Paid, &nothing, false, stage).1;
+        assert_eq!(
+            pill(OrderStage::AwaitingDespatch {
+                paid_at: 1,
+                despatch_by: 2
+            }),
+            "Paid"
+        );
+        assert_eq!(
+            pill(OrderStage::Despatched {
+                despatched_at: 1,
+                complaint_until: 2
+            }),
+            "Sent"
+        );
+        assert_eq!(
+            pill(OrderStage::DespatchWindowClosed {
+                despatch_by: 1,
+                complaint_until: 2
+            }),
+            "Not sent in time"
+        );
+        assert_eq!(pill(OrderStage::Closed { closed_at: 2 }), "Paid");
     }
 
     /// Round 2, Consider: the notes say the right thing in each case. An

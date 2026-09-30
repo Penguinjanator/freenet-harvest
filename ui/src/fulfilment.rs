@@ -606,13 +606,65 @@ pub fn approx_duration(blocks: u32) -> String {
     }
 }
 
+/// How long until something `blocks` away, as the count a date sits beside:
+/// "4 days left", "5 hours left". No "about": the date it goes with carries
+/// the one hedge (the 2026-09-30 critique: "about 4 Oct (about 4 days)" read
+/// as unreliable).
+pub fn time_left(blocks: u32) -> String {
+    let hours = u64::from(blocks) * 10 / 60;
+    let days = (hours + 12) / 24;
+    if hours < 1 {
+        "under an hour left".to_string()
+    } else if hours < 36 {
+        format!("{hours} hour{} left", if hours == 1 { "" } else { "s" })
+    } else {
+        format!("{days} days left")
+    }
+}
+
+/// Who reads an order's stage sentence ([`OrderStage::describe`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reader {
+    Buyer,
+    Seller,
+    /// Someone who is neither party, reading a store's public order list.
+    Onlooker,
+}
+
+/// The day block `height` is (or was) mined, roughly: counted from the
+/// reader's `tip` at Bitcoin's ten-minute target from `now_ms`, as "4 Oct".
+/// A person reads a date, not a block height (the 2026-09-27 friction
+/// report); the block stays the truth underneath, and a day is as precise as
+/// a count at ten minutes a block can honestly be. UTC, so it can be a day
+/// out near midnight.
+pub fn approx_date(height: u32, tip: u32, now_ms: u64) -> String {
+    let blocks = i64::from(height) - i64::from(tip);
+    let at_ms = (now_ms as i64).saturating_add(blocks.saturating_mul(10 * 60 * 1000));
+    chrono::DateTime::from_timestamp_millis(at_ms)
+        .map(|at| at.format("%-d %b").to_string())
+        .unwrap_or_else(|| "an unknown date".to_string())
+}
+
+/// The month block `height` was mined in, roughly, as "Oct 2026": for a
+/// record, where the day would claim more than a count of blocks can.
+pub fn approx_month(height: u32, tip: u32, now_ms: u64) -> String {
+    let blocks = i64::from(height) - i64::from(tip);
+    let at_ms = (now_ms as i64).saturating_add(blocks.saturating_mul(10 * 60 * 1000));
+    chrono::DateTime::from_timestamp_millis(at_ms)
+        .map(|at| at.format("%b %Y").to_string())
+        .unwrap_or_else(|| "an unknown month".to_string())
+}
+
 impl OrderStage {
     /// What an order card says about where the order stands, or `None` when
     /// the card's existing payment status already says it all.
     ///
-    /// Worded for BOTH parties, because the card is shared between the
-    /// seller's panel and the buyer's view (see `OrderCard`), so it names
-    /// "the seller" and "the buyer" rather than "you".
+    /// Worded for whoever reads it (`reader`): the seller is told what to do
+    /// ("Send it by ..."), the buyer what the seller has said, and everyone
+    /// until when a problem can be reported. That is said as the window, not
+    /// as "you can": the buyer may already have reported one (one per order)
+    /// or lack the key to (review). The 2026-09-30 whole-screen critique found
+    /// the one shared wording talking to a seller about "the seller".
     ///
     /// `status` is the order's published status, which [`OrderStage::Unknown`]
     /// needs to say anything true: a paid order whose deadline cannot be
@@ -621,56 +673,94 @@ impl OrderStage {
     /// # What this build can and cannot record, said plainly
     ///
     /// A seller can record a despatch (harvest#53 Phase B), so a despatch
-    /// window that closes with none recorded is now a fact about the SELLER,
-    /// and is said and styled as one. The buyer's complaint (Phase C) is
-    /// offered by the buyer's own card, not here: this card is shared with
-    /// the seller.
-    pub fn describe(self, tip_height: Option<u32>, status: OrderStatus) -> Option<String> {
-        // " (about 3 days)", or nothing when this reader has no tip to count
-        // from: a duration made up without one is a made-up number.
-        let left = |until: u32| {
-            tip_height
-                .map(|tip| format!(" ({})", approx_duration(until.saturating_sub(tip))))
+    /// window that closes with none recorded is a fact about the SELLER, and
+    /// is said and styled as one. A buyer can report a problem while the
+    /// report window is open (Phase C: `AppState::complaint_gate`), which
+    /// opens once the order is marked as sent or its send-by date passes and
+    /// closes at `complaint_until`, so the wording names that date.
+    /// A despatch is the seller's own statement, never proof of arrival, so
+    /// the buyer reads "the seller says".
+    pub fn describe(
+        self,
+        tip_height: Option<u32>,
+        status: OrderStatus,
+        now_ms: u64,
+        reader: Reader,
+    ) -> Option<String> {
+        let seller = reader == Reader::Seller;
+        // "about 4 Oct (4 days left)", or nothing when this reader has no tip
+        // to count from: a date made up without one is a made-up date. One
+        // "about", on the date: the count of days is only as rough as it.
+        let date_left = |until: u32| {
+            tip_height.map(|tip| {
+                format!(
+                    "about {} ({})",
+                    approx_date(until, tip, now_ms),
+                    time_left(until.saturating_sub(tip))
+                )
+            })
+        };
+        let by = |until: u32| {
+            date_left(until)
+                .map(|when| format!(" by {when}"))
                 .unwrap_or_default()
+        };
+        // Until when a problem can be reported: the end of the report window.
+        let report_until = |until: u32| {
+            tip_height
+                .map(|tip| format!("until about {}", approx_date(until, tip, now_ms)))
+                .unwrap_or_else(|| "until its report window closes".to_string())
+        };
+        let owes = if seller {
+            "you owe the goods"
+        } else {
+            "the seller owes the goods"
         };
         match self {
             // The payment pill and the notes beside it already cover an open
             // invoice.
             OrderStage::AwaitingPayment { .. } => None,
             OrderStage::Unknown => (status == OrderStatus::Paid).then(|| {
-                "Paid. This node cannot yet place the order against the Bitcoin chain, so its \
-                 despatch deadline is not shown."
-                    .to_string()
+                if seller {
+                    "Paid. The date to send it by isn't known yet.".to_string()
+                } else {
+                    "Paid. The date the seller should send it by isn't known yet.".to_string()
+                }
             }),
-            OrderStage::Lapsed { closed_at } => Some(format!(
-                "No payment was recorded for this invoice before its payment window closed at \
-                 block {closed_at}, so it can no longer be paid."
-            )),
-            OrderStage::Cancelled {
-                payment_seen: true, ..
-            } => Some(
-                "This invoice was cancelled, but a payment that settles it has been seen \
-                 at its address. A cancellation does not undo a payment: once it is recorded the \
-                 order is paid, and the seller owes the goods."
+            OrderStage::Lapsed { .. } => Some(
+                "No payment was recorded for this invoice before its payment window closed, so \
+                 it can no longer be paid."
                     .to_string(),
             ),
+            OrderStage::Cancelled {
+                payment_seen: true, ..
+            } => Some(format!(
+                "This invoice was cancelled, but a payment that settles it has been seen \
+                 at its address. A cancellation does not undo a payment: once it is recorded the \
+                 order is paid, and {owes}."
+            )),
             OrderStage::Cancelled {
                 payment_maybe: true,
                 ..
-            } => Some(
+            } => Some(format!(
                 "This invoice was cancelled. A payment at its address may be for this \
-                 invoice or for another one sharing the address; the seller has to confirm which. \
-                 If it is this invoice's, the order is paid and the seller owes the goods."
-                    .to_string(),
-            ),
+                 invoice or for another one sharing the address; {}. \
+                 If it is this invoice's, the order is paid and {owes}.",
+                if seller {
+                    "check your wallet to tell which"
+                } else {
+                    "the seller has to confirm which"
+                }
+            )),
             OrderStage::Cancelled {
                 settle_until: Some(until),
                 payment_seen: false,
                 payment_maybe: false,
             } => Some(format!(
-                "This invoice was cancelled. A payment made in time still counts until \
-                 block {until}{}, and the seller would then owe the goods.",
-                left(until),
+                "This invoice was cancelled. A payment made in time still counts if it confirms\
+                 {}, and {} would then owe the goods.",
+                by(until),
+                if seller { "you" } else { "the seller" },
             )),
             OrderStage::Cancelled {
                 settle_until: None, ..
@@ -678,35 +768,53 @@ impl OrderStage {
                 "This invoice was cancelled, and no payment was recorded for it in time."
                     .to_string(),
             ),
-            OrderStage::AwaitingDespatch {
-                paid_at,
-                despatch_by,
-            } => Some(format!(
-                "Paid, counting from block {paid_at}. The seller is expected to despatch by \
-                 block {despatch_by}{}.",
-                left(despatch_by)
-            )),
+            OrderStage::AwaitingDespatch { despatch_by, .. } => Some(if seller {
+                format!("Paid. Send it{}.", by(despatch_by))
+            } else {
+                format!(
+                    "Paid. The seller is expected to send it{}.",
+                    by(despatch_by)
+                )
+            }),
             OrderStage::Despatched {
-                despatched_at,
-                complaint_until,
-            } => Some(format!(
-                "Paid, and the seller says it was despatched (anchored at block \
-                 {despatched_at}). This order counts as complete from block \
-                 {complaint_until}{}.",
-                left(complaint_until)
-            )),
+                complaint_until, ..
+            } => Some(if seller {
+                format!(
+                    "Paid and sent. A problem can be reported {}.",
+                    report_until(complaint_until)
+                )
+            } else {
+                format!(
+                    "Paid, and the seller says it has been sent. A problem can be reported {}.",
+                    report_until(complaint_until)
+                )
+            }),
             OrderStage::DespatchWindowClosed {
                 despatch_by,
                 complaint_until,
-            } => Some(format!(
-                "Paid, but the seller has not recorded a despatch, and the despatch window \
-                 closed at block {despatch_by}. This order counts as complete from block \
-                 {complaint_until}{}.",
-                left(complaint_until)
-            )),
-            OrderStage::Closed { closed_at } => Some(format!(
-                "Paid and complete: every window on this order closed by block {closed_at}."
-            )),
+            } => {
+                let passed = tip_height
+                    .map(|tip| format!(", about {},", approx_date(despatch_by, tip, now_ms)))
+                    .unwrap_or_default();
+                Some(if seller {
+                    format!(
+                        "Paid, and the date to send it by{passed} has passed. Send it now and \
+                         mark it as sent. A problem can be reported {}.",
+                        report_until(complaint_until)
+                    )
+                } else {
+                    format!(
+                        "Paid, but the seller has not marked it as sent, and the date to send \
+                         it by{passed} has passed. A problem can be reported {}.",
+                        report_until(complaint_until)
+                    )
+                })
+            }
+            // Reached by silence too, with nothing ever marked as sent, so it
+            // claims no more than that the time to report has passed.
+            OrderStage::Closed { .. } => {
+                Some("Paid. The time to report a problem has passed.".to_string())
+            }
             OrderStage::Reversed => Some(
                 "The payment that settled this order was reversed on the Bitcoin chain, so it no \
                  longer counts as paid."
@@ -785,6 +893,7 @@ pub fn closed_window_note(
     order: &AuthorizedOrder,
     tip_height: Option<u32>,
     sight: PaymentSight,
+    now_ms: u64,
 ) -> Option<String> {
     if order.status != OrderStatus::AwaitingPayment || accepts_new_payment(&order.order, tip_height)
     {
@@ -811,10 +920,11 @@ pub fn closed_window_note(
         );
     }
     // Past `last` with nothing in sight the stage is Lapsed and says so.
-    tip_height.is_some_and(|tip| tip <= last).then(|| {
+    tip_height.filter(|tip| *tip <= last).map(|tip| {
         format!(
             "This invoice's payment window has closed, so a new payment would not count. A \
-             payment made in time can still be recorded until block {last}."
+             payment made in time can still be recorded if it confirms by about {}.",
+            approx_date(last, tip, now_ms)
         )
     })
 }
@@ -822,6 +932,9 @@ pub fn closed_window_note(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-09-27 12:00 UTC: the clock the date sentences are read against.
+    const NOW_MS: u64 = 1_790_510_400_000;
     use ed25519_dalek::SigningKey;
     use freenet_bitcoin_common::spv::testing::payment_proof;
     use freenet_bitcoin_common::{
@@ -1491,10 +1604,14 @@ mod tests {
         assert!(!offers_payment_address(&open, Some(window_end)));
         // No tip yet: an open invoice still shows its address.
         assert!(offers_payment_address(&open, None));
-        assert!(closed_window_note(&open, Some(window_end - 1), PaymentSight::default()).is_none());
-        let note =
-            closed_window_note(&open, Some(window_end), PaymentSight::default()).expect("said why");
-        assert!(note.contains(&format!("block {window_end}")), "{note}");
+        assert!(
+            closed_window_note(&open, Some(window_end - 1), PaymentSight::default(), NOW_MS)
+                .is_none()
+        );
+        let note = closed_window_note(&open, Some(window_end), PaymentSight::default(), NOW_MS)
+            .expect("said why");
+        assert!(note.contains("by about 27 Sep"), "{note}");
+        assert!(!note.contains("block"), "{note}");
         // Review round 2: past the window the STAGE can still read as
         // awaiting payment (a payment made in time gathering confirmations),
         // and the address must not come back with it.
@@ -1609,7 +1726,12 @@ mod tests {
         );
         assert!(stage.needs_attention());
         assert!(stage
-            .describe(Some(last + 1), OrderStatus::Cancelled)
+            .describe(
+                Some(last + 1),
+                OrderStatus::Cancelled,
+                NOW_MS,
+                Reader::Buyer
+            )
             .expect("said")
             .contains("owes the goods"));
     }
@@ -1631,20 +1753,70 @@ mod tests {
         let stage = order_stage(&cancelled, None, Some(last + 500), AMBIGUOUS);
         assert!(stage.needs_attention());
         let said = stage
-            .describe(Some(last + 500), OrderStatus::Cancelled)
+            .describe(
+                Some(last + 500),
+                OrderStatus::Cancelled,
+                NOW_MS,
+                Reader::Buyer,
+            )
             .expect("said");
         assert!(said.contains("confirm which"), "{said}");
         assert!(!said.contains("no payment was recorded"), "{said}");
         // Past the cutoff, the closed-window note never names a block that
         // has already gone by.
-        let note = closed_window_note(&open, Some(last + 500), AMBIGUOUS).expect("said");
+        let note = closed_window_note(&open, Some(last + 500), AMBIGUOUS, NOW_MS).expect("said");
         assert!(!note.contains("block"), "{note}");
         assert!(!note.contains("still counts"), "{note}");
         assert!(note.contains("may be for another invoice"), "{note}");
-        let covered = closed_window_note(&open, Some(last + 500), COVERED).expect("said");
+        let covered = closed_window_note(&open, Some(last + 500), COVERED, NOW_MS).expect("said");
         assert!(covered.contains("still counts"), "{covered}");
         assert!(!covered.contains("block"), "{covered}");
-        assert!(closed_window_note(&open, Some(last + 1), PaymentSight::default()).is_none());
+        assert!(
+            closed_window_note(&open, Some(last + 1), PaymentSight::default(), NOW_MS).is_none()
+        );
+    }
+
+    /// With no tip, no stage names a date or a duration it would have to
+    /// make up.
+    #[test]
+    fn with_no_tip_no_date_is_made_up() {
+        for stage in [
+            OrderStage::AwaitingDespatch {
+                paid_at: 1,
+                despatch_by: 1_000,
+            },
+            OrderStage::Despatched {
+                despatched_at: 1,
+                complaint_until: 3_000,
+            },
+            OrderStage::DespatchWindowClosed {
+                despatch_by: 1_000,
+                complaint_until: 3_000,
+            },
+        ] {
+            let said = stage
+                .describe(None, OrderStatus::Paid, NOW_MS, Reader::Buyer)
+                .expect("said");
+            for made_up in ["Sep", "Oct", "about", "under"] {
+                assert!(!said.contains(made_up), "{stage:?}: {said}");
+            }
+        }
+    }
+
+    /// Dates across a month and a year, and in the past.
+    #[test]
+    fn a_date_is_counted_from_the_tip() {
+        assert_eq!(approx_date(1_000, 1_000, NOW_MS), "27 Sep");
+        assert_eq!(approx_date(1_000 + 144 * 4, 1_000, NOW_MS), "1 Oct");
+        assert_eq!(approx_date(1_000 - 144, 1_000, NOW_MS), "26 Sep");
+        assert_eq!(approx_date(1_000 + 144 * 100, 1_000, NOW_MS), "5 Jan");
+    }
+
+    /// A record names the month, counted from the tip.
+    #[test]
+    fn a_record_names_the_month() {
+        assert_eq!(approx_month(1_000, 1_000, NOW_MS), "Sep 2026");
+        assert_eq!(approx_month(1_000 + 6 * 144, 1_000, NOW_MS), "Oct 2026");
     }
 
     #[test]
@@ -1655,12 +1827,13 @@ mod tests {
         assert!(!payment_could_still_settle(OrderStatus::PaymentReversed));
     }
 
-    /// The card's sentences: each names the block it is about, and none
-    /// offers a complaint this build cannot take (Phase C adds it).
+    /// The card's sentences: each names the DATE it is about, counted from
+    /// the tip (a person reads a date, not a block height), no block number,
+    /// and none claims the goods arrived.
     #[test]
     fn each_stage_says_what_is_true_and_nothing_this_build_cannot_do() {
         let tip = Some(1_000);
-        let say = |stage: OrderStage, status| stage.describe(tip, status);
+        let say = |stage: OrderStage, status| stage.describe(tip, status, NOW_MS, Reader::Buyer);
         assert_eq!(
             say(
                 OrderStage::AwaitingPayment {
@@ -1679,7 +1852,7 @@ mod tests {
             OrderStatus::AwaitingPayment,
         )
         .expect("lapsed");
-        assert!(lapsed.contains("block 900"), "{lapsed}");
+        assert!(lapsed.contains("payment window closed"), "{lapsed}");
         let open_cancel = say(
             OrderStage::Cancelled {
                 settle_until: Some(1_144),
@@ -1689,8 +1862,8 @@ mod tests {
             OrderStatus::Cancelled,
         )
         .expect("cancelled");
-        assert!(open_cancel.contains("block 1144"), "{open_cancel}");
-        assert!(open_cancel.contains("about 24 hours"), "{open_cancel}");
+        assert!(open_cancel.contains("by about 28 Sep"), "{open_cancel}");
+        assert!(open_cancel.contains("(24 hours left)"), "{open_cancel}");
         assert!(!open_cancel.contains("seen"), "{open_cancel}");
         let seen = say(
             OrderStage::Cancelled {
@@ -1702,18 +1875,17 @@ mod tests {
         )
         .expect("cancelled");
         assert!(seen.contains("has been seen"), "{seen}");
-        // No tip: the block, but no duration counted from nowhere (codex,
-        // review round 2).
+        // No tip: no date or duration counted from nowhere (codex, review
+        // round 2).
         let no_tip = OrderStage::Cancelled {
             settle_until: Some(1_144),
             payment_seen: false,
             payment_maybe: false,
         }
-        .describe(None, OrderStatus::Cancelled)
+        .describe(None, OrderStatus::Cancelled, NOW_MS, Reader::Buyer)
         .expect("cancelled");
-        assert!(no_tip.contains("block 1144"), "{no_tip}");
         assert!(
-            !no_tip.contains("about") && !no_tip.contains("under"),
+            !no_tip.contains("about") && !no_tip.contains("under") && !no_tip.contains("Sep"),
             "{no_tip}"
         );
         let despatch = say(
@@ -1724,9 +1896,8 @@ mod tests {
             OrderStatus::Paid,
         )
         .expect("despatch");
-        assert!(despatch.contains("block 990"), "{despatch}");
-        assert!(despatch.contains("block 1998"), "{despatch}");
-        assert!(despatch.contains("about 7 days"), "{despatch}");
+        assert!(despatch.contains("send it by about 4 Oct"), "{despatch}");
+        assert!(despatch.contains("(7 days left)"), "{despatch}");
         let closed_window = say(
             OrderStage::DespatchWindowClosed {
                 despatch_by: 900,
@@ -1735,9 +1906,13 @@ mod tests {
             OrderStatus::Paid,
         )
         .expect("window closed");
-        assert!(closed_window.contains("block 900"), "{closed_window}");
+        assert!(closed_window.contains("about 26 Sep"), "{closed_window}");
         assert!(
-            closed_window.contains("not recorded a despatch"),
+            closed_window.contains("until about 10 Oct"),
+            "{closed_window}"
+        );
+        assert!(
+            closed_window.contains("not marked it as sent"),
             "a closed window with no despatch says so, now a seller can record one: \
              {closed_window}"
         );
@@ -1749,17 +1924,29 @@ mod tests {
             OrderStatus::Paid,
         )
         .expect("despatched");
-        assert!(despatched.contains("despatched"), "{despatched}");
-        assert!(despatched.contains("block 995"), "{despatched}");
-        assert!(despatched.contains("block 3014"), "{despatched}");
+        assert!(despatched.contains("has been sent"), "{despatched}");
+        assert!(despatched.contains("until about 11 Oct"), "{despatched}");
         // "The seller says": a despatch is the seller's own statement, and
         // the card must not present it as proof the goods arrived.
         assert!(despatched.contains("seller says"), "{despatched}");
+        for stage_text in [
+            &lapsed,
+            &open_cancel,
+            &despatch,
+            &closed_window,
+            &despatched,
+        ] {
+            assert!(
+                !stage_text.contains("block"),
+                "{stage_text:?} names a block"
+            );
+        }
+        // A despatch is the seller's word, never proof the goods arrived.
         for stage_text in [&despatch, &closed_window, &despatched] {
-            for promise in ["complain", "delivered", "received"] {
+            for promise in ["delivered", "received", "arrived"] {
                 assert!(
                     !stage_text.contains(promise),
-                    "{stage_text:?} promises something this build cannot do ({promise})"
+                    "{stage_text:?} claims the goods arrived ({promise})"
                 );
             }
         }
@@ -1768,9 +1955,102 @@ mod tests {
             paid_at: 1,
             despatch_by: 10,
         }
-        .describe(Some(5_000), OrderStatus::Paid)
+        .describe(Some(5_000), OrderStatus::Paid, NOW_MS, Reader::Buyer)
         .expect("despatch");
         assert!(late.contains("under an hour"), "{late}");
+    }
+
+    /// Each party reads its own words: the seller is told what to do and
+    /// never about "the seller"; a buyer reads "you can report a problem";
+    /// anyone else reads neither party's "you". One "about" per date.
+    #[test]
+    fn each_reader_is_told_in_their_own_words() {
+        let tip = Some(1_000);
+        let despatch = OrderStage::AwaitingDespatch {
+            paid_at: 990,
+            despatch_by: 1_998,
+        };
+        let sent = OrderStage::Despatched {
+            despatched_at: 995,
+            complaint_until: 3_014,
+        };
+        let missed = OrderStage::DespatchWindowClosed {
+            despatch_by: 900,
+            complaint_until: 2_916,
+        };
+        let paid_cancel = OrderStage::Cancelled {
+            settle_until: Some(1_144),
+            payment_seen: true,
+            payment_maybe: false,
+        };
+        let say = |stage: OrderStage, reader| {
+            stage
+                .describe(tip, OrderStatus::Paid, NOW_MS, reader)
+                .expect("said")
+        };
+        assert_eq!(
+            say(despatch, Reader::Seller),
+            "Paid. Send it by about 4 Oct (7 days left)."
+        );
+        assert_eq!(
+            say(sent, Reader::Seller),
+            "Paid and sent. A problem can be reported until about 11 Oct."
+        );
+        assert!(say(missed, Reader::Seller).contains("Send it now and mark it as sent"));
+        assert!(say(paid_cancel, Reader::Seller).contains("you owe the goods"));
+        let maybe_cancel = OrderStage::Cancelled {
+            settle_until: Some(1_144),
+            payment_seen: false,
+            payment_maybe: true,
+        };
+        let open_cancel = OrderStage::Cancelled {
+            settle_until: Some(1_144),
+            payment_seen: false,
+            payment_maybe: false,
+        };
+        assert!(say(maybe_cancel, Reader::Seller).contains("check your wallet"));
+        assert!(say(open_cancel, Reader::Seller).contains("you would then owe the goods"));
+        for stage in [
+            despatch,
+            sent,
+            missed,
+            paid_cancel,
+            maybe_cancel,
+            open_cancel,
+            OrderStage::Unknown,
+        ] {
+            let seller = say(stage, Reader::Seller);
+            assert!(!seller.to_lowercase().contains("the seller"), "{seller}");
+            assert_eq!(
+                seller.matches("about").count(),
+                seller.matches(" Oct").count() + seller.matches(" Sep").count(),
+                "{seller}"
+            );
+            let onlooker = say(stage, Reader::Onlooker);
+            assert!(
+                !onlooker.contains("You ") && !onlooker.contains("you "),
+                "{onlooker}"
+            );
+        }
+        // Said as the window, never "you can": the buyer may already have
+        // reported one, or not hold the key to.
+        for reader in [Reader::Buyer, Reader::Onlooker] {
+            let said = say(sent, reader);
+            assert!(
+                said.contains("A problem can be reported until about 11 Oct"),
+                "{said}"
+            );
+            assert!(!said.contains("You can"), "{said}");
+        }
+        assert!(say(sent, Reader::Buyer).contains("seller says"));
+    }
+
+    #[test]
+    fn time_left_carries_no_hedge_of_its_own() {
+        assert_eq!(time_left(0), "under an hour left");
+        assert_eq!(time_left(6), "1 hour left");
+        assert_eq!(time_left(30), "5 hours left");
+        assert_eq!(time_left(DESPATCH_WINDOW_BLOCKS), "7 days left");
     }
 
     #[test]

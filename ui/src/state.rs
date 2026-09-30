@@ -17,6 +17,56 @@ use std::collections::{HashMap, HashSet};
 
 use freenet_bitcoin_common::BitcoinNetwork;
 
+/// What the seller's order card can say about what to send and where
+/// ([`AppState::seller_order_request`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum SellerRequest {
+    /// The buyer's request, agreeing with the order.
+    Found(SellerOrderRequest),
+    /// No readable request of the buyer's agrees with the order (another
+    /// device, keys not here, or it left the mailbox).
+    NotFound,
+    /// More than one does, and they differ (another address, say).
+    Conflict,
+}
+
+/// What a buyer asked for, as the seller's order card shows it
+/// ([`AppState::seller_order_request`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SellerOrderRequest {
+    /// The listing's title, while the store still lists it.
+    pub title: Option<String>,
+    pub quantity: u32,
+    /// Where to send it, as the buyer typed it.
+    pub shipping: String,
+    pub note: String,
+    pub region: Option<String>,
+    /// The buyer's picks, each named by its group ("Size: M").
+    pub choices: Vec<String>,
+}
+
+/// The buyer's picks named by their group, "Size: M", in the listing's group
+/// order. The listing is today's, not the one the buyer read, so a pick is
+/// named only when it is one of that group's options: after the seller
+/// removes or reorders a group, a pick usually shows alone rather than under
+/// the wrong name (review). Groups still match by position, so a new group
+/// in the same place that happens to offer the same option would still name
+/// it. The 2026-09-30 critique: a bare "Choices: M"
+/// doesn't say what M is.
+pub(crate) fn labelled_choices(
+    groups: &[harvest_common::listing::ChoiceGroup],
+    picks: &[String],
+) -> Vec<String> {
+    picks
+        .iter()
+        .enumerate()
+        .map(|(i, pick)| match groups.get(i) {
+            Some(group) if group.options.contains(pick) => format!("{}: {pick}", group.name),
+            _ => pick.clone(),
+        })
+        .collect()
+}
+
 /// Why asking the vault for a Ghost Key came back with none
 /// ([`AppState::ghostkey_access_problem`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1738,9 +1788,9 @@ pub struct PendingInvoice {
     ///
     /// May be empty, and often is: an invoice with no buyer named is one
     /// anyone holding the link may pay. Naming one records who it was issued
-    /// to and restricts nothing, since Bitcoin cannot say who sent a payment
-    /// -- the form says so where the seller types it
-    /// (`components::invoice_form::InvoiceForm`).
+    /// to and restricts nothing, since Bitcoin cannot say who sent a payment.
+    /// Every order the UI issues now answers a buyer's request and leaves it
+    /// empty (the invoice form that could name one was removed in #190).
     pub buyer_fingerprint: String,
     pub amount_sats: u64,
     pub required_confirmations: u32,
@@ -2462,30 +2512,30 @@ impl PaymentBlocker {
             PaymentBlocker::AnchorAheadOfTip {
                 anchor_height,
                 tip_height,
-            } => format!(
-                "The published order names block {anchor_height}, which is ahead of the \
-                 {tip_height} your node has seen. Either your node is behind or the order is \
-                 not genuine; wait before paying."
-            ),
+            } => {
+                let _ = (anchor_height, tip_height);
+                "The published order is newer than anything your node has seen from Bitcoin \
+                 yet. Either your node is behind or the order is not genuine; wait before \
+                 paying."
+                    .to_string()
+            }
             PaymentBlocker::AnchorStale {
                 anchor_height,
                 tip_height,
             } => format!(
-                "This order has expired. It was declared against Bitcoin block \
-                 {anchor_height}, which is {} blocks behind the {tip_height} your node sees, \
-                 and an order that old stops counting as something the seller openly owes. \
-                 Ask the seller to issue it again.",
-                tip_height.saturating_sub(*anchor_height)
+                "This order has expired: it was made {} ago, and an order that old stops \
+                 counting as something the seller openly owes.",
+                crate::fulfilment::approx_duration(tip_height.saturating_sub(*anchor_height))
             ),
             PaymentBlocker::UnfitForComplaint(why) => format!(
                 "If this order went wrong you could not complain about it on the seller's \
-                 record ({why}). Ask the seller to issue it again."
+                 record ({why}). Buy it again, or ask the seller."
             ),
             PaymentBlocker::AddressContractNotCurrent {
                 generation_known: true,
             } => "The published order watches for your payment somewhere the Bitcoin bridges \
-                 do not report to, so your payment could never be shown to have arrived. Ask \
-                 the seller to issue it again."
+                 do not report to, so your payment could never be shown to have arrived. Buy \
+                 it again to get an order you can pay."
                 .to_string(),
             PaymentBlocker::AddressContractNotCurrent {
                 generation_known: false,
@@ -6574,6 +6624,169 @@ impl AppState {
         self.keep_refusals.get(order_id).map(String::as_str)
     }
 
+    /// The paid orders `fingerprint` still has to send at one of its stores,
+    /// judged against this node's view of the chain
+    /// (`my_store::orders_to_send`, the rule the count uses too).
+    pub(crate) fn seller_orders_to_send(
+        &self,
+        store_contract_id: &[u8],
+        fingerprint: &str,
+    ) -> Vec<harvest_common::payment::AuthorizedOrder> {
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return Vec::new();
+        };
+        crate::components::my_store::orders_to_send(
+            &store.orders,
+            fingerprint,
+            |o| {
+                let tip = self
+                    .bitcoin
+                    .tips
+                    .get(&o.order.network)
+                    .and_then(|t| t.tip_height);
+                crate::fulfilment::order_stage(
+                    o,
+                    self.despatch_of(o).as_ref(),
+                    tip,
+                    self.payment_sight(o),
+                )
+            },
+            |o| self.despatch_recorded(store_contract_id, &o.order.id),
+        )
+    }
+
+    /// Other orders of this seller's paid for by the same payment as
+    /// `order` on a reused address (harvest#77), by short id: one payment
+    /// cannot pay for both, so the seller checks before sending both. Empty
+    /// for an order not paid, and in the normal case.
+    pub(crate) fn paid_twins(
+        &self,
+        order: &harvest_common::payment::AuthorizedOrder,
+    ) -> Vec<String> {
+        if order.status != harvest_common::payment::OrderStatus::Paid {
+            return Vec::new();
+        }
+        let live =
+            crate::components::bitcoin_view::live_address_for_order(&self.bitcoin, &order.order);
+        let reading =
+            crate::components::bitcoin_view::AddressReading::of(&order.order, live.as_ref());
+        self.orders_whose_window_holds(&order.order.id, &reading.in_window_heights)
+            .iter()
+            .map(|id| id.short())
+            .collect()
+    }
+
+    /// Put a notice away: every copy of it, however often it was raised.
+    /// The same thing raised again later shows again.
+    pub fn dismiss_notification(&mut self, notice: &str) {
+        self.notifications.retain(|n| n != notice);
+    }
+
+    /// What the buyer of this seller's `order` asked for, read from the Buy
+    /// now request it answers in the store's mailbox: the listing's title
+    /// (while it is listed), how many, where to send it, the note, and the
+    /// delivery region and choices. What the seller's order card shows, so
+    /// the address is on the card rather than in the message thread (the
+    /// 2026-09-27 friction report).
+    ///
+    /// A request counts only if it is the buyer's (addressed to the seller)
+    /// and agrees with the order the seller's store published for it: the
+    /// same listing (the order's tag) and the total the order asks. The
+    /// order's id binds the request's nonce and date, not its terms, so a
+    /// second request under the same id naming another quantity or listing
+    /// is possible (review of #190). Requests that agree with the order but
+    /// not with each other are a [`SellerRequest::Conflict`]: the seller asks
+    /// the buyer before sending.
+    pub fn seller_order_request(
+        &self,
+        store_contract_id: &[u8],
+        order: &harvest_common::payment::AuthorizedOrder,
+    ) -> SellerRequest {
+        self.seller_order_requests(store_contract_id, std::slice::from_ref(order))
+            .pop()
+            .unwrap_or(SellerRequest::NotFound)
+    }
+
+    /// [`AppState::seller_order_request`] for each of `orders`, in order,
+    /// reading (and decrypting) the store's mailbox once for all of them
+    /// rather than once per order: the Orders tab asks it for the whole
+    /// earlier-orders history on every render. (Each card still to send asks
+    /// for its own order, a handful at most.)
+    pub fn seller_order_requests(
+        &self,
+        store_contract_id: &[u8],
+        orders: &[harvest_common::payment::AuthorizedOrder],
+    ) -> Vec<SellerRequest> {
+        use crate::messaging::{Addressing, MailboxEntry, MessageContent};
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return orders.iter().map(|_| SellerRequest::NotFound).collect();
+        };
+        let entries = self.mailbox_entries(store_contract_id);
+        orders
+            .iter()
+            .map(|order| {
+                let asked: Vec<SellerOrderRequest> = entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        MailboxEntry::Readable {
+                            content:
+                                MessageContent::OrderRequest {
+                                    listing_id,
+                                    quantity,
+                                    shipping,
+                                    note,
+                                    instant: Some(selection),
+                                    ..
+                                },
+                            conversation,
+                            addressing: Addressing::ToSeller,
+                            ..
+                        } => {
+                            let tag: [u8; 32] = conversation.as_slice().try_into().ok()?;
+                            let answers = selection
+                                .answered_request(&tag)
+                                .is_some_and(|request| request.order_id() == order.order.id);
+                            let same_listing = self
+                                .conversation_keys
+                                .get(conversation.as_slice())
+                                .is_some_and(|keys| {
+                                    order.order.listing_tag == Some(keys.listing_tag(listing_id))
+                                });
+                            let same_total =
+                                selection.expected_total_sats == order.order.amount_sats;
+                            (answers && same_listing && same_total).then(|| {
+                                let listing = store
+                                    .listings
+                                    .iter()
+                                    .find(|l| l.listing.id == *listing_id)
+                                    .map(|l| &l.listing);
+                                SellerOrderRequest {
+                                    title: listing.map(|l| l.title.clone()),
+                                    quantity: *quantity,
+                                    shipping: shipping.clone(),
+                                    note: note.clone(),
+                                    region: selection.region.clone(),
+                                    choices: labelled_choices(
+                                        listing.map(|l| l.choices.as_slice()).unwrap_or_default(),
+                                        &selection.choices,
+                                    ),
+                                }
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                match asked.first() {
+                    None => SellerRequest::NotFound,
+                    Some(first) if asked.iter().all(|other| other == first) => {
+                        SellerRequest::Found(first.clone())
+                    }
+                    Some(_) => SellerRequest::Conflict,
+                }
+            })
+            .collect()
+    }
+
     /// What the buyer asked for in the Buy now that `purchase` answers: the
     /// listing's title (when the store still lists it) and the quantity,
     /// read from the buyer's own request in that conversation. The order
@@ -9651,7 +9864,7 @@ impl AppState {
             .ok_or("this order is not in the store as this device last read it")?;
         if order.status != OrderStatus::Paid {
             return Err(format!(
-                "only a paid order can be marked despatched, and this one is {}",
+                "only a paid order can be marked as sent, and this one is {}",
                 match order.status {
                     OrderStatus::AwaitingPayment => "not paid yet",
                     OrderStatus::Cancelled => "cancelled",
@@ -9661,7 +9874,7 @@ impl AppState {
             ));
         }
         if self.despatch_recorded(store_contract_id, order_id) {
-            return Err("this order is already marked despatched".to_string());
+            return Err("this order is already marked as sent".to_string());
         }
         if self.despatch_pending(store_contract_id, order_id)
             || self.despatch_sent(store_contract_id, order_id)
@@ -9775,7 +9988,7 @@ impl AppState {
         self.despatches_sent
             .remove(&order_at(store_contract_id, order_id));
         self.notifications.push(format!(
-            "Could not record the despatch of order {}: {reason}",
+            "Could not mark order {} as sent: {reason}",
             order_id.short()
         ));
     }
@@ -9889,9 +10102,8 @@ impl AppState {
             .ok_or_else(|| NO_STORE_KEY_MESSAGE.to_string())
             .and_then(|key| despatch.verify(&key));
         if let Err(why) = verdict {
-            self.notifications.push(format!(
-                "Could not record the despatch of order {short}: {why}"
-            ));
+            self.notifications
+                .push(format!("Could not mark order {short} as sent: {why}"));
             return;
         }
         self.despatches_sent.insert(order_at(
@@ -10241,16 +10453,22 @@ impl AppState {
             crate::fulfilment::OrderStage::Despatched { .. }
             | crate::fulfilment::OrderStage::DespatchWindowClosed { .. } => {}
             crate::fulfilment::OrderStage::AwaitingDespatch { despatch_by, .. } => {
-                return Err(format!(
-                    "the seller has until block {despatch_by} to despatch, and a complaint can \
-                     be made once they record a despatch or that deadline passes"
-                ))
+                return Err(match tip_height {
+                    Some(tip) => format!(
+                        "the seller has until about {} to send it, and a problem can be \
+                         reported once they mark it as sent or that date passes",
+                        crate::fulfilment::approx_date(despatch_by, tip, now_ms())
+                    ),
+                    None => "the seller still has time to send it, and a problem can be \
+                             reported once they mark it as sent or that time passes"
+                        .to_string(),
+                });
             }
-            crate::fulfilment::OrderStage::Closed { closed_at } => {
-                return Err(format!(
-                    "the complaint window closed at block {closed_at}, and the order counts as \
-                     complete"
-                ))
+            crate::fulfilment::OrderStage::Closed { .. } => {
+                return Err(
+                    "the time to report a problem has passed, and the order counts as complete"
+                        .to_string(),
+                )
             }
             crate::fulfilment::OrderStage::Unknown => {
                 return Err(
@@ -16185,7 +16403,7 @@ mod tests {
         line(failed, "app.end_details_publishing(&store_id, version);");
         let bar = include_str!("components/app.rs");
         line(bar, "let progress = app_state.progress_notices();");
-        assert!(bar.contains(".chain(progress.iter())"));
+        assert!(bar.contains("for notice in progress.iter()"));
         let my_store = include_str!("components/my_store.rs");
         assert!(!my_store.contains("Publishing your store's details"));
         let refused = include_str!("listing_status_flow.rs");
@@ -22751,6 +22969,130 @@ mod buy_flow_tests {
         (state, tag, request)
     }
 
+    /// **The seller's order card names what to send and where**, from the
+    /// buyer's Buy now request that the order answers (the 2026-09-27
+    /// friction report): only a request agreeing with the order's listing
+    /// and total, and a conflict when two such requests differ (the buyer
+    /// holds the keys and could write a second). Red without the id match,
+    /// without the listing or total check, and taking the first of two.
+    /// A pick reads with its group's name; one past the listing's groups
+    /// (the listing changed) still shows, alone.
+    #[test]
+    fn a_buyers_picks_are_named_by_their_group() {
+        let groups = vec![
+            harvest_common::listing::ChoiceGroup {
+                name: "Size".into(),
+                options: vec!["S".into(), "M".into()],
+            },
+            harvest_common::listing::ChoiceGroup {
+                name: "Colour".into(),
+                options: vec!["Blue".into()],
+            },
+        ];
+        assert_eq!(
+            labelled_choices(&groups, &["M".into(), "Blue".into(), "Extra".into()]),
+            vec!["Size: M", "Colour: Blue", "Extra"]
+        );
+        // The seller removed Size after the order: "M" is not a Colour.
+        assert_eq!(
+            labelled_choices(&groups[1..], &["M".into(), "Blue".into()]),
+            vec!["M", "Blue"]
+        );
+        assert!(labelled_choices(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn the_sellers_order_card_reads_the_buyers_request() {
+        use crate::messaging::BuyerConversation;
+        let (mut state, _, _) = seller_holding_a_request();
+        let buyer = BuyerConversation::open(&seller_encryption_key()).expect("open");
+        let tag = buyer.buyer_public_key;
+        state
+            .conversation_keys
+            .insert(tag.to_vec(), seller_keys_for(&tag));
+        let instant = |total: u64| crate::messaging::InstantSelection {
+            nonce: [4u8; 16],
+            region: Some("EU".into()),
+            choices: vec!["Blue".into()],
+            expected_total_sats: total,
+            requested_at_ms: 1_700_000_000_000,
+        };
+        let order_id = instant(12_000)
+            .answered_request(&tag)
+            .expect("dated")
+            .order_id();
+        // The order the store published for it: this listing's tag, the
+        // total the buyer agreed. Unsigned: the card reads terms only.
+        let mut order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 1)),
+            OrderStatus::Paid,
+        );
+        order.order.id = order_id.clone();
+        order.order.amount_sats = 12_000;
+        order.order.listing_tag = Some(seller_keys_for(&tag).listing_tag(&ListingId([3u8; 32])));
+        let ask = |listing: u8, quantity: u32, shipping: &str, total: u64| {
+            buyer
+                .request_order(
+                    &ListingId([listing; 32]),
+                    quantity,
+                    shipping.into(),
+                    "gift wrap".into(),
+                    Some(instant(total)),
+                )
+                .expect("sealed")
+        };
+        let set = |state: &mut AppState, msgs: Vec<EncryptedMessage>| {
+            state
+                .browsing_stores
+                .get_mut(STORE)
+                .expect("the store")
+                .mailbox_messages = msgs;
+        };
+        set(&mut state, vec![ask(3, 2, "Jo Buyer\n1 Lane", 12_000)]);
+        let SellerRequest::Found(asked) = state.seller_order_request(STORE, &order) else {
+            panic!("the request answers the order");
+        };
+        assert_eq!(asked.quantity, 2);
+        assert_eq!(asked.shipping, "Jo Buyer\n1 Lane");
+        assert_eq!(asked.note, "gift wrap");
+        assert_eq!(asked.region.as_deref(), Some("EU"));
+        assert_eq!(asked.choices, vec!["Blue".to_string()]);
+
+        let mut other = order.clone();
+        other.order.id = harvest_common::payment::OrderId([9; 32]);
+        assert_eq!(
+            state.seller_order_request(STORE, &other),
+            SellerRequest::NotFound,
+            "an order no request answers"
+        );
+        // A request under the same id for another listing, or another
+        // total, is not the one the order answers (review of #190).
+        set(&mut state, vec![ask(4, 5, "Elsewhere", 12_000)]);
+        assert_eq!(
+            state.seller_order_request(STORE, &order),
+            SellerRequest::NotFound
+        );
+        set(&mut state, vec![ask(3, 5, "Elsewhere", 60_000)]);
+        assert_eq!(
+            state.seller_order_request(STORE, &order),
+            SellerRequest::NotFound
+        );
+        // Two that both agree with the order but differ from each other.
+        set(
+            &mut state,
+            vec![
+                ask(3, 2, "Jo Buyer\n1 Lane", 12_000),
+                ask(3, 2, "Elsewhere", 12_000),
+            ],
+        );
+        assert_eq!(
+            state.seller_order_request(STORE, &order),
+            SellerRequest::Conflict,
+            "two versions: ask the buyer"
+        );
+    }
+
     fn invoice_answering(tag: [u8; 32]) -> PendingInvoice {
         PendingInvoice {
             answers_request: None,
@@ -29255,10 +29597,7 @@ mod buy_flow_tests {
         assert!(state.published_despatches.is_empty());
         assert!(!state.despatch_sent(STORE, &order.order.id));
         assert!(
-            state
-                .notifications
-                .iter()
-                .any(|n| n.contains("Could not record the despatch")),
+            state.notifications.iter().any(|n| n.contains("as sent:")),
             "{:?}",
             state.notifications
         );
@@ -29277,13 +29616,10 @@ mod buy_flow_tests {
         assert!(state.despatch_sent(STORE, &order.order.id));
         state.on_despatch_send_failed(STORE, &order.order.id, "the node is gone");
         assert!(!state.despatch_sent(STORE, &order.order.id));
-        assert!(
-            state
-                .notifications
-                .iter()
-                .any(|n| n.contains("Could not record the despatch")
-                    && n.contains("the node is gone"))
-        );
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("as sent:") && n.contains("the node is gone")));
         // And the seller may try again.
         state.despatch_order(STORE, &order.order.id).expect("again");
 
@@ -29377,7 +29713,7 @@ mod buy_flow_tests {
         assert!(state.despatch_recorded(STORE, &order.order.id));
         assert_eq!(
             state.despatch_refusal(STORE, &order.order.id).as_deref(),
-            Some("this order is already marked despatched")
+            Some("this order is already marked as sent")
         );
         assert!(state.despatch_order(STORE, &order.order.id).is_err());
         assert!(state.pending_signatures.is_empty());
@@ -31370,7 +31706,8 @@ mod buy_flow_tests {
         let refused = state
             .complaint_refusal(STORE, &purchase)
             .expect("too early");
-        assert!(refused.contains("despatch"), "{refused}");
+        assert!(refused.contains("to send it"), "{refused}");
+        assert!(!refused.contains("block"), "a date, not a block: {refused}");
         assert!(state
             .file_complaint(STORE, &order.order.id, FeedbackCategory::NonDelivery)
             .is_err());
@@ -31387,7 +31724,7 @@ mod buy_flow_tests {
         );
         let purchase = purchases(&state).remove(0);
         let refused = state.complaint_refusal(STORE, &purchase).expect("too late");
-        assert!(refused.contains("closed"), "{refused}");
+        assert!(refused.contains("has passed"), "{refused}");
 
         // An unpaid order takes no complaint at all.
         let (unpaid, _, _) = a_paid_order();
@@ -32722,7 +33059,10 @@ mod buy_flow_tests {
     /// long after arming is the hosted case, and is said plainly.
     #[test]
     fn the_store_page_says_how_instant_checkout_stands() {
-        use crate::auto_invoice_flow::{instant_checkout_status_text, NO_BACKGROUND_RUN_AFTER_MS};
+        use crate::auto_invoice_flow::{
+            instant_checkout_alerts, instant_checkout_state_line as instant_checkout_status_text,
+            NO_BACKGROUND_RUN_AFTER_MS,
+        };
         let status = |last_run, paused: Option<&str>| harvest_common::delegate::AutoInvoiceStatus {
             armed_at_ms: 0,
             watched_remaining: 7,
@@ -32739,7 +33079,7 @@ mod buy_flow_tests {
         };
         let hosted = instant_checkout_status_text(&status(None, None), NO_BACKGROUND_RUN_AFTER_MS);
         assert!(
-            hosted.starts_with("Your store can't take orders on this node"),
+            hosted.starts_with("This device hasn\u{2019}t been seen running"),
             "{hosted}"
         );
         // A node that did run is not told it does not, however long ago it armed.
@@ -32755,6 +33095,39 @@ mod buy_flow_tests {
         );
         let on = instant_checkout_status_text(&status(Some(1), None), 1);
         assert!(on.starts_with("Your store is taking orders"), "{on}");
+        // A lapsed watch is renewed by this very tab, so the seller reading
+        // it is told that, not "open Harvest" (the 2026-09-30 critique).
+        let lapsed = instant_checkout_status_text(
+            &status(Some(1), Some(crate::auto_invoice_flow::WATCH_LAPSED_REASON)),
+            1,
+        );
+        assert!(
+            lapsed.contains("renews it while it\u{2019}s open here"),
+            "{lapsed}"
+        );
+        assert!(!lapsed.contains("open Harvest"), "{lapsed}");
+        // The text matched on is the delegate's own, as it sends it.
+        let delegate = include_str!("../../delegates/harvest-delegate/src/auto_invoice.rs");
+        let mut joined = String::new();
+        let mut lines = delegate.lines();
+        while let Some(line) = lines.next() {
+            if let Some(head) = line.trim_end().strip_suffix('\\') {
+                joined.push_str(head);
+                if let Some(next) = lines.next() {
+                    joined.push_str(next.trim_start());
+                }
+            } else {
+                joined.push_str(line);
+            }
+            joined.push('\n');
+        }
+        assert!(
+            joined.contains(&format!(
+                "\"{}\"",
+                crate::auto_invoice_flow::WATCH_LAPSED_REASON
+            )),
+            "the delegate no longer sends the watch-lapsed reason Harvest matches"
+        );
         // Paused before any background run says why it is paused.
         let waiting = instant_checkout_status_text(&status(None, Some("no recent block")), 1);
         assert!(
@@ -32768,16 +33141,23 @@ mod buy_flow_tests {
         );
         let mut oversold = status(Some(1), None);
         oversold.oversold = vec![OrderId([7; 32])];
-        let told = instant_checkout_status_text(&oversold, 1);
-        assert!(told.contains(&OrderId([7; 32]).short()), "{told}");
+        let told = instant_checkout_alerts(&oversold);
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(told[0].contains(&OrderId([7; 32]).short()), "{told:?}");
+        assert!(told[0].contains("Refund or send these by hand"), "{told:?}");
+        assert!(instant_checkout_alerts(&status(Some(1), None)).is_empty());
         // A store limit that turned a buyer away is said, ahead of the rest.
         let mut capped = status(Some(1), None);
         capped.capped = Some("50 instant invoices are waiting for payment".into());
-        let said = instant_checkout_status_text(&capped, 1);
+        let said = instant_checkout_alerts(&capped);
+        assert_eq!(said.len(), 1, "{said:?}");
         assert!(
-            said.starts_with("In the last hour a buyer couldn't order because 50 instant"),
-            "{said}"
+            said[0].starts_with("In the last hour a buyer couldn't order because 50 instant"),
+            "{said:?}"
         );
+        // Both at once: both said.
+        capped.oversold = vec![OrderId([7; 32])];
+        assert_eq!(instant_checkout_alerts(&capped).len(), 2);
 
         let gk = inbox::authority().mint();
         let state = an_instant_seller(&gk);
@@ -32786,6 +33166,46 @@ mod buy_flow_tests {
             .unwrap()
             .contains("starting"));
         assert!(state.instant_checkout_notice(&[0xee; 32], 1).is_none());
+
+        // What the seller's one status is told about this device (review of
+        // #190: a hosted node read "Open"). Red if a never-run device past
+        // the grace time is not flagged, or a paused one reads Ready.
+        use crate::presence_flow::LocalSelling;
+        let mut state = state;
+        state.bitcoin.payment_xpub_loaded = true;
+        assert_eq!(
+            state.instant_checkout_local(&instant_store(), 1),
+            Some(LocalSelling::Starting)
+        );
+        state
+            .auto_invoice
+            .status
+            .insert(instant_store(), Ok(status(None, None)));
+        assert!(matches!(
+            state.instant_checkout_local(&instant_store(), NO_BACKGROUND_RUN_AFTER_MS),
+            Some(LocalSelling::Unconfirmed(why)) if why.contains("been seen running")
+        ));
+        assert_eq!(
+            state.instant_checkout_local(&instant_store(), 1),
+            Some(LocalSelling::Starting)
+        );
+        state.auto_invoice.status.insert(
+            instant_store(),
+            Ok(status(Some(1), Some("no recent block"))),
+        );
+        assert!(matches!(
+            state.instant_checkout_local(&instant_store(), 1),
+            Some(LocalSelling::Blocked(_))
+        ));
+        state
+            .auto_invoice
+            .status
+            .insert(instant_store(), Ok(status(Some(1), None)));
+        assert_eq!(
+            state.instant_checkout_local(&instant_store(), 1),
+            Some(LocalSelling::Ready { delegated: false })
+        );
+        assert_eq!(state.instant_checkout_local(&[0xee; 32], 1), None);
     }
 }
 

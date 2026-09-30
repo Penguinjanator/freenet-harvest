@@ -884,8 +884,62 @@ impl AppState {
         Some(match self.auto_invoice.status.get(store_contract_id) {
             None => "Your store is starting to take orders on this device.".into(),
             Some(Err(why)) => format!("Your store can't take orders on this device: {why}."),
-            Some(Ok(status)) => instant_checkout_status_text(status, now_ms),
+            // The state line alone: the alerts (oversold, capped) are said
+            // separately, in "Needs you", whether or not the store is open.
+            Some(Ok(status)) => instant_checkout_state_line(status, now_ms),
         })
+    }
+
+    /// Whether this device answers buyers' orders for one of our stores, for
+    /// the seller's one status (`presence_flow::seller_status`). `None` for a
+    /// store that is not selling here.
+    pub fn instant_checkout_local(
+        &self,
+        store_contract_id: &[u8],
+        now_ms: u64,
+    ) -> Option<crate::presence_flow::LocalSelling> {
+        use crate::presence_flow::LocalSelling;
+        let notice = self.instant_checkout_notice(store_contract_id, now_ms)?;
+        if !self.bitcoin.payment_xpub_loaded {
+            // Not answered yet: nothing to say against the store.
+            return Some(LocalSelling::Starting);
+        }
+        if self.bitcoin.payment_xpub.is_none() {
+            return Some(LocalSelling::Blocked(notice));
+        }
+        Some(match self.auto_invoice.status.get(store_contract_id) {
+            None => LocalSelling::Starting,
+            Some(Err(_)) => LocalSelling::Blocked(notice),
+            Some(Ok(status)) => {
+                let hosted = status.last_background_run_ms.is_none()
+                    && now_ms.saturating_sub(status.armed_at_ms) >= NO_BACKGROUND_RUN_AFTER_MS;
+                if status.paused.is_some() {
+                    LocalSelling::Blocked(notice)
+                } else if hosted {
+                    // Only a guess (a quiet half hour on a real node looks
+                    // the same, round 2 of #190), so a warning, not closed.
+                    LocalSelling::Unconfirmed(notice)
+                } else if status.last_background_run_ms.is_none() {
+                    LocalSelling::Starting
+                } else {
+                    LocalSelling::Ready {
+                        delegated: status
+                            .watch_delegation
+                            .as_ref()
+                            .is_some_and(|delegation| !delegation.stalled),
+                    }
+                }
+            }
+        })
+    }
+
+    /// [`instant_checkout_alerts`] for one of our stores; empty when it has
+    /// no status yet.
+    pub fn instant_checkout_alerts(&self, store_contract_id: &[u8]) -> Vec<String> {
+        match self.auto_invoice.status.get(store_contract_id) {
+            Some(Ok(status)) => instant_checkout_alerts(status),
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -950,44 +1004,65 @@ fn without_left(arm: &AutoInvoiceArm) -> AutoInvoiceArm {
     }
 }
 
-/// The store page's line for an armed store, led by any order that was paid
-/// after its item had gone to another buyer.
-pub fn instant_checkout_status_text(status: &AutoInvoiceStatus, now_ms: u64) -> String {
-    let line = instant_checkout_state_text(status, now_ms);
-    if status.oversold.is_empty() {
-        return line;
+/// What the seller must know about orders even while the store is open:
+/// paid orders the listing's count no longer covered (to refund or send by
+/// hand), and a buyer turned away by a cap in the last hour. Empty for none.
+pub fn instant_checkout_alerts(status: &AutoInvoiceStatus) -> Vec<String> {
+    let mut alerts = Vec::new();
+    if !status.oversold.is_empty() {
+        let orders: Vec<String> = status.oversold.iter().map(|id| id.short()).collect();
+        alerts.push(format!(
+            "Paid when the listing's count no longer covered them (the item went to another \
+             buyer, or you marked it sold out or took it down): {}. Refund or send these by \
+             hand.",
+            orders.join(", ")
+        ));
     }
-    let orders: Vec<String> = status.oversold.iter().map(|id| id.short()).collect();
-    format!(
-        "Paid when the listing's count no longer covered them (the item went to another \
-         buyer, or you marked it sold out or took it down): {}. Refund or fulfil these by \
-         hand. {line}",
-        orders.join(", ")
-    )
-}
-
-fn instant_checkout_state_text(status: &AutoInvoiceStatus, now_ms: u64) -> String {
-    let line = instant_checkout_state_line(status, now_ms);
-    match &status.capped {
-        Some(why) => format!(
+    if let Some(why) = &status.capped {
+        alerts.push(format!(
             "In the last hour a buyer couldn't order because {why}; they were told to try again \
-             later. {line}"
-        ),
-        None => line,
+             later."
+        ));
     }
+    alerts
 }
 
-fn instant_checkout_state_line(status: &AutoInvoiceStatus, now_ms: u64) -> String {
+/// The harvest delegate's reason for a lapsed watch (`Refusal::WatchLapsed`
+/// in `delegates/harvest-delegate/src/auto_invoice.rs`), exactly as it sends
+/// it. The status carries only the text, so this is matched on; a delegate
+/// that rewords it falls back to showing its words as they are.
+pub(crate) const WATCH_LAPSED_REASON: &str =
+    "the watch on its payment addresses would lapse before a buyer could pay; open Harvest to \
+     renew it";
+
+/// This device's line about taking orders: the reason buyers can't buy,
+/// said under the store's status while they can't (`presence_flow::
+/// seller_status`). The alerts that stand whether or not the store is open
+/// are [`instant_checkout_alerts`].
+pub fn instant_checkout_state_line(status: &AutoInvoiceStatus, now_ms: u64) -> String {
+    // A pause is certain and says what to do, so it comes before the guess
+    // below (round 3 of #190).
+    if let Some(why) = &status.paused {
+        // The delegate's own words for a lapsed watch end "open Harvest to
+        // renew it", said here to someone who has Harvest open (the
+        // 2026-09-30 critique). This tab renews it (module doc), so say that.
+        if why == WATCH_LAPSED_REASON {
+            return "Your store isn't taking orders right now: the watch on its payment \
+                    addresses has lapsed. Harvest renews it while it\u{2019}s open here, and \
+                    orders start again once it\u{2019}s renewed."
+                .into();
+        }
+        return format!("Your store isn't taking orders right now: {why}.");
+    }
     if status.last_background_run_ms.is_none()
         && now_ms.saturating_sub(status.armed_at_ms) >= NO_BACKGROUND_RUN_AFTER_MS
     {
-        return "Your store can't take orders on this node. This happens when you use Harvest \
-                through a hosted service such as try.freenet.org, where nothing runs while you \
-                are away. Run Harvest on your own Freenet node to sell."
+        // A guess, and worded as one: a quiet half hour on a real node looks
+        // the same as a hosted service (round 3 of #190).
+        return "This device hasn\u{2019}t been seen running your store in the background yet. \
+                If you use Harvest through a hosted service such as try.freenet.org, orders stop \
+                when you close Harvest: run Harvest on your own Freenet node to stay open."
             .into();
-    }
-    if let Some(why) = &status.paused {
-        return format!("Your store isn't taking orders right now: {why}.");
     }
     // Ready, but this node has not yet shown it runs in the background: the
     // tip read on arming (harvest#162) is answered even on a hosted gateway,
