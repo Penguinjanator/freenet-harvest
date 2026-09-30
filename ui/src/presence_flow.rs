@@ -173,15 +173,55 @@ impl AppState {
         store_presence(state, since, now_ms)
     }
 
+    /// Whether `store_contract_id` is a store the user removed from their
+    /// Stores list ("Remove from list"), other than the store opened last
+    /// (its page may be on screen) and never one of our own.
+    ///
+    /// A purchase from a removed store stays payable on Purchases: the pay
+    /// card rests on the store's own state (`payment_blockers`), not on its
+    /// presence, which here only stops being refreshed.
+    pub fn removed_from_list(&self, store_contract_id: &[u8]) -> bool {
+        self.removed_from_list_given(store_contract_id, &self.own_store_codes())
+    }
+
+    /// [`Self::removed_from_list`] with our own store codes worked out once
+    /// by the caller, which asks it for every loaded store.
+    fn removed_from_list_given(
+        &self,
+        store_contract_id: &[u8],
+        own: &std::collections::HashSet<String>,
+    ) -> bool {
+        if self.active_store_id.as_deref() == Some(store_contract_id) {
+            return false;
+        }
+        let Some(code) = self.store_codes.get(store_contract_id) else {
+            return false;
+        };
+        if own.contains(code) {
+            return false;
+        }
+        self.remembered_stores.as_ref().is_some_and(|stores| {
+            stores
+                .iter()
+                .any(|store| store.archived && store.store_code == *code)
+        })
+    }
+
     /// The presence contracts to GET (and subscribe to) now, each once:
     /// every loaded store's whose key is known and that this tab has not
     /// followed yet, and again each one that does not read open, spaced by
     /// [`presence_refresh_after`]. Changes nothing.
     pub fn presence_reads_due(&self, now_ms: u64) -> Vec<([u8; 32], [u8; 32])> {
+        // Not a store the user removed from their list (Ian, 2026-09-30:
+        // "Remove from list" stops following it). Its presence is still
+        // read if another store of the same key is on the list, or while
+        // it is the store opened last.
+        let own = self.own_store_codes();
         let keys: std::collections::BTreeSet<[u8; 32]> = self
             .browsing_stores
-            .values()
-            .filter_map(|s| s.owner)
+            .iter()
+            .filter(|(id, _)| !self.removed_from_list_given(id, &own))
+            .filter_map(|(_, s)| s.owner)
             .collect();
         keys.into_iter()
             .filter_map(|key| {

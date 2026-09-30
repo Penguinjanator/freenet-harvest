@@ -34110,6 +34110,85 @@ mod buy_flow_tests {
             state.store_presence(&[8; 32], late)
         );
         assert!(state.store_presence(&[9; 32], late).is_closed());
+
+        // A store removed from the list is no longer read (Ian, 2026-09-30),
+        // unless its page is open. Red without the removed-from-list filter.
+        let mut removed = AppState::default();
+        let other = ed25519_dalek::SigningKey::from_bytes(&[0x36; 32]);
+        removed.browsing_stores.insert(
+            vec![7; 32],
+            BrowsingStore {
+                owner: Some(other.verifying_key().to_bytes()),
+                ..Default::default()
+            },
+        );
+        removed
+            .store_codes
+            .insert(vec![7; 32], "Removedstore0001".to_string());
+        removed.remembered_stores = Some(vec![harvest_common::RememberedStore {
+            store_code: "Removedstore0001".to_string(),
+            archived: true,
+        }]);
+        assert!(removed.presence_reads_due(now).is_empty());
+        // Another listed store of the same key keeps the key read.
+        removed.browsing_stores.insert(
+            vec![6; 32],
+            BrowsingStore {
+                owner: Some(other.verifying_key().to_bytes()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(removed.presence_reads_due(now).len(), 1);
+        removed.browsing_stores.remove(&vec![6u8; 32]);
+        assert!(removed.presence_reads_due(now).is_empty());
+        // One of our own is never muted, even marked removed. Red without
+        // the own-store check.
+        let own_key = crate::state::test_store_key();
+        let own_code = harvest_common::store::store_code(
+            &ed25519_dalek::VerifyingKey::from_bytes(&own_key).expect("key"),
+        );
+        let mut ours = removed.clone();
+        ours.browsing_stores.insert(
+            vec![5; 32],
+            BrowsingStore {
+                owner: Some(own_key),
+                ..Default::default()
+            },
+        );
+        ours.store_codes.insert(vec![5; 32], own_code.clone());
+        ours.remembered_stores = Some(vec![
+            harvest_common::RememberedStore {
+                store_code: "Removedstore0001".to_string(),
+                archived: true,
+            },
+            harvest_common::RememberedStore {
+                store_code: own_code,
+                archived: true,
+            },
+        ]);
+        // Not yet known as ours: muted like any removed store.
+        assert!(ours.presence_reads_due(now).is_empty());
+        ours.my_stores.insert(
+            "fp-own".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: vec![5; 32],
+                reputation_contract_id: vec![3u8; 32],
+                mailbox_contract_id: vec![4u8; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(own_key),
+            }],
+        );
+        let due = ours.presence_reads_due(now);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, own_key);
+        removed.active_store_id = Some(vec![7; 32]);
+        assert_eq!(removed.presence_reads_due(now).len(), 1);
+        removed.active_store_id = None;
+        removed.remembered_stores = Some(vec![harvest_common::RememberedStore {
+            store_code: "Removedstore0001".to_string(),
+            archived: false,
+        }]);
+        assert_eq!(removed.presence_reads_due(now).len(), 1);
     }
 
     /// A store found open again starts its re-read spacing afresh. Mutated
