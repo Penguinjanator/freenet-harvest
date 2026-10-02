@@ -1481,6 +1481,15 @@ which is also when the store contract re-keys.
 | `auto_invoice::merge_ledgers` | Decides what the scanning merge decided, with membership against sets. | **Yes** -- `merge_ledgers_is_the_scanning_merge`, against the old merge kept verbatim in the tests. Dropping the held-settled skip is an equivalent mutation (the retain after the loop removes the same sales). |
 | `kept_purchases::conversation_seed` | Finds a conversation by the tag its key ends in, checked against its secret, and falls back to the scan. | **Yes** -- `a_conversation_is_found_by_its_tag`, `a_conversation_filed_under_another_name_is_still_found`. |
 
+## Delegate work per call (added 2026-10-01, harvest#206)
+
+A node stops a delegate call after 5 s of wall clock, and the web app then gets an error it cannot attribute (#203, #204). `tests/delegate-budget` runs the COMMITTED delegate WASM under wasmtime with fuel metering and fails CI when one call is over budget. It is a separate cargo workspace, so `cargo test --workspace` does not run it; only the `delegate-budget` CI job does.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `tests/delegate-budget` | Every driven handler's single call stays under 3,000,000,000 fuel (about 1 s of copy-heavy work on nova with the node's engine and memory layout) and 64 secret writes, with each collection it walks filled to its cap. | **Yes, for the driven handlers** -- red on the pre-#203 delegate (`GetStoreSubkeys` 3.4x-16.6x); caps are read from the delegate source, every step asserts its answer or the state it writes, and the memory cap is the node's (a smaller cap turns it red). **Red on V29** (main's delegate before #216, `cbe71dd9…`) on real findings: with the watch delegations full, the heartbeat wake-up (3526%), the tip read's answer (3369%), a re-arm (211%) and a forced heartbeat (204%); instant checkout's decide against a full store (870%); the byte-cap mailbox scan (346%), the same with plaintexts built to be slow to decode (457%) and the wake-up's mailbox read answered with it (455%); the export (269%) and heartbeat wake-up (255%) with every arm's ledger full; and the published-script scan (435% for one store, about 27,800% for all 64). Main's delegate since #216 (`ed88aa21…`, a re-key) is **green**: every call within budget, the largest 85% (instant checkout's decide against a store of 4,096 paid orders), then the payment counter's catch-up wake-ups (74-76%) and a keep into a full store (74%). The published-script scan costs about 41% a call: the delegate holds the scripts (`AddPublishedScripts`) and scans them in budgets, driven by the harness to the end for one store, a new key (pending slot, promotion, a stale resume refused) and the wake-ups. Figures and the commit that produced them: `tests/delegate-budget/README.md`. |
+| same | Handlers not driven, record sizes above the minimal fixture, secret READ time, slower-than-desktop hardware, and flows of many calls. | **No** -- listed in `tests/delegate-budget/README.md`, "What it does not cover". |
+
 ## The four that matter
 
 Ranked by what breaks if the claim turns out to be false, not by how easy the
