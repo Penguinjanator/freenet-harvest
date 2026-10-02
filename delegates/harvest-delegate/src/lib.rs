@@ -4,6 +4,7 @@ mod auto_invoice;
 mod background;
 mod bip32;
 mod bitcoin;
+mod fast_cbor;
 mod handlers;
 mod import;
 mod kept_purchases;
@@ -13,6 +14,7 @@ mod messaging;
 mod migration;
 mod node_glue;
 mod origin;
+mod published_set;
 mod secrets;
 mod store_keys;
 mod watch_delegation;
@@ -512,6 +514,7 @@ mod boundary_tests {
             xpub: A_VALID_ZPUB.to_string(),
             network: BitcoinNetwork::Bitcoin,
             published_scripts: Vec::new(),
+            resume: false,
         })
         .expect("cbor");
 
